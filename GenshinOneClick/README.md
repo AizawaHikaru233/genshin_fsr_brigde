@@ -13,31 +13,15 @@
 
 首次运行先选择游戏目录：可以直接输入游戏目录或游戏 EXE 路径，也可以不输入直接按回车打开目录选择窗口。有效路径保存在 `.installer-state.json`，下次运行自动读取；缓存失效时会重新进入选择页面。
 
-主界面会显示当前游戏目录、当前插件目录、强制基础组件 FPS Unlocker，以及三个可选插件的完整路径和安装状态，并提供安装、卸载、更换游戏目录、修改帧率和启动游戏等选项。
-
-- 首次安装 FPS Unlocker 后会要求设置帧率上限，直接按回车默认使用 60
-- 安装时输入 `A` 或直接按回车：安装全部三个可选插件
-- 卸载时输入 `A` 或直接按回车：卸载全部三个可选插件，保留 FPS Unlocker
-- 输入顶部表格中的模块 ID `2`、`3` 或 `4`：处理指定插件
-- 输入 `2`：FSR Bridge + OptiScaler
-- 输入 `3`：反虚化 / 隐藏 UID
-- 输入 `4`：ReShade HDR
-- 输入 `0`：返回上一层
-
-需要下载的组件提供三种方式：联网安装、检查更新和手动安装。手动安装可以输入本地文件或解压目录；直接按回车会打开文件选择窗口。地址无效或关闭选择窗口时会提示未找到目录或文件，并返回安装方式菜单，不会退出管理器。
-
-FPS Unlocker 是强制基础组件。选择游戏目录后若检测到它尚未就绪，管理器会先要求自动下载或手动导入，成功后才进入主界面；卸载向导不会卸载 FPS Unlocker。安装或卸载结束后会自动回到主界面，OptiScaler 尚未就绪时安装向导会继续询问使用官方下载还是本地文件。
-
-安装和卸载页面使用相同的横向表格，显示模块 ID、插件名、作者、当前版本和安装状态。当前版本与安装状态分别显示，过长版本会在版本列的起始位置继续显示，不会自然换行到窗口最左侧。表格下方不重复显示模块列表，只需输入顶部对应的模块 ID。
-
-主菜单提供“关于 / 作者主页”。同一作者的插件和脚本会合并显示，选择编号后由默认浏览器打开对应页面。`シリアCelia` 项包含 FSR Bridge、AntiPlayerMosaic 和安装管理脚本。
-
 官方下载来源：
 
 - FPS Unlocker：`https://github.com/34736384/genshin-fps-unlock/releases`
 - OptiScaler：`https://github.com/optiscaler/OptiScaler/releases`
+- NVIDIA DLSS 超分组件：`https://github.com/NVIDIA-RTX/Streamline/releases`
 
 自动下载会通过 GitHub API 获取最新正式发行版，压缩包只保存在系统临时目录，安装完成后自动删除。运行所需文件会放到安装器自身目录下。若 GitHub 无法访问，可在浏览器中手动下载，然后在安装器中选择本地 `exe`、`zip`、`7z` 或完整解压目录。
+
+一键脚本会在已安装 OptiScaler、检测到 NVIDIA 显卡且缺少 `nvngx_dlss.dll` 时，自动从 NVIDIA 官方 Streamline 最新正式包提取生产版 `bin/x64/nvngx_dlss.dll`，验证 NVIDIA 数字签名后安装并保留随包许可证。已有有效文件时不会覆盖。`nvngx_dlssg.dll` 和 `nvngx_dlssd.dll` 不在自动下载范围内，如有需要请自行从合法来源提供。
 
 ReShade 使用官方 Add-on 版 `6.7.3`，随发布包提供并保留 BSD-3-Clause 许可证。HDR 着色器来自 `EndlesslyFlowering/ReShade_HDR_shaders`，其 GPL-3.0 许可证会随包保留。
 
