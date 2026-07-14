@@ -1,3 +1,5 @@
+中文
+
 遇到游戏无法启动、FSR 无法激活、切换超分后闪退或其他异常时：
 
 1. 复现问题后不要再次启动游戏。
@@ -7,3 +9,15 @@
 5. 说明显卡型号、异常发生阶段和当时选择的超分/帧生成模式。
 
 默认日志采用适合长期启用的级别。需要更详细日志时，可临时将 OptiScaler.ini 中 [Log] 下的 LogLevel 改为 1（Debug）或 0（Trace）。
+
+English
+
+If the game cannot start, FSR does not activate, changing upscaling causes a crash, or another issue occurs:
+
+1. Reproduce the issue, then do not launch the game again.
+2. Submit `payload\Bridge\Dx11FsrBridge.log`.
+3. Submit `payload\OptiScaler\OptiScaler.log`.
+4. Submit `Dx11FsrBridge.ini` and `OptiScaler.ini` from the two directories.
+5. Describe the GPU model, the stage at which the issue occurred, and the selected upscaling or frame-generation mode.
+
+The default log level is suitable for regular use. For more detail, temporarily set `[Log] LogLevel` in `OptiScaler.ini` to `1` (Debug) or `0` (Trace).

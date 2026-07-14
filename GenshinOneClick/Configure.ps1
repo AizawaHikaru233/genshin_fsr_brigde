@@ -13,7 +13,9 @@
     [switch]$EnsureNvidiaDlssOnly,
     [switch]$NonInteractive,
     [switch]$NoShortcut,
-    [switch]$ResetPluginConfigsOnly
+    [switch]$ResetPluginConfigsOnly,
+    [ValidateSet('Auto', 'zh-CN', 'en-US')]
+    [string]$Language = 'Auto'
 )
 
 Set-StrictMode -Version Latest
@@ -45,6 +47,10 @@ $reshadeDll = Join-Path $reshadeDir 'ReShade64.dll'
 $shaderDir = Join-Path $reshadeDir 'reshade-shaders'
 $unlocker = Join-Path $root 'unlockfps_nc.exe'
 $fpsConfig = Join-Path $root 'fps_config.json'
+
+. (Join-Path $root 'Localization.ps1')
+$script:Language = Get-InstallerLanguage -RequestedLanguage $Language
+Initialize-InstallerLocalization -Language $script:Language
 
 function Assert-File {
     param([string]$Path)

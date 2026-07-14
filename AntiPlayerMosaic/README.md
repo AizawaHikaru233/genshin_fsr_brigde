@@ -30,7 +30,7 @@ cmake --build build --config Release
 
 ## 边界
 
-本项目不包含、加载或调用 Snap Hutao 二进制文件、共享内存接口或固定 RVA 表。它也不包含游戏文件、ReShade、OptiScaler 或其他第三方 Mod。
+本项目不包含、加载或调用第三方工具的二进制文件、共享内存接口或固定 RVA 表。它也不包含游戏文件、ReShade、OptiScaler 或其他第三方 Mod。
 
 ## 许可证
 
