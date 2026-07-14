@@ -6,6 +6,18 @@
 
 本仓库同时包含 `AntiPlayerMosaic/` 子项目。它是独立构建的原神马赛克修复与 UID 隐藏插件，具体用法见该目录的 README。
 
+## Lite 发布包
+
+`GenshinOneClick/` 包含 Lite 安装器的完整脚本、默认配置、官方 ReShade Add-on DLL 和 HDR 着色器。FPS Unlocker 与 OptiScaler 不随 Lite 包或本仓库分发，安装器会从其官方来源下载或要求用户手动选择。
+
+两个自有 DLL 是编译产物，不提交到仓库。要生成与 GitHub Actions 相同的 Lite ZIP，请在 Windows 上运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Build-Package.ps1
+```
+
+构建结果位于 `dist\原神解帧FSR插件包Lite_v*.zip`。GitHub Actions 在 `main` 分支推送后也会自动编译，并将 ZIP 上传为 `GenshinOneClick-Lite` Artifact。
+
 ## 功能
 
 - 通过 DX11 设备与上下文拦截获取原神的 FSR2 调用时机。

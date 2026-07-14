@@ -1,0 +1,27 @@
+name: Build Lite Package
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure and package Lite build
+        shell: pwsh
+        run: ./Build-Package.ps1 -Configuration Release
+
+      - name: Upload Lite package
+        uses: actions/upload-artifact@v4
+        with:
+          name: GenshinOneClick-Lite
+          path: dist/原神解帧FSR插件包Lite_*.zip
+          if-no-files-found: error

@@ -19,6 +19,7 @@ Makefile
 *.lib
 !third_party/detours/detours.lib
 *.dll
+!GenshinOneClick/payload/ReShade/ReShade64.dll
 *.exe
 *.iobj
 *.ipdb
@@ -32,6 +33,10 @@ Makefile
 Dx11FsrBridge.inputs/
 Dx11FsrBridge.shaders/
 Dx11FsrBridge.pixel_shaders/
+
+# Generated package payload binaries
+GenshinOneClick/payload/Bridge/Dx11FsrBridge.dll
+GenshinOneClick/payload/AntiPlayerMosaic.dll
 
 # Local OS files
 Desktop.ini
