@@ -1,0 +1,8 @@
+ReShade HDR shaders
+
+Upstream project: https://github.com/EndlesslyFlowering/ReShade_HDR_shaders
+License: GNU General Public License, version 3.0
+
+The bundled lilium__ shader and texture files originate from the upstream
+project above and remain subject to its GPL-3.0 license. The accompanying
+LICENSE-ReShade_HDR_shaders-GPL-3.0.txt contains the license text.

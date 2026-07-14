@@ -1,0 +1,9 @@
+遇到游戏无法启动、FSR 无法激活、切换超分后闪退或其他异常时：
+
+1. 复现问题后不要再次启动游戏。
+2. 提交 payload\Bridge\Dx11FsrBridge.log。
+3. 提交 payload\OptiScaler\OptiScaler.log。
+4. 同时提交两个目录中的 Dx11FsrBridge.ini 和 OptiScaler.ini。
+5. 说明显卡型号、异常发生阶段和当时选择的超分/帧生成模式。
+
+默认日志采用适合长期启用的级别。需要更详细日志时，可临时将 OptiScaler.ini 中 [Log] 下的 LogLevel 改为 1（Debug）或 0（Trace）。
