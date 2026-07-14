@@ -63,6 +63,8 @@ $bridgeDestination = Join-Path $packageRoot 'payload\Bridge\Dx11FsrBridge.dll'
 $antiDestination = Join-Path $packageRoot 'payload\AntiPlayerMosaic.dll'
 Copy-Item -LiteralPath $bridgeOutput -Destination $bridgeDestination -Force
 Copy-Item -LiteralPath $antiOutput -Destination $antiDestination -Force
+Copy-Item -LiteralPath (Join-Path $packageRoot 'Configure-Launcher.bat') -Destination (Join-Path $packageRoot '一键配置.bat') -Force
+Copy-Item -LiteralPath (Join-Path $packageRoot 'Feedback.txt') -Destination (Join-Path $packageRoot '日志与反馈.txt') -Force
 
 $manifestPath = Join-Path $packageRoot 'component-manifest.json'
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
