@@ -1,0 +1,7 @@
+EXPORTS
+    ffxFsr2ContextCreate
+    ffxFsr2ContextDispatch
+    ffxFsr2ContextDestroy
+    ffxFsr2GetUpscaleRatioFromQualityMode
+    ffxFsr2GetRenderResolutionFromQualityMode
+    ffxFsr2GetJitterPhaseCount
