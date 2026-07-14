@@ -6,7 +6,7 @@
 
 1. `Dx11FsrBridge.dll`
 2. `AntiPlayerMosaic.dll` 反虚化与隐藏 UID
-3. 官方 ReShade Add-on 版与 HDR 着色器运行文件
+3. 官方 ReShade Add-on 版、RenoDX Add-on 与 HDR 着色器运行文件
 4. 交互安装与配置脚本
 
 双击 `一键配置.bat` 后会进入两层命令行管理界面。本地不存在 FPS Unlocker 或 OptiScaler 时，安装器才会询问联网下载或手动选择。
@@ -24,6 +24,8 @@
 一键脚本会在已安装 OptiScaler、检测到 NVIDIA 显卡且缺少 `nvngx_dlss.dll` 时，自动从 NVIDIA 官方 Streamline 最新正式包提取生产版 `bin/x64/nvngx_dlss.dll`，验证 NVIDIA 数字签名后安装并保留随包许可证。已有有效文件时不会覆盖。`nvngx_dlssg.dll` 和 `nvngx_dlssd.dll` 不在自动下载范围内，如有需要请自行从合法来源提供。
 
 ReShade 使用官方 Add-on 版 `6.7.3`，随发布包提供并保留 BSD-3-Clause 许可证。HDR 着色器来自 `EndlesslyFlowering/ReShade_HDR_shaders`，其 GPL-3.0 许可证会随包保留。
+
+`renodx-genshin.addon64` 的作者为 [剪刀妹丽丽](https://www.bilibili.com/video/av116861345793770/)。作者已明确允许本项目在 GitHub Release 安装包中再分发未修改的 Add-on 二进制文件；详细范围见 `payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin.txt`。
 
 注入器和部分插件不可靠支持相对路径，因此配置器会从自身 `Configure.ps1` 所在目录动态计算完整绝对路径，再写入 `fps_config.json`、`OptiScaler.ini` 和游戏目录中的 `ReShade.ini`。发布包本身没有写死安装位置；移动整个目录后重新运行一次 `一键配置.bat` 即可刷新全部路径。旧版创建的 `GIUnifiedRuntime` 目录联接会在确认其确实为联接后自动删除。
 

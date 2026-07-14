@@ -1,0 +1,13 @@
+RenoDX Genshin Add-on
+
+File: renodx-genshin.addon64
+Author: 剪刀妹丽丽
+Author page and release reference: https://www.bilibili.com/video/av116861345793770/
+
+Redistribution permission: the author granted this project permission on
+2026-07-14 to redistribute the unmodified Add-on binary in this project's
+GitHub Release installer package.
+
+This permission applies only to the unmodified binary included with this
+project. It does not transfer authorship, grant permission to modify the
+Add-on, or replace any terms separately stated by the author.
