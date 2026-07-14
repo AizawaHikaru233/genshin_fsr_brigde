@@ -16,7 +16,7 @@
 powershell -ExecutionPolicy Bypass -File .\Build-Package.ps1
 ```
 
-构建结果位于 `dist\原神解帧FSR插件包Lite_v*.zip`。GitHub Actions 在 `main` 分支推送后也会自动编译，并将 ZIP 上传为 `GenshinOneClick-Lite` Artifact。
+构建结果位于 `dist\原神解帧FSR插件包Lite_v*.zip`。GitHub Actions 可从 Actions 页面手动触发，始终上传 ZIP 为 `GenshinOneClick-Lite` Artifact；勾选发布选项并填写版本标签时，会额外创建或更新对应 GitHub Release。
 
 ## 功能
 
