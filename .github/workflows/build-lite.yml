@@ -1,10 +1,17 @@
 name: Build Lite Package
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish the generated Lite ZIP to GitHub Releases
+        required: true
+        default: false
+        type: boolean
+      release_tag:
+        description: Release tag to create or update when publishing (for example v1.0.9)
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -27,9 +34,16 @@ jobs:
           path: dist/原神解帧FSR插件包Lite_*.zip
           if-no-files-found: error
 
-      - name: Publish tagged release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Validate release tag
+        if: inputs.publish_release && inputs.release_tag == ''
+        shell: pwsh
+        run: throw '发布到 Release 时必须填写 release_tag。'
+
+      - name: Publish release
+        if: inputs.publish_release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_tag }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
           files: dist/原神解帧FSR插件包Lite_*.zip
