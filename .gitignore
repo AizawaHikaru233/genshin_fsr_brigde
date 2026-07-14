@@ -1,0 +1,38 @@
+# Build products and IDE state
+build/
+build-*/
+out/
+artifacts/
+.vs/
+.vscode/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Compiler and linker output
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+!third_party/detours/detours.lib
+*.dll
+*.exe
+*.iobj
+*.ipdb
+
+# Runtime diagnostics and captures
+*.log
+*.dmp
+*.jsonl
+*.cso
+*.similarity.txt
+Dx11FsrBridge.inputs/
+Dx11FsrBridge.shaders/
+Dx11FsrBridge.pixel_shaders/
+
+# Local OS files
+Desktop.ini
+Thumbs.db
