@@ -32,17 +32,13 @@ powershell -ExecutionPolicy Bypass -File .\Build-Package.ps1
 - `AntiPlayerMosaic/`：反虚化、隐藏 UID 与水下马赛克修复插件。
 - `third_party/`：Bridge 的构建依赖及其原始声明。
 
-## 运行要求
+## 使用方法
 
-- 64 位 Windows、Direct3D 11 原神客户端。
-- FPS Unlocker 或其他支持按顺序加载 DLL 的第三方启动器/注入器。
-- 需要替换超分时，用户自行安装兼容的 OptiScaler 或其他可识别标准 FSR2 导出的转换工具及其依赖。
-
-## 加载与转换链路
+从 [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases) 下载压缩包，解压后运行 `一键配置.bat` 并根据提示安装。脚本会按环境自动获取 [Genshin FPS Unlock](https://github.com/34736384/genshin-fps-unlock/releases)、[NVIDIA DLSS 超分组件（`nvngx_dlss.dll`）](https://github.com/NVIDIA-RTX/Streamline/releases) 和 [OptiScaler](https://github.com/optiscaler/OptiScaler/releases)，补全运行环境。
 
 `Dx11FsrBridge.dll` 本身不执行 FSR、DLSS、XeSS 或其他超分算法。它只向外部工具暴露标准 FSR2 接口，并将游戏的 DX11 上采样调用转接到该接口。
 
-使用 FPS Unlocker 时，将 Bridge 与外部超分工具加入其 DLL 注入列表。也可以使用其他 DLL 注入工具，但必须保证它支持稳定的按序加载，且不会重复加载同一 DLL。
+也可以使用其他 DLL 注入工具，但必须保证它支持稳定的按序加载。
 
 推荐加载顺序：
 
@@ -51,7 +47,7 @@ powershell -ExecutionPolicy Bypass -File .\Build-Package.ps1
 3. `AntiPlayerMosaic.dll`（可选）
 4. `ReShade64.dll`（可选）
 
-仅使用超分桥接时，前两项必须保持该顺序：Bridge 先加载，随后由 OptiScaler（或同类工具）在启动时扫描标准 FSR2 导出并接管。Bridge 不直接加载、修改或捆绑 OptiScaler；后端选择、FSR3/FSR4 模型和其他 OptiScaler 配置均由用户自己的工具安装负责。
+仅使用超分桥接时，前两项必须保持该顺序：Bridge 先加载，随后由 [OptiScaler](https://github.com/optiscaler/OptiScaler)（或同类工具）在启动时扫描标准 FSR2 导出并接管。Bridge 不直接加载、修改或捆绑 OptiScaler；后端选择、FSR3/FSR4 模型和其他 OptiScaler 配置均由用户自己的工具安装负责。
 
 ## 构建
 
