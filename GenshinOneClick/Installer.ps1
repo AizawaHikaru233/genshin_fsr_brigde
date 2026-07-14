@@ -419,9 +419,11 @@ function Get-FileVersionLabel {
 
 function Write-InstallCatalog {
     param([string]$SelectedGamePath)
+    $renoDxPath = Join-Path $root 'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64'
     $unlockerVersion = Get-FileVersionLabel -Path $unlockerPath
     $optiVersion = Get-FileVersionLabel -Path $optiPath
     $reShadeVersion = Get-FileVersionLabel -Path $reShadePath
+    $renoDxVersion = Get-FileVersionLabel -Path $renoDxPath
     $state = Get-ModuleState -SelectedGamePath $SelectedGamePath
     $unlockerStatus = if ($state.Unlocker) { '已安装' } else { '未安装' }
     $optiStatus = if ($state.OptiScaler) { '已安装' } else { '未安装' }
@@ -433,7 +435,7 @@ function Write-InstallCatalog {
     Write-CatalogRow -Id '1.' -Name 'FPS Unlocker' -Author '34736384' -Version $unlockerVersion -Status $unlockerStatus
     Write-CatalogRow -Id '2.' -Name 'FSR Bridge + OptiScaler' -Author 'シリアCelia / OptiScaler' -Version "Bridge v1.0.0`nOptiScaler $optiVersion" -Status $optiStatus
     Write-CatalogRow -Id '3.' -Name '反虚化 / 隐藏 UID' -Author 'シリアCelia' -Version 'v1.1.0' -Status $antiStatus
-    Write-CatalogRow -Id '4.' -Name 'ReShade HDR' -Author 'crosire / Lilium' -Version "ReShade $reShadeVersion" -Status $hdrStatus
+    Write-CatalogRow -Id '4.' -Name 'ReShade + RenoDX HDR' -Author 'crosire / 剪刀妹丽丽' -Version "ReShade $reShadeVersion`nRenoDX $renoDxVersion" -Status $hdrStatus
 }
 
 function Select-ModuleSet {
@@ -780,6 +782,7 @@ function Update-FpsTarget {
 function Show-AboutMenu {
     $entries = @(
         [pscustomobject]@{ Name = 'シリアCelia'; Projects = 'FSR Bridge、AntiPlayerMosaic、安装管理脚本'; Url = 'https://space.bilibili.com/8218484' },
+        [pscustomobject]@{ Name = '剪刀妹丽丽'; Projects = 'RenoDX HDR'; Url = 'https://www.bilibili.com/video/av116861345793770/' },
         [pscustomobject]@{ Name = 'EndlesslyFlowering'; Projects = 'ReShade HDR shaders'; Url = 'https://github.com/EndlesslyFlowering/ReShade_HDR_shaders' },
         [pscustomobject]@{ Name = '34736384'; Projects = 'FPS Unlocker'; Url = 'https://github.com/34736384/genshin-fps-unlock' },
         [pscustomobject]@{ Name = 'OptiScaler contributors'; Projects = 'OptiScaler'; Url = 'https://github.com/optiscaler/OptiScaler' },
@@ -827,7 +830,7 @@ while ($true) {
     Write-ModuleLine -Number 1 -Name 'FPS Unlocker' -Installed $moduleState.Unlocker -Path $unlockerPath -Extra "当前帧率上限 $fpsTarget"
     Write-ModuleLine -Number 2 -Name 'FSR Bridge + OptiScaler' -Installed $moduleState.OptiScaler -Path $optiPath
     Write-ModuleLine -Number 3 -Name '反虚化 / 隐藏 UID' -Installed $moduleState.AntiBlur -Path $antiBlurPath
-    Write-ModuleLine -Number 4 -Name 'ReShade HDR' -Installed $moduleState.HDR -Path $reShadePath
+    Write-ModuleLine -Number 4 -Name 'ReShade + RenoDX HDR' -Installed $moduleState.HDR -Path $reShadePath
     Write-Host ''
     Write-Host '  1. 安装 / 更新模块' -ForegroundColor Cyan
     Write-Host '  2. 停止加载模块'

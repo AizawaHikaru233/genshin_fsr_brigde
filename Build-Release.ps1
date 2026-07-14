@@ -118,6 +118,8 @@ function Assert-ReleaseLayout {
         'payload\AntiPlayerMosaic.dll',
         'payload\ReShade\ReShade64.dll',
         'payload\ReShade\LICENSE-ReShade-BSD-3-Clause.txt',
+        'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64',
+        'payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin.txt',
         'payload\ReShade\reshade-shaders\LICENSE-ReShade_HDR_shaders-GPL-3.0.txt',
         'payload\ReShade\reshade-shaders\NOTICE-ReShade_HDR_shaders.txt'
     )) {

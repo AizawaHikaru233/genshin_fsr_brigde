@@ -531,6 +531,7 @@ function Set-IniValue {
 
 function New-ReShadeConfig {
     param(
+        [string]$AddonPath,
         [string]$ShaderPath,
         [string]$TexturePath,
         [string]$PresetPath,
@@ -538,7 +539,7 @@ function New-ReShadeConfig {
     )
     @"
 [ADDON]
-AddonPath=
+AddonPath=$AddonPath
 DisabledAddons=
 OverlayCollapsed=
 
@@ -560,6 +561,19 @@ PreprocessorDefinitions=RESHADE_DEPTH_LINEARIZATION_FAR_PLANE=1000.0,RESHADE_DEP
 SkipLoadingDisabledEffects=1
 StartupPresetPath=
 TutorialProgress=4
+
+[genshin-ae711f61-renodx-preset1]
+blackRangeEndNits=203
+blackRangeStartNits=3.5
+blackReductionNits=4
+colorGradeContrast=50
+colorGradeExposure=1
+colorGradeHighlights=50
+colorGradeSaturation=52
+colorGradeShadows=50
+toneMapPeakNits=1000
+toneMapType=1
+toneMapUINits=203
 
 [INPUT]
 ForceShortcutModifiers=1
@@ -664,6 +678,7 @@ function Reset-PluginConfigurations {
     if (Test-Path -LiteralPath $reshadeDll -PathType Leaf) {
         New-Item -ItemType Directory -Force -Path $screenshotsPath | Out-Null
         $reshadeConfig = New-ReShadeConfig `
+            -AddonPath (Join-Path $shaderDir 'Addons') `
             -ShaderPath (Join-Path $shaderDir 'Shaders') `
             -TexturePath (Join-Path $shaderDir 'Textures') `
             -PresetPath $reshadePresetPath `
@@ -715,7 +730,7 @@ if (-not $NonInteractive) {
     Write-Host '请选择需要安装的组件：' -ForegroundColor Yellow
     $DisableOptiScaler = -not (Read-YesNo -Prompt '启用 FSR Bridge + OptiScaler' -Default $true)
     $DisableAntiBlur = -not (Read-YesNo -Prompt '启用反虚化/隐藏 UID' -Default $true)
-    $DisableHDR = -not (Read-YesNo -Prompt '启用 ReShade HDR' -Default $true)
+    $DisableHDR = -not (Read-YesNo -Prompt '启用 ReShade + RenoDX HDR' -Default $true)
     while ($FpsTarget -le 0) {
         $fpsInput = (Read-Host '请输入帧率上限（直接回车使用 300）').Trim()
         if ([string]::IsNullOrWhiteSpace($fpsInput)) {
@@ -852,6 +867,7 @@ $config | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $fpsConfig -Encodi
 if (-not $DisableHDR) {
     New-Item -ItemType Directory -Force -Path $screenshots | Out-Null
     $reshadeConfig = New-ReShadeConfig `
+        -AddonPath (Join-Path $shaderDir 'Addons') `
         -ShaderPath (Join-Path $shaderDir 'Shaders') `
         -TexturePath (Join-Path $shaderDir 'Textures') `
         -PresetPath $reshadePreset `
