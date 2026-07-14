@@ -50,6 +50,8 @@ function Copy-ReleaseTree {
         'fps_config.json',
         'Repair-Paths.ps1',
         '启动原神.bat',
+        'Configure-Launcher.bat',
+        'Feedback.txt',
         'README.md',
         'README.txt',
         'SOURCE.md',
