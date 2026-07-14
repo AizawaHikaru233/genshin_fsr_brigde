@@ -9,7 +9,7 @@
 3. 官方 ReShade Add-on 版、RenoDX Add-on 与 HDR 着色器运行文件
 4. 交互安装与配置脚本
 
-双击 `一键配置.bat` 后会进入两层命令行管理界面。本地不存在 FPS Unlocker 或 OptiScaler 时，安装器才会询问联网下载或手动选择。
+双击 `一键配置.bat` 后会进入两层命令行管理界面；运行 `GenshinFSRBridgeTools.bat` 可直接进入 English 界面。主菜单也提供语言切换，选择会自动保存。本地不存在 FPS Unlocker 或 OptiScaler 时，安装器才会询问联网下载或手动选择。
 
 首次运行先选择游戏目录：可以直接输入游戏目录或游戏 EXE 路径，也可以不输入直接按回车打开目录选择窗口。有效路径保存在 `.installer-state.json`，下次运行自动读取；缓存失效时会重新进入选择页面。
 

@@ -1,6 +1,8 @@
 ﻿param(
     [string]$GamePath,
-    [switch]$NoShortcut
+    [switch]$NoShortcut,
+    [ValidateSet('Auto', 'zh-CN', 'en-US')]
+    [string]$Language = 'Auto'
 )
 
 Set-StrictMode -Version Latest
@@ -22,6 +24,10 @@ $antiBlurPath = Join-Path $root 'payload\AntiPlayerMosaic.dll'
 $reShadePath = Join-Path $root 'payload\ReShade\ReShade64.dll'
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) '原神.lnk'
 $legacyShortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) '原神整合版.lnk'
+
+. (Join-Path $root 'Localization.ps1')
+$script:Language = Get-InstallerLanguage -RequestedLanguage $Language -StatePath $statePath
+Initialize-InstallerLocalization -Language $script:Language
 
 function Write-Header {
     param([string]$Title)
@@ -56,7 +62,7 @@ function Resolve-GameExecutable {
 function Select-GameFolder {
     Add-Type -AssemblyName System.Windows.Forms
     $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dialog.Description = '请选择包含 YuanShen.exe 或 GenshinImpact.exe 的游戏目录'
+    $dialog.Description = Convert-InstallerText -Value '请选择包含 YuanShen.exe 或 GenshinImpact.exe 的游戏目录'
     $dialog.ShowNewFolderButton = $false
     if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { return $dialog.SelectedPath }
     return $null
@@ -64,24 +70,26 @@ function Select-GameFolder {
 
 function Read-State {
     if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
-        return [pscustomobject]@{ GamePath = $null; FpsTarget = 60 }
+        return [pscustomobject]@{ GamePath = $null; FpsTarget = 60; Language = $script:Language }
     }
     try {
         $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
         $fpsTarget = 60
         if ($null -ne $state.FpsTarget -and [int]$state.FpsTarget -gt 0) { $fpsTarget = [int]$state.FpsTarget }
-        return [pscustomobject]@{ GamePath = [string]$state.GamePath; FpsTarget = $fpsTarget }
+        $savedLanguage = if ([string]$state.Language -in @('zh-CN', 'en-US')) { [string]$state.Language } else { $script:Language }
+        return [pscustomobject]@{ GamePath = [string]$state.GamePath; FpsTarget = $fpsTarget; Language = $savedLanguage }
     }
     catch {
-        return [pscustomobject]@{ GamePath = $null; FpsTarget = 60 }
+        return [pscustomobject]@{ GamePath = $null; FpsTarget = 60; Language = $script:Language }
     }
 }
 
 function Save-State {
-    param([string]$SelectedGamePath, [int]$FpsTarget)
+    param([string]$SelectedGamePath, [int]$FpsTarget, [ValidateSet('zh-CN', 'en-US')][string]$SelectedLanguage = $script:Language)
     [ordered]@{
         GamePath = $SelectedGamePath
         FpsTarget = $FpsTarget
+        Language = $SelectedLanguage
     } | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding UTF8
 }
 
@@ -271,7 +279,7 @@ function Reset-AllPluginConfigurations {
 
     $arguments = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $configureScript,
-        '-ResetPluginConfigsOnly', '-GamePath', $SelectedGamePath, '-NonInteractive'
+        '-ResetPluginConfigsOnly', '-GamePath', $SelectedGamePath, '-NonInteractive', '-Language', $script:Language
     )
     $backendOutput = @(& powershell.exe @arguments 2>&1)
     if ($LASTEXITCODE -ne 0) {
@@ -466,7 +474,7 @@ function Select-LocalInstallPath {
     if ([string]::IsNullOrWhiteSpace($inputPath)) {
         Add-Type -AssemblyName System.Windows.Forms
         $dialog = New-Object System.Windows.Forms.OpenFileDialog
-        $dialog.Title = "选择 $Name 安装文件"
+        $dialog.Title = Convert-InstallerText -Value "选择 $Name 安装文件"
         $dialog.Filter = $Filter
         $dialog.CheckFileExists = $true
         $dialog.CheckPathExists = $true
@@ -599,7 +607,7 @@ function Invoke-FoundationSetup {
     $arguments = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $configureScript,
         '-GamePath', $SelectedGamePath, '-FpsTarget', $FpsTarget.Value,
-        '-UnlockerSource', $source.Mode, '-NonInteractive'
+        '-UnlockerSource', $source.Mode, '-NonInteractive', '-Language', $script:Language
     )
     if ($plugins.OptiScaler) { $arguments += @('-OptiScalerSource', 'Existing') } else { $arguments += '-DisableOptiScaler' }
     if (-not $plugins.AntiBlur) { $arguments += '-DisableAntiBlur' }
@@ -632,7 +640,7 @@ function Invoke-NvidiaDlssSetup {
     if (-not (Test-Path -LiteralPath $optiPath -PathType Leaf)) { return }
     $arguments = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $configureScript,
-        '-EnsureNvidiaDlssOnly', '-NonInteractive'
+        '-EnsureNvidiaDlssOnly', '-NonInteractive', '-Language', $script:Language
     )
     & powershell.exe @arguments
     if ($LASTEXITCODE -ne 0) {
@@ -691,7 +699,7 @@ function Invoke-InstallWizard {
     $arguments = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $configureScript,
         '-GamePath', $SelectedGamePath, '-FpsTarget', $FpsTarget,
-        '-UnlockerSource', $unlockerSource, '-NonInteractive'
+        '-UnlockerSource', $unlockerSource, '-NonInteractive', '-Language', $script:Language
     )
     if ($desired.OptiScaler) { $arguments += @('-OptiScalerSource', $optiSource) } else { $arguments += '-DisableOptiScaler' }
     if (-not $desired.AntiBlur) { $arguments += '-DisableAntiBlur' }
@@ -808,6 +816,23 @@ function Show-AboutMenu {
     }
 }
 
+function Select-InterfaceLanguage {
+    param([string]$SelectedGamePath, [int]$FpsTarget)
+    Write-Header -Title '语言 / Language'
+    Write-Host '  1. 中文'
+    Write-Host '  2. English'
+    Write-Host '  0. 返回上一层'
+    $choice = (Read-Host '请输入选项').Trim()
+    $selectedLanguage = switch ($choice) {
+        '1' { 'zh-CN' }
+        '2' { 'en-US' }
+        default { return }
+    }
+    $script:Language = $selectedLanguage
+    Initialize-InstallerLocalization -Language $script:Language
+    Save-State -SelectedGamePath $SelectedGamePath -FpsTarget $FpsTarget
+}
+
 $state = Read-State
 $initialGamePath = if (-not [string]::IsNullOrWhiteSpace($GamePath)) { $GamePath } else { [string]$state.GamePath }
 $selectedGamePath = Select-GamePath -InitialPath $initialGamePath
@@ -839,6 +864,7 @@ while ($true) {
     Write-Host '  5. 启动游戏'
     Write-Host '  6. 恢复所有插件默认配置'
     Write-Host '  7. 关于 / 作者主页'
+    Write-Host '  8. 语言 / Language'
     Write-Host '  0. 退出'
     $choice = (Read-Host '请输入选项').Trim()
     switch ($choice) {
@@ -864,6 +890,7 @@ while ($true) {
             if (Reset-AllPluginConfigurations -SelectedGamePath $selectedGamePath) { $fpsTarget = 60 }
         }
         '7' { Show-AboutMenu }
+        '8' { Select-InterfaceLanguage -SelectedGamePath $selectedGamePath -FpsTarget $fpsTarget }
         '0' { break }
         default { Write-Host '无效选项。' -ForegroundColor Red; Start-Sleep -Milliseconds 700 }
     }

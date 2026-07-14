@@ -51,6 +51,7 @@ function Copy-ReleaseTree {
         'Repair-Paths.ps1',
         '启动原神.bat',
         'Configure-Launcher.bat',
+        'Configure-Launcher.en.bat',
         'Feedback.txt',
         'README.md',
         'README.txt',
@@ -108,10 +109,13 @@ function Assert-ReleaseLayout {
     )
     foreach ($required in @(
         '一键配置.bat',
+        'GenshinFSRBridgeTools.bat',
         'Installer.ps1',
         'Configure.ps1',
+        'Localization.ps1',
         'component-manifest.json',
         '日志与反馈.txt',
+        'Logs and Feedback.txt',
         'payload\Bridge\Dx11FsrBridge.dll',
         'payload\Bridge\Dx11FsrBridge.ini',
         'payload\Bridge\Dx11FsrBridge.default.ini',
@@ -198,8 +202,10 @@ function Assert-ReleaseArchive {
     $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
     try {
         $entryNames = @($archive.Entries | ForEach-Object { $_.FullName.Replace('/', '\') })
-        if ($entryNames -notcontains '日志与反馈.txt') {
-            throw "ZIP 缺少日志反馈文档: $ArchivePath"
+        foreach ($feedbackDocument in @('日志与反馈.txt', 'Logs and Feedback.txt')) {
+            if ($entryNames -notcontains $feedbackDocument) {
+                throw "ZIP 缺少日志反馈文档: $ArchivePath\\$feedbackDocument"
+            }
         }
         foreach ($forbidden in @(
             'README.md',
