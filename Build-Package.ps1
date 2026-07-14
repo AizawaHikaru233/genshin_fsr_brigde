@@ -61,10 +61,12 @@ foreach ($output in @($bridgeOutput, $antiOutput)) {
 
 $bridgeDestination = Join-Path $packageRoot 'payload\Bridge\Dx11FsrBridge.dll'
 $antiDestination = Join-Path $packageRoot 'payload\AntiPlayerMosaic.dll'
+$launcherOutputName = -join [char[]]@(0x4E00, 0x952E, 0x914D, 0x7F6E, 0x002E, 0x0062, 0x0061, 0x0074)
+$feedbackOutputName = -join [char[]]@(0x65E5, 0x5FD7, 0x4E0E, 0x53CD, 0x9988, 0x002E, 0x0074, 0x0078, 0x0074)
 Copy-Item -LiteralPath $bridgeOutput -Destination $bridgeDestination -Force
 Copy-Item -LiteralPath $antiOutput -Destination $antiDestination -Force
-Copy-Item -LiteralPath (Join-Path $packageRoot 'Configure-Launcher.bat') -Destination (Join-Path $packageRoot '一键配置.bat') -Force
-Copy-Item -LiteralPath (Join-Path $packageRoot 'Feedback.txt') -Destination (Join-Path $packageRoot '日志与反馈.txt') -Force
+Copy-Item -LiteralPath (Join-Path $packageRoot 'Configure-Launcher.bat') -Destination (Join-Path $packageRoot $launcherOutputName) -Force
+Copy-Item -LiteralPath (Join-Path $packageRoot 'Feedback.txt') -Destination (Join-Path $packageRoot $feedbackOutputName) -Force
 
 $manifestPath = Join-Path $packageRoot 'component-manifest.json'
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
