@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release', 'RelWithDebInfo', 'MinSizeRel')]
     [string]$Configuration = 'Release'
@@ -24,6 +24,8 @@ $antiBuild = Join-Path $root 'build-package-antiplayermosaic'
 $packageRoot = Join-Path $root 'GenshinOneClick'
 $bridgeOutput = Join-Path $bridgeBuild "$Configuration\Dx11FsrBridge.dll"
 $antiOutput = Join-Path $antiBuild "$Configuration\AntiPlayerMosaic.dll"
+$renoDxArchive = Join-Path $root 'RenoDX-Genshin\renodx-genshin.addon64'
+$renoDxDestination = Join-Path $packageRoot 'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64'
 
 function Invoke-Cmake {
     param([string[]]$Arguments)
@@ -67,19 +69,29 @@ foreach ($output in @($bridgeOutput, $antiOutput)) {
         throw "未找到编译输出: $output"
     }
 }
+if (-not (Test-Path -LiteralPath $renoDxArchive -PathType Leaf)) {
+    throw "RenoDX 归档文件不存在: $renoDxArchive"
+}
 
 $bridgeDestination = Join-Path $packageRoot 'payload\Bridge\Dx11FsrBridge.dll'
 $antiDestination = Join-Path $packageRoot 'payload\AntiPlayerMosaic.dll'
-$launcherOutputName = -join [char[]]@(0x4E00, 0x952E, 0x914D, 0x7F6E, 0x002E, 0x0062, 0x0061, 0x0074)
-$englishLauncherOutputName = 'GenshinFSRBridgeTools.bat'
-$feedbackOutputName = -join [char[]]@(0x65E5, 0x5FD7, 0x4E0E, 0x53CD, 0x9988, 0x002E, 0x0074, 0x0078, 0x0074)
-$englishFeedbackOutputName = 'Logs and Feedback.txt'
 Copy-Item -LiteralPath $bridgeOutput -Destination $bridgeDestination -Force
 Copy-Item -LiteralPath $antiOutput -Destination $antiDestination -Force
-Copy-Item -LiteralPath (Join-Path $packageRoot 'Configure-Launcher.bat') -Destination (Join-Path $packageRoot $launcherOutputName) -Force
-Copy-Item -LiteralPath (Join-Path $packageRoot 'Configure-Launcher.en.bat') -Destination (Join-Path $packageRoot $englishLauncherOutputName) -Force
-Copy-Item -LiteralPath (Join-Path $packageRoot 'Feedback.txt') -Destination (Join-Path $packageRoot $feedbackOutputName) -Force
-Copy-Item -LiteralPath (Join-Path $packageRoot 'Feedback.txt') -Destination (Join-Path $packageRoot $englishFeedbackOutputName) -Force
+Copy-Item -LiteralPath $renoDxArchive -Destination $renoDxDestination -Force
+if ((Get-FileHash -LiteralPath $renoDxArchive -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $renoDxDestination -Algorithm SHA256).Hash) {
+    throw 'RenoDX 归档同步校验失败。'
+}
+foreach ($staleGeneratedFile in @(
+    '一键配置.bat',
+    'GenshinFSRBridgeTools.bat',
+    'Logs and Feedback.txt',
+    '日志与反馈.txt'
+)) {
+    $stalePath = Join-Path $packageRoot $staleGeneratedFile
+    if (Test-Path -LiteralPath $stalePath -PathType Leaf) {
+        Remove-Item -LiteralPath $stalePath -Force
+    }
+}
 
 $manifestPath = Join-Path $packageRoot 'component-manifest.json'
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json

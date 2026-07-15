@@ -1,12 +1,16 @@
 RenoDX Genshin Add-on
 
 File: renodx-genshin.addon64
+Version: 0.2026.0714.1910
+SHA-256: C33119583BAAB324310CD317B964BA9EB5B1D494F2228E30884462690739CE7C
 Author: 剪刀妹丽丽
 Author page and release reference: https://www.bilibili.com/video/av116861345793770/
 
+Canonical repository archive: RenoDX-Genshin/renodx-genshin.addon64
+
 Redistribution permission: the author granted this project permission on
-2026-07-14 to redistribute the unmodified Add-on binary in this project's
-GitHub Release installer package.
+2026-07-14 to redistribute the unmodified Add-on binary through this
+project's GitHub repository and Release installer package.
 
 This permission applies only to the unmodified binary included with this
 project. It does not transfer authorship, grant permission to modify the

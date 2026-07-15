@@ -92,7 +92,7 @@ Do not submit game account information, login details, or screenshots containing
 
 - FSR2 ABI headers and Microsoft Detours are build dependencies only; their original licenses and notices are retained.
 - OptiScaler is an independent project: <https://github.com/optiscaler/OptiScaler>.
-- Lite resources include the official ReShade Add-on DLL (BSD-3-Clause), the RenoDX Add-on redistributed with permission from [剪刀妹丽丽](https://www.bilibili.com/video/av116861345793770/), and Lilium HDR shaders (GPL-3.0). Their licenses and permission records are kept with the resources.
+- Lite resources include the official ReShade Add-on DLL (BSD-3-Clause), the RenoDX Add-on redistributed with permission from [剪刀妹丽丽](https://www.bilibili.com/video/av116861345793770/), and Lilium HDR shaders (GPL-3.0). `RenoDX-Genshin/` is the sole archived source for RenoDX and is automatically synchronized to the ReShade payload during packaging; their licenses and permission records are kept with the resources.
 - This project does not include NVIDIA DLSS, the AMD FSR SDK, or OptiScaler runtime binaries.
 
 ## License
