@@ -11,7 +11,7 @@
 ## 支持范围与风险声明
 
 - 目标支持原神中国服与全球服的 Windows DX11 客户端。
-- 仅在 6.7（「月之八」，两者是同一版本的不同称呼）测试；不保证与其他游戏版本或客户端环境兼容。
+- 仅在 6.7 测试；不保证与其他游戏版本或客户端环境兼容。
 - 本项目与 HoYoverse、miHoYo、《原神》及 Genshin Impact 均无关联，也未获得其认可或授权；相关名称与商标归其各自权利人所有。
 - 使用第三方 DLL、注入器、Mod 或图形插件可能违反游戏规则，并可能导致账号限制或封禁。使用者须自行评估风险并承担全部责任。
 
@@ -36,7 +36,7 @@ powershell -ExecutionPolicy Bypass -File .\Build-Package.ps1
 - 通过 DX11 设备与上下文拦截获取原神的 FSR2 调用时机。
 - 提供标准 FSR2 导出，使外部超分工具可以识别 FSR2 接口。
 - 为外部处理器准备颜色、深度、运动向量、抖动和历史资源。
-- 运行时日志默认写入 DLL 同目录的 `Dx11FsrBridge.log`，用于排查加载与 Hook 状态。
+- Release 版仅将基础错误写入 DLL 同目录的 `Dx11FsrBridge.log`，并在每次启动时覆盖上一轮日志。
 - 正式配置关闭资源导出、逐帧追踪和调试探针，避免额外开销。
 
 ## 仓库结构
@@ -75,7 +75,7 @@ cmake --build build --config Release
 
 生成的 DLL 位于 `build\Release`。Bridge 的正式 mode2 配置固定在 DLL 内，不再读取 Bridge INI。发布配置需要仓库内的 `third_party` 目录，其中包含 FSR2 兼容 ABI 头文件和 Microsoft Detours 构建依赖。
 
-`DX11FSRBRIDGE_ENABLE_FSR31_EXPERIMENTAL`、`DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL` 等 CMake 选项仅用于实验，不属于正式运行链路。
+正式构建只启用 FSR2 转译层；旧 FSR3.1 自建后端和 NGX 集成入口已从 `main` 的构建配置中移除。
 
 ## 配置与反馈
 

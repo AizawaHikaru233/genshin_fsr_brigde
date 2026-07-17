@@ -6,12 +6,12 @@ This is not an official project of HoYoverse, AMD, or OptiScaler. Neither the re
 
 This repository also includes the `AntiPlayerMosaic/` subproject, an independently built plugin for player mosaic fixes and UID hiding. Refer to its README for details.
 
-[\u7b80\u4f53\u4e2d\u6587](README.md)
+[简体中文](README.md)
 
 ## Support Scope and Risk Notice
 
 - Intended for the Chinese and Global Windows DX11 clients of Genshin Impact.
-- Tested only with version 6.7, also known as “Luna VIII”; these are two names for the same version. Compatibility with other game versions or client environments is not guaranteed.
+- Tested only with version 6.7. Compatibility with other game versions or client environments is not guaranteed.
 - This project is not affiliated with, endorsed by, or authorized by HoYoverse, miHoYo, Genshin Impact, or 《原神》. All related names and trademarks belong to their respective owners.
 - Third-party DLLs, injectors, mods, and graphics plugins may violate game rules and can result in account restrictions or bans. You are solely responsible for evaluating and accepting these risks.
 
@@ -36,7 +36,7 @@ The output is written to `dist\原神解帧FSR插件包Lite_v*.zip`. GitHub Acti
 - Intercepts DX11 device and context activity to identify Genshin Impact FSR2 call timing.
 - Exposes standard FSR2 exports so external upscalers can detect the FSR2 interface.
 - Prepares color, depth, motion-vector, jitter, and history resources for the external processor.
-- Writes runtime logs to `Dx11FsrBridge.log` beside the DLL by default for load and hook diagnostics.
+- Release builds write only basic errors to `Dx11FsrBridge.log` beside the DLL and overwrite the previous run's log at startup.
 - Disables resource exports, per-frame tracing, and debug probes in the release configuration to avoid unnecessary overhead.
 
 ## Repository Layout
@@ -75,7 +75,7 @@ cmake --build build --config Release
 
 The DLL is written to `build\Release`. The supported mode2 configuration is fixed in the DLL and no Bridge INI is used. The release configuration requires the repository `third_party` directory, which contains FSR2-compatible ABI headers and the Microsoft Detours build dependency.
 
-`DX11FSRBRIDGE_ENABLE_FSR31_EXPERIMENTAL`, `DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL`, and related CMake options are experimental only and are not part of the supported release path.
+Production builds enable only the FSR2 translation layer. The legacy self-hosted FSR3.1 backend and NGX integration entries have been removed from the `main` build configuration.
 
 ## Configuration and Feedback
 

@@ -19,7 +19,7 @@
 - OptiScaler：`https://github.com/optiscaler/OptiScaler/releases`
 - NVIDIA DLSS 超分组件：`https://github.com/NVIDIA-RTX/Streamline/releases`
 
-自动下载会通过 GitHub API 获取最新正式发行版，压缩包只保存在系统临时目录，安装完成后自动删除。运行所需文件会放到安装器自身目录下。若 GitHub 无法访问，可在浏览器中手动下载，然后在安装器中选择本地 `exe`、`zip`、`7z` 或完整解压目录。
+自动下载会通过 GitHub API 获取官方发行版：FPS Unlocker 与 NVIDIA DLSS 获取最新正式版，非帧生成包固定获取 OptiScaler 0.9.3。压缩包只保存在系统临时目录，安装完成后自动删除。运行所需文件会放到安装器自身目录下。若 GitHub 无法访问，可在浏览器中手动下载，然后在安装器中选择本地 `exe`、`zip`、`7z` 或完整解压目录。
 
 一键脚本会在已安装 OptiScaler、检测到 NVIDIA 显卡且缺少 `nvngx_dlss.dll` 时，自动从 NVIDIA 官方 Streamline 最新正式包提取生产版 `bin/x64/nvngx_dlss.dll`，验证 NVIDIA 数字签名后安装并保留随包许可证。已有有效文件时不会覆盖。`nvngx_dlssg.dll` 和 `nvngx_dlssd.dll` 不在自动下载范围内，如有需要请自行从合法来源提供。
 
@@ -62,4 +62,4 @@ powershell -ExecutionPolicy Bypass -File .\Configure.ps1 `
 3. `payload\OptiScaler\OptiScaler.ini`
 4. 简要说明显卡型号、异常发生阶段和当时选择的超分模式
 
-Bridge 的预发布 mode2 配置固定在 DLL 内，不再使用 INI。发行版的 Bridge、OptiScaler 和反虚化组件默认仅记录错误，并在每次启动时覆盖上一轮日志；单次运行期间不限制日志大小。需要进一步排查时，可临时把 `OptiScaler.ini` 中 `[Log]` 的 `LogLevel` 改为 `1`（Debug）或 `0`（Trace）。
+Bridge 的正式 mode2 配置固定在 DLL 内，不再使用 INI。发行版的 Bridge、OptiScaler 和反虚化组件默认仅记录错误，并在每次启动时覆盖上一轮日志；单次运行期间不限制日志大小。需要进一步排查时，可临时把 `OptiScaler.ini` 中 `[Log]` 的 `LogLevel` 改为 `1`（Debug）或 `0`（Trace）。

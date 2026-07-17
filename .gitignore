@@ -40,6 +40,7 @@ Dx11FsrBridge.pixel_shaders/
 # Generated package payload binaries
 GenshinOneClick/payload/Bridge/Dx11FsrBridge.dll
 GenshinOneClick/payload/AntiPlayerMosaic.dll
+GenshinOneClick/payload/ReShade/reshade-shaders/Addons/renodx-genshin.addon64
 
 # Local OS files
 Desktop.ini

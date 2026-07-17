@@ -5,7 +5,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSCommandPath
 $source = Join-Path $root 'GenshinOneClick'
 $dist = Join-Path $root 'dist'
-$nonFgOutput = Join-Path $dist 'GenshinOneClick-NonFG-OptiScaler-0.9.3-Release'
+$nonFgOutput = Join-Path $dist 'GenshinOneClick-Online'
 
 function Get-BridgeVersion {
     $manifestPath = Join-Path $source 'component-manifest.json'

@@ -119,17 +119,23 @@ function Get-ManualPath {
     return (Resolve-Path -LiteralPath $path).Path
 }
 
-function Get-GitHubLatestAsset {
-    param([string]$Repository, [scriptblock]$AssetFilter)
+function Get-GitHubReleaseAsset {
+    param([string]$Repository, [scriptblock]$AssetFilter, [string]$Tag)
     $headers = @{ 'User-Agent' = 'GenshinOneClick-Installer' }
+    $releaseUri = if ([string]::IsNullOrWhiteSpace($Tag)) {
+        "https://api.github.com/repos/$Repository/releases/latest"
+    }
+    else {
+        "https://api.github.com/repos/$Repository/releases/tags/$([Uri]::EscapeDataString($Tag))"
+    }
     try {
-        $release = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$Repository/releases/latest"
+        $release = Invoke-RestMethod -Headers $headers -Uri $releaseUri
     }
     catch {
         throw "无法查询 $Repository 官方发行版，请检查网络或改用手动下载。$([Environment]::NewLine)$($_.Exception.Message)"
     }
     $asset = @($release.assets | Where-Object $AssetFilter | Select-Object -First 1)
-    if ($asset.Count -eq 0) { throw "$Repository 的最新发行版中没有找到需要的文件。" }
+    if ($asset.Count -eq 0) { throw "$Repository 的目标发行版中没有找到需要的文件。" }
     return [pscustomobject]@{
         Tag = [string]$release.tag_name
         Page = [string]$release.html_url
@@ -199,7 +205,7 @@ function Install-NvidiaDlssIfNeeded {
     $temporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) ("GenshinOneClick-DLSS-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
     try {
-        $asset = Get-GitHubLatestAsset -Repository 'NVIDIA-RTX/Streamline' -AssetFilter { $_.name -match '^streamline-sdk-v[0-9.]+\.zip$' }
+        $asset = Get-GitHubReleaseAsset -Repository 'NVIDIA-RTX/Streamline' -AssetFilter { $_.name -match '^streamline-sdk-v[0-9.]+\.zip$' }
         Write-Host "正在从 NVIDIA 官方 Streamline $($asset.Tag) 下载 DLSS 组件..." -ForegroundColor Cyan
         $packagePath = Join-Path $temporaryDirectory $asset.Name
         Invoke-OfficialDownload -Url $asset.Url -Destination $packagePath
@@ -257,7 +263,7 @@ function Install-Unlocker {
     New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
     try {
         if ($Mode -eq 'Auto') {
-            $asset = Get-GitHubLatestAsset -Repository '34736384/genshin-fps-unlock' -AssetFilter { $_.name -eq 'unlockfps_nc.exe' }
+            $asset = Get-GitHubReleaseAsset -Repository '34736384/genshin-fps-unlock' -AssetFilter { $_.name -eq 'unlockfps_nc.exe' }
             Write-Host "正在从官方发行版下载 FPS Unlocker $($asset.Tag)..." -ForegroundColor Cyan
             $source = Join-Path $temporaryDirectory 'unlockfps_nc.exe'
             Invoke-OfficialDownload -Url $asset.Url -Destination $source
@@ -306,7 +312,8 @@ function Install-OptiScaler {
     New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
     try {
         if ($Mode -eq 'Auto') {
-            $asset = Get-GitHubLatestAsset -Repository 'optiscaler/OptiScaler' -AssetFilter { $_.name -match '\.7z$' }
+            $optiReleaseTag = if ($nonFrameGenerationEdition) { 'v0.9.3' } else { $null }
+            $asset = Get-GitHubReleaseAsset -Repository 'optiscaler/OptiScaler' -Tag $optiReleaseTag -AssetFilter { $_.name -match '\.7z$' }
             Write-Host "正在从官方发行版下载 OptiScaler $($asset.Tag)..." -ForegroundColor Cyan
             $packagePath = Join-Path $temporaryDirectory $asset.Name
             Invoke-OfficialDownload -Url $asset.Url -Destination $packagePath
