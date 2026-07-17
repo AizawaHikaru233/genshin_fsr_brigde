@@ -16,6 +16,8 @@ $packageRoot = Join-Path $root 'GenshinOneClick'
 $bridgeOutput = Join-Path $bridgeBuild "$Configuration\Dx11FsrBridge.dll"
 $antiOutput = Join-Path $antiBuild "$Configuration\AntiPlayerMosaic.dll"
 $renoDxArchive = Join-Path $root 'RenoDX-Genshin\renodx-genshin.addon64'
+$bridgeDestination = Join-Path $packageRoot 'payload\Bridge\Dx11FsrBridge.dll'
+$antiDestination = Join-Path $packageRoot 'payload\AntiPlayerMosaic.dll'
 $renoDxDestination = Join-Path $packageRoot 'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64'
 
 function Invoke-Cmake {
@@ -55,8 +57,9 @@ if (-not (Test-Path -LiteralPath $renoDxArchive -PathType Leaf)) {
     throw "RenoDX 归档文件不存在: $renoDxArchive"
 }
 
-$bridgeDestination = Join-Path $packageRoot 'payload\Bridge\Dx11FsrBridge.dll'
-$antiDestination = Join-Path $packageRoot 'payload\AntiPlayerMosaic.dll'
+foreach ($destination in @($bridgeDestination, $antiDestination, $renoDxDestination)) {
+    New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+}
 Copy-Item -LiteralPath $bridgeOutput -Destination $bridgeDestination -Force
 Copy-Item -LiteralPath $antiOutput -Destination $antiDestination -Force
 Copy-Item -LiteralPath $renoDxArchive -Destination $renoDxDestination -Force
