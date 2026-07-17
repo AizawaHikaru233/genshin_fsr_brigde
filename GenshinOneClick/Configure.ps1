@@ -32,8 +32,6 @@ $bridgeDir = Join-Path $payload 'Bridge'
 $optiDir = Join-Path $payload 'OptiScaler'
 $reshadeDir = Join-Path $payload 'ReShade'
 $bridgeDll = Join-Path $bridgeDir 'Dx11FsrBridge.dll'
-$bridgeIni = Join-Path $bridgeDir 'Dx11FsrBridge.ini'
-$bridgeDefaultIni = Join-Path $bridgeDir 'Dx11FsrBridge.default.ini'
 $optiDll = Join-Path $optiDir 'OptiScaler.dll'
 $optiIni = Join-Path $optiDir 'OptiScaler.ini'
 $optiDefaultIni = Join-Path $optiDir 'OptiScaler.default.ini'
@@ -47,6 +45,7 @@ $reshadeDll = Join-Path $reshadeDir 'ReShade64.dll'
 $shaderDir = Join-Path $reshadeDir 'reshade-shaders'
 $unlocker = Join-Path $root 'unlockfps_nc.exe'
 $fpsConfig = Join-Path $root 'fps_config.json'
+$nonFrameGenerationEdition = Test-Path -LiteralPath (Join-Path $root 'NonFrameGeneration.edition') -PathType Leaf
 
 . (Join-Path $root 'Localization.ps1')
 $script:Language = Get-InstallerLanguage -RequestedLanguage $Language
@@ -484,6 +483,39 @@ function Remove-ManagedPath {
     }
 }
 
+function Test-PathCompatibilityRisk {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    foreach ($character in $Path.ToCharArray()) {
+        if ([int]$character -gt 127) { return $true }
+    }
+    return ($Path -match '[^A-Za-z0-9 _:\.\\/\-]')
+}
+
+function Show-PathCompatibilityWarning {
+    param([string]$GameExePath)
+    $gameDirectory = if ([string]::IsNullOrWhiteSpace($GameExePath)) { $null } else { Split-Path -Parent $GameExePath }
+    $riskyPaths = [System.Collections.Generic.List[string]]::new()
+    if (Test-PathCompatibilityRisk -Path $gameDirectory) { $riskyPaths.Add("游戏目录: $gameDirectory") }
+    if (Test-PathCompatibilityRisk -Path $root) { $riskyPaths.Add("插件目录: $root") }
+    if ($riskyPaths.Count -eq 0) { return }
+
+    Write-Host ''
+    Write-Host '路径兼容性提醒：检测到游戏或插件路径包含中文或特殊符号。' -ForegroundColor Yellow
+    foreach ($entry in $riskyPaths) {
+        Write-Host "  $entry" -ForegroundColor DarkYellow
+    }
+    Write-Host '若遇到无法注入、插件不加载或日志目录乱码，建议将游戏和插件移动到仅包含英文、数字、下划线和短横线的路径。' -ForegroundColor DarkGray
+}
+
+function Add-UniquePath {
+    param([System.Collections.Generic.List[string]]$List, [string]$Path)
+    foreach ($entry in $List) {
+        if ([string]::Equals([System.IO.Path]::GetFullPath($entry), [System.IO.Path]::GetFullPath($Path), [StringComparison]::OrdinalIgnoreCase)) { return }
+    }
+    $List.Add($Path)
+}
+
 function Set-IniValue {
     param(
         [string]$Path,
@@ -626,7 +658,9 @@ function Reset-PluginConfigurations {
     }
     $loadedDlls = [Collections.Generic.List[string]]::new()
     if ($null -ne $existingConfig -and $null -ne $existingConfig.PSObject.Properties['DllList']) {
-        foreach ($entry in @($existingConfig.DllList)) { $loadedDlls.Add([string]$entry) }
+        foreach ($entry in @($existingConfig.DllList)) {
+            Add-UniquePath -List $loadedDlls -Path ([string]$entry)
+        }
     }
     else {
         foreach ($candidate in @($bridgeDll, $optiDll, $antiBlurDll, $reshadeDll)) {
@@ -651,9 +685,9 @@ function Reset-PluginConfigurations {
             @{ Section = 'Upscalers'; Key = 'Dx11Upscaler'; Value = 'auto' },
             @{ Section = 'Upscalers'; Key = 'Dx12Upscaler'; Value = 'auto' },
             @{ Section = 'Upscalers'; Key = 'VulkanUpscaler'; Value = 'auto' },
-            @{ Section = 'FrameGen'; Key = 'Enabled'; Value = 'auto' },
-            @{ Section = 'FrameGen'; Key = 'FGInput'; Value = 'auto' },
-            @{ Section = 'FrameGen'; Key = 'FGOutput'; Value = 'auto' },
+            @{ Section = 'FrameGen'; Key = 'Enabled'; Value = $(if ($nonFrameGenerationEdition) { 'false' } else { 'auto' }) },
+            @{ Section = 'FrameGen'; Key = 'FGInput'; Value = $(if ($nonFrameGenerationEdition) { 'nofg' } else { 'auto' }) },
+            @{ Section = 'FrameGen'; Key = 'FGOutput'; Value = $(if ($nonFrameGenerationEdition) { 'nofg' } else { 'auto' }) },
             @{ Section = 'FrameGen'; Key = 'FTInput'; Value = 'auto' },
             @{ Section = 'Inputs'; Key = 'EnableFsr2Inputs'; Value = 'true' },
             @{ Section = 'Inputs'; Key = 'UseFsr2Dx11Inputs'; Value = 'true' },
@@ -661,10 +695,10 @@ function Reset-PluginConfigurations {
             @{ Section = 'Inputs'; Key = 'EnableFsr3Inputs'; Value = 'false' },
             @{ Section = 'FSR'; Key = 'Fsr4Update'; Value = 'true' },
             @{ Section = 'Log'; Key = 'LogToFile'; Value = 'true' },
-            @{ Section = 'Log'; Key = 'LogLevel'; Value = '2' },
+            @{ Section = 'Log'; Key = 'LogLevel'; Value = '4' },
             @{ Section = 'Log'; Key = 'SingleFile'; Value = 'true' },
             @{ Section = 'Log'; Key = 'LogFileName'; Value = 'OptiScaler.log' },
-            @{ Section = 'Log'; Key = 'LogAsync'; Value = 'true' },
+            @{ Section = 'Log'; Key = 'LogAsync'; Value = 'false' },
             @{ Section = 'Log'; Key = 'LogAsyncThreads'; Value = '1' },
             @{ Section = 'Libraries'; Key = 'OptiDllPath'; Value = $optiDir },
             @{ Section = 'Plugins'; Key = 'Path'; Value = 'auto' },
@@ -676,10 +710,6 @@ function Reset-PluginConfigurations {
         if (Test-Path -LiteralPath $fakeNvapiDefaultIni -PathType Leaf) {
             Copy-Item -LiteralPath $fakeNvapiDefaultIni -Destination $fakeNvapiIni -Force
         }
-    }
-    if (Test-Path -LiteralPath $bridgeDll -PathType Leaf) {
-        Assert-File -Path $bridgeDefaultIni
-        Copy-Item -LiteralPath $bridgeDefaultIni -Destination $bridgeIni -Force
     }
     if (Test-Path -LiteralPath $reshadeDll -PathType Leaf) {
         New-Item -ItemType Directory -Force -Path $screenshotsPath | Out-Null
@@ -730,6 +760,7 @@ if ($EnsureNvidiaDlssOnly) {
 }
 
 $gameExe = Get-GamePath -RequestedPath $GamePath -ConfigPath $fpsConfig
+Show-PathCompatibilityWarning -GameExePath $gameExe
 
 if (-not $NonInteractive) {
     Write-Host ''
@@ -766,7 +797,6 @@ if (-not $DisableOptiScaler) {
     Install-OptiScaler -Mode $optiMode -ManualPath $OptiScalerPackagePath
     Install-NvidiaDlssIfNeeded
     Assert-File -Path $bridgeDll
-    Assert-File -Path $bridgeIni
     $ffxMainCandidates = @(
         (Join-Path $optiDir 'amd_fidelityfx_dx12.dll'),
         (Join-Path $optiDir 'amd_fidelityfx_loader_dx12.dll')
@@ -801,9 +831,9 @@ if (-not $DisableOptiScaler) {
         Set-IniValue -Path $optiIni -Section 'Upscalers' -Key 'Dx11Upscaler' -Value 'auto'
         Set-IniValue -Path $optiIni -Section 'Upscalers' -Key 'Dx12Upscaler' -Value 'auto'
         Set-IniValue -Path $optiIni -Section 'Upscalers' -Key 'VulkanUpscaler' -Value 'auto'
-        Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'Enabled' -Value 'auto'
-        Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'FGInput' -Value 'auto'
-        Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'FGOutput' -Value 'auto'
+        Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'Enabled' -Value $(if ($nonFrameGenerationEdition) { 'false' } else { 'auto' })
+        Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'FGInput' -Value $(if ($nonFrameGenerationEdition) { 'nofg' } else { 'auto' })
+        Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'FGOutput' -Value $(if ($nonFrameGenerationEdition) { 'nofg' } else { 'auto' })
         Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'FTInput' -Value 'auto'
         Set-IniValue -Path $optiIni -Section 'Inputs' -Key 'EnableFsr2Inputs' -Value 'true'
         Set-IniValue -Path $optiIni -Section 'Inputs' -Key 'UseFsr2Dx11Inputs' -Value 'true'
@@ -816,12 +846,16 @@ if (-not $DisableOptiScaler) {
     }
     Set-IniValue -Path $optiIni -Section 'Libraries' -Key 'OptiDllPath' -Value $optiDir
     Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogToFile' -Value 'true'
-    Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogLevel' -Value '2'
+    Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogLevel' -Value '4'
     Set-IniValue -Path $optiIni -Section 'Log' -Key 'SingleFile' -Value 'true'
     Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogFileName' -Value 'OptiScaler.log'
-    Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogAsync' -Value 'true'
+    Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogAsync' -Value 'false'
     Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogAsyncThreads' -Value '1'
-    Set-IniValue -Path $bridgeIni -Section 'Dx11FsrBridge' -Key 'EnableLogging' -Value '1'
+    if ($nonFrameGenerationEdition) {
+        Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'Enabled' -Value 'false'
+        Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'FGInput' -Value 'nofg'
+        Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'FGOutput' -Value 'nofg'
+    }
 }
 
 $dllList = [System.Collections.Generic.List[string]]::new()

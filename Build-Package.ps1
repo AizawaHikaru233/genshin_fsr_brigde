@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release', 'RelWithDebInfo', 'MinSizeRel')]
     [string]$Configuration = 'Release'
@@ -10,15 +10,6 @@ $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSCommandPath
 $cmake = Get-Command cmake -ErrorAction Stop
-$bridgeSource = if (Test-Path -LiteralPath (Join-Path $root 'CMakeLists.txt') -PathType Leaf) {
-    $root
-}
-else {
-    Join-Path $root 'Dx11FsrBridge'
-}
-if (-not (Test-Path -LiteralPath (Join-Path $bridgeSource 'CMakeLists.txt') -PathType Leaf)) {
-    throw "Bridge CMake 源目录不存在: $bridgeSource"
-}
 $bridgeBuild = Join-Path $root 'build-package-bridge'
 $antiBuild = Join-Path $root 'build-package-antiplayermosaic'
 $packageRoot = Join-Path $root 'GenshinOneClick'
@@ -29,7 +20,6 @@ $renoDxDestination = Join-Path $packageRoot 'payload\ReShade\reshade-shaders\Add
 
 function Invoke-Cmake {
     param([string[]]$Arguments)
-
     & $cmake.Path @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "CMake 命令失败: cmake $($Arguments -join ' ')"
@@ -37,36 +27,28 @@ function Invoke-Cmake {
 }
 
 function Update-ManifestEntry {
-    param(
-        [object[]]$Manifest,
-        [string]$Name,
-        [string]$Path
-    )
-
+    param([object[]]$Manifest, [string]$Name, [string]$Path)
     $entry = @($Manifest | Where-Object { $_.Name -eq $Name } | Select-Object -First 1)
-    if ($entry.Count -ne 1) {
-        throw "组件清单缺少条目: $Name"
-    }
+    if ($entry.Count -ne 1) { throw "组件清单缺少条目: $Name" }
     $file = Get-Item -LiteralPath $Path -ErrorAction Stop
     $entry[0].SHA256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
     $entry[0].Bytes = $file.Length
 }
 
 Invoke-Cmake @(
-    '-S', $bridgeSource,
+    '-S', $root,
     '-B', $bridgeBuild,
     '-A', 'x64',
     '-DDX11FSRBRIDGE_RELEASE_RUNTIME=ON',
     '-DDX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=ON'
 )
 Invoke-Cmake @('--build', $bridgeBuild, '--config', $Configuration)
-
 Invoke-Cmake @('-S', (Join-Path $root 'AntiPlayerMosaic'), '-B', $antiBuild, '-A', 'x64')
 Invoke-Cmake @('--build', $antiBuild, '--config', $Configuration)
 
 foreach ($output in @($bridgeOutput, $antiOutput)) {
     if (-not (Test-Path -LiteralPath $output -PathType Leaf)) {
-        throw "未找到编译输出: $output"
+        throw "未找到编译或发行输入: $output"
     }
 }
 if (-not (Test-Path -LiteralPath $renoDxArchive -PathType Leaf)) {
@@ -78,20 +60,6 @@ $antiDestination = Join-Path $packageRoot 'payload\AntiPlayerMosaic.dll'
 Copy-Item -LiteralPath $bridgeOutput -Destination $bridgeDestination -Force
 Copy-Item -LiteralPath $antiOutput -Destination $antiDestination -Force
 Copy-Item -LiteralPath $renoDxArchive -Destination $renoDxDestination -Force
-if ((Get-FileHash -LiteralPath $renoDxArchive -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $renoDxDestination -Algorithm SHA256).Hash) {
-    throw 'RenoDX 归档同步校验失败。'
-}
-foreach ($staleGeneratedFile in @(
-    '一键配置.bat',
-    'GenshinFSRBridgeTools.bat',
-    'Logs and Feedback.txt',
-    '日志与反馈.txt'
-)) {
-    $stalePath = Join-Path $packageRoot $staleGeneratedFile
-    if (Test-Path -LiteralPath $stalePath -PathType Leaf) {
-        Remove-Item -LiteralPath $stalePath -Force
-    }
-}
 
 $manifestPath = Join-Path $packageRoot 'component-manifest.json'
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json

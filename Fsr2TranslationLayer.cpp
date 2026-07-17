@@ -53,6 +53,7 @@ std::uint32_t g_output_height = 0;
 bool g_translation_context_created = false;
 bool g_reset_next_dispatch = true;
 bool g_auto_exposure = true;
+bool g_hdr10_pq_color = false;
 bool g_hook_entry_detected = false;
 LARGE_INTEGER g_last_dispatch_counter {};
 
@@ -96,6 +97,7 @@ void release_translation_locked()
     g_output_width = 0;
     g_output_height = 0;
     g_auto_exposure = true;
+    g_hdr10_pq_color = false;
     g_reset_next_dispatch = true;
     g_last_dispatch_counter = {};
 }
@@ -418,13 +420,18 @@ bool ensure_translation_locked(const Fsr2TranslationFrame &frame, bool &created,
         g_translation_context_created && g_translation_device == device &&
         g_render_width == frame.render_width && g_render_height == frame.render_height &&
         g_output_width == frame.output_width && g_output_height == frame.output_height &&
-        g_auto_exposure == (frame.exposure == nullptr);
+        g_auto_exposure == (frame.exposure == nullptr) &&
+        g_hdr10_pq_color == frame.hdr10_pq_color;
     if (matches)
     {
         device->Release();
         return true;
     }
 
+    const bool display_contract_changed =
+        g_translation_context_created && g_hdr10_pq_color != frame.hdr10_pq_color;
+    if (display_contract_changed)
+        frame.context->Flush();
     release_translation_locked();
     g_translation_device = device;
     g_render_width = frame.render_width;
@@ -432,6 +439,7 @@ bool ensure_translation_locked(const Fsr2TranslationFrame &frame, bool &created,
     g_output_width = frame.output_width;
     g_output_height = frame.output_height;
     g_auto_exposure = frame.exposure == nullptr;
+    g_hdr10_pq_color = frame.hdr10_pq_color;
 
     if (!create_input_prepare_shader_locked(error) || !create_prepared_resources_locked(error))
     {
@@ -440,9 +448,9 @@ bool ensure_translation_locked(const Fsr2TranslationFrame &frame, bool &created,
     }
 
     FfxFsr2ContextDescription description {};
-    description.flags =
-        FFX_FSR2_ENABLE_HIGH_DYNAMIC_RANGE |
-        FFX_FSR2_ENABLE_DEPTH_INVERTED;
+    description.flags = FFX_FSR2_ENABLE_DEPTH_INVERTED;
+    if (frame.hdr10_pq_color)
+        description.flags |= FFX_FSR2_ENABLE_HIGH_DYNAMIC_RANGE;
     if (g_auto_exposure)
         description.flags |= FFX_FSR2_ENABLE_AUTO_EXPOSURE;
     if (frame.motion_vectors_jittered)

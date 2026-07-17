@@ -1,10 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(AntiPlayerMosaic LANGUAGES CXX)
+project(AntiPlayerMosaic LANGUAGES CXX RC)
 
 add_executable(scan_test scan_test.cpp)
 target_compile_features(scan_test PRIVATE cxx_std_20)
 
-add_library(AntiPlayerMosaic SHARED AntiPlayerMosaic.cpp)
+add_library(AntiPlayerMosaic SHARED AntiPlayerMosaic.cpp AntiPlayerMosaic.rc)
 target_compile_features(AntiPlayerMosaic PRIVATE cxx_std_20)
+target_compile_definitions(AntiPlayerMosaic PRIVATE
+    $<$<CONFIG:Release>:ANTIPLAYER_RELEASE_RUNTIME=1>
+)
 target_link_libraries(AntiPlayerMosaic PRIVATE Psapi)

@@ -5,7 +5,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSCommandPath
 $source = Join-Path $root 'GenshinOneClick'
 $dist = Join-Path $root 'dist'
-$liteOutput = Join-Path $dist 'GenshinOneClick-Online'
+$nonFgOutput = Join-Path $dist 'GenshinOneClick-NonFG-OptiScaler-0.9.3-Release'
 
 function Get-BridgeVersion {
     $manifestPath = Join-Path $source 'component-manifest.json'
@@ -37,11 +37,73 @@ function Reset-OutputDirectory {
     New-Item -ItemType Directory -Path $targetPath | Out-Null
 }
 
+function Remove-DistItem {
+    param([string]$Path)
+    $distPath = [IO.Path]::GetFullPath($dist).TrimEnd('\') + '\'
+    $targetPath = [IO.Path]::GetFullPath($Path)
+    if (-not $targetPath.StartsWith($distPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "清理目标不在 dist 下: $targetPath"
+    }
+    if (Test-Path -LiteralPath $targetPath) {
+        Remove-Item -LiteralPath $targetPath -Recurse -Force
+    }
+}
+
+function Set-IniSectionValue {
+    param(
+        [string]$Path,
+        [string]$Section,
+        [string]$Key,
+        [string]$Value
+    )
+    $lines = [Collections.Generic.List[string]]::new()
+    $lines.AddRange([string[]][IO.File]::ReadAllLines($Path, [Text.Encoding]::UTF8))
+    $currentSection = ''
+    $updated = $false
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        if ($lines[$index] -match '^\s*\[(?<name>[^\]]+)\]\s*$') {
+            $currentSection = $Matches.name.Trim()
+            continue
+        }
+        if ([string]::Equals($currentSection, $Section, [StringComparison]::OrdinalIgnoreCase) -and
+            $lines[$index] -match ('^\s*' + [regex]::Escape($Key) + '\s*=')) {
+            $lines[$index] = "$Key = $Value"
+            $updated = $true
+            break
+        }
+    }
+    if (-not $updated) {
+        throw "INI 缺少设置: $Path [$Section] $Key"
+    }
+    [IO.File]::WriteAllLines($Path, $lines, [Text.UTF8Encoding]::new($false))
+}
+
+function Get-IniSectionValue {
+    param(
+        [string]$Path,
+        [string]$Section,
+        [string]$Key
+    )
+    $currentSection = ''
+    foreach ($line in [IO.File]::ReadAllLines($Path, [Text.Encoding]::UTF8)) {
+        if ($line -match '^\s*\[(?<name>[^\]]+)\]\s*$') {
+            $currentSection = $Matches.name.Trim()
+            continue
+        }
+        if ([string]::Equals($currentSection, $Section, [StringComparison]::OrdinalIgnoreCase) -and
+            $line -match ('^\s*' + [regex]::Escape($Key) + '\s*=\s*(?<value>.*)$')) {
+            return $Matches.value.Trim()
+        }
+    }
+    return $null
+}
+
 function Copy-ReleaseTree {
     param(
         [string]$Destination,
         [bool]$IncludeUnlocker,
-        [bool]$IncludeOptiScaler
+        [bool]$IncludeOptiScaler,
+        [bool]$NonFrameGeneration
     )
     Reset-OutputDirectory -Path $Destination
     $excludedRootFiles = @(
@@ -53,6 +115,10 @@ function Copy-ReleaseTree {
         'Configure-Launcher.bat',
         'Configure-Launcher.en.bat',
         'Feedback.txt',
+        '一键配置.bat',
+        'GenshinFSRBridgeTools.bat',
+        '日志与反馈.txt',
+        'Logs and Feedback.txt',
         'README.md',
         'README.txt',
         'SOURCE.md',
@@ -76,6 +142,32 @@ function Copy-ReleaseTree {
         Where-Object { $IncludeOptiScaler -or $_.Name -notin @('OptiScaler', 'NVIDIA') } |
         Copy-Item -Destination $payloadDestination -Recurse -Force
 
+    if ($NonFrameGeneration) {
+        [IO.File]::WriteAllText(
+            (Join-Path $Destination 'NonFrameGeneration.edition'),
+            "OptiScaler 0.9.3 stable; frame generation disabled.`r`n",
+            [Text.UTF8Encoding]::new($false))
+        if ($IncludeOptiScaler) {
+            $optiDestination = Join-Path $payloadDestination 'OptiScaler'
+            foreach ($configName in @('OptiScaler.ini', 'OptiScaler.default.ini')) {
+                $configPath = Join-Path $optiDestination $configName
+                Set-IniSectionValue -Path $configPath -Section 'FrameGen' -Key 'Enabled' -Value 'false'
+                Set-IniSectionValue -Path $configPath -Section 'FrameGen' -Key 'FGInput' -Value 'nofg'
+                Set-IniSectionValue -Path $configPath -Section 'FrameGen' -Key 'FGOutput' -Value 'nofg'
+            }
+            foreach ($frameGenerationFile in @(
+                'amd_fidelityfx_framegeneration_dx12.dll',
+                'libxess_fg.dll',
+                'dlssg_to_fsr3_amd_is_better.dll'
+            )) {
+                $frameGenerationPath = Join-Path $optiDestination $frameGenerationFile
+                if (Test-Path -LiteralPath $frameGenerationPath -PathType Leaf) {
+                    Remove-Item -LiteralPath $frameGenerationPath -Force
+                }
+            }
+        }
+    }
+
     Get-ChildItem -LiteralPath $Destination -Recurse -File -Force |
         Where-Object {
             $_.Name -like '*.log' -or
@@ -98,6 +190,10 @@ function Copy-ReleaseTree {
             Remove-Item -LiteralPath $path -Force
         }
     }
+
+    Copy-Item -LiteralPath (Join-Path $source 'Configure-Launcher.bat') -Destination (Join-Path $Destination '一键配置.bat') -Force
+    Copy-Item -LiteralPath (Join-Path $source 'Configure-Launcher.en.bat') -Destination (Join-Path $Destination 'GenshinFSRBridgeTools.bat') -Force
+    Copy-Item -LiteralPath (Join-Path $source 'Feedback.txt') -Destination (Join-Path $Destination 'Feedback.txt') -Force
 }
 
 function Assert-ReleaseLayout {
@@ -105,7 +201,8 @@ function Assert-ReleaseLayout {
         [string]$Path,
         [bool]$ExpectUnlocker,
         [bool]$ExpectOptiScaler,
-        [bool]$ExpectNvidiaDlss
+        [bool]$ExpectNvidiaDlss,
+        [bool]$ExpectNonFrameGeneration
     )
     foreach ($required in @(
         '一键配置.bat',
@@ -114,11 +211,8 @@ function Assert-ReleaseLayout {
         'Configure.ps1',
         'Localization.ps1',
         'component-manifest.json',
-        '日志与反馈.txt',
-        'Logs and Feedback.txt',
+        'Feedback.txt',
         'payload\Bridge\Dx11FsrBridge.dll',
-        'payload\Bridge\Dx11FsrBridge.ini',
-        'payload\Bridge\Dx11FsrBridge.default.ini',
         'payload\AntiPlayerMosaic.dll',
         'payload\ReShade\ReShade64.dll',
         'payload\ReShade\LICENSE-ReShade-BSD-3-Clause.txt',
@@ -133,13 +227,19 @@ function Assert-ReleaseLayout {
     }
     foreach ($forbidden in @(
         '启动原神.bat',
+        'Configure-Launcher.bat',
+        'Configure-Launcher.en.bat',
         'Repair-Paths.ps1',
         'fps_config.json',
         '.installer-state.json',
+        '日志与反馈.txt',
+        'Logs and Feedback.txt',
         'README.md',
         'README.txt',
         'SOURCE.md',
         'SOURCE.txt',
+        'payload\Bridge\Dx11FsrBridge.ini',
+        'payload\Bridge\Dx11FsrBridge.default.ini',
         'payload\NVIDIA\DLSS\SOURCE.txt',
         'payload\NVIDIA\DLSS\README.md',
         'payload\NVIDIA\DLSS\README.txt'
@@ -158,6 +258,40 @@ function Assert-ReleaseLayout {
     if ($optiDefaultConfigExists -ne $ExpectOptiScaler) { throw "OptiScaler 默认配置模板状态不正确: $Path" }
     if ($fakeNvapiDefaultConfigExists -ne $ExpectOptiScaler) { throw "fakenvapi 默认配置模板状态不正确: $Path" }
     if ($nvidiaDlssExists -ne $ExpectNvidiaDlss) { throw "NVIDIA DLSS 内置状态不正确: $Path" }
+    $nonFrameGenerationMarkerExists = Test-Path -LiteralPath (Join-Path $Path 'NonFrameGeneration.edition') -PathType Leaf
+    if ($nonFrameGenerationMarkerExists -ne $ExpectNonFrameGeneration) {
+        throw "非帧生成版本标记状态不正确: $Path"
+    }
+    if ($ExpectOptiScaler) {
+        $optiPath = Join-Path $Path 'payload\OptiScaler\OptiScaler.dll'
+        $optiFile = Get-Item -LiteralPath $optiPath
+        if ($optiFile.VersionInfo.FileVersion -ne '0.9.3.0') {
+            throw "OptiScaler 版本不是 0.9.3.0: $optiPath"
+        }
+        if ((Get-FileHash -LiteralPath $optiPath -Algorithm SHA256).Hash -ne
+            '2369120927264BB2B120E7FB0940CB0B3242DC788417AB92FB99953555016511') {
+            throw "OptiScaler 0.9.3 哈希不匹配: $optiPath"
+        }
+    }
+    if ($ExpectNonFrameGeneration -and $ExpectOptiScaler) {
+        foreach ($configName in @('OptiScaler.ini', 'OptiScaler.default.ini')) {
+            $configPath = Join-Path $Path "payload\OptiScaler\$configName"
+            if ((Get-IniSectionValue -Path $configPath -Section 'FrameGen' -Key 'Enabled') -ne 'false' -or
+                (Get-IniSectionValue -Path $configPath -Section 'FrameGen' -Key 'FGInput') -ne 'nofg' -or
+                (Get-IniSectionValue -Path $configPath -Section 'FrameGen' -Key 'FGOutput') -ne 'nofg') {
+                throw "非帧生成配置未锁定: $configPath"
+            }
+        }
+        foreach ($forbiddenFrameGenerationFile in @(
+            'payload\OptiScaler\amd_fidelityfx_framegeneration_dx12.dll',
+            'payload\OptiScaler\libxess_fg.dll',
+            'payload\OptiScaler\dlssg_to_fsr3_amd_is_better.dll'
+        )) {
+            if (Test-Path -LiteralPath (Join-Path $Path $forbiddenFrameGenerationFile)) {
+                throw "非帧生成包包含 FG 后端: $forbiddenFrameGenerationFile"
+            }
+        }
+    }
 
     $scriptText = @(
         Get-Content -LiteralPath (Join-Path $Path 'Installer.ps1') -Raw -Encoding UTF8
@@ -202,16 +336,26 @@ function Assert-ReleaseArchive {
     $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
     try {
         $entryNames = @($archive.Entries | ForEach-Object { $_.FullName.Replace('/', '\') })
-        foreach ($feedbackDocument in @('日志与反馈.txt', 'Logs and Feedback.txt')) {
-            if ($entryNames -notcontains $feedbackDocument) {
-                throw "ZIP 缺少日志反馈文档: $ArchivePath\\$feedbackDocument"
-            }
+        if ($entryNames -notcontains 'Feedback.txt') {
+            throw "ZIP 缺少日志反馈文档: $ArchivePath\Feedback.txt"
+        }
+        if ($entryNames -notcontains 'NonFrameGeneration.edition') {
+            throw "ZIP 缺少非帧生成版本标记: $ArchivePath"
         }
         foreach ($forbidden in @(
+            'Configure-Launcher.bat',
+            'Configure-Launcher.en.bat',
+            '日志与反馈.txt',
+            'Logs and Feedback.txt',
             'README.md',
             'README.txt',
             'SOURCE.md',
             'SOURCE.txt',
+            'payload\Bridge\Dx11FsrBridge.ini',
+            'payload\Bridge\Dx11FsrBridge.default.ini',
+            'payload\OptiScaler\amd_fidelityfx_framegeneration_dx12.dll',
+            'payload\OptiScaler\libxess_fg.dll',
+            'payload\OptiScaler\dlssg_to_fsr3_amd_is_better.dll',
             'payload\NVIDIA\DLSS\SOURCE.txt',
             'payload\NVIDIA\DLSS\README.md',
             'payload\NVIDIA\DLSS\README.txt'
@@ -230,23 +374,23 @@ if (-not (Test-Path -LiteralPath $source -PathType Container)) {
     throw "源目录不存在: $source"
 }
 
-Copy-ReleaseTree -Destination $liteOutput -IncludeUnlocker $false -IncludeOptiScaler $false
-Assert-ReleaseLayout -Path $liteOutput -ExpectUnlocker $false -ExpectOptiScaler $false -ExpectNvidiaDlss $false
-
 $bridgeVersion = Get-BridgeVersion
-$liteArchive = Join-Path $dist ("原神解帧FSR插件包Lite_v{0}.zip" -f $bridgeVersion)
-New-ReleaseArchive -SourceDirectory $liteOutput -ArchivePath $liteArchive
-Assert-ReleaseArchive -ArchivePath $liteArchive
+$nonFgArchive = Join-Path $dist ("原神解帧FSR插件包Lite_v{0}.zip" -f $bridgeVersion)
+$obsoleteNonFgArchive = Join-Path $dist ("原神解帧FSR插件包-非帧生成-OptiScaler0.9.3_v{0}-pre.zip" -f $bridgeVersion)
 
 foreach ($obsoletePath in @(
-    (Join-Path $dist 'GenshinOneClick-Full'),
-    (Join-Path $dist ("原神解帧FSR插件包Full_v{0}.zip" -f $bridgeVersion))
+    $obsoleteNonFgArchive,
+    (Join-Path $dist 'GenshinOneClick-FG-OptiScaler-0.10.0-pre1-Test'),
+    (Join-Path $dist 'GenshinOneClick-FG-OptiScaler-0.10.0-pre1-Test.zip')
 )) {
-    if (Test-Path -LiteralPath $obsoletePath) {
-        Remove-Item -LiteralPath $obsoletePath -Recurse -Force
-    }
+    Remove-DistItem -Path $obsoletePath
 }
 
-Write-Host '正式发布目录构建完成。' -ForegroundColor Green
-Write-Host "联网精简版: $liteOutput"
-Write-Host "Lite ZIP: $liteArchive"
+Copy-ReleaseTree -Destination $nonFgOutput -IncludeUnlocker $false -IncludeOptiScaler $false -NonFrameGeneration $true
+Assert-ReleaseLayout -Path $nonFgOutput -ExpectUnlocker $false -ExpectOptiScaler $false -ExpectNvidiaDlss $false -ExpectNonFrameGeneration $true
+New-ReleaseArchive -SourceDirectory $nonFgOutput -ArchivePath $nonFgArchive
+Assert-ReleaseArchive -ArchivePath $nonFgArchive
+
+Write-Host '非帧生成正式发布目录构建完成。' -ForegroundColor Green
+Write-Host "目录: $nonFgOutput"
+Write-Host "ZIP: $nonFgArchive"

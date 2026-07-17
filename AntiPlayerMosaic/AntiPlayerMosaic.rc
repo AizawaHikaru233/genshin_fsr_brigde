@@ -1,0 +1,33 @@
+#pragma code_page(65001)
+
+#include <windows.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,1,0,0
+ PRODUCTVERSION 1,1,0,0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "CompanyName", "Celia"
+            VALUE "FileDescription", "Genshin Impact Anti-Blur and Player Mosaic Control"
+            VALUE "FileVersion", "1.1.0.0"
+            VALUE "InternalName", "AntiPlayerMosaic"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Celia"
+            VALUE "OriginalFilename", "AntiPlayerMosaic.dll"
+            VALUE "ProductName", "Genshin Impact Visual Fixes"
+            VALUE "ProductVersion", "1.1.0.0"
+            VALUE "Comments", "Runtime anti-blur and player mosaic control module."
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

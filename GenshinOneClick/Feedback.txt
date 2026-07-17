@@ -5,10 +5,10 @@
 1. 复现问题后不要再次启动游戏。
 2. 提交 payload\Bridge\Dx11FsrBridge.log。
 3. 提交 payload\OptiScaler\OptiScaler.log。
-4. 同时提交两个目录中的 Dx11FsrBridge.ini 和 OptiScaler.ini。
-5. 说明显卡型号、异常发生阶段和当时选择的超分/帧生成模式。
+4. 提交 payload\OptiScaler\OptiScaler.ini。
+5. 说明显卡型号、异常发生阶段和当时选择的超分模式。
 
-默认日志采用适合长期启用的级别。需要更详细日志时，可临时将 OptiScaler.ini 中 [Log] 下的 LogLevel 改为 1（Debug）或 0（Trace）。
+发行版默认仅记录错误，每次启动覆盖上一轮日志，单次运行期间不限制日志大小。需要更详细日志时，可临时将 OptiScaler.ini 中 [Log] 下的 LogLevel 改为 1（Debug）或 0（Trace）。
 
 English
 
@@ -17,7 +17,7 @@ If the game cannot start, FSR does not activate, changing upscaling causes a cra
 1. Reproduce the issue, then do not launch the game again.
 2. Submit `payload\Bridge\Dx11FsrBridge.log`.
 3. Submit `payload\OptiScaler\OptiScaler.log`.
-4. Submit `Dx11FsrBridge.ini` and `OptiScaler.ini` from the two directories.
-5. Describe the GPU model, the stage at which the issue occurred, and the selected upscaling or frame-generation mode.
+4. Submit `payload\OptiScaler\OptiScaler.ini`.
+5. Describe the GPU model, the stage at which the issue occurred, and the selected upscaling mode.
 
-The default log level is suitable for regular use. For more detail, temporarily set `[Log] LogLevel` in `OptiScaler.ini` to `1` (Debug) or `0` (Trace).
+Release builds log errors only by default and overwrite the previous run's logs at startup, with no per-session size limit. For more detail, temporarily set `[Log] LogLevel` in `OptiScaler.ini` to `1` (Debug) or `0` (Trace).

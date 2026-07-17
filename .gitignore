@@ -1,6 +1,7 @@
 # Build products and IDE state
 build/
 build-*/
+dist/
 out/
 artifacts/
 .vs/
@@ -21,6 +22,8 @@ Makefile
 *.dll
 !GenshinOneClick/payload/ReShade/ReShade64.dll
 *.exe
+*.zip
+*.7z
 *.iobj
 *.ipdb
 

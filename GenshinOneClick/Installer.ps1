@@ -17,11 +17,14 @@ $statePath = Join-Path $root '.installer-state.json'
 $fpsConfigPath = Join-Path $root 'fps_config.json'
 $errorLogPath = Join-Path $root '.last-install-error.log'
 $unlockerPath = Join-Path $root 'unlockfps_nc.exe'
-$optiDirectory = Join-Path $root 'payload\OptiScaler'
+$payloadDirectory = Join-Path $root 'payload'
+$optiDirectory = Join-Path $payloadDirectory 'OptiScaler'
 $optiPath = Join-Path $optiDirectory 'OptiScaler.dll'
-$bridgePath = Join-Path $root 'payload\Bridge\Dx11FsrBridge.dll'
-$antiBlurPath = Join-Path $root 'payload\AntiPlayerMosaic.dll'
-$reShadePath = Join-Path $root 'payload\ReShade\ReShade64.dll'
+$bridgePath = Join-Path $payloadDirectory 'Bridge\Dx11FsrBridge.dll'
+$antiBlurPath = Join-Path $payloadDirectory 'AntiPlayerMosaic.dll'
+$reShadePath = Join-Path $payloadDirectory 'ReShade\ReShade64.dll'
+$componentManifestPath = Join-Path $root 'component-manifest.json'
+$nonFrameGenerationEdition = Test-Path -LiteralPath (Join-Path $root 'NonFrameGeneration.edition') -PathType Leaf
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) '原神.lnk'
 $legacyShortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) '原神整合版.lnk'
 
@@ -193,6 +196,32 @@ function Set-IniPathValue {
     return $true
 }
 
+function Test-PathCompatibilityRisk {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    foreach ($character in $Path.ToCharArray()) {
+        if ([int]$character -gt 127) { return $true }
+    }
+    return ($Path -match '[^A-Za-z0-9 _:\.\\/\-]')
+}
+
+function Show-PathCompatibilityWarning {
+    param([string]$GameExePath)
+    $gameDirectory = if ([string]::IsNullOrWhiteSpace($GameExePath)) { $null } else { Split-Path -Parent $GameExePath }
+    $riskyPaths = [Collections.Generic.List[string]]::new()
+    if (Test-PathCompatibilityRisk -Path $gameDirectory) { $riskyPaths.Add("游戏目录: $gameDirectory") }
+    if (Test-PathCompatibilityRisk -Path $root) { $riskyPaths.Add("插件目录: $root") }
+    if ($riskyPaths.Count -eq 0) { return $false }
+
+    Write-Host ''
+    Write-Host '路径兼容性提醒：检测到游戏或插件路径包含中文或特殊符号。' -ForegroundColor Yellow
+    foreach ($entry in $riskyPaths) {
+        Write-Host "  $entry" -ForegroundColor DarkYellow
+    }
+    Write-Host '若遇到无法注入、插件不加载或日志目录乱码，建议将游戏和插件移动到仅包含英文、数字、下划线和短横线的路径。' -ForegroundColor DarkGray
+    return $true
+}
+
 function Repair-RuntimePaths {
     param([string]$SelectedGamePath)
     $config = Get-FpsConfig
@@ -246,15 +275,16 @@ function Repair-RuntimePaths {
             Set-IniPathValue -Path $optiIni -Section 'Libraries' -Key $libraryKey -Value 'auto' | Out-Null
         }
         Set-IniPathValue -Path $optiIni -Section 'Log' -Key 'LogToFile' -Value 'true' | Out-Null
-        Set-IniPathValue -Path $optiIni -Section 'Log' -Key 'LogLevel' -Value '2' | Out-Null
+        Set-IniPathValue -Path $optiIni -Section 'Log' -Key 'LogLevel' -Value '4' | Out-Null
         Set-IniPathValue -Path $optiIni -Section 'Log' -Key 'SingleFile' -Value 'true' | Out-Null
         Set-IniPathValue -Path $optiIni -Section 'Log' -Key 'LogFileName' -Value 'OptiScaler.log' | Out-Null
-        Set-IniPathValue -Path $optiIni -Section 'Log' -Key 'LogAsync' -Value 'true' | Out-Null
+        Set-IniPathValue -Path $optiIni -Section 'Log' -Key 'LogAsync' -Value 'false' | Out-Null
         Set-IniPathValue -Path $optiIni -Section 'Log' -Key 'LogAsyncThreads' -Value '1' | Out-Null
-    }
-    $bridgeIni = Join-Path (Split-Path -Parent $bridgePath) 'Dx11FsrBridge.ini'
-    if (Test-Path -LiteralPath $bridgePath -PathType Leaf) {
-        Set-IniPathValue -Path $bridgeIni -Section 'Dx11FsrBridge' -Key 'EnableLogging' -Value '1' | Out-Null
+        if ($nonFrameGenerationEdition) {
+            Set-IniPathValue -Path $optiIni -Section 'FrameGen' -Key 'Enabled' -Value 'false' | Out-Null
+            Set-IniPathValue -Path $optiIni -Section 'FrameGen' -Key 'FGInput' -Value 'nofg' | Out-Null
+            Set-IniPathValue -Path $optiIni -Section 'FrameGen' -Key 'FGOutput' -Value 'nofg' | Out-Null
+        }
     }
 
     $gameDirectory = Split-Path -Parent $SelectedGamePath
@@ -425,11 +455,27 @@ function Get-FileVersionLabel {
     return "v$version"
 }
 
+function Get-ComponentVersionLabel {
+    param([string]$Name, [string]$Fallback = '未知')
+    if (-not (Test-Path -LiteralPath $componentManifestPath -PathType Leaf)) { return $Fallback }
+    try {
+        $manifest = Get-Content -LiteralPath $componentManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $component = @($manifest | Where-Object { $_.Name -eq $Name } | Select-Object -First 1)
+        if ($component.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$component[0].Version)) { return $Fallback }
+        return "v$([string]$component[0].Version)"
+    }
+    catch {
+        return $Fallback
+    }
+}
+
 function Write-InstallCatalog {
     param([string]$SelectedGamePath)
     $renoDxPath = Join-Path $root 'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64'
     $unlockerVersion = Get-FileVersionLabel -Path $unlockerPath
     $optiVersion = Get-FileVersionLabel -Path $optiPath
+    $bridgeVersion = Get-ComponentVersionLabel -Name 'Dx11FsrBridge.dll' -Fallback (Get-FileVersionLabel -Path $bridgePath)
+    $antiVersion = Get-ComponentVersionLabel -Name 'AntiPlayerMosaic.dll' -Fallback (Get-FileVersionLabel -Path $antiBlurPath)
     $reShadeVersion = Get-FileVersionLabel -Path $reShadePath
     $renoDxVersion = Get-FileVersionLabel -Path $renoDxPath
     $state = Get-ModuleState -SelectedGamePath $SelectedGamePath
@@ -441,8 +487,8 @@ function Write-InstallCatalog {
     Write-CatalogRow -Id '模块 ID' -Name '插件名' -Author '作者' -Version '当前版本' -Status '安装状态' -Header
     Write-CatalogRow -Id '------' -Name '--------------------' -Author '----------------' -Version '--------------------' -Status '------' -Header
     Write-CatalogRow -Id '1.' -Name 'FPS Unlocker' -Author '34736384' -Version $unlockerVersion -Status $unlockerStatus
-    Write-CatalogRow -Id '2.' -Name 'FSR Bridge + OptiScaler' -Author 'シリアCelia / OptiScaler' -Version "Bridge v1.0.0`nOptiScaler $optiVersion" -Status $optiStatus
-    Write-CatalogRow -Id '3.' -Name '反虚化 / 隐藏 UID' -Author 'シリアCelia' -Version 'v1.1.0' -Status $antiStatus
+    Write-CatalogRow -Id '2.' -Name 'FSR Bridge + OptiScaler' -Author 'シリアCelia / OptiScaler' -Version "Bridge $bridgeVersion`nOptiScaler $optiVersion" -Status $optiStatus
+    Write-CatalogRow -Id '3.' -Name '反虚化 / 隐藏 UID' -Author 'シリアCelia' -Version $antiVersion -Status $antiStatus
     Write-CatalogRow -Id '4.' -Name 'ReShade + RenoDX HDR' -Author 'crosire / 剪刀妹丽丽' -Version "ReShade $reShadeVersion`nRenoDX $renoDxVersion" -Status $hdrStatus
 }
 
@@ -837,6 +883,9 @@ $state = Read-State
 $initialGamePath = if (-not [string]::IsNullOrWhiteSpace($GamePath)) { $GamePath } else { [string]$state.GamePath }
 $selectedGamePath = Select-GamePath -InitialPath $initialGamePath
 if ($null -eq $selectedGamePath) { exit 0 }
+$shouldShowPathWarning = [string]::IsNullOrWhiteSpace([string]$state.GamePath) -or
+    -not [string]::Equals([string]$state.GamePath, $selectedGamePath, [StringComparison]::OrdinalIgnoreCase)
+if ($shouldShowPathWarning -and (Show-PathCompatibilityWarning -GameExePath $selectedGamePath)) { Pause-Menu }
 $fpsTarget = [int]$state.FpsTarget
 Repair-RuntimePaths -SelectedGamePath $selectedGamePath
 if (-not (Invoke-FoundationSetup -SelectedGamePath $selectedGamePath -FpsTarget ([ref]$fpsTarget))) { exit 1 }
@@ -874,6 +923,8 @@ while ($true) {
             $newPath = Select-GamePath -InitialPath $selectedGamePath -ForceSelection
             if ($null -ne $newPath -and (Invoke-FoundationSetup -SelectedGamePath $newPath -FpsTarget ([ref]$fpsTarget))) {
                 $selectedGamePath = $newPath
+                if (Show-PathCompatibilityWarning -GameExePath $selectedGamePath) { Pause-Menu }
+                Repair-RuntimePaths -SelectedGamePath $selectedGamePath
                 Save-State -SelectedGamePath $selectedGamePath -FpsTarget $fpsTarget
             }
         }

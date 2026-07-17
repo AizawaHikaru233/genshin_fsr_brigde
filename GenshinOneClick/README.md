@@ -59,8 +59,7 @@ powershell -ExecutionPolicy Bypass -File .\Configure.ps1 `
 
 1. `payload\Bridge\Dx11FsrBridge.log`
 2. `payload\OptiScaler\OptiScaler.log`
-3. `payload\Bridge\Dx11FsrBridge.ini`
-4. `payload\OptiScaler\OptiScaler.ini`
-5. 简要说明显卡型号、异常发生阶段和当时选择的超分/帧生成模式
+3. `payload\OptiScaler\OptiScaler.ini`
+4. 简要说明显卡型号、异常发生阶段和当时选择的超分模式
 
-Bridge 默认记录加载、Hook、FSR2 转译和失败代码；OptiScaler 默认使用异步 `Info` 级文件日志，以保留初始化、依赖选择、超分和帧生成错误，同时避免 Trace/Debug 日志带来的明显额外开销。需要进一步排查时，可临时把 `OptiScaler.ini` 中 `[Log]` 的 `LogLevel` 改为 `1`（Debug）或 `0`（Trace）。
+Bridge 的预发布 mode2 配置固定在 DLL 内，不再使用 INI。发行版的 Bridge、OptiScaler 和反虚化组件默认仅记录错误，并在每次启动时覆盖上一轮日志；单次运行期间不限制日志大小。需要进一步排查时，可临时把 `OptiScaler.ini` 中 `[Log]` 的 `LogLevel` 改为 `1`（Debug）或 `0`（Trace）。

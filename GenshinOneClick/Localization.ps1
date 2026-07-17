@@ -1,7 +1,13 @@
 ﻿Set-StrictMode -Version Latest
 
 function Get-InstallerDefaultLanguage {
-    if ([Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName -eq 'zh') { return 'zh-CN' }
+    $cultures = @(
+        [Globalization.CultureInfo]::CurrentUICulture,
+        [Globalization.CultureInfo]::CurrentCulture
+    )
+    foreach ($culture in $cultures) {
+        if ($null -ne $culture -and $culture.TwoLetterISOLanguageName -eq 'zh') { return 'zh-CN' }
+    }
     return 'en-US'
 }
 
@@ -139,7 +145,9 @@ function Convert-InstallerText {
         '  6. 恢复所有插件默认配置' = '  6. Restore All Plugin Defaults'
         '  7. 关于 / 作者主页' = '  7. About / Author Pages'
     }
-    foreach ($entry in $replacements.GetEnumerator()) { $text = $text.Replace($entry.Key, $entry.Value) }
+    foreach ($entry in @($replacements.GetEnumerator() | Sort-Object { $_.Key.Length } -Descending)) {
+        $text = $text.Replace($entry.Key, $entry.Value)
+    }
     return $text
 }
 

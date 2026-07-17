@@ -3,8 +3,14 @@
 #include <d3d11.h>
 #include <d3d11_3.h>
 #include <d3dcompiler.h>
+#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
+#include <d3d12.h>
+#endif
 #include <dxgi.h>
 #include <dxgi1_2.h>
+#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
+#include <intrin.h>
+#endif
 
 #include "Fsr31Bridge.h"
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
@@ -18,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -40,10 +47,14 @@
 
 namespace
 {
+std::once_flag g_initialize_once;
 constexpr std::size_t k_context_vtable_size = 128;
 constexpr std::size_t k_context4_vtable_size = 149;
 constexpr std::size_t k_device_vtable_size = 80;
-constexpr std::size_t k_swapchain_vtable_size = 32;
+// DLSSG exposes the returned DX11-on-DX12 swap chain as IDXGISwapChain4.
+// Keep all inherited entries when cloning its vtable, not only the older
+// IDXGISwapChain2-sized prefix.
+constexpr std::size_t k_swapchain_vtable_size = 41;
 constexpr std::size_t k_factory_vtable_size = 32;
 constexpr std::size_t k_factory2_vtable_size = 40;
 constexpr std::size_t k_idx_device_create_buffer = 3;
@@ -75,6 +86,10 @@ constexpr std::size_t k_idx_cs_set_shader = k_context_base_methods + 62;
 constexpr std::size_t k_idx_cs_set_constant_buffers = k_context_base_methods + 64;
 constexpr std::size_t k_swapchain_base_methods = 8;
 constexpr std::size_t k_idx_present = k_swapchain_base_methods + 0;
+constexpr std::size_t k_idx_set_fullscreen_state = k_swapchain_base_methods + 2;
+constexpr std::size_t k_idx_get_fullscreen_state = k_swapchain_base_methods + 3;
+constexpr std::size_t k_idx_resize_buffers = k_swapchain_base_methods + 5;
+constexpr std::size_t k_idx_resize_target = k_swapchain_base_methods + 6;
 constexpr std::size_t k_idx_factory_create_swap_chain = 10;
 constexpr std::size_t k_idx_factory2_create_swap_chain_for_hwnd = 15;
 
@@ -89,6 +104,7 @@ struct Config
     bool log_loader_activity = false;
     bool log_interesting_dispatch_details = false;
     bool hook_present = false;
+    int dlssg_dxgi_workaround = -1;
     bool capture_metadata_only = true;
     bool dump_compute_shaders = false;
     bool dump_pixel_shaders = false;
@@ -129,6 +145,10 @@ struct Config
     bool fsr2_lock_color_producer_shader = true;
     bool fsr2_gpu_timing = false;
     bool fsr2_reset_on_color_path_change = false;
+    bool fsr2_reset_on_optiscaler_config_change = false;
+    std::uint32_t fsr2_optiscaler_config_reset_frames = 4;
+    bool fsr2_reset_on_optiscaler_log_change = false;
+    std::uint32_t fsr2_optiscaler_log_reset_duration_ms = 4000;
     std::uint32_t fsr2_auto_recover_upscaler_ms = 0;
     bool fsr2_trace_color_producers = false;
     bool fsr2_early_output_probe = false;
@@ -284,6 +304,9 @@ HMODULE g_module = nullptr;
 Config g_config;
 std::filesystem::path g_module_dir;
 std::filesystem::path g_log_path;
+#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
+std::atomic_uint64_t g_dxgi_swapchain_request_id = 0;
+#endif
 std::filesystem::path g_frames_path;
 std::filesystem::path g_similarity_path;
 std::filesystem::path g_ps_trace_path;
@@ -309,6 +332,8 @@ std::atomic_uint64_t g_replacement_draw_count = 0;
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
 std::atomic_uint64_t g_fsr2_translation_dispatch_count = 0;
 std::atomic_uint32_t g_fsr2_translation_failure_count = 0;
+std::atomic_uint64_t g_mode2_last_takeover_tick = 0;
+std::atomic_uint64_t g_mode2_native_bypass_start_tick = 0;
 std::atomic_uint64_t g_fsr2_stale_producer_fallback_count = 0;
 std::atomic_uint64_t g_fsr2_late_composed_dispatch_count = 0;
 std::atomic_bool g_fsr2_dx11on12_block_logged = false;
@@ -348,6 +373,12 @@ std::unordered_map<std::uint64_t, std::uint64_t> g_fsr2_latest_producer_write_ge
 std::unordered_map<std::uint64_t, std::uint64_t> g_fsr2_consumed_producer_generations;
 std::unordered_map<std::uint64_t, bool> g_fsr2_late_path_states;
 std::atomic_uint64_t g_fsr2_color_path_switch_count = 0;
+std::atomic_uint64_t g_fsr2_optiscaler_config_next_poll_tick = 0;
+std::atomic_uint64_t g_fsr2_optiscaler_config_last_write = 0;
+std::atomic_uint32_t g_fsr2_optiscaler_config_reset_frames_remaining = 0;
+std::atomic_uint64_t g_fsr2_optiscaler_log_next_poll_tick = 0;
+std::atomic_uint64_t g_fsr2_optiscaler_log_last_write = 0;
+std::atomic_uint64_t g_fsr2_optiscaler_log_reset_until_tick = 0;
 std::optional<Fsr2DynamicColorTarget> match_fsr2_dynamic_color_producer();
 struct Fsr2ColorReplayState
 {
@@ -504,6 +535,10 @@ using copy_subresource_region_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext
 using update_subresource_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *, UINT, const D3D11_BOX *, const void *, UINT, UINT);
 using clear_rtv_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11RenderTargetView *, const FLOAT[4]);
 using clear_dsv_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11DepthStencilView *, UINT, FLOAT, UINT8);
+using set_fullscreen_state_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, BOOL, IDXGIOutput *);
+using get_fullscreen_state_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, BOOL *, IDXGIOutput **);
+using resize_buffers_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+using resize_target_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, const DXGI_MODE_DESC *);
 
 create_device_and_swapchain_fn g_original_create_device_and_swapchain = nullptr;
 create_device_fn g_original_create_device = nullptr;
@@ -520,6 +555,10 @@ create_vertex_shader_fn g_original_create_vertex_shader = nullptr;
 create_pixel_shader_fn g_original_create_pixel_shader = nullptr;
 create_compute_shader_fn g_original_create_compute_shader = nullptr;
 present_fn g_original_present = nullptr;
+set_fullscreen_state_fn g_original_set_fullscreen_state = nullptr;
+get_fullscreen_state_fn g_original_get_fullscreen_state = nullptr;
+resize_buffers_fn g_original_resize_buffers = nullptr;
+resize_target_fn g_original_resize_target = nullptr;
 vs_set_constant_buffers_fn g_original_vs_set_constant_buffers = nullptr;
 vs_set_shader_fn g_original_vs_set_shader = nullptr;
 ps_set_shader_resources_fn g_original_ps_set_shader_resources = nullptr;
@@ -587,6 +626,8 @@ void log_line(const std::string &line);
 void set_osd_text(const std::wstring &text);
 void start_osd();
 void update_osd_from_dispatch(std::uint32_t phase, UINT group_x, UINT group_y, UINT group_z);
+bool dlssg_framegen_selected();
+bool dlssg_dxgi_workaround_active();
 
 std::wstring current_process_name()
 {
@@ -618,6 +659,15 @@ std::string hex64(std::uint64_t value)
     out << "0x" << std::uppercase << std::hex << value;
     return out.str();
 }
+
+#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
+std::string hex32(std::uint32_t value)
+{
+    std::ostringstream out;
+    out << "0x" << std::uppercase << std::hex << value;
+    return out.str();
+}
+#endif
 
 std::wstring widen_ascii(std::string_view value)
 {
@@ -2579,6 +2629,29 @@ void log_line(const std::string &line)
 {
     if (!g_logging_enabled.load(std::memory_order_relaxed))
         return;
+#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    std::string lowered = line;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char value)
+        { return static_cast<char>(std::tolower(value)); });
+    static constexpr std::array<std::string_view, 12> error_terms {
+        "failed",
+        "failure",
+        "error",
+        "rejected",
+        "unsupported",
+        "missing",
+        "blocked",
+        "unavailable",
+        "disabled",
+        "exception",
+        "mismatch",
+        "invalid",
+    };
+    const bool is_error = std::any_of(error_terms.begin(), error_terms.end(), [&](std::string_view term)
+        { return lowered.find(term) != std::string::npos; });
+    if (!is_error)
+        return;
+#endif
     std::lock_guard lock(g_log_mutex);
     std::ofstream out(g_log_path, std::ios::app);
     SYSTEMTIME st {};
@@ -2588,6 +2661,169 @@ void log_line(const std::string &line)
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     out << prefix << line << "\n";
 }
+
+#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+void truncate_log_file(const std::filesystem::path &path)
+{
+    HANDLE file = CreateFileW(
+        path.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file != INVALID_HANDLE_VALUE)
+        CloseHandle(file);
+}
+
+void reset_release_log_files()
+{
+    const std::filesystem::path payload_directory = g_module_dir.parent_path();
+    truncate_log_file(g_log_path);
+    truncate_log_file(payload_directory / L"OptiScaler" / L"OptiScaler.log");
+    truncate_log_file(payload_directory / L"AntiPlayerMosaic.log");
+}
+#endif
+
+#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
+std::string module_path_from_address(void *address)
+{
+    HMODULE module = nullptr;
+    if (address == nullptr || !GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            static_cast<LPCSTR>(address),
+            &module))
+    {
+        return "unknown";
+    }
+
+    char path[MAX_PATH] {};
+    const DWORD length = GetModuleFileNameA(module, path, static_cast<DWORD>(std::size(path)));
+    return length != 0 ? std::string(path, length) : "unknown";
+}
+
+std::string describe_dxgi_swapchain_device(IUnknown *device)
+{
+    if (device == nullptr)
+        return "null";
+
+    std::ostringstream out;
+    out << "ptr=" << hex64(reinterpret_cast<std::uintptr_t>(device));
+
+    ID3D12CommandQueue *queue = nullptr;
+    if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&queue))) && queue != nullptr)
+    {
+        const D3D12_COMMAND_QUEUE_DESC desc = queue->GetDesc();
+        ID3D12Device *d3d12_device = nullptr;
+        const HRESULT device_hr = queue->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&d3d12_device));
+        out << " kind=d3d12_queue type=" << static_cast<unsigned>(desc.Type)
+            << " priority=" << desc.Priority
+            << " flags=" << hex32(static_cast<std::uint32_t>(desc.Flags))
+            << " node_mask=" << desc.NodeMask
+            << " get_device_hr=" << hex32(static_cast<std::uint32_t>(device_hr));
+        if (d3d12_device != nullptr)
+        {
+            const LUID luid = d3d12_device->GetAdapterLuid();
+            out << " adapter_luid=" << hex32(static_cast<std::uint32_t>(luid.HighPart))
+                << ":" << hex32(luid.LowPart);
+            d3d12_device->Release();
+        }
+        queue->Release();
+        return out.str();
+    }
+
+    ID3D12Device *d3d12_device = nullptr;
+    if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D12Device), reinterpret_cast<void **>(&d3d12_device))) && d3d12_device != nullptr)
+    {
+        const LUID luid = d3d12_device->GetAdapterLuid();
+        out << " kind=d3d12_device adapter_luid=" << hex32(static_cast<std::uint32_t>(luid.HighPart))
+            << ":" << hex32(luid.LowPart);
+        d3d12_device->Release();
+        return out.str();
+    }
+
+    ID3D11Device *d3d11_device = nullptr;
+    if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D11Device), reinterpret_cast<void **>(&d3d11_device))) && d3d11_device != nullptr)
+    {
+        out << " kind=d3d11_device feature_level=" << hex32(static_cast<std::uint32_t>(d3d11_device->GetFeatureLevel()))
+            << " creation_flags=" << hex32(d3d11_device->GetCreationFlags());
+        d3d11_device->Release();
+        return out.str();
+    }
+
+    return out.str() + " kind=unknown";
+}
+
+std::string describe_dxgi_swapchain_desc(const DXGI_SWAP_CHAIN_DESC1 *desc)
+{
+    if (desc == nullptr)
+        return "desc=null";
+
+    std::ostringstream out;
+    out << "size=" << desc->Width << "x" << desc->Height
+        << " format=" << static_cast<unsigned>(desc->Format)
+        << " sample=" << desc->SampleDesc.Count << "/" << desc->SampleDesc.Quality
+        << " usage=" << hex32(desc->BufferUsage)
+        << " buffers=" << desc->BufferCount
+        << " scaling=" << static_cast<unsigned>(desc->Scaling)
+        << " swap_effect=" << static_cast<unsigned>(desc->SwapEffect)
+        << " alpha=" << static_cast<unsigned>(desc->AlphaMode)
+        << " flags=" << hex32(desc->Flags)
+        << " stereo=" << (desc->Stereo ? 1 : 0);
+    return out.str();
+}
+
+std::string describe_dxgi_swapchain_desc(const DXGI_SWAP_CHAIN_DESC *desc)
+{
+    if (desc == nullptr)
+        return "desc=null";
+
+    std::ostringstream out;
+    out << "size=" << desc->BufferDesc.Width << "x" << desc->BufferDesc.Height
+        << " format=" << static_cast<unsigned>(desc->BufferDesc.Format)
+        << " refresh=" << desc->BufferDesc.RefreshRate.Numerator << "/" << desc->BufferDesc.RefreshRate.Denominator
+        << " sample=" << desc->SampleDesc.Count << "/" << desc->SampleDesc.Quality
+        << " usage=" << hex32(desc->BufferUsage)
+        << " buffers=" << desc->BufferCount
+        << " windowed=" << (desc->Windowed ? 1 : 0)
+        << " swap_effect=" << static_cast<unsigned>(desc->SwapEffect)
+        << " flags=" << hex32(desc->Flags)
+        << " output_window=" << hex64(reinterpret_cast<std::uintptr_t>(desc->OutputWindow));
+    return out.str();
+}
+
+std::string describe_dxgi_fullscreen_desc(const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *desc)
+{
+    if (desc == nullptr)
+        return "fullscreen=null";
+
+    std::ostringstream out;
+    out << "fullscreen_windowed=" << (desc->Windowed ? 1 : 0)
+        << " refresh=" << desc->RefreshRate.Numerator << "/" << desc->RefreshRate.Denominator
+        << " scanline=" << static_cast<unsigned>(desc->ScanlineOrdering)
+        << " scaling=" << static_cast<unsigned>(desc->Scaling);
+    return out.str();
+}
+
+std::string describe_dxgi_window(HWND hwnd)
+{
+    if (hwnd == nullptr)
+        return "hwnd=null";
+
+    RECT client {};
+    RECT window {};
+    GetClientRect(hwnd, &client);
+    GetWindowRect(hwnd, &window);
+    std::ostringstream out;
+    out << "hwnd=" << hex64(reinterpret_cast<std::uintptr_t>(hwnd))
+        << " client=" << (client.right - client.left) << "x" << (client.bottom - client.top)
+        << " window=" << (window.right - window.left) << "x" << (window.bottom - window.top)
+        << " style=" << hex64(static_cast<std::uint64_t>(GetWindowLongPtrW(hwnd, GWL_STYLE)))
+        << " exstyle=" << hex64(static_cast<std::uint64_t>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)));
+    return out.str();
+}
+#endif
 
 void set_osd_text(const std::wstring &text)
 {
@@ -2794,6 +3030,7 @@ void load_config()
     g_config.log_loader_activity = GetPrivateProfileIntW(L"Dx11FsrBridge", L"LogLoaderActivity", 0, config_path.c_str()) != 0;
     g_config.log_interesting_dispatch_details = GetPrivateProfileIntW(L"Dx11FsrBridge", L"LogInterestingDispatchDetails", 0, config_path.c_str()) != 0;
     g_config.hook_present = GetPrivateProfileIntW(L"Dx11FsrBridge", L"HookPresent", 0, config_path.c_str()) != 0;
+    g_config.dlssg_dxgi_workaround = GetPrivateProfileIntW(L"Dx11FsrBridge", L"DlssgDxgiWorkaround", -1, config_path.c_str());
     g_config.capture_metadata_only = GetPrivateProfileIntW(L"Dx11FsrBridge", L"CaptureMetadataOnly", 1, config_path.c_str()) != 0;
     g_config.dump_compute_shaders = GetPrivateProfileIntW(L"Dx11FsrBridge", L"DumpComputeShaders", 0, config_path.c_str()) != 0;
     g_config.dump_pixel_shaders = GetPrivateProfileIntW(L"Dx11FsrBridge", L"DumpPixelShaders", 0, config_path.c_str()) != 0;
@@ -2862,6 +3099,20 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2GpuTiming", 0, config_path.c_str()) != 0;
     g_config.fsr2_reset_on_color_path_change =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2ResetOnColorPathChange", 0, config_path.c_str()) != 0;
+    g_config.fsr2_reset_on_optiscaler_config_change =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2ResetOnOptiScalerConfigChange", 0, config_path.c_str()) != 0;
+    g_config.fsr2_optiscaler_config_reset_frames = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"Fsr2OptiScalerConfigResetFrames", 4, config_path.c_str())),
+        1u,
+        16u);
+    g_config.fsr2_reset_on_optiscaler_log_change =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2ResetOnOptiScalerLogChange", 0, config_path.c_str()) != 0;
+    g_config.fsr2_optiscaler_log_reset_duration_ms = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"Fsr2OptiScalerLogResetDurationMs", 4000, config_path.c_str())),
+        250u,
+        10000u);
     g_config.fsr2_auto_recover_upscaler_ms = static_cast<std::uint32_t>(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2AutoRecoverUpscalerMs", 0, config_path.c_str()));
     g_config.fsr2_trace_color_producers =
@@ -2885,6 +3136,38 @@ void load_config()
     wchar_t label_buffer[128] {};
     GetPrivateProfileStringW(L"Dx11FsrBridge", L"RunLabel", L"", label_buffer, static_cast<DWORD>(std::size(label_buffer)), config_path.c_str());
     g_config.run_label = label_buffer;
+#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
+    // This independent test build has one supported route: replace the native
+    // 78057 TAAU draw in place and submit its first-hand inputs to OptiScaler.
+    // It intentionally does not depend on a deployment INI or retain the
+    // producer/late-color modes from the former mode 4 implementation.
+    g_config.enable_logging = true;
+    g_logging_enabled.store(true, std::memory_order_relaxed);
+    g_config.enable_fsr2_get_proc_address_shim = true;
+    g_config.fsr2_translation_mode = 2;
+    g_config.fsr2_fast_state_tracking = false;
+    g_config.fsr2_output_validation_target = 0;
+    g_config.fsr2_motion_vectors_jittered = false;
+    g_config.fsr2_positive_motion_vector_scale = false;
+    g_config.fsr2_use_reactive_mask = true;
+    g_config.fsr2_use_transparency_mask = false;
+    g_config.fsr2_jitter_mode = 3;
+    g_config.fsr2_dump_input_textures = 0;
+    g_config.fsr2_compare_output_capture = false;
+    g_config.fsr2_sharpness_percent = 0;
+    g_config.fsr2_hdr10_pq_color = false;
+    g_config.fsr2_use_native_exposure = false;
+    g_config.fsr2_fast_metadata_copy = true;
+    g_config.fsr2_gpu_timing = false;
+    g_config.fsr2_reset_on_color_path_change = false;
+    g_config.fsr2_reset_on_optiscaler_config_change = false;
+    g_config.fsr2_reset_on_optiscaler_log_change = false;
+    g_config.fsr2_auto_recover_upscaler_ms = 0;
+    g_config.fsr2_trace_color_producers = false;
+    g_config.fsr2_early_output_probe = false;
+    g_config.block_dx11_on12_upscalers = false;
+    g_config.show_osd = false;
+#endif
 }
 
 bool process_matches()
@@ -3882,9 +4165,110 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
         g_state.candidate_count = 0;
     }
 
-    log_line("present frame=" + std::to_string(g_state.frame_index) +
-        " size=" + std::to_string(g_state.backbuffer_width) + "x" + std::to_string(g_state.backbuffer_height));
+    static std::atomic_bool first_present_logged { false };
+    if (!first_present_logged.exchange(true, std::memory_order_relaxed))
+    {
+        std::string message = "first_present size=" + std::to_string(g_state.backbuffer_width) + "x" +
+            std::to_string(g_state.backbuffer_height);
+#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
+        message += " fsr2_query_mask=" + hex64(fsr2_get_proc_address_shim_query_mask());
+#endif
+        log_line(message);
+    }
     return g_original_present(swapchain, sync_interval, flags);
+}
+
+HRESULT STDMETHODCALLTYPE hooked_set_fullscreen_state(IDXGISwapChain *swapchain, BOOL fullscreen, IDXGIOutput *target)
+{
+    if (!fullscreen && dlssg_dxgi_workaround_active())
+    {
+        static std::atomic_uint64_t skip_count = 0;
+        const std::uint64_t count = skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count == 1 || count % 16 == 0)
+        {
+            log_line("dlssg_dxgi_workaround skip_set_fullscreen_state fullscreen=0 count=" +
+                std::to_string(count) + " target=" + hex64(reinterpret_cast<std::uint64_t>(target)));
+        }
+        return S_OK;
+    }
+
+    return g_original_set_fullscreen_state != nullptr
+        ? g_original_set_fullscreen_state(swapchain, fullscreen, target)
+        : DXGI_ERROR_INVALID_CALL;
+}
+
+HRESULT STDMETHODCALLTYPE hooked_get_fullscreen_state(IDXGISwapChain *swapchain, BOOL *fullscreen, IDXGIOutput **target)
+{
+    return g_original_get_fullscreen_state != nullptr
+        ? g_original_get_fullscreen_state(swapchain, fullscreen, target)
+        : DXGI_ERROR_INVALID_CALL;
+}
+
+HRESULT STDMETHODCALLTYPE hooked_resize_buffers(
+    IDXGISwapChain *swapchain,
+    UINT buffer_count,
+    UINT width,
+    UINT height,
+    DXGI_FORMAT format,
+    UINT flags)
+{
+    if (dlssg_dxgi_workaround_active() && swapchain != nullptr)
+    {
+        DXGI_SWAP_CHAIN_DESC current {};
+        if (SUCCEEDED(swapchain->GetDesc(&current)))
+        {
+            const bool unchanged =
+                (buffer_count == 0 || buffer_count == current.BufferCount) &&
+                (width == 0 || width == current.BufferDesc.Width) &&
+                (height == 0 || height == current.BufferDesc.Height) &&
+                (format == DXGI_FORMAT_UNKNOWN || format == current.BufferDesc.Format) &&
+                flags == current.Flags;
+            if (unchanged)
+            {
+                static std::atomic_uint64_t skip_count = 0;
+                const std::uint64_t count = skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (count == 1 || count % 16 == 0)
+                {
+                    log_line("dlssg_dxgi_workaround skip_noop_resize_buffers count=" +
+                        std::to_string(count) + " request=" +
+                        std::to_string(buffer_count) + "/" + std::to_string(width) + "x" +
+                        std::to_string(height) + " fmt=" + std::to_string(static_cast<UINT>(format)) +
+                        " flags=" + std::to_string(flags));
+                }
+                return S_OK;
+            }
+        }
+    }
+
+    return g_original_resize_buffers != nullptr
+        ? g_original_resize_buffers(swapchain, buffer_count, width, height, format, flags)
+        : DXGI_ERROR_INVALID_CALL;
+}
+
+HRESULT STDMETHODCALLTYPE hooked_resize_target(IDXGISwapChain *swapchain, const DXGI_MODE_DESC *target_parameters)
+{
+    if (dlssg_dxgi_workaround_active())
+    {
+        static std::atomic_uint64_t skip_count = 0;
+        const std::uint64_t count = skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count == 1 || count % 16 == 0)
+        {
+            std::string detail = "null";
+            if (target_parameters != nullptr)
+            {
+                detail = std::to_string(target_parameters->Width) + "x" +
+                    std::to_string(target_parameters->Height) + " fmt=" +
+                    std::to_string(static_cast<UINT>(target_parameters->Format));
+            }
+            log_line("dlssg_dxgi_workaround skip_resize_target count=" +
+                std::to_string(count) + " target=" + detail);
+        }
+        return S_OK;
+    }
+
+    return g_original_resize_target != nullptr
+        ? g_original_resize_target(swapchain, target_parameters)
+        : DXGI_ERROR_INVALID_CALL;
 }
 
 void STDMETHODCALLTYPE hooked_ps_set_shader_resources(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11ShaderResourceView *const *views)
@@ -4086,7 +4470,47 @@ struct TargetUpscalerDrawInfo
     std::uint64_t constant_buffer_key = 0;
     std::uint64_t color_resource_key = 0;
     std::uint64_t motion_resource_key = 0;
+    DXGI_FORMAT color_format = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT output_color_format = DXGI_FORMAT_UNKNOWN;
 };
+
+enum class Mode2ColorContract : std::uint32_t
+{
+    unsupported = 0,
+    sdr_srgb = 1,
+    hdr10_pq = 2,
+};
+
+bool is_mode2_sdr_format(DXGI_FORMAT format)
+{
+    return format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+        format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+        format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+        format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+        format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+        format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+}
+
+bool is_mode2_hdr10_format(DXGI_FORMAT format)
+{
+    return format == DXGI_FORMAT_R10G10B10A2_TYPELESS ||
+        format == DXGI_FORMAT_R10G10B10A2_UNORM;
+}
+
+Mode2ColorContract classify_mode2_color_contract(const TargetUpscalerDrawInfo &draw_info)
+{
+    if (is_mode2_sdr_format(draw_info.color_format) &&
+        is_mode2_sdr_format(draw_info.output_color_format))
+    {
+        return Mode2ColorContract::sdr_srgb;
+    }
+    if (is_mode2_hdr10_format(draw_info.color_format) &&
+        is_mode2_hdr10_format(draw_info.output_color_format))
+    {
+        return Mode2ColorContract::hdr10_pq;
+    }
+    return Mode2ColorContract::unsupported;
+}
 
 std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(UINT element_count)
 {
@@ -4164,6 +4588,8 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(UINT element_
         g_state.ps_cbs[0].resource_key,
         color.resource_key,
         motion.resource_key,
+        color.format,
+        output_color.format,
     };
 }
 
@@ -4259,6 +4685,8 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(
             constant_buffer_key,
             color.resource_key,
             motion.resource_key,
+            color.format,
+            output_color.format,
         };
     }
 #endif
@@ -4275,6 +4703,102 @@ void maybe_dump_target_color_chain(ID3D11DeviceContext *context, UINT element_co
         maybe_dump_color_source_history(context, draw_info->color_resource_key);
         maybe_dump_motion_source_history(context, draw_info->motion_resource_key);
     }
+}
+
+std::wstring lower_wstring(std::wstring value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t character)
+        {
+            return static_cast<wchar_t>(std::towlower(character));
+        });
+    return value;
+}
+
+std::vector<std::filesystem::path> optiscaler_ini_candidates()
+{
+    std::vector<std::filesystem::path> paths;
+    auto add_path = [&](const std::filesystem::path &path)
+    {
+        if (path.empty())
+            return;
+        if (std::find(paths.begin(), paths.end(), path) == paths.end())
+            paths.push_back(path);
+    };
+
+    wchar_t process_path[MAX_PATH] {};
+    const DWORD length = GetModuleFileNameW(nullptr, process_path, static_cast<DWORD>(std::size(process_path)));
+    if (length != 0)
+        add_path(std::filesystem::path(std::wstring(process_path, process_path + length)).parent_path() / L"OptiScaler.ini");
+
+    add_path(g_module_dir / L"OptiScaler.ini");
+    if (!g_module_dir.empty())
+    {
+        add_path(g_module_dir.parent_path() / L"OptiScaler.ini");
+        add_path(g_module_dir.parent_path() / L"OptiScaler" / L"OptiScaler.ini");
+    }
+
+    return paths;
+}
+
+bool optiscaler_framegen_value_is_dlssg(const std::wstring &value)
+{
+    const std::wstring lower = lower_wstring(value);
+    return lower == L"dlssg" || lower == L"dlssgwithnvngx";
+}
+
+bool dlssg_framegen_selected()
+{
+    static std::mutex mutex;
+    static ULONGLONG last_check_tick = 0;
+    static bool cached_result = false;
+    static bool logged_active = false;
+    const ULONGLONG now = GetTickCount64();
+
+    std::lock_guard lock(mutex);
+    if (now - last_check_tick < 250)
+        return cached_result;
+    last_check_tick = now;
+
+    cached_result = false;
+    for (const std::filesystem::path &ini_path : optiscaler_ini_candidates())
+    {
+        std::error_code error;
+        if (!std::filesystem::exists(ini_path, error))
+            continue;
+
+        wchar_t output_buffer[64] {};
+        GetPrivateProfileStringW(
+            L"FrameGen",
+            L"FGOutput",
+            L"",
+            output_buffer,
+            static_cast<DWORD>(std::size(output_buffer)),
+            ini_path.c_str());
+
+        const std::wstring output = output_buffer;
+        if (!optiscaler_framegen_value_is_dlssg(output))
+            continue;
+
+        cached_result = true;
+        if (!logged_active)
+        {
+            logged_active = true;
+            log_line("dlssg_dxgi_workaround auto_enabled optiscaler_ini=" +
+                narrow(ini_path.wstring()) + " fg_output=" + narrow(output));
+        }
+        break;
+    }
+
+    return cached_result;
+}
+
+bool dlssg_dxgi_workaround_active()
+{
+    if (g_config.dlssg_dxgi_workaround > 0)
+        return true;
+    if (g_config.dlssg_dxgi_workaround == 0)
+        return false;
+    return dlssg_framegen_selected();
 }
 
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
@@ -5714,6 +6238,96 @@ void end_fsr2_gpu_timing(ID3D11DeviceContext *context, Fsr2GpuTimingSlot *slot)
     slot->pending = true;
 }
 
+bool consume_fsr2_optiscaler_config_reset()
+{
+    if (!g_config.fsr2_reset_on_optiscaler_config_change)
+        return false;
+
+    const ULONGLONG now = GetTickCount64();
+    std::uint64_t next_poll = g_fsr2_optiscaler_config_next_poll_tick.load(std::memory_order_relaxed);
+    if (now >= next_poll &&
+        g_fsr2_optiscaler_config_next_poll_tick.compare_exchange_strong(
+            next_poll,
+            now + 250,
+            std::memory_order_relaxed))
+    {
+        WIN32_FILE_ATTRIBUTE_DATA attributes {};
+        const std::filesystem::path optiscaler_config =
+            g_module_dir.parent_path() / L"OptiScaler" / L"OptiScaler.ini";
+        if (GetFileAttributesExW(
+                optiscaler_config.c_str(),
+                GetFileExInfoStandard,
+                &attributes) != 0)
+        {
+            ULARGE_INTEGER last_write {};
+            last_write.LowPart = attributes.ftLastWriteTime.dwLowDateTime;
+            last_write.HighPart = attributes.ftLastWriteTime.dwHighDateTime;
+            const std::uint64_t previous_write = g_fsr2_optiscaler_config_last_write.exchange(
+                last_write.QuadPart,
+                std::memory_order_relaxed);
+            if (previous_write != 0 && previous_write != last_write.QuadPart)
+            {
+                g_fsr2_optiscaler_config_reset_frames_remaining.store(
+                    g_config.fsr2_optiscaler_config_reset_frames,
+                    std::memory_order_release);
+                log_line("fsr2_optiscaler_config_changed reset_frames=" +
+                    std::to_string(g_config.fsr2_optiscaler_config_reset_frames));
+            }
+        }
+    }
+
+    std::uint32_t remaining =
+        g_fsr2_optiscaler_config_reset_frames_remaining.load(std::memory_order_acquire);
+    while (remaining != 0)
+    {
+        if (g_fsr2_optiscaler_config_reset_frames_remaining.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                std::memory_order_acq_rel))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool should_reset_for_optiscaler_log_activity()
+{
+    if (!g_config.fsr2_reset_on_optiscaler_log_change)
+        return false;
+
+    const ULONGLONG now = GetTickCount64();
+    std::uint64_t next_poll = g_fsr2_optiscaler_log_next_poll_tick.load(std::memory_order_relaxed);
+    if (now >= next_poll &&
+        g_fsr2_optiscaler_log_next_poll_tick.compare_exchange_strong(
+            next_poll,
+            now + 100,
+            std::memory_order_relaxed))
+    {
+        WIN32_FILE_ATTRIBUTE_DATA attributes {};
+        const std::filesystem::path optiscaler_log =
+            g_module_dir.parent_path() / L"OptiScaler" / L"OptiScaler.log";
+        if (GetFileAttributesExW(optiscaler_log.c_str(), GetFileExInfoStandard, &attributes) != 0)
+        {
+            ULARGE_INTEGER last_write {};
+            last_write.LowPart = attributes.ftLastWriteTime.dwLowDateTime;
+            last_write.HighPart = attributes.ftLastWriteTime.dwHighDateTime;
+            const std::uint64_t previous_write = g_fsr2_optiscaler_log_last_write.exchange(
+                last_write.QuadPart,
+                std::memory_order_relaxed);
+            if (previous_write != 0 && previous_write != last_write.QuadPart)
+            {
+                const ULONGLONG reset_until = now + g_config.fsr2_optiscaler_log_reset_duration_ms;
+                g_fsr2_optiscaler_log_reset_until_tick.store(reset_until, std::memory_order_release);
+                log_line("fsr2_optiscaler_log_activity reset_duration_ms=" +
+                    std::to_string(g_config.fsr2_optiscaler_log_reset_duration_ms));
+            }
+        }
+    }
+
+    return now < g_fsr2_optiscaler_log_reset_until_tick.load(std::memory_order_acquire);
+}
+
 template <typename DrawCall>
 bool try_fsr2_translation_draw(
     ID3D11DeviceContext *context,
@@ -5721,7 +6335,8 @@ bool try_fsr2_translation_draw(
     const std::optional<TargetUpscalerDrawInfo> &inspected_draw_info,
     DrawCall &&draw_call)
 {
-    if (g_config.fsr2_translation_mode == 0 || context == nullptr)
+    const std::uint32_t translation_mode = g_config.fsr2_translation_mode;
+    if (translation_mode == 0 || context == nullptr)
         return false;
 
     if (g_fsr2_translation_recovery_requested.exchange(false, std::memory_order_acq_rel))
@@ -5743,15 +6358,100 @@ bool try_fsr2_translation_draw(
         : inspect_target_upscaler_draw(context, element_count);
     if (!draw_info)
         return false;
-    if (draw_info->render_width >= draw_info->output_width &&
-        draw_info->render_height >= draw_info->output_height)
+    const bool native_upscaling_enabled =
+        draw_info->render_width < draw_info->output_width &&
+        draw_info->render_height < draw_info->output_height;
+    if (!native_upscaling_enabled)
     {
+        const std::uint64_t now_tick = GetTickCount64();
+        std::uint64_t no_bypass_started = 0;
+        g_mode2_native_bypass_start_tick.compare_exchange_strong(
+            no_bypass_started,
+            now_tick,
+            std::memory_order_acq_rel);
+        static std::atomic_bool initial_bypass_logged { false };
+        if (!initial_bypass_logged.exchange(true, std::memory_order_relaxed))
+        {
+            log_line("mode2_bypass route=native_taau reason=not_upscaling render=" +
+                std::to_string(draw_info->render_width) + "x" +
+                    std::to_string(draw_info->render_height) +
+                " output=" + std::to_string(draw_info->output_width) + "x" +
+                    std::to_string(draw_info->output_height) +
+                " context_policy=keep_resident");
+        }
         return false;
+    }
+
+    const Mode2ColorContract color_contract = classify_mode2_color_contract(*draw_info);
+    if (color_contract == Mode2ColorContract::unsupported)
+    {
+        const std::uint64_t now_tick = GetTickCount64();
+        std::uint64_t no_bypass_started = 0;
+        g_mode2_native_bypass_start_tick.compare_exchange_strong(
+            no_bypass_started,
+            now_tick,
+            std::memory_order_acq_rel);
+        static std::atomic_uint64_t rejected_contracts { 0 };
+        const std::uint64_t count = rejected_contracts.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count == 1 || count % 600 == 0)
+        {
+            log_line("mode2_target_rejected reason=unsupported_color_contract count=" +
+                std::to_string(count) +
+                " input_format=" + format_string(draw_info->color_format) +
+                " output_format=" + format_string(draw_info->output_color_format) +
+                " native_draw_skipped=1");
+        }
+        return true;
+    }
+    const bool hdr10_pq = color_contract == Mode2ColorContract::hdr10_pq;
+    const std::uint64_t now_tick = GetTickCount64();
+    const std::uint64_t previous_takeover_tick =
+        g_mode2_last_takeover_tick.exchange(now_tick, std::memory_order_acq_rel);
+    const std::uint64_t native_bypass_start_tick =
+        g_mode2_native_bypass_start_tick.exchange(0, std::memory_order_acq_rel);
+    const bool entering_takeover = previous_takeover_tick == 0;
+    const bool resume_after_native_bypass =
+        native_bypass_start_tick != 0 && now_tick >= native_bypass_start_tick + 100;
+    const bool takeover_history_gap =
+        previous_takeover_tick != 0 && now_tick >= previous_takeover_tick + 1000;
+    if (entering_takeover)
+    {
+        log_line("mode2_route_switch route=optiscaler reason=native_upscaling history_reset=1");
+    }
+    else if (resume_after_native_bypass)
+    {
+        log_line("mode2_history_reset reason=resume_after_native_bypass bypass_ms=" +
+            std::to_string(now_tick - native_bypass_start_tick) +
+            " context_policy=keep_resident");
+    }
+    else if (takeover_history_gap)
+    {
+        log_line("mode2_history_reset reason=takeover_gap gap_ms=" +
+            std::to_string(now_tick - previous_takeover_tick));
+    }
+    static std::atomic_uint32_t last_color_contract { 0 };
+    const std::uint32_t current_color_contract = static_cast<std::uint32_t>(color_contract);
+    const std::uint32_t previous_color_contract =
+        last_color_contract.exchange(current_color_contract, std::memory_order_acq_rel);
+    const bool display_contract_changed =
+        previous_color_contract != 0 && previous_color_contract != current_color_contract;
+    if (previous_color_contract != current_color_contract)
+    {
+        log_line("mode2_color_contract path=" +
+            std::string(hdr10_pq ? "hdr10_pq" : "sdr_srgb") +
+            " input_format=" + format_string(draw_info->color_format) +
+            " output_format=" + format_string(draw_info->output_color_format) +
+            " render=" + std::to_string(draw_info->render_width) + "x" +
+                std::to_string(draw_info->render_height) +
+            " output=" + std::to_string(draw_info->output_width) + "x" +
+                std::to_string(draw_info->output_height) +
+            " contract_switch=" + std::to_string(display_contract_changed ? 1 : 0) +
+            " shim_query_mask=" + hex64(fsr2_get_proc_address_shim_query_mask()));
     }
 
     Fsr2FreshProducerPath producer_path;
     std::uint64_t producer_generation = 0;
-    if (g_config.fsr2_translation_mode >= 3)
+    if (translation_mode >= 3)
     {
         producer_path = consume_fsr2_fresh_producer_path(draw_info->color_resource_key);
         if (!producer_path.has_fresh_write)
@@ -5773,8 +6473,8 @@ bool try_fsr2_translation_draw(
         producer_generation = producer_path.linear_generation;
     }
     const bool use_late_composed_color =
-        g_config.fsr2_translation_mode >= 3 && !producer_path.has_fresh_linear_color;
-    const bool color_path_changed = g_config.fsr2_translation_mode >= 3 &&
+        translation_mode >= 3 && !producer_path.has_fresh_linear_color;
+    const bool color_path_changed = translation_mode >= 3 &&
         update_fsr2_late_path_state(draw_info->color_resource_key, use_late_composed_color);
     if (color_path_changed)
     {
@@ -5826,7 +6526,10 @@ bool try_fsr2_translation_draw(
         }
         if (depth_stencil != nullptr)
             depth_stencil->Release();
-        return false;
+        static std::atomic_bool missing_binding_logged { false };
+        if (!missing_binding_logged.exchange(true, std::memory_order_relaxed))
+            log_line("mode2_dispatch_failed reason=missing_native_binding native_draw_skipped=1");
+        return true;
     }
     render_targets[1]->GetResource(&output);
 
@@ -5836,7 +6539,7 @@ bool try_fsr2_translation_draw(
     ID3D11Resource *color_replay_output = nullptr;
     ID3D11ShaderResourceView *color_replay_output_view = nullptr;
     ID3D11Resource *translation_output = output;
-    if (g_config.fsr2_translation_mode >= 3 && !use_late_composed_color)
+    if (translation_mode >= 3 && !use_late_composed_color)
     {
         early_color = acquire_fsr2_candidate_color_view(
             draw_info->color_resource_key, producer_generation);
@@ -5865,7 +6568,7 @@ bool try_fsr2_translation_draw(
         }
         translation_color = early_color;
     }
-    if (g_config.fsr2_translation_mode >= 4 && !use_late_composed_color)
+    if (translation_mode >= 4 && !use_late_composed_color)
     {
         exposure = acquire_fsr2_color_replay_exposure_view(
             draw_info->color_resource_key,
@@ -5893,7 +6596,7 @@ bool try_fsr2_translation_draw(
             return false;
         }
     }
-    if (g_config.fsr2_translation_mode >= 4 && use_late_composed_color)
+    if (translation_mode >= 4 && use_late_composed_color)
     {
         exposure = acquire_fsr2_neutral_exposure_view(context);
         if (exposure == nullptr)
@@ -5915,7 +6618,7 @@ bool try_fsr2_translation_draw(
             return false;
         }
     }
-    if (g_config.fsr2_translation_mode >= 4 && !use_late_composed_color)
+    if (translation_mode >= 4 && !use_late_composed_color)
     {
         if (!acquire_fsr2_color_replay_output(
                 context,
@@ -5986,9 +6689,18 @@ bool try_fsr2_translation_draw(
     frame.use_transparency_mask = g_config.fsr2_use_transparency_mask;
     frame.enable_sharpening = g_config.fsr2_sharpness_percent > 0;
     frame.sharpness = static_cast<float>(g_config.fsr2_sharpness_percent) / 100.0f;
-    frame.hdr10_pq_color = use_late_composed_color || g_config.fsr2_hdr10_pq_color;
-    frame.use_direct_linear_color = !use_late_composed_color && !g_config.fsr2_hdr10_pq_color;
-    frame.reset = color_path_changed && g_config.fsr2_reset_on_color_path_change;
+    frame.hdr10_pq_color = hdr10_pq;
+    frame.use_direct_linear_color = !hdr10_pq;
+    const bool optiscaler_config_reset = consume_fsr2_optiscaler_config_reset();
+    const bool optiscaler_log_reset = should_reset_for_optiscaler_log_activity();
+    frame.reset =
+        entering_takeover ||
+        resume_after_native_bypass ||
+        takeover_history_gap ||
+        display_contract_changed ||
+        (color_path_changed && g_config.fsr2_reset_on_color_path_change) ||
+        optiscaler_config_reset ||
+        optiscaler_log_reset;
     Fsr2GpuTimingSlot *gpu_timing_slot = begin_fsr2_gpu_timing(context);
     frame.gpu_timestamp_after_prepare =
         gpu_timing_slot != nullptr ? gpu_timing_slot->timestamps[1] : nullptr;
@@ -6136,7 +6848,7 @@ bool try_fsr2_translation_draw(
 #endif
     bool metadata_updated = false;
     if (outcome.succeeded && outcome.hook_entry_detected && g_config.fsr2_fast_metadata_copy &&
-        g_config.fsr2_translation_mode >= 4 && render_targets[0] != nullptr)
+        translation_mode >= 2 && render_targets[0] != nullptr)
     {
         metadata_updated = copy_fsr2_history_metadata(
             context,
@@ -6148,11 +6860,11 @@ bool try_fsr2_translation_draw(
         {
             static std::atomic_bool failure_logged { false };
             if (!failure_logged.exchange(true, std::memory_order_relaxed))
-                log_line("fsr2_fast_metadata_copy_failed fallback=original_taau");
+                log_line("fsr2_fast_metadata_copy_failed native_draw_skipped=1");
         }
     }
     if (outcome.succeeded && outcome.hook_entry_detected && !metadata_updated &&
-        g_config.fsr2_translation_mode >= 4 && render_targets[0] != nullptr)
+        translation_mode >= 4 && render_targets[0] != nullptr)
     {
         if (g_original_om_set_render_targets != nullptr)
             g_original_om_set_render_targets(context, 1, render_targets.data(), depth_stencil);
@@ -6177,7 +6889,7 @@ bool try_fsr2_translation_draw(
     }
     if (gpu_timing_slot != nullptr)
         context->End(gpu_timing_slot->timestamps[3]);
-    if (outcome.succeeded && outcome.hook_entry_detected && g_config.fsr2_translation_mode >= 4 &&
+    if (outcome.succeeded && outcome.hook_entry_detected && translation_mode >= 4 &&
         !use_late_composed_color)
     {
         color_replayed = replay_fsr2_color_processing(
@@ -6195,9 +6907,9 @@ bool try_fsr2_translation_draw(
             std::forward<DrawCall>(draw_call));
     }
     end_fsr2_gpu_timing(context, gpu_timing_slot);
-    const bool skip_original_draw = outcome.succeeded && outcome.hook_entry_detected &&
-        ((g_config.fsr2_translation_mode >= 2 && g_config.fsr2_translation_mode < 4) ||
-            use_late_composed_color || color_replayed);
+    const bool skip_original_draw = translation_mode == 2 ||
+        (outcome.succeeded && outcome.hook_entry_detected &&
+            (use_late_composed_color || color_replayed));
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_fsr2_transient_capture_snapshot && render_targets[1] != nullptr)
     {
@@ -6285,7 +6997,7 @@ bool try_fsr2_translation_draw(
             log_line("fsr2_translation_dispatch_failed code=" + std::to_string(outcome.error_code) +
                 " error=" + outcome.error);
         }
-        return false;
+        return translation_mode == 2;
     }
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
@@ -6294,10 +7006,10 @@ bool try_fsr2_translation_draw(
     if (dispatch_index == 1 || dispatch_index % 1024 == 0)
     {
         log_line("fsr2_translation_dispatch_succeeded count=" + std::to_string(dispatch_index) +
-            " mode=" + std::to_string(g_config.fsr2_translation_mode) +
+            " mode=" + std::to_string(translation_mode) +
             " input_source=" + (use_late_composed_color
                 ? std::string("late_composed")
-                : (g_config.fsr2_translation_mode >= 3 ? std::string("early_raw") : std::string("late_color"))) +
+                : (translation_mode >= 3 ? std::string("early_raw") : std::string("late_color"))) +
             " color_replayed=" + (color_replayed ? std::string("1") : std::string("0")) +
             " native_exposure=" + (frame.exposure != nullptr ? std::string("1") : std::string("0")) +
             " skip_original_draw=" + (skip_original_draw ? std::string("1") : std::string("0")) +
@@ -6312,11 +7024,22 @@ bool try_fsr2_translation_draw(
             " reactive_mask=" + (g_config.fsr2_use_reactive_mask ? std::string("1") : std::string("0")) +
             " transparency_mask=" + (g_config.fsr2_use_transparency_mask ? std::string("1") : std::string("0")) +
             " sharpness=" + std::to_string(frame.sharpness) +
-            " hdr10_pq_color=" + (g_config.fsr2_hdr10_pq_color ? std::string("1") : std::string("0")) +
+            " hdr10_pq_color=" +
+                (g_config.fsr2_hdr10_pq_color ? std::string("1") : std::string("0")) +
             " jitter_mode=" + std::to_string(g_config.fsr2_jitter_mode) +
             " jitter=" + std::to_string(jitter_x) + "," + std::to_string(jitter_y));
     }
 #endif
+    static std::atomic_bool first_mode2_dispatch_logged { false };
+    if (translation_mode == 2 &&
+        !first_mode2_dispatch_logged.exchange(true, std::memory_order_relaxed))
+    {
+        log_line("mode2_dispatch_succeeded opti_detoured=" +
+            std::to_string(outcome.hook_entry_detected ? 1 : 0) +
+            " path=" + std::string(hdr10_pq ? "hdr10_pq" : "sdr_srgb") +
+            " metadata_updated=" + std::to_string(metadata_updated ? 1 : 0) +
+            " native_draw_skipped=1");
+    }
     return skip_original_draw;
 }
 #endif
@@ -7205,13 +7928,33 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
     if (swapchain == nullptr)
         return;
 
-    void **vtable = *reinterpret_cast<void ***>(swapchain);
-    if (g_original_present == nullptr)
-        g_original_present = reinterpret_cast<present_fn>(vtable[k_idx_present]);
+    const bool should_hook_present = g_config.hook_present;
+    const bool should_hook_dlssg_dxgi = dlssg_dxgi_workaround_active();
+    if (!should_hook_present && !should_hook_dlssg_dxgi)
+        return;
 
-    clone_and_patch_vtable(swapchain, k_swapchain_vtable_size, {
-        { k_idx_present, reinterpret_cast<void *>(&hooked_present) },
-    });
+    void **vtable = *reinterpret_cast<void ***>(swapchain);
+    if (should_hook_present && g_original_present == nullptr)
+        g_original_present = reinterpret_cast<present_fn>(vtable[k_idx_present]);
+    if (should_hook_dlssg_dxgi && g_original_set_fullscreen_state == nullptr)
+        g_original_set_fullscreen_state = reinterpret_cast<set_fullscreen_state_fn>(vtable[k_idx_set_fullscreen_state]);
+    if (should_hook_dlssg_dxgi && g_original_get_fullscreen_state == nullptr)
+        g_original_get_fullscreen_state = reinterpret_cast<get_fullscreen_state_fn>(vtable[k_idx_get_fullscreen_state]);
+    if (should_hook_dlssg_dxgi && g_original_resize_buffers == nullptr)
+        g_original_resize_buffers = reinterpret_cast<resize_buffers_fn>(vtable[k_idx_resize_buffers]);
+    if (should_hook_dlssg_dxgi && g_original_resize_target == nullptr)
+        g_original_resize_target = reinterpret_cast<resize_target_fn>(vtable[k_idx_resize_target]);
+    std::vector<std::pair<std::size_t, void *>> patches;
+    if (should_hook_present)
+        patches.emplace_back(k_idx_present, reinterpret_cast<void *>(&hooked_present));
+    if (should_hook_dlssg_dxgi)
+    {
+        patches.emplace_back(k_idx_set_fullscreen_state, reinterpret_cast<void *>(&hooked_set_fullscreen_state));
+        patches.emplace_back(k_idx_get_fullscreen_state, reinterpret_cast<void *>(&hooked_get_fullscreen_state));
+        patches.emplace_back(k_idx_resize_buffers, reinterpret_cast<void *>(&hooked_resize_buffers));
+        patches.emplace_back(k_idx_resize_target, reinterpret_cast<void *>(&hooked_resize_target));
+    }
+    clone_and_patch_vtable(swapchain, k_swapchain_vtable_size, patches);
 }
 
 void set_output_size(UINT width, UINT height, const char *source)
@@ -7332,7 +8075,7 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
             DXGI_SWAP_CHAIN_DESC created_desc {};
             if (SUCCEEDED((*swapchain)->GetDesc(&created_desc)))
                 set_output_size(created_desc.BufferDesc.Width, created_desc.BufferDesc.Height, "CreateDeviceAndSwapChain");
-            if (g_config.hook_present)
+            if (g_config.hook_present || dlssg_dxgi_workaround_active())
                 install_swapchain_hooks(*swapchain);
         }
         log_line("hooked D3D11CreateDeviceAndSwapChain");
@@ -7376,12 +8119,27 @@ HRESULT WINAPI hooked_create_device(
 
 HRESULT STDMETHODCALLTYPE hooked_factory_create_swap_chain(IDXGIFactory *factory, IUnknown *device, DXGI_SWAP_CHAIN_DESC *desc, IDXGISwapChain **swapchain)
 {
+#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
+    const std::uint64_t request_id = g_dxgi_swapchain_request_id.fetch_add(1, std::memory_order_relaxed) + 1;
+    void *const caller = _ReturnAddress();
+    log_line("dxgi_swapchain_request id=" + std::to_string(request_id) +
+        " api=CreateSwapChain caller=" + module_path_from_address(caller) +
+        " factory=" + hex64(reinterpret_cast<std::uintptr_t>(factory)) +
+        " device={" + describe_dxgi_swapchain_device(device) + "} " +
+        describe_dxgi_swapchain_desc(desc));
+#endif
+
     const HRESULT hr = g_original_factory_create_swap_chain(factory, device, desc, swapchain);
+#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
+    log_line("dxgi_swapchain_result id=" + std::to_string(request_id) +
+        " api=CreateSwapChain hr=" + hex32(static_cast<std::uint32_t>(hr)) +
+        " swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain != nullptr ? *swapchain : nullptr)));
+#endif
     if (SUCCEEDED(hr))
     {
         if (desc != nullptr)
             set_output_size(desc->BufferDesc.Width, desc->BufferDesc.Height, "CreateSwapChain");
-        if (g_config.hook_present)
+        if (g_config.hook_present || dlssg_dxgi_workaround_active())
             install_swapchain_hooks(swapchain != nullptr ? *swapchain : nullptr);
         if (desc != nullptr)
             log_line("hooked CreateSwapChain size=" + std::to_string(desc->BufferDesc.Width) + "x" + std::to_string(desc->BufferDesc.Height));
@@ -7393,12 +8151,30 @@ HRESULT STDMETHODCALLTYPE hooked_factory_create_swap_chain(IDXGIFactory *factory
 
 HRESULT STDMETHODCALLTYPE hooked_factory2_create_swap_chain_for_hwnd(IDXGIFactory2 *factory, IUnknown *device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1 *desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fullscreen_desc, IDXGIOutput *restrict_to_output, IDXGISwapChain1 **swapchain)
 {
+#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
+    const std::uint64_t request_id = g_dxgi_swapchain_request_id.fetch_add(1, std::memory_order_relaxed) + 1;
+    void *const caller = _ReturnAddress();
+    log_line("dxgi_swapchain_request id=" + std::to_string(request_id) +
+        " api=CreateSwapChainForHwnd caller=" + module_path_from_address(caller) +
+        " factory=" + hex64(reinterpret_cast<std::uintptr_t>(factory)) +
+        " restrict_output=" + hex64(reinterpret_cast<std::uintptr_t>(restrict_to_output)) +
+        " device={" + describe_dxgi_swapchain_device(device) + "} " +
+        describe_dxgi_swapchain_desc(desc) + " " +
+        describe_dxgi_fullscreen_desc(fullscreen_desc) + " " +
+        describe_dxgi_window(hwnd));
+#endif
+
     const HRESULT hr = g_original_factory2_create_swap_chain_for_hwnd(factory, device, hwnd, desc, fullscreen_desc, restrict_to_output, swapchain);
+#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
+    log_line("dxgi_swapchain_result id=" + std::to_string(request_id) +
+        " api=CreateSwapChainForHwnd hr=" + hex32(static_cast<std::uint32_t>(hr)) +
+        " swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain != nullptr ? *swapchain : nullptr)));
+#endif
     if (SUCCEEDED(hr))
     {
         if (desc != nullptr)
             set_output_size(desc->Width, desc->Height, "CreateSwapChainForHwnd");
-        if (g_config.hook_present)
+        if (g_config.hook_present || dlssg_dxgi_workaround_active())
             install_swapchain_hooks(swapchain != nullptr ? *swapchain : nullptr);
         if (desc != nullptr)
             log_line("hooked CreateSwapChainForHwnd size=" + std::to_string(desc->Width) + "x" + std::to_string(desc->Height));
@@ -7494,6 +8270,9 @@ void initialize()
     g_frames_path = g_module_dir / L"Dx11FsrBridge.frames.jsonl";
     g_similarity_path = g_module_dir / L"Dx11FsrBridge.similarity.txt";
     g_ps_trace_path = g_module_dir / L"Dx11FsrBridge.ps_trace.jsonl";
+#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    reset_release_log_files();
+#endif
     load_config();
 
     if (!process_matches())
@@ -7557,7 +8336,22 @@ void initialize()
     scan_optiscaler_ngx_exports("initialize", true);
 #endif
 }
+
+void initialize_once()
+{
+    std::call_once(g_initialize_once, []() { initialize(); });
 }
+}
+
+#if defined(DX11FSRBRIDGE_ASI)
+extern "C" __declspec(dllexport) void InitializeASI()
+{
+    // OptiScaler calls this optional entry point immediately after loading an
+    // ASI.  DllMain already calls initialize_once(), so this is intentionally
+    // idempotent and also works with generic ASI loaders.
+    initialize_once();
+}
+#endif
 
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
 {
@@ -7565,7 +8359,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
     {
         g_module = module;
         DisableThreadLibraryCalls(module);
-        initialize();
+        initialize_once();
     }
     else if (reason == DLL_PROCESS_DETACH)
     {

@@ -3,8 +3,10 @@
 
 #include "PatternScanner.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -12,6 +14,7 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <string_view>
 
 namespace
 {
@@ -47,6 +50,27 @@ bool hide_uid_once();
 
 void log_line(const std::string &line)
 {
+#if defined(ANTIPLAYER_RELEASE_RUNTIME)
+    std::string lowered = line;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char value)
+        { return static_cast<char>(std::tolower(value)); });
+    static constexpr std::array<std::string_view, 10> error_terms {
+        "failed",
+        "failure",
+        "disabled",
+        "unresolved",
+        "unavailable",
+        "mismatch",
+        "exception",
+        "invalid",
+        "allocation",
+        "error",
+    };
+    const bool is_error = std::any_of(error_terms.begin(), error_terms.end(), [&](std::string_view term)
+        { return lowered.find(term) != std::string::npos; });
+    if (!is_error)
+        return;
+#endif
     std::lock_guard lock(g_log_mutex);
     std::ofstream out(g_log_path, std::ios::app);
     SYSTEMTIME st {};
@@ -55,6 +79,14 @@ void log_line(const std::string &line)
     std::snprintf(prefix, sizeof(prefix), "%04u-%02u-%02u %02u:%02u:%02u.%03u ",
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     out << prefix << line << "\n";
+}
+
+void reset_release_log()
+{
+#if defined(ANTIPLAYER_RELEASE_RUNTIME)
+    std::lock_guard lock(g_log_mutex);
+    std::ofstream truncate(g_log_path, std::ios::trunc);
+#endif
 }
 
 std::filesystem::path module_dir(HMODULE module)
@@ -352,6 +384,7 @@ std::uint8_t *scan_unique_signature(
 
 DWORD WINAPI worker_thread(void *)
 {
+    reset_release_log();
     log_line("AntiPlayerMosaic loaded (dynamic scan)");
     Sleep(3000);
 
