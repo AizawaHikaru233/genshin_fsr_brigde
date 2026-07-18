@@ -21,9 +21,12 @@ $payloadDirectory = Join-Path $root 'payload'
 $optiDirectory = Join-Path $payloadDirectory 'OptiScaler'
 $optiPath = Join-Path $optiDirectory 'OptiScaler.dll'
 $bridgePath = Join-Path $payloadDirectory 'Bridge\Dx11FsrBridge.dll'
-$antiBlurPath = Join-Path $payloadDirectory 'AntiPlayerMosaic.dll'
+$antiBlurPath = Join-Path $payloadDirectory 'AntiPlayerMosaic\AntiPlayerMosaic.dll'
 $reShadePath = Join-Path $payloadDirectory 'ReShade\ReShade64.dll'
 $componentManifestPath = Join-Path $root 'component-manifest.json'
+$selfUpdateRepository = 'AizawaHikaru233/genshin_fsr_brigde'
+$selfUpdateHelperPath = Join-Path $root 'Apply-PackageUpdate.ps1'
+$script:SelfUpdateStarted = $false
 $nonFrameGenerationEdition = Test-Path -LiteralPath (Join-Path $root 'NonFrameGeneration.edition') -PathType Leaf
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) '原神.lnk'
 $legacyShortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) '原神整合版.lnk'
@@ -288,14 +291,20 @@ function Repair-RuntimePaths {
     }
 
     $gameDirectory = Split-Path -Parent $SelectedGamePath
-    $reShadeIni = Join-Path $gameDirectory 'ReShade.ini'
+    $reShadeDirectory = Split-Path -Parent $reShadePath
+    $reShadeIni = Join-Path $reShadeDirectory 'ReShade.ini'
     if ((Test-Path -LiteralPath $reShadePath -PathType Leaf) -and (Test-Path -LiteralPath $reShadeIni -PathType Leaf)) {
-        $shaderDirectory = Join-Path $root 'payload\ReShade\reshade-shaders'
+        $shaderDirectory = Join-Path $reShadeDirectory 'reshade-shaders'
         Set-IniPathValue -Path $reShadeIni -Section 'ADDON' -Key 'AddonPath' -Value (Join-Path $shaderDirectory 'Addons') | Out-Null
         Set-IniPathValue -Path $reShadeIni -Section 'GENERAL' -Key 'EffectSearchPaths' -Value (Join-Path $shaderDirectory 'Shaders') | Out-Null
         Set-IniPathValue -Path $reShadeIni -Section 'GENERAL' -Key 'TextureSearchPaths' -Value (Join-Path $shaderDirectory 'Textures') | Out-Null
-        Set-IniPathValue -Path $reShadeIni -Section 'GENERAL' -Key 'PresetPath' -Value (Join-Path $gameDirectory 'ReShadePreset.ini') | Out-Null
-        Set-IniPathValue -Path $reShadeIni -Section 'SCREENSHOT' -Key 'SavePath' -Value (Join-Path $gameDirectory 'Screenshots') | Out-Null
+        Set-IniPathValue -Path $reShadeIni -Section 'GENERAL' -Key 'PresetPath' -Value (Join-Path $reShadeDirectory 'ReShadePreset.ini') | Out-Null
+        Set-IniPathValue -Path $reShadeIni -Section 'SCREENSHOT' -Key 'SavePath' -Value (Join-Path $reShadeDirectory 'Screenshots') | Out-Null
+        [IO.File]::WriteAllLines(
+            (Join-Path $gameDirectory 'ReShade.ini'),
+            @('[INSTALL]', "BasePath=$reShadeDirectory"),
+            [Text.UTF8Encoding]::new($false))
+        Remove-Item -LiteralPath (Join-Path $gameDirectory 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -315,7 +324,6 @@ function Reset-AllPluginConfigurations {
     if ($LASTEXITCODE -ne 0) {
         $backendOutput | Set-Content -LiteralPath $errorLogPath -Encoding UTF8
         Write-Host '恢复默认配置失败，请重试。' -ForegroundColor Red
-        Pause-Menu
         return $false
     }
     Remove-Item -LiteralPath $errorLogPath -Force -ErrorAction SilentlyContinue
@@ -344,7 +352,7 @@ function Get-ModuleState {
         Unlocker = $unlockerInstalled -and $gameMatches
         OptiScaler = $unlockerInstalled -and $gameMatches -and (Test-Path -LiteralPath $optiPath -PathType Leaf) -and (Test-ConfiguredDll -Config $config -Path $bridgePath) -and (Test-ConfiguredDll -Config $config -Path $optiPath)
         AntiBlur = $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $antiBlurPath)
-        HDR = $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $reShadePath) -and (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $SelectedGamePath) 'ReShade.ini') -PathType Leaf)
+        HDR = $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $reShadePath) -and (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $reShadePath) 'ReShade.ini') -PathType Leaf)
     }
 }
 
@@ -478,6 +486,7 @@ function Write-InstallCatalog {
     $antiVersion = Get-ComponentVersionLabel -Name 'AntiPlayerMosaic.dll' -Fallback (Get-FileVersionLabel -Path $antiBlurPath)
     $reShadeVersion = Get-FileVersionLabel -Path $reShadePath
     $renoDxVersion = Get-FileVersionLabel -Path $renoDxPath
+    $managerVersion = Get-ComponentVersionLabel -Name 'Dx11FsrBridge.dll' -Fallback '未知'
     $state = Get-ModuleState -SelectedGamePath $SelectedGamePath
     $unlockerStatus = if ($state.Unlocker) { '已安装' } else { '未安装' }
     $optiStatus = if ($state.OptiScaler) { '已安装' } else { '未安装' }
@@ -490,10 +499,15 @@ function Write-InstallCatalog {
     Write-CatalogRow -Id '2.' -Name 'FSR Bridge + OptiScaler' -Author 'シリアCelia / OptiScaler' -Version "Bridge $bridgeVersion`nOptiScaler $optiVersion" -Status $optiStatus
     Write-CatalogRow -Id '3.' -Name '反虚化 / 隐藏 UID' -Author 'シリアCelia' -Version $antiVersion -Status $antiStatus
     Write-CatalogRow -Id '4.' -Name 'ReShade + RenoDX HDR' -Author 'crosire / 剪刀妹丽丽' -Version "ReShade $reShadeVersion`nRenoDX $renoDxVersion" -Status $hdrStatus
+    Write-CatalogRow -Id '5.' -Name '管理脚本 / 发行资源' -Author 'シリアCelia' -Version $managerVersion -Status '已安装'
 }
 
 function Select-ModuleSet {
-    param([string]$ActionName, [switch]$Uninstall)
+    param([string]$ActionName, [switch]$IncludeFoundation, [switch]$IncludeSelfUpdate)
+    $allowed = [Collections.Generic.List[int]]::new()
+    if ($IncludeFoundation) { $allowed.Add(1) }
+    foreach ($id in @(2, 3, 4)) { $allowed.Add($id) }
+    if ($IncludeSelfUpdate) { $allowed.Add(5) }
     while ($true) {
         Write-Host "请输入需要${ActionName}的模块 ID" -ForegroundColor Yellow
         Write-Host ''
@@ -502,10 +516,11 @@ function Select-ModuleSet {
         Write-Host '  0. 返回上一层'
         $choice = (Read-Host '请输入选项').Trim().ToUpperInvariant()
         if ([string]::IsNullOrWhiteSpace($choice) -or $choice -eq 'A') {
-            return @(2, 3, 4)
+            return @($allowed)
         }
         if ($choice -eq '0') { return @() }
-        if ($choice -in @('2', '3', '4')) { return @([int]$choice) }
+        $selectedId = 0
+        if ([int]::TryParse($choice, [ref]$selectedId) -and $allowed.Contains($selectedId)) { return @($selectedId) }
         Write-Host '无效选项。' -ForegroundColor Red
     }
 }
@@ -550,19 +565,111 @@ function Get-LatestRelease {
     catch { return $null }
 }
 
+function Get-CurrentPackageVersion {
+    if (-not (Test-Path -LiteralPath $componentManifestPath -PathType Leaf)) { return '0.0.0' }
+    try {
+        $manifest = Get-Content -LiteralPath $componentManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $bridge = @($manifest | Where-Object { $_.Name -eq 'Dx11FsrBridge.dll' } | Select-Object -First 1)
+        if ($bridge.Count -eq 1 -and [string]$bridge[0].Version -match '^\d+(\.\d+)+$') { return [string]$bridge[0].Version }
+    }
+    catch { }
+    return '0.0.0'
+}
+
+function Start-PackageSelfUpdate {
+    Write-Host ''
+    Write-Host '正在检查管理脚本和发行资源更新...' -ForegroundColor Cyan
+    try {
+        $release = Invoke-RestMethod -Headers @{ 'User-Agent' = 'GenshinOneClick-SelfUpdater' } `
+            -Uri "https://api.github.com/repos/$selfUpdateRepository/releases/latest"
+    }
+    catch {
+        Write-Host "检查脚本更新失败: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+    $assets = @($release.assets | Where-Object {
+        $_.name -match '^(GenshinFSRBridge\.Lite_v|原神解帧FSR插件包Lite_|FSR\.Lite_v).+\.zip$'
+    })
+    if ($assets.Count -eq 0) {
+        Write-Host '最新 Release 中没有找到 FPS Unlock Lite 更新包。' -ForegroundColor Red
+        return $false
+    }
+    $asset = @($assets | Sort-Object @{ Expression = {
+        if ($_.name -like 'GenshinFSRBridge.Lite_v*') { 0 }
+        elseif ($_.name -like '原神解帧FSR插件包Lite_*') { 1 }
+        else { 2 }
+    } } | Select-Object -First 1)[0]
+    $currentVersion = Get-CurrentPackageVersion
+    $latestVersion = ([string]$release.tag_name).TrimStart('v')
+    if ($latestVersion -match '^\d+(\.\d+)+$' -and
+        [version]$currentVersion -ge [version]$latestVersion) {
+        Write-Host "管理脚本和发行资源已经是最新版本 v$currentVersion。" -ForegroundColor Green
+        return $false
+    }
+    if (-not (Test-Path -LiteralPath $selfUpdateHelperPath -PathType Leaf)) {
+        Write-Host '当前包缺少自更新替换程序，请手动下载最新发布包。' -ForegroundColor Red
+        return $false
+    }
+    $temporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) ('GenshinOneClick-SelfUpdate-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $temporaryDirectory | Out-Null
+    try {
+        $packagePath = Join-Path $temporaryDirectory ([string]$asset.name)
+        Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'GenshinOneClick-SelfUpdater' } `
+            -Uri ([string]$asset.browser_download_url) -OutFile $packagePath
+        if ([string]$asset.digest -match '^sha256:(.+)$') {
+            $actualHash = (Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash
+            if (-not [string]::Equals($actualHash, $matches[1], [StringComparison]::OrdinalIgnoreCase)) {
+                throw (Convert-InstallerText -Value '管理脚本更新包 SHA-256 校验失败。')
+            }
+        }
+        $expanded = Join-Path $temporaryDirectory 'expanded'
+        Expand-Archive -LiteralPath $packagePath -DestinationPath $expanded -Force
+        foreach ($required in @(
+            'Installer.ps1', 'Configure.ps1', 'Localization.ps1', 'Apply-PackageUpdate.ps1',
+            'payload\OptiScaler\default_config\OptiScaler.ini', 'payload\OptiScaler\default_config\OptiScaler-UpscalingFiles.json',
+            'payload\ReShade\default_config\ReShade.ini', 'payload\ReShade\default_config\ReShadePreset.ini',
+            'payload\Bridge\Dx11FsrBridge.dll'
+        )) {
+            if (-not (Test-Path -LiteralPath (Join-Path $expanded $required) -PathType Leaf)) { throw (Convert-InstallerText -Value "更新包缺少文件: $required") }
+        }
+        foreach ($forbidden in @('unlockfps_nc.exe', 'OptiScaler.dll', 'nvngx_dlss.dll')) {
+            if (Get-ChildItem -LiteralPath $expanded -Recurse -File | Where-Object { $_.Name -ieq $forbidden }) {
+                throw (Convert-InstallerText -Value "更新包包含不应内置的第三方组件: $forbidden")
+            }
+        }
+        $helperCopy = Join-Path $temporaryDirectory 'Apply-PackageUpdate.ps1'
+        Copy-Item -LiteralPath $selfUpdateHelperPath -Destination $helperCopy -Force
+        Start-Process -FilePath 'powershell.exe' -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $helperCopy + '"'),
+            '-ParentProcessId', $PID,
+            '-SourceDirectory', ('"' + $expanded + '"'),
+            '-TargetDirectory', ('"' + $root + '"'),
+            '-RelaunchScript', ('"' + (Join-Path $root 'Installer.ps1') + '"')
+        ) | Out-Null
+        Write-Host "已下载管理脚本 v$latestVersion，当前窗口关闭后自动替换并重新打开。" -ForegroundColor Green
+        $script:SelfUpdateStarted = $true
+        return $true
+    }
+    catch {
+        Write-Host "管理脚本更新失败: $($_.Exception.Message)" -ForegroundColor Red
+        if (Test-Path -LiteralPath $temporaryDirectory) { Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force -ErrorAction SilentlyContinue }
+        return $false
+    }
+}
+
 function Test-ComponentUpdate {
-    param([string]$Name, [string]$Repository, [string]$AssetPattern, [string]$LocalPath, [ValidateSet('Hash', 'Version')] [string]$CompareMode)
+    param([string]$Name, [string]$Repository, [string]$AssetPattern, [string]$LocalPath, [ValidateSet('Hash', 'Version')] [string]$CompareMode, [switch]$NoConfirm, [switch]$NoPause)
     Write-Host ''
     Write-Host '正在检查更新，请稍候...' -ForegroundColor Cyan
     $release = Get-LatestRelease -Repository $Repository -AssetPattern $AssetPattern
     if ($null -eq $release) {
         Write-Host '检查更新失败，请稍后重试。' -ForegroundColor Red
-        Pause-Menu
+        if (-not $NoPause) { Pause-Menu }
         return 'Retry'
     }
     if (-not (Test-Path -LiteralPath $LocalPath -PathType Leaf)) {
         Write-Host "$Name 尚未安装。" -ForegroundColor Yellow
-        Pause-Menu
+        if (-not $NoPause) { Pause-Menu }
         return 'Retry'
     }
     $isCurrent = $false
@@ -576,10 +683,11 @@ function Test-ComponentUpdate {
     }
     if ($isCurrent) {
         Write-Host '当前已经是最新版本。' -ForegroundColor Green
-        Pause-Menu
+        if (-not $NoPause) { Pause-Menu }
         return 'Existing'
     }
     Write-Host "发现新版本 $($release.Tag)。" -ForegroundColor Yellow
+    if ($NoConfirm) { return 'Auto' }
     $answer = (Read-Host '是否现在安装？直接回车确认，输入 n 取消').Trim().ToLowerInvariant()
     if ([string]::IsNullOrWhiteSpace($answer) -or $answer -in @('y', 'yes')) { return 'Auto' }
     return 'Retry'
@@ -601,17 +709,11 @@ function Select-ComponentSource {
         Write-Host ''
         Write-Host "$Name 安装方式：" -ForegroundColor Yellow
         Write-Host '  1. 联网安装'
-        Write-Host '  2. 检查更新'
-        Write-Host '  3. 手动安装'
+        Write-Host '  2. 手动安装'
         Write-Host '  0. 返回上一层'
         $choice = (Read-Host '请输入选项').Trim()
         if ($choice -eq '1') { return [pscustomobject]@{ Mode = 'Auto'; Path = $null } }
         if ($choice -eq '2') {
-            $result = Test-ComponentUpdate -Name $Name -Repository $Repository -AssetPattern $AssetPattern -LocalPath $LocalPath -CompareMode $CompareMode
-            if ($result -eq 'Auto' -or $result -eq 'Existing') { return [pscustomobject]@{ Mode = $result; Path = $null } }
-            continue
-        }
-        if ($choice -eq '3') {
             $selectedPath = Select-LocalInstallPath -Name $Name -Filter $FileFilter
             if ($null -ne $selectedPath) { return [pscustomobject]@{ Mode = 'Manual'; Path = $selectedPath } }
             continue
@@ -690,14 +792,14 @@ function Invoke-NvidiaDlssSetup {
     )
     & powershell.exe @arguments
     if ($LASTEXITCODE -ne 0) {
-        Write-Host 'NVIDIA DLSS 组件安装失败，可在“安装 / 更新模块”中重试。' -ForegroundColor Red
+        Write-Host 'NVIDIA DLSS 组件安装失败，可在“安装模块”或“更新模块”中重试。' -ForegroundColor Red
         Pause-Menu
     }
 }
 
 function Invoke-InstallWizard {
     param([string]$SelectedGamePath, [int]$FpsTarget)
-    Write-Header -Title '安装 / 更新模块'
+    Write-Header -Title '安装模块'
     Write-InstallCatalog -SelectedGamePath $SelectedGamePath
     $selection = @(Select-ModuleSet -ActionName '安装')
     if ($selection.Count -eq 0) { return }
@@ -763,6 +865,91 @@ function Invoke-InstallWizard {
     else {
         Remove-Item -LiteralPath $errorLogPath -Force -ErrorAction SilentlyContinue
         Write-Host '安装完成。' -ForegroundColor Green
+    }
+    Pause-Menu
+}
+
+function Invoke-UpdateWizard {
+    param([string]$SelectedGamePath, [int]$FpsTarget)
+    Write-Header -Title '更新模块'
+    Write-InstallCatalog -SelectedGamePath $SelectedGamePath
+    $selection = @(Select-ModuleSet -ActionName '更新' -IncludeFoundation -IncludeSelfUpdate)
+    if ($selection.Count -eq 0) { return }
+
+    $state = Get-ModuleState -SelectedGamePath $SelectedGamePath
+    $installed = @{
+        1 = [bool]$state.Unlocker
+        2 = [bool]$state.OptiScaler
+        3 = [bool]$state.AntiBlur
+        4 = [bool]$state.HDR
+        5 = $true
+    }
+    $validSelection = [Collections.Generic.List[int]]::new()
+    foreach ($module in $selection) {
+        if ($installed[$module]) { $validSelection.Add($module) }
+        else { Write-Host "模块 $module 尚未安装，已跳过。" -ForegroundColor Yellow }
+    }
+    if ($validSelection.Count -eq 0) { Pause-Menu; return }
+
+    $unlockerSource = 'Existing'
+    $optiSource = 'Existing'
+    if ($validSelection.Contains(1)) {
+        $unlockerSource = Test-ComponentUpdate `
+            -Name 'FPS Unlocker' `
+            -Repository '34736384/genshin-fps-unlock' `
+            -AssetPattern '^unlockfps_nc\.exe$' `
+            -LocalPath $unlockerPath `
+            -CompareMode 'Hash' `
+            -NoConfirm `
+            -NoPause
+        if ($unlockerSource -eq 'Retry') { $unlockerSource = 'Existing' }
+    }
+    if ($validSelection.Contains(2)) {
+        $optiSource = Test-ComponentUpdate `
+            -Name 'OptiScaler' `
+            -Repository 'optiscaler/OptiScaler' `
+            -AssetPattern '\.7z$' `
+            -LocalPath $optiPath `
+            -CompareMode 'Version' `
+            -NoConfirm `
+            -NoPause
+        if ($optiSource -eq 'Retry') { $optiSource = 'Existing' }
+    }
+
+    $componentSelection = @($validSelection | Where-Object { $_ -in @(1, 2, 3, 4) })
+    if ($componentSelection.Count -gt 0) {
+        $desired = [ordered]@{
+            OptiScaler = [bool]$state.OptiScaler
+            AntiBlur = [bool]$state.AntiBlur
+            HDR = [bool]$state.HDR
+        }
+        $arguments = @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $configureScript,
+            '-GamePath', $SelectedGamePath, '-FpsTarget', $FpsTarget,
+            '-UnlockerSource', $unlockerSource, '-NonInteractive', '-Language', $script:Language
+        )
+        if ($desired.OptiScaler) { $arguments += @('-OptiScalerSource', $optiSource) } else { $arguments += '-DisableOptiScaler' }
+        if (-not $desired.AntiBlur) { $arguments += '-DisableAntiBlur' }
+        if (-not $desired.HDR) { $arguments += '-DisableHDR' }
+        if ($NoShortcut) { $arguments += '-NoShortcut' }
+        Write-Host ''
+        Write-Host '正在更新所选模块，请稍候...' -ForegroundColor Cyan
+        $backendOutput = @(& powershell.exe @arguments 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            $backendOutput | Set-Content -LiteralPath $errorLogPath -Encoding UTF8
+            Write-Host '模块更新失败，请查看错误日志。' -ForegroundColor Red
+        }
+        else {
+            Remove-Item -LiteralPath $errorLogPath -Force -ErrorAction SilentlyContinue
+            if ($validSelection.Contains(3)) { Write-Host '反虚化组件已同步为当前发布包版本。' -ForegroundColor Green }
+            if ($validSelection.Contains(4)) { Write-Host 'ReShade 与 RenoDX 已同步为当前发布包版本。' -ForegroundColor Green }
+            Write-Host '所选模块更新完成。' -ForegroundColor Green
+            if ($validSelection.Contains(2)) { Invoke-NvidiaDlssSetup }
+        }
+    }
+
+    if ($validSelection.Contains(5)) {
+        if (Start-PackageSelfUpdate) { return }
     }
     Pause-Menu
 }
@@ -906,20 +1093,25 @@ while ($true) {
     Write-ModuleLine -Number 3 -Name '反虚化 / 隐藏 UID' -Installed $moduleState.AntiBlur -Path $antiBlurPath
     Write-ModuleLine -Number 4 -Name 'ReShade + RenoDX HDR' -Installed $moduleState.HDR -Path $reShadePath
     Write-Host ''
-    Write-Host '  1. 安装 / 更新模块' -ForegroundColor Cyan
-    Write-Host '  2. 停止加载模块'
-    Write-Host '  3. 更换游戏目录'
-    Write-Host '  4. 修改帧率上限'
-    Write-Host '  5. 启动游戏'
-    Write-Host '  6. 恢复所有插件默认配置'
-    Write-Host '  7. 关于 / 作者主页'
-    Write-Host '  8. 语言 / Language'
+    Write-Host '  1. 安装模块' -ForegroundColor Cyan
+    Write-Host '  2. 更新模块'
+    Write-Host '  3. 停止加载 / 卸载模块'
+    Write-Host '  4. 更换游戏目录'
+    Write-Host '  5. 修改帧率上限'
+    Write-Host '  6. 启动游戏'
+    Write-Host '  7. 恢复所有插件默认配置'
+    Write-Host '  8. 关于 / 作者主页'
+    Write-Host '  9. 语言 / Language'
     Write-Host '  0. 退出'
     $choice = (Read-Host '请输入选项').Trim()
     switch ($choice) {
         '1' { Invoke-InstallWizard -SelectedGamePath $selectedGamePath -FpsTarget $fpsTarget }
-        '2' { Invoke-UninstallWizard -SelectedGamePath $selectedGamePath }
-        '3' {
+        '2' {
+            Invoke-UpdateWizard -SelectedGamePath $selectedGamePath -FpsTarget $fpsTarget
+            if ($script:SelfUpdateStarted) { break }
+        }
+        '3' { Invoke-UninstallWizard -SelectedGamePath $selectedGamePath }
+        '4' {
             $newPath = Select-GamePath -InitialPath $selectedGamePath -ForceSelection
             if ($null -ne $newPath -and (Invoke-FoundationSetup -SelectedGamePath $newPath -FpsTarget ([ref]$fpsTarget))) {
                 $selectedGamePath = $newPath
@@ -928,22 +1120,22 @@ while ($true) {
                 Save-State -SelectedGamePath $selectedGamePath -FpsTarget $fpsTarget
             }
         }
-        '4' {
+        '5' {
             $fpsTarget = Set-FpsTarget -CurrentValue $fpsTarget
             Update-FpsTarget -FpsTarget $fpsTarget
             Save-State -SelectedGamePath $selectedGamePath -FpsTarget $fpsTarget
         }
-        '5' {
+        '6' {
             if (Test-Path -LiteralPath $unlockerPath -PathType Leaf) { Start-Process -FilePath $unlockerPath -WorkingDirectory $root }
             else { Write-Host 'FPS Unlocker 尚未安装。' -ForegroundColor Red; Pause-Menu }
         }
-        '6' {
+        '7' {
             if (Reset-AllPluginConfigurations -SelectedGamePath $selectedGamePath) { $fpsTarget = 60 }
         }
-        '7' { Show-AboutMenu }
-        '8' { Select-InterfaceLanguage -SelectedGamePath $selectedGamePath -FpsTarget $fpsTarget }
+        '8' { Show-AboutMenu }
+        '9' { Select-InterfaceLanguage -SelectedGamePath $selectedGamePath -FpsTarget $fpsTarget }
         '0' { break }
         default { Write-Host '无效选项。' -ForegroundColor Red; Start-Sleep -Milliseconds 700 }
     }
-    if ($choice -eq '0') { break }
+    if ($choice -eq '0' -or $script:SelfUpdateStarted) { break }
 }

@@ -24,7 +24,6 @@
 #include <array>
 #include <atomic>
 #include <cmath>
-#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -332,8 +331,6 @@ std::atomic_uint64_t g_replacement_draw_count = 0;
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
 std::atomic_uint64_t g_fsr2_translation_dispatch_count = 0;
 std::atomic_uint32_t g_fsr2_translation_failure_count = 0;
-std::atomic_uint64_t g_mode2_last_takeover_tick = 0;
-std::atomic_uint64_t g_mode2_native_bypass_start_tick = 0;
 std::atomic_uint64_t g_fsr2_stale_producer_fallback_count = 0;
 std::atomic_uint64_t g_fsr2_late_composed_dispatch_count = 0;
 std::atomic_bool g_fsr2_dx11on12_block_logged = false;
@@ -2629,29 +2626,6 @@ void log_line(const std::string &line)
 {
     if (!g_logging_enabled.load(std::memory_order_relaxed))
         return;
-#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    std::string lowered = line;
-    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char value)
-        { return static_cast<char>(std::tolower(value)); });
-    static constexpr std::array<std::string_view, 12> error_terms {
-        "failed",
-        "failure",
-        "error",
-        "rejected",
-        "unsupported",
-        "missing",
-        "blocked",
-        "unavailable",
-        "disabled",
-        "exception",
-        "mismatch",
-        "invalid",
-    };
-    const bool is_error = std::any_of(error_terms.begin(), error_terms.end(), [&](std::string_view term)
-        { return lowered.find(term) != std::string::npos; });
-    if (!is_error)
-        return;
-#endif
     std::lock_guard lock(g_log_mutex);
     std::ofstream out(g_log_path, std::ios::app);
     SYSTEMTIME st {};
@@ -2661,30 +2635,6 @@ void log_line(const std::string &line)
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     out << prefix << line << "\n";
 }
-
-#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-void truncate_log_file(const std::filesystem::path &path)
-{
-    HANDLE file = CreateFileW(
-        path.c_str(),
-        GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr);
-    if (file != INVALID_HANDLE_VALUE)
-        CloseHandle(file);
-}
-
-void reset_release_log_files()
-{
-    const std::filesystem::path payload_directory = g_module_dir.parent_path();
-    truncate_log_file(g_log_path);
-    truncate_log_file(payload_directory / L"OptiScaler" / L"OptiScaler.log");
-    truncate_log_file(payload_directory / L"AntiPlayerMosaic.log");
-}
-#endif
 
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
 std::string module_path_from_address(void *address)
@@ -3136,38 +3086,6 @@ void load_config()
     wchar_t label_buffer[128] {};
     GetPrivateProfileStringW(L"Dx11FsrBridge", L"RunLabel", L"", label_buffer, static_cast<DWORD>(std::size(label_buffer)), config_path.c_str());
     g_config.run_label = label_buffer;
-#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
-    // This independent test build has one supported route: replace the native
-    // 78057 TAAU draw in place and submit its first-hand inputs to OptiScaler.
-    // It intentionally does not depend on a deployment INI or retain the
-    // producer/late-color modes from the former mode 4 implementation.
-    g_config.enable_logging = true;
-    g_logging_enabled.store(true, std::memory_order_relaxed);
-    g_config.enable_fsr2_get_proc_address_shim = true;
-    g_config.fsr2_translation_mode = 2;
-    g_config.fsr2_fast_state_tracking = false;
-    g_config.fsr2_output_validation_target = 0;
-    g_config.fsr2_motion_vectors_jittered = false;
-    g_config.fsr2_positive_motion_vector_scale = false;
-    g_config.fsr2_use_reactive_mask = true;
-    g_config.fsr2_use_transparency_mask = false;
-    g_config.fsr2_jitter_mode = 3;
-    g_config.fsr2_dump_input_textures = 0;
-    g_config.fsr2_compare_output_capture = false;
-    g_config.fsr2_sharpness_percent = 0;
-    g_config.fsr2_hdr10_pq_color = false;
-    g_config.fsr2_use_native_exposure = false;
-    g_config.fsr2_fast_metadata_copy = true;
-    g_config.fsr2_gpu_timing = false;
-    g_config.fsr2_reset_on_color_path_change = false;
-    g_config.fsr2_reset_on_optiscaler_config_change = false;
-    g_config.fsr2_reset_on_optiscaler_log_change = false;
-    g_config.fsr2_auto_recover_upscaler_ms = 0;
-    g_config.fsr2_trace_color_producers = false;
-    g_config.fsr2_early_output_probe = false;
-    g_config.block_dx11_on12_upscalers = false;
-    g_config.show_osd = false;
-#endif
 }
 
 bool process_matches()
@@ -4165,16 +4083,8 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
         g_state.candidate_count = 0;
     }
 
-    static std::atomic_bool first_present_logged { false };
-    if (!first_present_logged.exchange(true, std::memory_order_relaxed))
-    {
-        std::string message = "first_present size=" + std::to_string(g_state.backbuffer_width) + "x" +
-            std::to_string(g_state.backbuffer_height);
-#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
-        message += " fsr2_query_mask=" + hex64(fsr2_get_proc_address_shim_query_mask());
-#endif
-        log_line(message);
-    }
+    log_line("present frame=" + std::to_string(g_state.frame_index) +
+        " size=" + std::to_string(g_state.backbuffer_width) + "x" + std::to_string(g_state.backbuffer_height));
     return g_original_present(swapchain, sync_interval, flags);
 }
 
@@ -4470,47 +4380,7 @@ struct TargetUpscalerDrawInfo
     std::uint64_t constant_buffer_key = 0;
     std::uint64_t color_resource_key = 0;
     std::uint64_t motion_resource_key = 0;
-    DXGI_FORMAT color_format = DXGI_FORMAT_UNKNOWN;
-    DXGI_FORMAT output_color_format = DXGI_FORMAT_UNKNOWN;
 };
-
-enum class Mode2ColorContract : std::uint32_t
-{
-    unsupported = 0,
-    sdr_srgb = 1,
-    hdr10_pq = 2,
-};
-
-bool is_mode2_sdr_format(DXGI_FORMAT format)
-{
-    return format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
-        format == DXGI_FORMAT_R8G8B8A8_UNORM ||
-        format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
-        format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
-        format == DXGI_FORMAT_B8G8R8A8_UNORM ||
-        format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-}
-
-bool is_mode2_hdr10_format(DXGI_FORMAT format)
-{
-    return format == DXGI_FORMAT_R10G10B10A2_TYPELESS ||
-        format == DXGI_FORMAT_R10G10B10A2_UNORM;
-}
-
-Mode2ColorContract classify_mode2_color_contract(const TargetUpscalerDrawInfo &draw_info)
-{
-    if (is_mode2_sdr_format(draw_info.color_format) &&
-        is_mode2_sdr_format(draw_info.output_color_format))
-    {
-        return Mode2ColorContract::sdr_srgb;
-    }
-    if (is_mode2_hdr10_format(draw_info.color_format) &&
-        is_mode2_hdr10_format(draw_info.output_color_format))
-    {
-        return Mode2ColorContract::hdr10_pq;
-    }
-    return Mode2ColorContract::unsupported;
-}
 
 std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(UINT element_count)
 {
@@ -4588,8 +4458,6 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(UINT element_
         g_state.ps_cbs[0].resource_key,
         color.resource_key,
         motion.resource_key,
-        color.format,
-        output_color.format,
     };
 }
 
@@ -4685,8 +4553,6 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(
             constant_buffer_key,
             color.resource_key,
             motion.resource_key,
-            color.format,
-            output_color.format,
         };
     }
 #endif
@@ -6358,95 +6224,10 @@ bool try_fsr2_translation_draw(
         : inspect_target_upscaler_draw(context, element_count);
     if (!draw_info)
         return false;
-    const bool native_upscaling_enabled =
-        draw_info->render_width < draw_info->output_width &&
-        draw_info->render_height < draw_info->output_height;
-    if (!native_upscaling_enabled)
+    if (draw_info->render_width >= draw_info->output_width &&
+        draw_info->render_height >= draw_info->output_height)
     {
-        const std::uint64_t now_tick = GetTickCount64();
-        std::uint64_t no_bypass_started = 0;
-        g_mode2_native_bypass_start_tick.compare_exchange_strong(
-            no_bypass_started,
-            now_tick,
-            std::memory_order_acq_rel);
-        static std::atomic_bool initial_bypass_logged { false };
-        if (!initial_bypass_logged.exchange(true, std::memory_order_relaxed))
-        {
-            log_line("mode2_bypass route=native_taau reason=not_upscaling render=" +
-                std::to_string(draw_info->render_width) + "x" +
-                    std::to_string(draw_info->render_height) +
-                " output=" + std::to_string(draw_info->output_width) + "x" +
-                    std::to_string(draw_info->output_height) +
-                " context_policy=keep_resident");
-        }
         return false;
-    }
-
-    const Mode2ColorContract color_contract = classify_mode2_color_contract(*draw_info);
-    if (color_contract == Mode2ColorContract::unsupported)
-    {
-        const std::uint64_t now_tick = GetTickCount64();
-        std::uint64_t no_bypass_started = 0;
-        g_mode2_native_bypass_start_tick.compare_exchange_strong(
-            no_bypass_started,
-            now_tick,
-            std::memory_order_acq_rel);
-        static std::atomic_uint64_t rejected_contracts { 0 };
-        const std::uint64_t count = rejected_contracts.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (count == 1 || count % 600 == 0)
-        {
-            log_line("mode2_target_rejected reason=unsupported_color_contract count=" +
-                std::to_string(count) +
-                " input_format=" + format_string(draw_info->color_format) +
-                " output_format=" + format_string(draw_info->output_color_format) +
-                " native_draw_skipped=1");
-        }
-        return true;
-    }
-    const bool hdr10_pq = color_contract == Mode2ColorContract::hdr10_pq;
-    const std::uint64_t now_tick = GetTickCount64();
-    const std::uint64_t previous_takeover_tick =
-        g_mode2_last_takeover_tick.exchange(now_tick, std::memory_order_acq_rel);
-    const std::uint64_t native_bypass_start_tick =
-        g_mode2_native_bypass_start_tick.exchange(0, std::memory_order_acq_rel);
-    const bool entering_takeover = previous_takeover_tick == 0;
-    const bool resume_after_native_bypass =
-        native_bypass_start_tick != 0 && now_tick >= native_bypass_start_tick + 100;
-    const bool takeover_history_gap =
-        previous_takeover_tick != 0 && now_tick >= previous_takeover_tick + 1000;
-    if (entering_takeover)
-    {
-        log_line("mode2_route_switch route=optiscaler reason=native_upscaling history_reset=1");
-    }
-    else if (resume_after_native_bypass)
-    {
-        log_line("mode2_history_reset reason=resume_after_native_bypass bypass_ms=" +
-            std::to_string(now_tick - native_bypass_start_tick) +
-            " context_policy=keep_resident");
-    }
-    else if (takeover_history_gap)
-    {
-        log_line("mode2_history_reset reason=takeover_gap gap_ms=" +
-            std::to_string(now_tick - previous_takeover_tick));
-    }
-    static std::atomic_uint32_t last_color_contract { 0 };
-    const std::uint32_t current_color_contract = static_cast<std::uint32_t>(color_contract);
-    const std::uint32_t previous_color_contract =
-        last_color_contract.exchange(current_color_contract, std::memory_order_acq_rel);
-    const bool display_contract_changed =
-        previous_color_contract != 0 && previous_color_contract != current_color_contract;
-    if (previous_color_contract != current_color_contract)
-    {
-        log_line("mode2_color_contract path=" +
-            std::string(hdr10_pq ? "hdr10_pq" : "sdr_srgb") +
-            " input_format=" + format_string(draw_info->color_format) +
-            " output_format=" + format_string(draw_info->output_color_format) +
-            " render=" + std::to_string(draw_info->render_width) + "x" +
-                std::to_string(draw_info->render_height) +
-            " output=" + std::to_string(draw_info->output_width) + "x" +
-                std::to_string(draw_info->output_height) +
-            " contract_switch=" + std::to_string(display_contract_changed ? 1 : 0) +
-            " shim_query_mask=" + hex64(fsr2_get_proc_address_shim_query_mask()));
     }
 
     Fsr2FreshProducerPath producer_path;
@@ -6526,10 +6307,7 @@ bool try_fsr2_translation_draw(
         }
         if (depth_stencil != nullptr)
             depth_stencil->Release();
-        static std::atomic_bool missing_binding_logged { false };
-        if (!missing_binding_logged.exchange(true, std::memory_order_relaxed))
-            log_line("mode2_dispatch_failed reason=missing_native_binding native_draw_skipped=1");
-        return true;
+        return false;
     }
     render_targets[1]->GetResource(&output);
 
@@ -6689,15 +6467,11 @@ bool try_fsr2_translation_draw(
     frame.use_transparency_mask = g_config.fsr2_use_transparency_mask;
     frame.enable_sharpening = g_config.fsr2_sharpness_percent > 0;
     frame.sharpness = static_cast<float>(g_config.fsr2_sharpness_percent) / 100.0f;
-    frame.hdr10_pq_color = hdr10_pq;
-    frame.use_direct_linear_color = !hdr10_pq;
+    frame.hdr10_pq_color = use_late_composed_color || g_config.fsr2_hdr10_pq_color;
+    frame.use_direct_linear_color = !use_late_composed_color && !g_config.fsr2_hdr10_pq_color;
     const bool optiscaler_config_reset = consume_fsr2_optiscaler_config_reset();
     const bool optiscaler_log_reset = should_reset_for_optiscaler_log_activity();
     frame.reset =
-        entering_takeover ||
-        resume_after_native_bypass ||
-        takeover_history_gap ||
-        display_contract_changed ||
         (color_path_changed && g_config.fsr2_reset_on_color_path_change) ||
         optiscaler_config_reset ||
         optiscaler_log_reset;
@@ -6848,7 +6622,7 @@ bool try_fsr2_translation_draw(
 #endif
     bool metadata_updated = false;
     if (outcome.succeeded && outcome.hook_entry_detected && g_config.fsr2_fast_metadata_copy &&
-        translation_mode >= 2 && render_targets[0] != nullptr)
+        translation_mode >= 4 && render_targets[0] != nullptr)
     {
         metadata_updated = copy_fsr2_history_metadata(
             context,
@@ -6860,7 +6634,7 @@ bool try_fsr2_translation_draw(
         {
             static std::atomic_bool failure_logged { false };
             if (!failure_logged.exchange(true, std::memory_order_relaxed))
-                log_line("fsr2_fast_metadata_copy_failed native_draw_skipped=1");
+                log_line("fsr2_fast_metadata_copy_failed fallback=original_taau");
         }
     }
     if (outcome.succeeded && outcome.hook_entry_detected && !metadata_updated &&
@@ -6907,9 +6681,9 @@ bool try_fsr2_translation_draw(
             std::forward<DrawCall>(draw_call));
     }
     end_fsr2_gpu_timing(context, gpu_timing_slot);
-    const bool skip_original_draw = translation_mode == 2 ||
-        (outcome.succeeded && outcome.hook_entry_detected &&
-            (use_late_composed_color || color_replayed));
+    const bool skip_original_draw = outcome.succeeded && outcome.hook_entry_detected &&
+        ((translation_mode >= 2 && translation_mode < 4) ||
+            use_late_composed_color || color_replayed);
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_fsr2_transient_capture_snapshot && render_targets[1] != nullptr)
     {
@@ -6997,7 +6771,7 @@ bool try_fsr2_translation_draw(
             log_line("fsr2_translation_dispatch_failed code=" + std::to_string(outcome.error_code) +
                 " error=" + outcome.error);
         }
-        return translation_mode == 2;
+        return false;
     }
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
@@ -7030,16 +6804,6 @@ bool try_fsr2_translation_draw(
             " jitter=" + std::to_string(jitter_x) + "," + std::to_string(jitter_y));
     }
 #endif
-    static std::atomic_bool first_mode2_dispatch_logged { false };
-    if (translation_mode == 2 &&
-        !first_mode2_dispatch_logged.exchange(true, std::memory_order_relaxed))
-    {
-        log_line("mode2_dispatch_succeeded opti_detoured=" +
-            std::to_string(outcome.hook_entry_detected ? 1 : 0) +
-            " path=" + std::string(hdr10_pq ? "hdr10_pq" : "sdr_srgb") +
-            " metadata_updated=" + std::to_string(metadata_updated ? 1 : 0) +
-            " native_draw_skipped=1");
-    }
     return skip_original_draw;
 }
 #endif
@@ -8270,9 +8034,6 @@ void initialize()
     g_frames_path = g_module_dir / L"Dx11FsrBridge.frames.jsonl";
     g_similarity_path = g_module_dir / L"Dx11FsrBridge.similarity.txt";
     g_ps_trace_path = g_module_dir / L"Dx11FsrBridge.ps_trace.jsonl";
-#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    reset_release_log_files();
-#endif
     load_config();
 
     if (!process_matches())

@@ -9,7 +9,7 @@ on:
         default: false
         type: boolean
       release_tag:
-        description: Release tag to create or update when publishing (for example v1.1.0)
+        description: Release tag to create or update when publishing (for example v1.0.9)
         required: false
         type: string
 
@@ -23,15 +23,17 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Configure and package Lite build
+      - name: Build FPS Unlock and Fufu Lite packages
         shell: pwsh
-        run: ./Build-Package.ps1 -Configuration Release
+        run: ./Build-OnlineInstaller.ps1 -Configuration Release
 
-      - name: Upload Lite package
+      - name: Upload Lite packages
         uses: actions/upload-artifact@v4
         with:
-          name: GenshinOneClick-Lite
-          path: dist/原神解帧FSR插件包Lite_*.zip
+          name: GenshinOneClick-Lite-Packages
+          path: |
+            dist/原神解帧FSR插件包Lite_*.zip
+            dist/芙芙启动器插件包Lite_*.zip
           if-no-files-found: error
 
       - name: Validate release tag
@@ -46,4 +48,6 @@ jobs:
           tag_name: ${{ inputs.release_tag }}
           target_commitish: ${{ github.sha }}
           generate_release_notes: true
-          files: dist/原神解帧FSR插件包Lite_*.zip
+          files: |
+            dist/github-release/GenshinFSRBridge.Lite_v*.zip
+            dist/github-release/FuFuLauncherPlugin.Lite_v*.zip

@@ -1,47 +1,79 @@
-# Build products and IDE state
-build/
-build-*/
-dist/
-out/
-artifacts/
-.vs/
-.vscode/
-cmake-build-*/
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-
-# Compiler and linker output
+# Build directories and compiler output
+**/build/
+**/build-*/
+**/artifacts/
+**/.vs/
+**/x64/
+**/Debug/
+**/Release/
 *.obj
 *.pdb
 *.ilk
 *.exp
-*.lib
-!third_party/detours/detours.lib
-*.dll
-!GenshinOneClick/payload/ReShade/ReShade64.dll
-*.exe
-*.zip
-*.7z
 *.iobj
 *.ipdb
+__pycache__/
+*.pyc
 
-# Runtime diagnostics and captures
+# Generated packages and runtime diagnostics
+dist/
 *.log
 *.dmp
-*.jsonl
-*.cso
-*.similarity.txt
-Dx11FsrBridge.inputs/
-Dx11FsrBridge.shaders/
-Dx11FsrBridge.pixel_shaders/
+*.zip
+*.7z
 
-# Generated package payload binaries
-GenshinOneClick/payload/Bridge/Dx11FsrBridge.dll
-GenshinOneClick/payload/AntiPlayerMosaic.dll
-GenshinOneClick/payload/ReShade/reshade-shaders/Addons/renodx-genshin.addon64
+# Locally generated package builds
+build-package-bridge/
+build-package-antiplayermosaic/
+publish-staging/
+local-only/
 
-# Local OS files
-Desktop.ini
+# Runtime state and third-party release files kept only for local Full builds
+GenshinOneClick/.installer-state.json
+GenshinOneClick/fps_config.json
+GenshinOneClick/UnlockerStub.dll
+GenshinOneClick/unlockfps_nc.exe
+GenshinOneClick/payload/OptiScaler/
+GenshinOneClick/payload/NVIDIA/
+GenshinOneClick/payload/ReShade/ReShade.ini
+GenshinOneClick/payload/ReShade/ReShadePreset.ini
+GenshinOneClick/payload/ReShade/Screenshots/
+
+# Local research trees and diagnostic artifacts are not release sources
+experiments/
+external/
+GIDx11Probe/
+GIDx11Trace/
+GenericFsrGpuProbe/
+TexFxLite/
+HANDOFF.md
+InputReplay/
+NgxFeatureCache/
+OptiFgPerfProbe/
+PeReferenceProbe/
+RenderScaleExternalProbe/
+RenderScaleOverride/
+RenderScaleWriteProbe/
+RenderTransitionProbe/
+vendor/
+hutao*.disasm.txt
+tools/*
+!tools/Test-FpsUnlockLocalization.ps1
+Dx11FsrBridge/Dx11FsrBridge.server-debug.ini
+Build-Package.ps1
+backups/
+router-config*.yaml
+router-config*.yaml.bak
+probe_hutao_offsets.cpp
+YuanShen.exe
+
+# Large duplicate OptiScaler source/build snapshots
+vendor/OptiScaler-build-src/
+vendor/OptiScaler-v092-build-src/
+vendor/OptiScaler-v0.9.3-release/
+
+# Local editor and OS files
+.vs/
+.vscode/
 Thumbs.db
+Desktop.ini
