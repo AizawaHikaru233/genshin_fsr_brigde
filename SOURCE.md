@@ -24,4 +24,4 @@
 
 ## 依赖边界
 
-两个运行插件只依赖 Windows、Direct3D、Detours（FSR2 翻译层）与明确列出的 OptiScaler SDK/库。反虚化插件不加载、不调用也不分发 Snap Hutao 的 DLL、共享内存接口或固定偏移表。
+两个运行插件只依赖 Windows、Direct3D、Detours（FSR2 翻译层）与明确列出的 OptiScaler SDK/库。反虚化插件不加载、共享内存接口或固定偏移表。
