@@ -429,7 +429,7 @@ function Set-OptiScalerConfiguration {
     Set-IniValue -Path $Path -Section 'FrameGen' -Key 'Enabled' -Value 'false'
     Set-IniValue -Path $Path -Section 'FrameGen' -Key 'FGInput' -Value 'nofg'
     Set-IniValue -Path $Path -Section 'FrameGen' -Key 'FGOutput' -Value 'nofg'
-    Set-IniValue -Path $Path -Section 'Libraries' -Key 'OptiDllPath' -Value $FinalOptiDirectory
+    Set-IniValue -Path $Path -Section 'Libraries' -Key 'OptiDllPath' -Value '.'
     Set-IniValue -Path $Path -Section 'Menu' -Key 'LoadReshade' -Value 'false'
     Set-IniValue -Path $Path -Section 'Plugins' -Key 'LoadAsiPlugins' -Value 'false'
     Set-IniValue -Path $Path -Section 'Plugins' -Key 'LoadReshade' -Value 'false'
@@ -655,11 +655,11 @@ function Install-FufuPlugin {
             $finalReShadeDirectory = Join-Path $targetDirectory 'payload\ReShade'
             $finalShaderDirectory = Join-Path $finalReShadeDirectory 'reshade-shaders'
             $stageReShadeIni = Join-Path $stageReShadeDirectory 'ReShade.ini'
-            Set-IniValue -Path $stageReShadeIni -Section 'ADDON' -Key 'AddonPath' -Value (Join-Path $finalShaderDirectory 'Addons')
-            Set-IniValue -Path $stageReShadeIni -Section 'GENERAL' -Key 'EffectSearchPaths' -Value (Join-Path $finalShaderDirectory 'Shaders')
-            Set-IniValue -Path $stageReShadeIni -Section 'GENERAL' -Key 'TextureSearchPaths' -Value (Join-Path $finalShaderDirectory 'Textures')
-            Set-IniValue -Path $stageReShadeIni -Section 'GENERAL' -Key 'PresetPath' -Value (Join-Path $finalReShadeDirectory 'ReShadePreset.ini')
-            Set-IniValue -Path $stageReShadeIni -Section 'SCREENSHOT' -Key 'SavePath' -Value (Join-Path $finalReShadeDirectory 'Screenshots')
+            Set-IniValue -Path $stageReShadeIni -Section 'ADDON' -Key 'AddonPath' -Value '.\reshade-shaders\Addons'
+            Set-IniValue -Path $stageReShadeIni -Section 'GENERAL' -Key 'EffectSearchPaths' -Value '.\reshade-shaders\Shaders'
+            Set-IniValue -Path $stageReShadeIni -Section 'GENERAL' -Key 'TextureSearchPaths' -Value '.\reshade-shaders\Textures'
+            Set-IniValue -Path $stageReShadeIni -Section 'GENERAL' -Key 'PresetPath' -Value '.\ReShadePreset.ini'
+            Set-IniValue -Path $stageReShadeIni -Section 'SCREENSHOT' -Key 'SavePath' -Value '.\Screenshots'
         }
 
         if (-not (Test-Path -LiteralPath $stagePluginConfig -PathType Leaf)) {

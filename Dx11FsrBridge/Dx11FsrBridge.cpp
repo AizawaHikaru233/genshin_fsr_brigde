@@ -13,6 +13,7 @@
 #endif
 
 #include "Fsr31Bridge.h"
+#include "RenderScaleMenu.h"
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
 #include "Fsr2TranslationLayer.h"
 #endif
@@ -2618,7 +2619,9 @@ void log_interesting_dispatch_details(UINT group_x, UINT group_y, UINT group_z)
         if (text.starts_with(prefix))
             text.insert(prefix.size(), " phase=" + std::to_string(phase));
         log_line(text);
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         update_osd_from_dispatch(phase, group_x, group_y, group_z);
+#endif
     }
 }
 
@@ -2626,6 +2629,17 @@ void log_line(const std::string &line)
 {
     if (!g_logging_enabled.load(std::memory_order_relaxed))
         return;
+#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    static constexpr std::array<std::string_view, 11> error_terms {
+        "failed", "failure", "error", "invalid", "mismatch", "exception",
+        "unavailable", "unresolved", "unsupported", "missing", "refusing"
+    };
+    const bool startup_marker = line.starts_with("Dx11FsrBridge active");
+    const bool error_message = std::any_of(error_terms.begin(), error_terms.end(),
+        [&](std::string_view term) { return line.find(term) != std::string::npos; });
+    if (!startup_marker && !error_message)
+        return;
+#endif
     std::lock_guard lock(g_log_mutex);
     std::ofstream out(g_log_path, std::ios::app);
     SYSTEMTIME st {};
@@ -2634,6 +2648,14 @@ void log_line(const std::string &line)
     std::snprintf(prefix, sizeof(prefix), "%04u-%02u-%02u %02u:%02u:%02u.%03u ",
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     out << prefix << line << "\n";
+}
+
+void reset_log()
+{
+    if (!g_logging_enabled.load(std::memory_order_relaxed))
+        return;
+    std::lock_guard lock(g_log_mutex);
+    std::ofstream(g_log_path, std::ios::trunc).close();
 }
 
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
@@ -2968,6 +2990,45 @@ void update_osd_from_dispatch(std::uint32_t phase, UINT group_x, UINT group_y, U
 void load_config()
 {
     const std::filesystem::path config_path = g_module_dir / L"Dx11FsrBridge.ini";
+#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    g_config.enabled = GetPrivateProfileIntW(L"Dx11FsrBridge", L"Enabled", 1, config_path.c_str()) != 0;
+    g_config.enable_logging = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableLogging", 1, config_path.c_str()) != 0;
+    g_logging_enabled.store(g_config.enable_logging, std::memory_order_relaxed);
+    g_config.dlssg_dxgi_workaround =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"DlssgDxgiWorkaround", -1, config_path.c_str());
+    g_config.capture_metadata_only =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"CaptureMetadataOnly", 0, config_path.c_str()) != 0;
+#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
+    g_config.enable_fsr2_get_proc_address_shim =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableFsr2GetProcAddressShim", 1, config_path.c_str()) != 0;
+    g_config.fsr2_translation_mode = static_cast<std::uint32_t>(
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2TranslationMode", 4, config_path.c_str()));
+    g_config.fsr2_motion_vectors_jittered =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2MotionVectorsJittered", 0, config_path.c_str()) != 0;
+    g_config.fsr2_positive_motion_vector_scale =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2MotionVectorScaleMode", 0, config_path.c_str()) == 1;
+    g_config.fsr2_use_reactive_mask =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2UseReactiveMask", 1, config_path.c_str()) != 0;
+    g_config.fsr2_use_transparency_mask =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2UseTransparencyMask", 1, config_path.c_str()) != 0;
+    g_config.fsr2_jitter_mode = static_cast<std::uint32_t>(
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2JitterMode", 3, config_path.c_str()));
+    g_config.fsr2_hdr10_pq_color =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2Hdr10PqColor", 0, config_path.c_str()) != 0;
+    g_config.fsr2_use_native_exposure =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2UseNativeExposure", 1, config_path.c_str()) != 0;
+    g_config.fsr2_fast_metadata_copy =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2FastMetadataCopy", 1, config_path.c_str()) != 0;
+    g_config.fsr2_compact_linear_output =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2CompactLinearOutput", 1, config_path.c_str()) != 0;
+    g_config.fsr2_lock_color_producer_shader =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2LockColorProducerShader", 1, config_path.c_str()) != 0;
+    g_config.fsr2_reset_on_color_path_change =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2ResetOnColorPathChange", 1, config_path.c_str()) != 0;
+    g_config.block_dx11_on12_upscalers =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"BlockDx11On12Upscalers", 0, config_path.c_str()) != 0;
+#endif
+#else
     g_config.enabled = GetPrivateProfileIntW(L"Dx11FsrBridge", L"Enabled", 1, config_path.c_str()) != 0;
     g_config.enable_logging = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableLogging", 0, config_path.c_str()) != 0;
     g_logging_enabled.store(g_config.enable_logging, std::memory_order_relaxed);
@@ -3086,6 +3147,7 @@ void load_config()
     wchar_t label_buffer[128] {};
     GetPrivateProfileStringW(L"Dx11FsrBridge", L"RunLabel", L"", label_buffer, static_cast<DWORD>(std::size(label_buffer)), config_path.c_str());
     g_config.run_label = label_buffer;
+#endif
 }
 
 bool process_matches()
@@ -4367,7 +4429,9 @@ void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_
             " out=" + hex64(candidate->output.resource_key));
     }
 
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     record_similarity_dispatch(group_x, group_y, group_z);
+#endif
     g_original_dispatch(context, group_x, group_y, group_z);
 }
 
@@ -8031,14 +8095,19 @@ void initialize()
     DWORD length = GetModuleFileNameW(g_module, module_path, MAX_PATH);
     g_module_dir = std::filesystem::path(std::wstring(module_path, module_path + length)).parent_path();
     g_log_path = g_module_dir / L"Dx11FsrBridge.log";
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_frames_path = g_module_dir / L"Dx11FsrBridge.frames.jsonl";
     g_similarity_path = g_module_dir / L"Dx11FsrBridge.similarity.txt";
     g_ps_trace_path = g_module_dir / L"Dx11FsrBridge.ps_trace.jsonl";
+#endif
     load_config();
 
     if (!process_matches())
         return;
 
+    reset_log();
+
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_config.trace_pixel_shader_draws)
     {
         std::lock_guard lock(g_ps_trace_mutex);
@@ -8048,6 +8117,7 @@ void initialize()
     }
     g_ps_trace_count = 0;
     g_trace_ps_cb0_key = 0;
+#endif
 
     g_active = true;
     log_line("Dx11FsrBridge active pid=" + std::to_string(GetCurrentProcessId()));
@@ -8087,8 +8157,10 @@ void initialize()
             log_line("fsr2_get_proc_address_shim_failed error=" + error);
     }
 #endif
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     start_osd();
     set_osd_text(L"Dx11FsrBridge OSD\n等待 DX11 dispatch 数据");
+#endif
 
     log_line(std::string("d3d11_loaded=") + (GetModuleHandleW(L"d3d11.dll") != nullptr ? "1" : "0"));
     install_create_hooks_for_loaded_modules();
@@ -8121,6 +8193,8 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
         g_module = module;
         DisableThreadLibraryCalls(module);
         initialize_once();
+        if (g_active)
+            initialize_render_scale_menu(module, &log_line);
     }
     else if (reason == DLL_PROCESS_DETACH)
     {

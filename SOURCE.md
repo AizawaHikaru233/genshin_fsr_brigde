@@ -4,6 +4,7 @@
 
 - `Dx11FsrBridge/`：原神 DX11 渲染链路的 FSR2 ABI 桥接层。
   - `Dx11FsrBridge.cpp`：D3D11 拦截、渲染状态跟踪、动态输入采集与运行日志。
+  - `RenderScaleMenu.*`：渲染精度候选值、菜单标签和低于原生比例的应用逻辑；Release 只保留 3 个必要 Hook 与菜单事件触发的受限扫描，探针 Hook、硬件断点和手动热键不进入正式运行路径。
   - `Fsr2TranslationLayer.*`：标准 FSR2 导出、输入准备和调度实现。
   - `Fsr31Bridge.*`：可选 FSR 3.1 实验后端；默认构建使用 `Fsr31BridgeStub.cpp`。
   - `OptiScalerNgxBridge.*`：可选 NGX 探测功能，不参与正式桥接链路。

@@ -2,18 +2,22 @@
 
 An FSR2 ABI bridge DLL for the Genshin Impact Windows DX11 client. It exposes standard FSR2 exports inside the game process and forwards the game's upscaling calls to a compatible external implementation, such as OptiScaler.
 
-This is not an official project of HoYoverse, AMD, or OptiScaler. It does not include OptiScaler, FSR SDK runtimes, GPU driver components, or any other upscaling DLLs.
+This repository also includes the `AntiPlayerMosaic/` subproject. It is an independently built plugin for fixing Genshin Impact's mosaic effects and hiding the UID. See the README in that directory for details.
 
-This repository also includes the `AntiPlayerMosaic/` subproject, an independently built plugin for player mosaic fixes and UID hiding. Refer to its README for details.
-
-[\u7b80\u4f53\u4e2d\u6587](README.md)
+For the Chinese documentation, see [README.md](README.md).
 
 ## Support Scope and Risk Notice
 
 - Intended for the Chinese and Global Windows DX11 clients of Genshin Impact.
-- Tested only with version 6.7 (“Luna VIII”). Compatibility with other game versions or client environments is not guaranteed.
-- This project is not affiliated with, endorsed by, or authorized by HoYoverse, miHoYo, Genshin Impact, or 《原神》. All related names and trademarks belong to their respective owners.
-- Third-party DLLs, injectors, mods, and graphics plugins may violate game rules and can result in account restrictions or bans. You are solely responsible for evaluating and accepting these risks.
+- Tested only with version `6.7 (Luna VIII)`; compatibility with other game versions or client environments is not guaranteed.
+- This project is not affiliated with, endorsed by, or authorized by `HoYoverse`, `miHoYo`, `Genshin Impact`, or `原神`. All related names and trademarks belong to their respective owners.
+- Third-party DLLs, injectors, mods, and graphics plugins may violate game rules and could result in account restrictions or bans. Users must evaluate the risks themselves and accept full responsibility.
+
+## Demo
+
+![FSR4 active](assets/FSR4激活.jpg)
+
+![Upscaling preset selection](assets/超分档位切换.jpg)
 
 ## Frame-Generation Branch
 
@@ -21,37 +25,38 @@ The frame-generation feature in the `frame-generation` branch is built against `
 
 ## Lite Release Package
 
-`GenshinOneClick/` contains the complete Lite installer scripts, default configuration, the official ReShade Add-on DLL, and HDR shaders. FPS Unlocker and OptiScaler are not distributed with the Lite package or this repository; the installer downloads them from their official sources or asks you to select them manually.
+`GenshinOneClick/` contains the complete Lite installer scripts, default configuration, the official ReShade Add-on DLL, and HDR shaders. FPS Unlocker and OptiScaler are not distributed with the Lite package or this repository; the installer downloads them from their official sources or asks the user to select them manually.
 
-The two first-party DLLs are build outputs and are not committed. To generate the same Lite ZIP as GitHub Actions on Windows, run:
+The two first-party DLLs are build outputs and are not committed to the repository. To generate the same Lite ZIP files as GitHub Actions, run the following command on Windows:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release
 ```
 
-The outputs are written to `dist\原神解帧FSR插件包Lite_v*.zip` and `dist\芙芙启动器插件包Lite_v*.zip`. GitHub Actions is manually dispatched from the Actions page and uploads both ZIPs as the `GenshinOneClick-Lite-Packages` artifact. When the release option is enabled and a version tag is supplied, it creates or updates the corresponding GitHub Release with `GenshinFSRBridge.Lite_v<version>.zip` and `FuFuLauncherPlugin.Lite_v<version>.zip`.
+The outputs are written to `dist\原神解帧FSR插件包Lite_v*.zip` and `dist\芙芙启动器插件包Lite_v*.zip`. GitHub Actions can be triggered manually from the Actions page and uploads both ZIP files as the `GenshinOneClick-Lite-Packages` artifact. When the release option is selected and a version tag is provided, it creates or updates the corresponding GitHub Release using the names `GenshinFSRBridge.Lite_v<version>.zip` and `FuFuLauncherPlugin.Lite_v<version>.zip`.
 
 ## Features
 
-- Intercepts DX11 device and context activity to identify Genshin Impact FSR2 call timing.
-- Exposes standard FSR2 exports so external upscalers can detect the FSR2 interface.
+- Intercepts DX11 device and context activity to obtain the timing of Genshin Impact's FSR2 calls.
+- Exposes standard FSR2 exports so external upscaling tools can detect the FSR2 interface.
 - Prepares color, depth, motion-vector, jitter, and history resources for the external processor.
+- Extends the in-game render-scale menu to `0.2–0.9 + Native`; the `Native` preset uses the game's original `1.0` render scale.
 - Writes runtime logs to `Dx11FsrBridge.log` beside the DLL by default for load and hook diagnostics.
-- Disables resource exports, per-frame tracing, and debug probes in the release configuration to avoid unnecessary overhead.
 
 ## Repository Layout
 
 - Repository root: FSR Bridge source, configuration, and build files.
-- `AntiPlayerMosaic/`: player mosaic, UID hiding, and underwater mosaic fix plugin.
+- `AntiPlayerMosaic/`: anti-aliasing blur removal, UID hiding, and underwater mosaic fix plugin.
 - `third_party/`: Bridge build dependencies and their original notices.
 
 ## Usage
 
-Download a package from [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases), extract it, then run `GenshinFSRBridgeTools.bat` for English or `一键配置.bat` for Chinese. You can also switch languages at any time from the installer main menu; the selected language is saved automatically. Depending on your environment, the script obtains [Genshin FPS Unlock](https://github.com/34736384/genshin-fps-unlock/releases), the [NVIDIA DLSS upscaling component (`nvngx_dlss.dll`)](https://github.com/NVIDIA-RTX/Streamline/releases), and [OptiScaler](https://github.com/optiscaler/OptiScaler/releases) to complete the runtime environment.
+Download an archive from [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases), extract it, and run `一键配置.bat`, then follow the prompts to install. For the English interface, run `GenshinFSRBridgeTools.bat`. You can also switch between Chinese and English at any time from the installer main menu; the selection is saved automatically. Depending on the environment, the script obtains [Genshin FPS Unlock](https://github.com/34736384/genshin-fps-unlock/releases), the [NVIDIA DLSS upscaling component (`nvngx_dlss.dll`)](https://github.com/NVIDIA-RTX/Streamline/releases), and [OptiScaler](https://github.com/optiscaler/OptiScaler/releases) to complete the runtime environment.
+In-game `FSR2` anti-aliasing must be enabled, and the render scale must be below `1`.
 
-`Dx11FsrBridge.dll` does not implement FSR, DLSS, XeSS, or any other upscaling algorithm. It only exposes a standard FSR2 interface to external tools and redirects the game's DX11 upscaling calls to that interface.
+`Dx11FsrBridge.dll` does not implement FSR, DLSS, XeSS, or any other upscaling algorithm. It only exposes a standard FSR2 interface to external tools and forwards the game's DX11 upscaling calls to that interface.
 
-Other DLL injection tools may be used, but they must support stable ordered loading.
+Other DLL injection tools may also be used, but they must support stable ordered loading.
 
 Recommended loading order:
 
@@ -60,11 +65,13 @@ Recommended loading order:
 3. `AntiPlayerMosaic.dll` (optional)
 4. `ReShade64.dll` (optional)
 
-When only using the upscaling bridge, the first two items must stay in this order: load Bridge first, then let [OptiScaler](https://github.com/optiscaler/OptiScaler) or a comparable tool scan and take over the standard FSR2 exports at startup. Bridge does not load, modify, or bundle OptiScaler. Backend selection, FSR3/FSR4 models, and other OptiScaler settings remain the responsibility of the user's own tool installation.
+When using only the upscaling bridge, the first two items must remain in this order: load Bridge first, then let [OptiScaler](https://github.com/optiscaler/OptiScaler), or a comparable tool, scan and take over the standard FSR2 exports at startup. Bridge does not directly load, modify, or bundle OptiScaler. Backend selection, FSR3/FSR4 models, and other OptiScaler settings are managed by the user's own tool installation.
+
+OptiScaler and ReShade runtime configurations are located in their respective component directories. OptiScaler DLL and log paths, as well as ReShade shader, texture, preset, and screenshot paths, use relative paths. This prevents third-party configuration-saving logic from incorrectly transcoding installation paths that contain Chinese characters. Only the game-directory `[INSTALL] BasePath`, which locates the external ReShade directory, must use a dynamically generated absolute path when installed across directories or drives.
 
 ## Build
 
-Visual Studio 2022 with the Desktop C++ workload, the Windows SDK, and CMake 3.20 or newer are required.
+Visual Studio 2022 with the Desktop development with C++ workload, the Windows SDK, and CMake 3.20 or newer are required.
 
 ```powershell
 cmake -S .\Dx11FsrBridge -B .\build-package-bridge -G "Visual Studio 17 2022" -A x64 `
@@ -73,26 +80,31 @@ cmake -S .\Dx11FsrBridge -B .\build-package-bridge -G "Visual Studio 17 2022" -A
 cmake --build .\build-package-bridge --config Release
 ```
 
-The DLL and `Dx11FsrBridge.release.ini` are written to `build-package-bridge\Release`. The release configuration requires the repository `Dx11FsrBridge\third_party` directory, which contains FSR2-compatible ABI headers and the Microsoft Detours build dependency.
+The DLL and `Dx11FsrBridge.release.ini` are written to `build-package-bridge\Release`. The release configuration requires the repository's `Dx11FsrBridge\third_party` directory, which contains FSR2-compatible ABI headers and the Microsoft Detours build dependency.
 
 `DX11FSRBRIDGE_ENABLE_FSR31_EXPERIMENTAL`, `DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL`, and related CMake options are experimental only and are not part of the supported release path.
 
-## Configuration and Feedback
+## Logs and Issue Feedback
 
-The DLL reads `Dx11FsrBridge.ini` from its own directory. The release package enables basic logging by default. After reproducing a problem, retain and submit:
+Bridge, OptiScaler, and the anti-mosaic component retain error logs by default. Each new run overwrites the previous run's logs.
+If the game fails to start, FSR cannot be activated, switching upscalers causes a crash, or another issue occurs, do not launch the game again after reproducing it. Provide the following files and information:
 
-- `Dx11FsrBridge.log`
-- `Dx11FsrBridge.ini`
-- OptiScaler logs and configuration, if used
-- GPU model, game version, failure stage, and selected upscaling mode
+1. `payload/Bridge/Dx11FsrBridge.log` (required)
+2. `payload/OptiScaler/OptiScaler.log` (required)
+3. `payload/OptiScaler/OptiScaler.ini`
+4. `payload/ReShade/ReShade.log` (for ReShade-related issues)
+5. `payload/AntiPlayerMosaic/AntiPlayerMosaic.log` (for anti-mosaic, UID, or underwater mosaic issues)
+6. `FSR-Bridge-Plugin.log` from the FuFu plugin directory (when using the FuFu Launcher plugin)
+7. GPU model, game version, the stage at which the issue occurs, and the selected upscaling mode
 
-Do not submit game account information, login details, or screenshots containing personal information to public issues.
+When further diagnostics are needed, temporarily change `LogLevel` under `Log` in `OptiScaler.ini` to `1 (Debug)` or `0 (Trace)`. Restore the release setting after diagnostics to avoid additional overhead.
+Do not submit game account details, login information, or screenshots containing personal information to a public Issue.
 
 ## Third-Party Components
 
 - FSR2 ABI headers and Microsoft Detours are build dependencies only; their original licenses and notices are retained.
 - OptiScaler is an independent project: <https://github.com/optiscaler/OptiScaler>.
-- Lite resources include the official ReShade Add-on DLL (BSD-3-Clause), the RenoDX Add-on redistributed with permission from [剪刀妹丽丽](https://www.bilibili.com/video/av116861345793770/), and Lilium HDR shaders (GPL-3.0). `RenoDX-Genshin/` is the sole archived source for RenoDX and is automatically synchronized to the ReShade payload during packaging; their licenses and permission records are kept with the resources.
+- Lite resources include the official ReShade Add-on DLL (BSD-3-Clause), the RenoDX Add-on redistributed with permission from [剪刀妹丽丽](https://www.bilibili.com/video/av116861345793770/), and Lilium HDR shaders (GPL-3.0). `RenoDX-Genshin/` is the sole archived source for RenoDX and is automatically synchronized to the ReShade payload during packaging; their licenses and permission records are kept in the resource directories.
 - This project does not include NVIDIA DLSS, the AMD FSR SDK, or OptiScaler runtime binaries.
 
 ## License

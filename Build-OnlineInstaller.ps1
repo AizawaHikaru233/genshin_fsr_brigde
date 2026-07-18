@@ -177,6 +177,7 @@ function Build-FpsUnlockOnlinePackage {
             'payload\default_config\ReShade.ini',
             'payload\default_config\ReShadePreset.ini',
             'payload\Bridge\Dx11FsrBridge.dll',
+            'payload\Bridge\Dx11FsrBridge.ini',
             'payload\AntiPlayerMosaic\AntiPlayerMosaic.dll',
             'payload\ReShade\ReShade64.dll',
             'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64'
@@ -194,7 +195,8 @@ function Build-FpsUnlockOnlinePackage {
             '一键配置.bat', 'Configure.ps1', 'Feedback.txt', 'Package-Version.txt',
             'payload\default_config\OptiScaler.ini', 'payload\default_config\OptiScaler-UpscalingFiles.json',
             'payload\default_config\ReShade.ini', 'payload\default_config\ReShadePreset.ini',
-            'payload\Bridge\Dx11FsrBridge.dll', 'payload\ReShade\ReShade64.dll'
+            'payload\Bridge\Dx11FsrBridge.dll', 'payload\ReShade\ReShade64.dll',
+            'payload\Bridge\Dx11FsrBridge.ini'
         )) {
             if ($entries -notcontains $required) { throw "FPS Unlock 在线 ZIP 缺少文件: $required" }
         }
@@ -237,6 +239,7 @@ function Build-FufuOnlinePackage {
         $stageReShade = Join-Path $stagePayload 'ReShade'
         New-Item -ItemType Directory -Force -Path $stageBridge, $stageReShade | Out-Null
         Copy-Item -LiteralPath (Join-Path $source 'payload\Bridge\Dx11FsrBridge.dll') -Destination $stageBridge -Force
+        Copy-Item -LiteralPath (Join-Path $source 'payload\Bridge\Dx11FsrBridge.ini') -Destination $stageBridge -Force
         Get-ChildItem -LiteralPath (Join-Path $source 'payload\ReShade') -Force |
             Copy-Item -Destination $stageReShade -Recurse -Force
         $stageOpti = Join-Path $stagePayload 'OptiScaler'
@@ -255,6 +258,7 @@ function Build-FufuOnlinePackage {
             'FSR-Bridge-Plugin.dll',
             'config.ini',
             'payload\Bridge\Dx11FsrBridge.dll',
+            'payload\Bridge\Dx11FsrBridge.ini',
             'payload\ReShade\ReShade64.dll',
             'payload\default_config\OptiScaler.ini',
             'payload\default_config\OptiScaler-UpscalingFiles.json',
@@ -277,7 +281,8 @@ function Build-FufuOnlinePackage {
             'Feedback.txt', 'payload\default_config\OptiScaler.ini', 'payload\default_config\OptiScaler-UpscalingFiles.json',
             'payload\default_config\ReShade.ini',
             'payload\default_config\ReShadePreset.ini', 'FSR-Bridge-Plugin.dll', 'config.ini',
-            'payload\Bridge\Dx11FsrBridge.dll'
+            'payload\Bridge\Dx11FsrBridge.dll',
+            'payload\Bridge\Dx11FsrBridge.ini'
         )) {
             if ($entries -notcontains $required) { throw "Fufu 在线 ZIP 缺少文件: $required" }
         }

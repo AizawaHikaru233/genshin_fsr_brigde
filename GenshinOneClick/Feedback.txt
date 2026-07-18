@@ -1,23 +1,29 @@
-中文
+日志与问题反馈
 
-遇到游戏无法启动、FSR 无法激活、切换超分后闪退或其他异常时：
+Bridge、OptiScaler 和反虚化组件默认会保留错误日志。每次重新运行会覆盖上一轮日志。
+遇到游戏无法启动、FSR 无法激活、切换超分后闪退或其他异常时，请在复现后不要再次启动游戏，并提供：
 
-1. 复现问题后不要再次启动游戏。
-2. 提交 payload\Bridge\Dx11FsrBridge.log。
-3. 提交 payload\OptiScaler\OptiScaler.log。
-4. 提交 payload\OptiScaler\OptiScaler.ini。
-5. 说明显卡型号、异常发生阶段和当时选择的超分模式。
+1. payload/Bridge/Dx11FsrBridge.log (必须)
+2. payload/OptiScaler/OptiScaler.log (必须)
+3. payload/OptiScaler/OptiScaler.ini
+4. payload/ReShade/ReShade.log（涉及 ReShade 时）
+5. payload/AntiPlayerMosaic/AntiPlayerMosaic.log（涉及反虚化、UID 或水下马赛克时）
+6. 芙芙插件目录下的 FSR-Bridge-Plugin.log（使用芙芙启动器插件时）
+7. 显卡型号、游戏版本、异常发生阶段和所选超分模式
 
-发行版默认仅记录错误，每次启动覆盖上一轮日志，单次运行期间不限制日志大小。需要更详细日志时，可临时将 OptiScaler.ini 中 [Log] 下的 LogLevel 改为 1（Debug）或 0（Trace）。
+需要进一步排查时，可临时将 OptiScaler.ini 中 [Log] 下的 LogLevel 改为 1（Debug）或 0（Trace），但诊断结束后应恢复正式配置以避免额外开销。
+不要把游戏账号、登录信息或包含个人信息的截图提交到公开 Issue。
 
-English
 
 If the game cannot start, FSR does not activate, changing upscaling causes a crash, or another issue occurs:
 
 1. Reproduce the issue, then do not launch the game again.
 2. Submit `payload\Bridge\Dx11FsrBridge.log`.
 3. Submit `payload\OptiScaler\OptiScaler.log`.
-4. Submit `payload\OptiScaler\OptiScaler.ini`.
-5. Describe the GPU model, the stage at which the issue occurred, and the selected upscaling mode.
+4. For anti-aliasing/UID/mosaic issues, submit `payload\AntiPlayerMosaic\AntiPlayerMosaic.log`.
+5. For ReShade/HDR issues, submit `payload\ReShade\ReShade.log`.
+6. When using the FuFu Launcher plugin, also submit `FSR-Bridge-Plugin.log` from the plugin directory.
+7. Submit `payload\OptiScaler\OptiScaler.ini`.
+8. Describe the GPU model, the stage at which the issue occurred, and the selected upscaling mode.
 
-Release builds log errors only by default and overwrite the previous run's logs at startup, with no per-session size limit. For more detail, temporarily set `[Log] LogLevel` in `OptiScaler.ini` to `1` (Debug) or `0` (Trace).
+Bridge, OptiScaler, and AntiPlayerMosaic release builds keep basic errors by default and overwrite the previous run at startup, with no per-session size limit. ReShade 6.7.3 cannot filter logs by level, so `ReShade.log` contains the complete current session. For more OptiScaler detail, temporarily set `[Log] LogLevel` in `OptiScaler.ini` to `1` (Debug) or `0` (Trace).

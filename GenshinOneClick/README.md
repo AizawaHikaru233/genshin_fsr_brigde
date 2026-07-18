@@ -39,7 +39,13 @@ OptiScaler 和 ReShade 各自从组件目录读取运行配置。不会随组件
 
 模板不使用维护者本机配置，不包含旧 preset、绝对用户路径或运行状态。首次安装时优先使用包内对应版本已有的官方配置作为模板；仅当资源中不存在所需模板时，安装器才创建最小默认文件。
 
-配置器从自身目录动态计算完整路径，再写入 FPS Unlock 配置和各组件运行配置。发布包没有写死安装位置；移动整个目录后重新运行配置即可刷新路径。
+配置器从自身目录动态计算完整路径并写入 FPS Unlock 的 DLL 列表；组件内部配置尽量只使用相对路径。OptiScaler 使用 `OptiDllPath=.` 与 `LogFileName=OptiScaler.log`，ReShade 使用相对于组件目录的着色器、纹理、Preset 和截图路径。只有游戏目录中的 ReShade `[INSTALL] BasePath` 重定向在跨目录或跨盘时使用动态绝对路径。发布包没有写死安装位置；移动整个目录后重新运行配置即可刷新重定向和注入路径。
+
+## 渲染精度菜单
+
+Bridge 将原神渲染精度菜单扩展为 `0.2 / 0.3 / 0.4 / 0.5 / 0.6 / 0.7 / 0.8 / 0.9 / 原生`。比例根据当前输出分辨率动态生效；例如 4K 输出下 `0.5` 为 `1920×1080`，`0.6` 为 `2304×1296`。
+
+`原生` 对应游戏原本的 `1.0` 渲染精度。菜单打开事件只会启动一段有次数上限的标签扫描窗口，不会被连续 UI 调用反复刷新。
 
 DLL 加载顺序固定为：
 
@@ -63,16 +69,20 @@ powershell -ExecutionPolicy Bypass -File .\Configure.ps1 `
 
 可选开关包括 `-DisableOptiScaler`、`-DisableAntiBlur`、`-DisableHDR` 和 `-NoShortcut`。手动导入可使用 `-UnlockerSource Manual -UnlockerPackagePath <路径>` 与 `-OptiScalerSource Manual -OptiScalerPackagePath <路径>`。
 
-## 日志与问题反馈
+## ## 日志与问题反馈
 
-正式版的 Bridge、OptiScaler 和反虚化组件默认仅保留基础错误日志。每次重新运行会覆盖上一轮日志，单次运行期间不限制日志大小。
-
+Bridge、OptiScaler 和反虚化组件默认会保留错误日志。每次重新运行会覆盖上一轮日志。
 遇到游戏无法启动、FSR 无法激活、切换超分后闪退或其他异常时，请在复现后不要再次启动游戏，并提供：
 
-1. `payload/Bridge/Dx11FsrBridge.log`
-2. `payload/OptiScaler/OptiScaler.log`
+1. `payload/Bridge/Dx11FsrBridge.log` (必须)
+2. `payload/OptiScaler/OptiScaler.log` (必须)
 3. `payload/OptiScaler/OptiScaler.ini`
-4. 安装器最后一次错误日志（若存在）
-5. 显卡型号、游戏版本、异常发生阶段和所选超分模式
+4. `payload/ReShade/ReShade.log`（涉及 ReShade 时）
+5. `payload/AntiPlayerMosaic/AntiPlayerMosaic.log`（涉及反虚化、UID 或水下马赛克时）
+6. 芙芙插件目录下的 `FSR-Bridge-Plugin.log`（使用芙芙启动器插件时）
+7. 显卡型号、游戏版本、异常发生阶段和所选超分模式
 
-Bridge 的正式 mode2 配置固定在 DLL 内，不再依赖 `Dx11FsrBridge.ini`。需要进一步排查时，可临时提高 OptiScaler 日志等级，但诊断结束后应恢复正式配置以避免额外开销。
+Bridge 的发行配置只保留正式 Mode 4、输入约定、兼容开关和渲染精度菜单所需设置。相似度采样、OSD、资源导出、热键探针和高数据量诊断会在 Release 构建中直接排除，而不只是写成关闭状态。
+
+需要进一步排查时，可临时提高 OptiScaler 日志等级，但诊断结束后应恢复正式配置以避免额外开销。
+不要把游戏账号、登录信息或包含个人信息的截图提交到公开 Issue。

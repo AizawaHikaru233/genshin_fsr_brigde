@@ -264,7 +264,7 @@ function Repair-RuntimePaths {
 
     $optiIni = Join-Path $optiDirectory 'OptiScaler.ini'
     if (Test-Path -LiteralPath $optiPath -PathType Leaf) {
-        Set-IniPathValue -Path $optiIni -Section 'Libraries' -Key 'OptiDllPath' -Value $optiDirectory | Out-Null
+        Set-IniPathValue -Path $optiIni -Section 'Libraries' -Key 'OptiDllPath' -Value '.' | Out-Null
         foreach ($libraryKey in @(
             'NvngxDlssPath',
             'FfxDx12Path',
@@ -295,11 +295,11 @@ function Repair-RuntimePaths {
     $reShadeIni = Join-Path $reShadeDirectory 'ReShade.ini'
     if ((Test-Path -LiteralPath $reShadePath -PathType Leaf) -and (Test-Path -LiteralPath $reShadeIni -PathType Leaf)) {
         $shaderDirectory = Join-Path $reShadeDirectory 'reshade-shaders'
-        Set-IniPathValue -Path $reShadeIni -Section 'ADDON' -Key 'AddonPath' -Value (Join-Path $shaderDirectory 'Addons') | Out-Null
-        Set-IniPathValue -Path $reShadeIni -Section 'GENERAL' -Key 'EffectSearchPaths' -Value (Join-Path $shaderDirectory 'Shaders') | Out-Null
-        Set-IniPathValue -Path $reShadeIni -Section 'GENERAL' -Key 'TextureSearchPaths' -Value (Join-Path $shaderDirectory 'Textures') | Out-Null
-        Set-IniPathValue -Path $reShadeIni -Section 'GENERAL' -Key 'PresetPath' -Value (Join-Path $reShadeDirectory 'ReShadePreset.ini') | Out-Null
-        Set-IniPathValue -Path $reShadeIni -Section 'SCREENSHOT' -Key 'SavePath' -Value (Join-Path $reShadeDirectory 'Screenshots') | Out-Null
+        Set-IniPathValue -Path $reShadeIni -Section 'ADDON' -Key 'AddonPath' -Value '.\reshade-shaders\Addons' | Out-Null
+        Set-IniPathValue -Path $reShadeIni -Section 'GENERAL' -Key 'EffectSearchPaths' -Value '.\reshade-shaders\Shaders' | Out-Null
+        Set-IniPathValue -Path $reShadeIni -Section 'GENERAL' -Key 'TextureSearchPaths' -Value '.\reshade-shaders\Textures' | Out-Null
+        Set-IniPathValue -Path $reShadeIni -Section 'GENERAL' -Key 'PresetPath' -Value '.\ReShadePreset.ini' | Out-Null
+        Set-IniPathValue -Path $reShadeIni -Section 'SCREENSHOT' -Key 'SavePath' -Value '.\Screenshots' | Out-Null
         [IO.File]::WriteAllLines(
             (Join-Path $gameDirectory 'ReShade.ini'),
             @('[INSTALL]', "BasePath=$reShadeDirectory"),

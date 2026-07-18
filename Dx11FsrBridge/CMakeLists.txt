@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(Dx11FsrBridge LANGUAGES CXX)
+project(Dx11FsrBridge LANGUAGES CXX RC)
 
 option(DX11FSRBRIDGE_ENABLE_FSR31_EXPERIMENTAL "Build the experimental AMD FSR3.1 backend" OFF)
 option(DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL "Build the passive OptiScaler NGX export probe" OFF)
@@ -13,6 +13,8 @@ option(DX11FSRBRIDGE_ASI "Build the bridge as an OptiScaler ASI plugin (.asi)" O
 
 add_library(Dx11FsrBridge SHARED
     Dx11FsrBridge.cpp
+    Dx11FsrBridge.rc
+    RenderScaleMenu.cpp
 )
 
 if(DX11FSRBRIDGE_ASI)
@@ -51,12 +53,6 @@ if(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
         Fsr2TranslationLayer.def
     )
     target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=1)
-    target_include_directories(Dx11FsrBridge PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
-    )
-    target_link_libraries(Dx11FsrBridge PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/detours/detours.lib"
-    )
 endif()
 
 if(DX11FSRBRIDGE_RELEASE_RUNTIME)
@@ -85,10 +81,15 @@ target_compile_definitions(Dx11FsrBridge PRIVATE
     UNICODE
     _UNICODE
 )
+target_include_directories(Dx11FsrBridge PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/detours"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
+)
 target_link_libraries(Dx11FsrBridge PRIVATE
     d3d11
     d3dcompiler
     dxgi
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/detours/detours.lib"
 )
 
 if(DX11FSRBRIDGE_ENABLE_FSR31_EXPERIMENTAL)

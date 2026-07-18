@@ -706,24 +706,31 @@ function Initialize-ReShadeConfiguration {
         [string]$ScreenshotPath,
         [switch]$Force
     )
+    # ReShade resolves these entries from the directory containing this INI.
+    # Keep machine/user paths out of the runtime configuration.
+    $configAddonPath = '.\reshade-shaders\Addons'
+    $configShaderPath = '.\reshade-shaders\Shaders'
+    $configTexturePath = '.\reshade-shaders\Textures'
+    $configPresetPath = '.\ReShadePreset.ini'
+    $configScreenshotPath = '.\Screenshots'
     if ($Force -or -not (Test-Path -LiteralPath $IniPath -PathType Leaf)) {
         if (Test-Path -LiteralPath $reshadeIniTemplate -PathType Leaf) {
             Copy-Item -LiteralPath $reshadeIniTemplate -Destination $IniPath -Force
         }
         else {
             $generated = New-ReShadeConfig `
-                -AddonPath $AddonPath `
-                -ShaderPath $ShaderPath `
-                -TexturePath $TexturePath `
-                -PresetPath $PresetPath `
-                -ScreenshotPath $ScreenshotPath
+                -AddonPath $configAddonPath `
+                -ShaderPath $configShaderPath `
+                -TexturePath $configTexturePath `
+                -PresetPath $configPresetPath `
+                -ScreenshotPath $configScreenshotPath
             Set-Content -LiteralPath $IniPath -Value $generated -Encoding UTF8
         }
-        Set-IniValue -Path $IniPath -Section 'ADDON' -Key 'AddonPath' -Value $AddonPath
-        Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'EffectSearchPaths' -Value $ShaderPath
-        Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'TextureSearchPaths' -Value $TexturePath
-        Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'PresetPath' -Value $PresetPath
-        Set-IniValue -Path $IniPath -Section 'SCREENSHOT' -Key 'SavePath' -Value $ScreenshotPath
+        Set-IniValue -Path $IniPath -Section 'ADDON' -Key 'AddonPath' -Value $configAddonPath
+        Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'EffectSearchPaths' -Value $configShaderPath
+        Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'TextureSearchPaths' -Value $configTexturePath
+        Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'PresetPath' -Value $configPresetPath
+        Set-IniValue -Path $IniPath -Section 'SCREENSHOT' -Key 'SavePath' -Value $configScreenshotPath
     }
     if ($Force -or -not (Test-Path -LiteralPath $PresetPath -PathType Leaf)) {
         if (Test-Path -LiteralPath $reshadePresetTemplate -PathType Leaf) {
@@ -799,7 +806,7 @@ function Reset-PluginConfigurations {
             @{ Section = 'Log'; Key = 'LogFileName'; Value = 'OptiScaler.log' },
             @{ Section = 'Log'; Key = 'LogAsync'; Value = 'false' },
             @{ Section = 'Log'; Key = 'LogAsyncThreads'; Value = '1' },
-            @{ Section = 'Libraries'; Key = 'OptiDllPath'; Value = $optiDir },
+            @{ Section = 'Libraries'; Key = 'OptiDllPath'; Value = '.' },
             @{ Section = 'Plugins'; Key = 'Path'; Value = 'auto' },
             @{ Section = 'Plugins'; Key = 'LoadAsiPlugins'; Value = 'false' },
             @{ Section = 'Plugins'; Key = 'LoadReshade'; Value = 'false' }
@@ -935,7 +942,7 @@ if (-not $DisableOptiScaler) {
     Set-IniValue -Path $optiIni -Section 'FSR' -Key 'Fsr4Update' -Value 'true'
     Set-IniValue -Path $optiIni -Section 'Plugins' -Key 'LoadAsiPlugins' -Value 'false'
     Set-IniValue -Path $optiIni -Section 'Plugins' -Key 'LoadReshade' -Value 'false'
-    Set-IniValue -Path $optiIni -Section 'Libraries' -Key 'OptiDllPath' -Value $optiDir
+    Set-IniValue -Path $optiIni -Section 'Libraries' -Key 'OptiDllPath' -Value '.'
     Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogToFile' -Value 'true'
     Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogLevel' -Value '4'
     Set-IniValue -Path $optiIni -Section 'Log' -Key 'SingleFile' -Value 'true'
