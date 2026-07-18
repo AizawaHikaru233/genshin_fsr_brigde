@@ -35,10 +35,7 @@ Lite 包内置：
 
 ## 配置与目录
 
-OptiScaler 和 ReShade 各自从组件目录读取配置。发布模板位于：
-
-- `payload/OptiScaler/default_config/`
-- `payload/ReShade/default_config/`
+OptiScaler 和 ReShade 各自从组件目录读取运行配置。不会随组件目录替换而删除的发布模板统一位于 `payload/default_config/`。
 
 模板不使用维护者本机配置，不包含旧 preset、绝对用户路径或运行状态。首次安装时优先使用包内对应版本已有的官方配置作为模板；仅当资源中不存在所需模板时，安装器才创建最小默认文件。
 

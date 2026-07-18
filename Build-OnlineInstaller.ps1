@@ -100,8 +100,16 @@ function Assert-RequiredFiles {
 
 function Assert-ComponentConfigLayout {
     param([string]$Path)
-    if (Test-Path -LiteralPath (Join-Path $Path 'payload\default_config')) {
-        throw "发布目录仍包含旧的全局 default_config: $Path"
+    $defaultConfig = Join-Path $Path 'payload\default_config'
+    foreach ($required in @('OptiScaler.ini', 'OptiScaler-UpscalingFiles.json', 'ReShade.ini', 'ReShadePreset.ini')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $defaultConfig $required) -PathType Leaf)) {
+            throw "发布目录缺少独立默认配置: payload\default_config\$required"
+        }
+    }
+    foreach ($nested in @('payload\OptiScaler\default_config', 'payload\ReShade\default_config')) {
+        if (Test-Path -LiteralPath (Join-Path $Path $nested) -PathType Container) {
+            throw "发布目录仍包含组件内部默认配置: $nested"
+        }
     }
     foreach ($runtimeConfig in @('payload\ReShade\ReShade.ini', 'payload\ReShade\ReShadePreset.ini')) {
         if (Test-Path -LiteralPath (Join-Path $Path $runtimeConfig) -PathType Leaf) {
@@ -148,9 +156,10 @@ function Build-FpsUnlockOnlinePackage {
             Copy-Item -Destination $stagePayload -Recurse -Force
         $stageOpti = Join-Path $stagePayload 'OptiScaler'
         $stageReShade = Join-Path $stagePayload 'ReShade'
-        New-Item -ItemType Directory -Force -Path $stageOpti, $stageReShade | Out-Null
-        Copy-Item -LiteralPath $sharedOptiDefaultConfig -Destination (Join-Path $stageOpti 'default_config') -Recurse -Force
-        Copy-Item -LiteralPath $sharedReShadeDefaultConfig -Destination (Join-Path $stageReShade 'default_config') -Recurse -Force
+        $stageDefaultConfig = Join-Path $stagePayload 'default_config'
+        New-Item -ItemType Directory -Force -Path $stageOpti, $stageReShade, $stageDefaultConfig | Out-Null
+        Get-ChildItem -LiteralPath $sharedOptiDefaultConfig -File -Force | Copy-Item -Destination $stageDefaultConfig -Force
+        Get-ChildItem -LiteralPath $sharedReShadeDefaultConfig -File -Force | Copy-Item -Destination $stageDefaultConfig -Force
         Remove-Item -LiteralPath (Join-Path $stageReShade 'ReShade.ini'), (Join-Path $stageReShade 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
 
         Assert-RequiredFiles -Path $stage -RelativePaths @(
@@ -163,10 +172,10 @@ function Build-FpsUnlockOnlinePackage {
             'component-manifest.json',
             'Feedback.txt',
             'Package-Version.txt',
-            'payload\OptiScaler\default_config\OptiScaler.ini',
-            'payload\OptiScaler\default_config\OptiScaler-UpscalingFiles.json',
-            'payload\ReShade\default_config\ReShade.ini',
-            'payload\ReShade\default_config\ReShadePreset.ini',
+            'payload\default_config\OptiScaler.ini',
+            'payload\default_config\OptiScaler-UpscalingFiles.json',
+            'payload\default_config\ReShade.ini',
+            'payload\default_config\ReShadePreset.ini',
             'payload\Bridge\Dx11FsrBridge.dll',
             'payload\AntiPlayerMosaic\AntiPlayerMosaic.dll',
             'payload\ReShade\ReShade64.dll',
@@ -183,8 +192,8 @@ function Build-FpsUnlockOnlinePackage {
         $entries = Get-ZipEntries -ArchivePath $archivePath
         foreach ($required in @(
             '一键配置.bat', 'Configure.ps1', 'Feedback.txt', 'Package-Version.txt',
-            'payload\OptiScaler\default_config\OptiScaler.ini', 'payload\OptiScaler\default_config\OptiScaler-UpscalingFiles.json',
-            'payload\ReShade\default_config\ReShade.ini', 'payload\ReShade\default_config\ReShadePreset.ini',
+            'payload\default_config\OptiScaler.ini', 'payload\default_config\OptiScaler-UpscalingFiles.json',
+            'payload\default_config\ReShade.ini', 'payload\default_config\ReShadePreset.ini',
             'payload\Bridge\Dx11FsrBridge.dll', 'payload\ReShade\ReShade64.dll'
         )) {
             if ($entries -notcontains $required) { throw "FPS Unlock 在线 ZIP 缺少文件: $required" }
@@ -231,9 +240,10 @@ function Build-FufuOnlinePackage {
         Get-ChildItem -LiteralPath (Join-Path $source 'payload\ReShade') -Force |
             Copy-Item -Destination $stageReShade -Recurse -Force
         $stageOpti = Join-Path $stagePayload 'OptiScaler'
-        New-Item -ItemType Directory -Force -Path $stageOpti | Out-Null
-        Copy-Item -LiteralPath $sharedOptiDefaultConfig -Destination (Join-Path $stageOpti 'default_config') -Recurse -Force
-        Copy-Item -LiteralPath $sharedReShadeDefaultConfig -Destination (Join-Path $stageReShade 'default_config') -Recurse -Force
+        $stageDefaultConfig = Join-Path $stagePayload 'default_config'
+        New-Item -ItemType Directory -Force -Path $stageOpti, $stageDefaultConfig | Out-Null
+        Get-ChildItem -LiteralPath $sharedOptiDefaultConfig -File -Force | Copy-Item -Destination $stageDefaultConfig -Force
+        Get-ChildItem -LiteralPath $sharedReShadeDefaultConfig -File -Force | Copy-Item -Destination $stageDefaultConfig -Force
         Remove-Item -LiteralPath (Join-Path $stageReShade 'ReShade.ini'), (Join-Path $stageReShade 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
 
         Assert-RequiredFiles -Path $stage -RelativePaths @(
@@ -246,10 +256,10 @@ function Build-FufuOnlinePackage {
             'config.ini',
             'payload\Bridge\Dx11FsrBridge.dll',
             'payload\ReShade\ReShade64.dll',
-            'payload\OptiScaler\default_config\OptiScaler.ini',
-            'payload\OptiScaler\default_config\OptiScaler-UpscalingFiles.json',
-            'payload\ReShade\default_config\ReShade.ini',
-            'payload\ReShade\default_config\ReShadePreset.ini',
+            'payload\default_config\OptiScaler.ini',
+            'payload\default_config\OptiScaler-UpscalingFiles.json',
+            'payload\default_config\ReShade.ini',
+            'payload\default_config\ReShadePreset.ini',
             'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64'
         )
         Assert-ComponentConfigLayout -Path $stage
@@ -264,9 +274,9 @@ function Build-FufuOnlinePackage {
         $entries = Get-ZipEntries -ArchivePath $archivePath
         foreach ($required in @(
             '安装到芙芙启动器.bat', 'Install-FufuPlugin.ps1', 'Apply-PackageUpdate.ps1', 'Package-Version.txt',
-            'Feedback.txt', 'payload\OptiScaler\default_config\OptiScaler.ini', 'payload\OptiScaler\default_config\OptiScaler-UpscalingFiles.json',
-            'payload\ReShade\default_config\ReShade.ini',
-            'payload\ReShade\default_config\ReShadePreset.ini', 'FSR-Bridge-Plugin.dll', 'config.ini',
+            'Feedback.txt', 'payload\default_config\OptiScaler.ini', 'payload\default_config\OptiScaler-UpscalingFiles.json',
+            'payload\default_config\ReShade.ini',
+            'payload\default_config\ReShadePreset.ini', 'FSR-Bridge-Plugin.dll', 'config.ini',
             'payload\Bridge\Dx11FsrBridge.dll'
         )) {
             if ($entries -notcontains $required) { throw "Fufu 在线 ZIP 缺少文件: $required" }

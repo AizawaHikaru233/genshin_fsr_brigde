@@ -27,7 +27,8 @@ $selfUpdateRepository = 'AizawaHikaru233/genshin_fsr_brigde'
 $selfUpdateHelperPath = Join-Path $root 'Apply-PackageUpdate.ps1'
 $packagedOptiDirectory = Join-Path $root 'payload\OptiScaler'
 $packagedNvidiaDirectory = Join-Path $root 'payload\NVIDIA\DLSS'
-$optiUpscalingManifest = Join-Path $packagedOptiDirectory 'default_config\OptiScaler-UpscalingFiles.json'
+$packagedDefaultConfigDirectory = Join-Path $root 'payload\default_config'
+$optiUpscalingManifest = Join-Path $packagedDefaultConfigDirectory 'OptiScaler-UpscalingFiles.json'
 $script:SelfUpdateStarted = $false
 $pluginDirectoryName = 'FSR-Bridge-Plugin'
 $legacyPluginDirectoryNames = @('FSRGraphics', 'FSRBootstrap')
@@ -283,11 +284,10 @@ function Install-NvidiaDlssIfNeeded {
         $bundledLicense = Join-Path $BundledNvidiaDirectory 'nvngx_dlss.license.txt'
         if (Test-Path -LiteralPath $bundledDll -PathType Leaf) {
             Assert-NvidiaSignedFile -Path $bundledDll
-            if (-not (Test-Path -LiteralPath $bundledLicense -PathType Leaf)) {
-                throw "内置 NVIDIA DLSS 组件缺少许可证: $bundledLicense"
-            }
             Copy-Item -LiteralPath $bundledDll -Destination $destinationDll -Force
-            Copy-Item -LiteralPath $bundledLicense -Destination $destinationLicense -Force
+            if (Test-Path -LiteralPath $bundledLicense -PathType Leaf) {
+                Copy-Item -LiteralPath $bundledLicense -Destination $destinationLicense -Force
+            }
             Write-Host '已安装内置 NVIDIA DLSS 超分组件。' -ForegroundColor Green
             return
         }
@@ -323,8 +323,9 @@ function Install-NvidiaDlssIfNeeded {
     $sourceLicense = Get-ChildItem -LiteralPath $expanded -Recurse -File |
         Where-Object { $_.Name -ieq 'nvngx_dlss.license.txt' -or $_.FullName -match '(?i)[\\/]external[\\/]ngx-sdk[\\/]license\.txt$' } |
         Select-Object -First 1
-    if ($null -eq $sourceLicense) { throw 'NVIDIA Streamline 官方包缺少 NGX/DLSS 许可证。' }
-    Copy-Item -LiteralPath $sourceLicense.FullName -Destination $destinationLicense -Force
+    if ($null -ne $sourceLicense) {
+        Copy-Item -LiteralPath $sourceLicense.FullName -Destination $destinationLicense -Force
+    }
     Write-Host '已从 NVIDIA 官方来源安装 DLSS 超分组件。' -ForegroundColor Green
 }
 
@@ -468,10 +469,11 @@ function Copy-CuratedOptiScaler {
     }
     foreach ($licenseName in @($manifest.LicenseFiles)) {
         $sourcePath = Join-Path $SourceDirectory "Licenses\$licenseName"
-        if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) { throw "OptiScaler 官方包缺少许可证: $licenseName" }
-        $licenseDirectory = Join-Path $Destination 'Licenses'
-        New-Item -ItemType Directory -Force -Path $licenseDirectory | Out-Null
-        Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $licenseDirectory $licenseName) -Force
+        if (Test-Path -LiteralPath $sourcePath -PathType Leaf) {
+            $licenseDirectory = Join-Path $Destination 'Licenses'
+            New-Item -ItemType Directory -Force -Path $licenseDirectory | Out-Null
+            Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $licenseDirectory $licenseName) -Force
+        }
     }
     foreach ($licenseName in @($manifest.OptionalLicenseFiles)) {
         $sourcePath = Join-Path $SourceDirectory "Licenses\$licenseName"
@@ -481,17 +483,15 @@ function Copy-CuratedOptiScaler {
             Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $licenseDirectory $licenseName) -Force
         }
     }
-    $packagedDefaultConfig = Join-Path $packagedOptiDirectory 'default_config'
-    if (-not (Test-Path -LiteralPath $packagedDefaultConfig -PathType Container)) {
-        throw "缺少 OptiScaler 默认配置目录: $packagedDefaultConfig"
+    if (-not (Test-Path -LiteralPath $packagedDefaultConfigDirectory -PathType Container)) {
+        throw "缺少独立默认配置目录: $packagedDefaultConfigDirectory"
     }
-    Copy-Item -LiteralPath $packagedDefaultConfig -Destination (Join-Path $Destination 'default_config') -Recurse -Force
     $sourceIni = Join-Path $SourceDirectory 'OptiScaler.default.ini'
     if (-not (Test-Path -LiteralPath $sourceIni -PathType Leaf)) {
         $sourceIni = Join-Path $SourceDirectory 'OptiScaler.ini'
     }
     if (-not (Test-Path -LiteralPath $sourceIni -PathType Leaf)) {
-        $sourceIni = Join-Path $packagedOptiDirectory 'default_config\OptiScaler.ini'
+        $sourceIni = Join-Path $packagedDefaultConfigDirectory 'OptiScaler.ini'
     }
     if (-not (Test-Path -LiteralPath $sourceIni -PathType Leaf)) { throw 'OptiScaler 包和脚本资源均缺少 OptiScaler.ini 模板。' }
     $defaultIni = Join-Path $Destination 'OptiScaler.default.ini'
@@ -507,11 +507,10 @@ function Assert-Bundle {
         'config.ini',
         'payload\Bridge\Dx11FsrBridge.dll',
         'payload\ReShade\ReShade64.dll',
-        'payload\OptiScaler\default_config\OptiScaler.ini',
-        'payload\OptiScaler\default_config\OptiScaler-UpscalingFiles.json',
-        'payload\ReShade\default_config\ReShade.ini',
-        'payload\ReShade\default_config\ReShadePreset.ini',
-        'payload\ReShade\LICENSE-ReShade-BSD-3-Clause.txt',
+        'payload\default_config\OptiScaler.ini',
+        'payload\default_config\OptiScaler-UpscalingFiles.json',
+        'payload\default_config\ReShade.ini',
+        'payload\default_config\ReShadePreset.ini',
         'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64'
     )) {
         if (-not (Test-Path -LiteralPath (Join-Path $bundle $relativePath) -PathType Leaf)) {
@@ -604,6 +603,7 @@ function Install-FufuPlugin {
             Remove-Item -LiteralPath $stageDefaultConfigDirectory -Recurse -Force
         }
         New-Item -ItemType Directory -Force -Path $stagePayloadDirectory | Out-Null
+        Copy-Item -LiteralPath $packagedDefaultConfigDirectory -Destination $stageDefaultConfigDirectory -Recurse -Force
 
         $stagePluginConfig = Join-Path $stageDirectory 'config.ini'
         if ($Core) {
@@ -650,7 +650,7 @@ function Install-FufuPlugin {
             Copy-Item -LiteralPath (Join-Path $bundle 'payload\ReShade') -Destination $stageReShadeDirectory -Recurse -Force
             foreach ($fileName in @('ReShade.ini', 'ReShadePreset.ini')) {
                 $stageConfig = Join-Path $stageReShadeDirectory $fileName
-                Copy-Item -LiteralPath (Join-Path $stageReShadeDirectory "default_config\$fileName") -Destination $stageConfig -Force
+                Copy-Item -LiteralPath (Join-Path $stageDefaultConfigDirectory $fileName) -Destination $stageConfig -Force
             }
             $finalReShadeDirectory = Join-Path $targetDirectory 'payload\ReShade'
             $finalShaderDirectory = Join-Path $finalReShadeDirectory 'reshade-shaders'
@@ -823,9 +823,9 @@ function Start-PackageSelfUpdate {
         foreach ($required in @(
             'Install-FufuPlugin.ps1', 'Apply-PackageUpdate.ps1', 'Package-Version.txt',
             'FSR-Bridge-Plugin.dll', 'config.ini', 'payload\Bridge\Dx11FsrBridge.dll',
-            'payload\OptiScaler\default_config\OptiScaler.ini', 'payload\OptiScaler\default_config\OptiScaler-UpscalingFiles.json',
-            'payload\ReShade\default_config\ReShade.ini',
-            'payload\ReShade\default_config\ReShadePreset.ini'
+            'payload\default_config\OptiScaler.ini', 'payload\default_config\OptiScaler-UpscalingFiles.json',
+            'payload\default_config\ReShade.ini',
+            'payload\default_config\ReShadePreset.ini'
         )) {
             if (-not (Test-Path -LiteralPath (Join-Path $expanded $required) -PathType Leaf)) {
                 throw "更新包缺少文件: $required"

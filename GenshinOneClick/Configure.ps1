@@ -35,14 +35,15 @@ $bridgeDll = Join-Path $bridgeDir 'Dx11FsrBridge.dll'
 $optiDll = Join-Path $optiDir 'OptiScaler.dll'
 $optiIni = Join-Path $optiDir 'OptiScaler.ini'
 $optiDefaultIni = Join-Path $optiDir 'OptiScaler.default.ini'
-$packagedOptiTemplateDir = Join-Path $optiDir 'default_config'
+$packagedDefaultConfigDir = Join-Path $payload 'default_config'
+$packagedOptiTemplateDir = $packagedDefaultConfigDir
 $sharedOptiTemplateDir = Join-Path (Split-Path -Parent $root) 'SharedResources\OptiScaler\default_config'
 $optiTemplateDir = if (Test-Path -LiteralPath $packagedOptiTemplateDir -PathType Container) {
     $packagedOptiTemplateDir
 } else {
     $sharedOptiTemplateDir
 }
-$packagedReShadeTemplateDir = Join-Path $reshadeDir 'default_config'
+$packagedReShadeTemplateDir = $packagedDefaultConfigDir
 $sharedReShadeTemplateDir = Join-Path (Split-Path -Parent $root) 'SharedResources\ReShade\default_config'
 $reShadeTemplateDir = if (Test-Path -LiteralPath $packagedReShadeTemplateDir -PathType Container) {
     $packagedReShadeTemplateDir
@@ -289,10 +290,11 @@ function Copy-CuratedOptiScaler {
     }
     foreach ($licenseName in @($manifest.LicenseFiles)) {
         $sourcePath = Join-Path $SourceDirectory ("Licenses\" + [string]$licenseName)
-        Assert-File -Path $sourcePath
-        $licenseDirectory = Join-Path $Destination 'Licenses'
-        New-Item -ItemType Directory -Force -Path $licenseDirectory | Out-Null
-        Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $licenseDirectory ([string]$licenseName)) -Force
+        if (Test-Path -LiteralPath $sourcePath -PathType Leaf) {
+            $licenseDirectory = Join-Path $Destination 'Licenses'
+            New-Item -ItemType Directory -Force -Path $licenseDirectory | Out-Null
+            Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $licenseDirectory ([string]$licenseName)) -Force
+        }
     }
     foreach ($licenseName in @($manifest.OptionalLicenseFiles)) {
         $sourcePath = Join-Path $SourceDirectory ("Licenses\" + [string]$licenseName)
@@ -407,8 +409,6 @@ function Install-OptiScaler {
         $stagedConfigTemplate = Join-Path $temporaryDirectory 'OptiScaler.template.ini'
         Copy-Item -LiteralPath $configTemplate -Destination $stagedConfigTemplate -Force
         Get-OptiScalerUpscalingManifest | Out-Null
-        $stagedDefaultConfig = Join-Path $temporaryDirectory 'OptiScaler-default-config'
-        Copy-Item -LiteralPath $optiTemplateDir -Destination $stagedDefaultConfig -Recurse -Force
         $preservedNvidiaDirectory = Join-Path $temporaryDirectory 'preserved-nvidia'
         foreach ($fileName in @('nvngx_dlss.dll', 'nvngx_dlssg.dll', 'nvngx_dlssd.dll', 'nvngx_dlss.license.txt')) {
             $existingFile = Join-Path $optiDir $fileName
@@ -419,7 +419,6 @@ function Install-OptiScaler {
         }
         if (Test-Path -LiteralPath $optiDir) { Remove-Item -LiteralPath $optiDir -Recurse -Force }
         Copy-CuratedOptiScaler -SourceDirectory $sourceDirectory -Destination $optiDir
-        Copy-Item -LiteralPath $stagedDefaultConfig -Destination (Join-Path $optiDir 'default_config') -Recurse -Force
         Copy-Item -LiteralPath $stagedConfigTemplate -Destination $optiDefaultIni -Force
         Copy-Item -LiteralPath $stagedConfigTemplate -Destination $optiIni -Force
         if (Test-Path -LiteralPath $fakeNvapiIni -PathType Leaf) {

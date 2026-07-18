@@ -626,8 +626,8 @@ function Start-PackageSelfUpdate {
         Expand-Archive -LiteralPath $packagePath -DestinationPath $expanded -Force
         foreach ($required in @(
             'Installer.ps1', 'Configure.ps1', 'Localization.ps1', 'Apply-PackageUpdate.ps1',
-            'payload\OptiScaler\default_config\OptiScaler.ini', 'payload\OptiScaler\default_config\OptiScaler-UpscalingFiles.json',
-            'payload\ReShade\default_config\ReShade.ini', 'payload\ReShade\default_config\ReShadePreset.ini',
+            'payload\default_config\OptiScaler.ini', 'payload\default_config\OptiScaler-UpscalingFiles.json',
+            'payload\default_config\ReShade.ini', 'payload\default_config\ReShadePreset.ini',
             'payload\Bridge\Dx11FsrBridge.dll'
         )) {
             if (-not (Test-Path -LiteralPath (Join-Path $expanded $required) -PathType Leaf)) { throw (Convert-InstallerText -Value "更新包缺少文件: $required") }
