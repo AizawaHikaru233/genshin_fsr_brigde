@@ -1,101 +1,100 @@
 # Genshin FSR Bridge
 
-面向原神 Windows DX11 客户端的 FSR2 ABI 桥接项目。Bridge 在游戏进程中提供标准 FSR2 导出，并把原神的上采样调用转接给 OptiScaler 等兼容实现。
+面向原神 Windows DX11 客户端的 FSR2 ABI 桥接 DLL。它在游戏进程中提供标准 FSR2 导出，并把游戏的上采样调用转接给外部兼容实现，例如 OptiScaler。
 
-本项目不是 HoYoverse、miHoYo、AMD、OptiScaler 或芙芙启动器的官方项目。GitHub 仓库与 Lite 发布包不分发 OptiScaler、FPS Unlocker 或 NVIDIA 运行库；安装脚本只从对应项目的官方来源下载，或要求用户手动选择本地文件。
+本项目不是 HoYoverse、AMD 或 OptiScaler 的官方项目；不包含 OptiScaler、FSR SDK 运行时、显卡驱动组件或其他超分 DLL。
 
-Bridge 的详细技术说明见 [Dx11FsrBridge/README.md](Dx11FsrBridge/README.md)，英文技术说明见 [Dx11FsrBridge/README_EN.md](Dx11FsrBridge/README_EN.md)。
+本仓库同时包含 `AntiPlayerMosaic/` 子项目。它是独立构建的原神马赛克修复与 UID 隐藏插件，具体用法见该目录的 README。
+
+英文说明见 [README_EN.md](README_EN.md)。
 
 ## 支持范围与风险声明
 
 - 目标支持原神中国服与全球服的 Windows DX11 客户端。
-- 当前版本仅针对已验证的游戏版本和渲染路径；游戏更新后不保证继续兼容。
+- 仅在 6.7（「月之八」）测试；不保证与其他游戏版本或客户端环境兼容。
 - 本项目与 HoYoverse、miHoYo、《原神》及 Genshin Impact 均无关联，也未获得其认可或授权；相关名称与商标归其各自权利人所有。
 - 使用第三方 DLL、注入器、Mod 或图形插件可能违反游戏规则，并可能导致账号限制或封禁。使用者须自行评估风险并承担全部责任。
 
-## 发布包
+## 帧生成分支
 
-GitHub 只发布两种联网 Lite 包：
+`frame-generation` 分支中的帧生成功能基于 `OptiScaler 0.10.0-pre1` 构建。低于 `0.10.0-pre1` 的 OptiScaler 不支持该帧生成功能。
 
-- FPS Unlock 方案：`GenshinFSRBridge.Lite_v版本号.zip`
-- 芙芙启动器插件方案：`FuFuLauncherPlugin.Lite_v版本号.zip`
+## Lite 发布包
 
-两种包共用 Bridge、OptiScaler 默认配置和 ReShade 默认配置，但使用不同的注入方式：
+`GenshinOneClick/` 包含 Lite 安装器的完整脚本、默认配置、官方 ReShade Add-on DLL 和 HDR 着色器。FPS Unlocker 与 OptiScaler 不随 Lite 包或本仓库分发，安装器会从其官方来源下载或要求用户手动选择。
 
-- FPS Unlock 方案通过 Genshin FPS Unlock 按顺序加载 Bridge、OptiScaler、反虚化插件和 ReShade。
-- 芙芙方案安装为 `FSR-Bridge-Plugin`，由芙芙启动器加载 Bootstrap，再由 Bootstrap 加载同一插件目录中的 Bridge、OptiScaler 和 ReShade。芙芙启动器已提供反虚化相关功能，因此该包不包含 `AntiPlayerMosaic`。
-
-Lite 包不内置 FPS Unlocker、OptiScaler 或 NVIDIA DLSS 组件。安装器会固定获取非帧生成版使用的 OptiScaler 0.9.3，并在 NVIDIA 显卡需要 DLSS 时从 NVIDIA 官方 Streamline 发布包补全对应组件。
-
-`frame-generation` 分支保留基于 OptiScaler 0.10.0-pre1 的帧生成实现，不进入 `main` 的 Lite 发布流程。
-
-## 使用方法
-
-从 [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases) 下载对应 Lite 压缩包并完整解压：
-
-- FPS Unlock 包运行 `一键配置.bat`，也可运行 `GenshinFSRBridgeTools.bat` 使用英文界面。
-- 芙芙包运行 `安装到芙芙启动器.bat`，并手动选择 `FufuLauncher.exe` 所在目录。
-
-两套管理脚本都支持安装、卸载、组件更新和脚本自身更新，并保存上次由用户确认的安装位置。
-
-Bridge 本身不执行 FSR、DLSS、XeSS 或其他超分算法。它只暴露标准 FSR2 接口并转接原神的 DX11 上采样输入，实际后端由 OptiScaler 负责。
-
-## 功能
-
-- 接管原神原生 TAAU/FSR 上采样路径并提供标准 FSR2 ABI。
-- 向外部超分后端传递颜色、深度、运动矢量、抖动和历史资源。
-- 动态读取输入与输出分辨率，不硬编码 0.6、0.8 或 0.9 渲染精度。
-- 正式版只保留基础诊断日志，每次重新运行覆盖上一轮日志；单次运行不限制日志大小。
-- 正式版不集成逐帧探针、资源导出或实验渲染路径。
-
-## 仓库结构
-
-- `Dx11FsrBridge/`：Bridge 源码、配置、技术文档和构建依赖。
-- `FufuGraphicsPlugin/`：芙芙启动器 Bootstrap 插件与安装脚本。
-- `GenshinOneClick/`：FPS Unlock 交互安装器、组件清单和 Lite 资源模板。
-- `AntiPlayerMosaic/`：反虚化、隐藏 UID 与水下马赛克修复插件。
-- `SharedResources/`：两种安装方案共用的全新 OptiScaler 与 ReShade 默认配置模板。
-- `RenoDX-Genshin/`：经授权归档的 RenoDX Add-on。
-- `Build-OnlineInstaller.ps1`：一次构建两种 Lite 包并生成 GitHub Release 英文别名。
-
-## 构建
-
-需要 Visual Studio 2022（含 C++ 桌面开发组件）、Windows SDK、CMake 3.20 或更新版本，以及仓库中声明的第三方构建依赖。
-
-构建 Bridge：
-
-```powershell
-cmake -S .\Dx11FsrBridge -B .\build-package-bridge -A x64 `
-  -DDX11FSRBRIDGE_RELEASE_RUNTIME=ON `
-  -DDX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=ON
-cmake --build .\build-package-bridge --config Release
-```
-
-在 `GenshinOneClick/payload` 中准备好自有 DLL 与允许分发的 Lite 资源后，一次生成两种在线包：
+两个自有 DLL 是编译产物，不提交到仓库。要生成与 GitHub Actions 相同的 Lite ZIP，请在 Windows 上运行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release
 ```
 
-中文本地包输出到 `dist/`，GitHub Release 英文别名输出到 `dist/github-release/`。GitHub Actions 需要从 Actions 页面手动触发；选择发布并填写标签后，会将两个英文别名上传到对应 Release。
+构建结果位于 `dist\原神解帧FSR插件包Lite_v*.zip` 和 `dist\芙芙启动器插件包Lite_v*.zip`。GitHub Actions 可从 Actions 页面手动触发，并将两个 ZIP 上传为 `GenshinOneClick-Lite-Packages` Artifact；勾选发布选项并填写版本标签时，会以 `GenshinFSRBridge.Lite_v版本号.zip` 和 `FuFuLauncherPlugin.Lite_v版本号.zip` 创建或更新对应 GitHub Release。
 
-## 日志与反馈
+## 功能
 
-正式发行版默认只记录基础错误。复现问题后请不要再次启动游戏，并根据所用方案保留：
+- 通过 DX11 设备与上下文拦截获取原神的 FSR2 调用时机。
+- 提供标准 FSR2 导出，使外部超分工具可以识别 FSR2 接口。
+- 为外部处理器准备颜色、深度、运动向量、抖动和历史资源。
+- 运行时日志默认写入 DLL 同目录的 `Dx11FsrBridge.log`，用于排查加载与 Hook 状态。
+- 正式配置关闭资源导出、逐帧追踪和调试探针，避免额外开销。
+
+## 仓库结构
+
+- 仓库根目录：FSR Bridge 源码、配置与构建文件。
+- `AntiPlayerMosaic/`：反虚化、隐藏 UID 与水下马赛克修复插件。
+- `third_party/`：Bridge 的构建依赖及其原始声明。
+
+## 使用方法
+
+从 [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases) 下载压缩包，解压后运行 `一键配置.bat` 并根据提示安装。英语界面可运行 `GenshinFSRBridgeTools.bat`；也可在安装器主菜单中随时切换中文或 English，选择会自动保存。脚本会按环境自动获取 [Genshin FPS Unlock](https://github.com/34736384/genshin-fps-unlock/releases)、[NVIDIA DLSS 超分组件（`nvngx_dlss.dll`）](https://github.com/NVIDIA-RTX/Streamline/releases) 和 [OptiScaler](https://github.com/optiscaler/OptiScaler/releases)，补全运行环境。
+
+`Dx11FsrBridge.dll` 本身不执行 FSR、DLSS、XeSS 或其他超分算法。它只向外部工具暴露标准 FSR2 接口，并将游戏的 DX11 上采样调用转接到该接口。
+
+也可以使用其他 DLL 注入工具，但必须保证它支持稳定的按序加载。
+
+推荐加载顺序：
+
+1. `Dx11FsrBridge.dll`
+2. `OptiScaler.dll`
+3. `AntiPlayerMosaic.dll`（可选）
+4. `ReShade64.dll`（可选）
+
+仅使用超分桥接时，前两项必须保持该顺序：Bridge 先加载，随后由 [OptiScaler](https://github.com/optiscaler/OptiScaler)（或同类工具）在启动时扫描标准 FSR2 导出并接管。Bridge 不直接加载、修改或捆绑 OptiScaler；后端选择、FSR3/FSR4 模型和其他 OptiScaler 配置均由用户自己的工具安装负责。
+
+## 构建
+
+需要 Visual Studio 2022（含 C++ 桌面开发组件）、Windows SDK 和 CMake 3.20 或更新版本。
+
+```powershell
+cmake -S .\Dx11FsrBridge -B .\build-package-bridge -G "Visual Studio 17 2022" -A x64 `
+  -DDX11FSRBRIDGE_RELEASE_RUNTIME=ON `
+  -DDX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=ON
+cmake --build .\build-package-bridge --config Release
+```
+
+生成的 DLL 与 `Dx11FsrBridge.release.ini` 会位于 `build-package-bridge\Release`。发布配置需要仓库内的 `Dx11FsrBridge\third_party` 目录，其中包含 FSR2 兼容 ABI 头文件和 Microsoft Detours 构建依赖。
+
+`DX11FSRBRIDGE_ENABLE_FSR31_EXPERIMENTAL`、`DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL` 等 CMake 选项仅用于实验，不属于正式运行链路。
+
+## 配置与反馈
+
+DLL 从自身目录读取 `Dx11FsrBridge.ini`。正式发行版默认启用基础日志；请在复现问题后保留并提交：
 
 - `Dx11FsrBridge.log`
-- `OptiScaler.log` 与 `OptiScaler.ini`
-- 安装器生成的最后一次错误日志（若存在）
-- 显卡型号、游戏版本、异常发生阶段和选择的超分模式
+- `Dx11FsrBridge.ini`
+- OptiScaler 的日志与配置（若使用）
+- 显卡型号、游戏版本、异常阶段和选择的超分模式
 
 不要把游戏账号、登录信息或包含个人信息的截图提交到公开 Issue。
 
-## 第三方组件与许可证
+## 第三方组件
 
-- OptiScaler：<https://github.com/optiscaler/OptiScaler>
-- Genshin FPS Unlock：<https://github.com/34736384/genshin-fps-unlock>
-- NVIDIA Streamline：<https://github.com/NVIDIA-RTX/Streamline>
-- ReShade：<https://reshade.me/>
-- ReShade HDR shaders：<https://github.com/EndlesslyFlowering/ReShade_HDR_shaders>
+- FSR2 ABI 头文件与 Microsoft Detours 仅作为构建依赖，保留各自原始许可证与声明。
+- OptiScaler 是独立项目：<https://github.com/optiscaler/OptiScaler>。
+- Lite 资源包含官方 ReShade Add-on DLL（BSD-3-Clause）、[剪刀妹丽丽](https://www.bilibili.com/video/av116861345793770/) 授权再分发的 RenoDX Add-on，以及 Lilium HDR 着色器（GPL-3.0）。RenoDX 的唯一归档源位于 `RenoDX-Genshin/`，打包时会自动同步到 ReShade 载荷；各自许可证与授权记录位于资源目录。
+- 本项目不包含 NVIDIA DLSS、AMD FSR SDK 或 OptiScaler 运行时二进制文件。
 
-各可分发资源的许可证和来源声明随对应目录或发布包保留。本项目 Bridge 源码采用 [GPL-3.0-or-later](Dx11FsrBridge/LICENSE)。
+## 许可证
+
+本项目采用 [GPL-3.0-or-later](Dx11FsrBridge/LICENSE)。你可以使用、修改和再分发代码；分发修改版本时必须同时提供对应完整源码，并以 GPL-3.0-or-later 发布。

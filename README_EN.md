@@ -26,10 +26,10 @@ The frame-generation feature in the `frame-generation` branch is built against `
 The two first-party DLLs are build outputs and are not committed. To generate the same Lite ZIP as GitHub Actions on Windows, run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Build-Package.ps1
+powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release
 ```
 
-The output is written to `dist\原神解帧FSR插件包Lite_v*.zip`. GitHub Actions is manually dispatched from the Actions page and always uploads a ZIP as the `GenshinOneClick-Lite` artifact. When the release option is enabled and a version tag is supplied, it also creates or updates the corresponding GitHub Release.
+The outputs are written to `dist\原神解帧FSR插件包Lite_v*.zip` and `dist\芙芙启动器插件包Lite_v*.zip`. GitHub Actions is manually dispatched from the Actions page and uploads both ZIPs as the `GenshinOneClick-Lite-Packages` artifact. When the release option is enabled and a version tag is supplied, it creates or updates the corresponding GitHub Release with `GenshinFSRBridge.Lite_v<version>.zip` and `FuFuLauncherPlugin.Lite_v<version>.zip`.
 
 ## Features
 
@@ -67,13 +67,13 @@ When only using the upscaling bridge, the first two items must stay in this orde
 Visual Studio 2022 with the Desktop C++ workload, the Windows SDK, and CMake 3.20 or newer are required.
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+cmake -S .\Dx11FsrBridge -B .\build-package-bridge -G "Visual Studio 17 2022" -A x64 `
   -DDX11FSRBRIDGE_RELEASE_RUNTIME=ON `
   -DDX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=ON
-cmake --build build --config Release
+cmake --build .\build-package-bridge --config Release
 ```
 
-The DLL and `Dx11FsrBridge.release.ini` are written to `build\Release`. The release configuration requires the repository `third_party` directory, which contains FSR2-compatible ABI headers and the Microsoft Detours build dependency.
+The DLL and `Dx11FsrBridge.release.ini` are written to `build-package-bridge\Release`. The release configuration requires the repository `Dx11FsrBridge\third_party` directory, which contains FSR2-compatible ABI headers and the Microsoft Detours build dependency.
 
 `DX11FSRBRIDGE_ENABLE_FSR31_EXPERIMENTAL`, `DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL`, and related CMake options are experimental only and are not part of the supported release path.
 
@@ -97,4 +97,4 @@ Do not submit game account information, login details, or screenshots containing
 
 ## License
 
-This project is licensed under [GPL-3.0-or-later](LICENSE). You may use, modify, and redistribute the code; when distributing a modified version, you must provide the corresponding complete source code and license it under GPL-3.0-or-later.
+This project is licensed under [GPL-3.0-or-later](Dx11FsrBridge/LICENSE). You may use, modify, and redistribute the code; when distributing a modified version, you must provide the corresponding complete source code and license it under GPL-3.0-or-later.
