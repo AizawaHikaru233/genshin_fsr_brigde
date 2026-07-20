@@ -26,11 +26,14 @@ jobs:
       - name: Build release DLLs for the Lite package
         shell: pwsh
         run: |
-          cmake -S .\Dx11FsrBridge -B .\build-package-bridge -G "Visual Studio 17 2022" -A x64 `
+          $generator = ((cmake --help | Select-String -Pattern 'Visual Studio [0-9]+ [0-9]{4}' | ForEach-Object { $_.Matches.Value } | Select-Object -Unique) | Select-Object -Last 1)
+          if ([string]::IsNullOrWhiteSpace($generator)) { throw '没有找到可用的 Visual Studio CMake 生成器。' }
+          Write-Host "使用 CMake 生成器: $generator"
+          cmake -S .\Dx11FsrBridge -B .\build-package-bridge -G $generator -A x64 `
             -DDX11FSRBRIDGE_RELEASE_RUNTIME=ON `
             -DDX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=ON
           cmake --build .\build-package-bridge --config Release
-          cmake -S .\AntiPlayerMosaic -B .\build-package-antiplayermosaic -G "Visual Studio 17 2022" -A x64
+          cmake -S .\AntiPlayerMosaic -B .\build-package-antiplayermosaic -G $generator -A x64
           cmake --build .\build-package-antiplayermosaic --config Release
           Copy-Item .\build-package-bridge\Release\Dx11FsrBridge.dll .\GenshinOneClick\payload\Bridge\Dx11FsrBridge.dll -Force
           Copy-Item .\build-package-antiplayermosaic\Release\AntiPlayerMosaic.dll .\GenshinOneClick\payload\AntiPlayerMosaic\AntiPlayerMosaic.dll -Force
