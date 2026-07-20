@@ -23,20 +23,25 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Initialize MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Build release DLLs for the Lite package
         shell: pwsh
         run: |
-          $generator = ((cmake --help | Select-String -Pattern 'Visual Studio [0-9]+ [0-9]{4}' | ForEach-Object { $_.Matches.Value } | Select-Object -Unique) | Select-Object -Last 1)
-          if ([string]::IsNullOrWhiteSpace($generator)) { throw '没有找到可用的 Visual Studio CMake 生成器。' }
-          Write-Host "使用 CMake 生成器: $generator"
-          cmake -S .\Dx11FsrBridge -B .\build-package-bridge -G $generator -A x64 `
+          cmake -S .\Dx11FsrBridge -B .\build-package-bridge -G Ninja `
             -DDX11FSRBRIDGE_RELEASE_RUNTIME=ON `
             -DDX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=ON
           cmake --build .\build-package-bridge --config Release
-          cmake -S .\AntiPlayerMosaic -B .\build-package-antiplayermosaic -G $generator -A x64
+          cmake -S .\AntiPlayerMosaic -B .\build-package-antiplayermosaic -G Ninja
           cmake --build .\build-package-antiplayermosaic --config Release
-          Copy-Item .\build-package-bridge\Release\Dx11FsrBridge.dll .\GenshinOneClick\payload\Bridge\Dx11FsrBridge.dll -Force
-          Copy-Item .\build-package-antiplayermosaic\Release\AntiPlayerMosaic.dll .\GenshinOneClick\payload\AntiPlayerMosaic\AntiPlayerMosaic.dll -Force
+          $bridgeDll = Get-ChildItem .\build-package-bridge -Recurse -File -Filter Dx11FsrBridge.dll | Select-Object -First 1
+          $antiDll = Get-ChildItem .\build-package-antiplayermosaic -Recurse -File -Filter AntiPlayerMosaic.dll | Select-Object -First 1
+          if ($null -eq $bridgeDll -or $null -eq $antiDll) { throw 'CMake 未生成必要的 Lite DLL。' }
+          Copy-Item $bridgeDll.FullName .\GenshinOneClick\payload\Bridge\Dx11FsrBridge.dll -Force
+          Copy-Item $antiDll.FullName .\GenshinOneClick\payload\AntiPlayerMosaic\AntiPlayerMosaic.dll -Force
 
       - name: Build FPS Unlock Lite package
         shell: pwsh
