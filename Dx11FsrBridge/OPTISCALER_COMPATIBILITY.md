@@ -18,4 +18,4 @@ fsr2_get_proc_address_shim_queries mask=0x3F
 fsr2_translation_context_created ... detoured=1
 ```
 
-This contract was checked against the official OptiScaler 0.9.3 source and binary release. Compatible OptiScaler 0.9.x builds can be replaced without rebuilding the Bridge as long as they retain the six standard FSR2 lookups. The external loader remains responsible for the order: `Dx11FsrBridge.dll` first, `OptiScaler.dll` second.
+This contract was checked against the official OptiScaler 0.9.4 binary release. Compatible OptiScaler 0.9.x builds can be replaced without rebuilding the Bridge as long as they retain the six standard FSR2 lookups. The external loader remains responsible for the order: `Dx11FsrBridge.dll` first, `OptiScaler.dll` second.

@@ -3,12 +3,15 @@
 #include <d3d11.h>
 #include <d3d11_3.h>
 #include <d3dcompiler.h>
-#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
+#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS) || defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
 #include <d3d12.h>
 #endif
 #include <dxgi.h>
 #include <dxgi1_2.h>
-#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+#include <dxgi1_5.h>
+#endif
+#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS) || defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
 #include <intrin.h>
 #endif
 
@@ -57,6 +60,11 @@ constexpr std::size_t k_device_vtable_size = 80;
 constexpr std::size_t k_swapchain_vtable_size = 41;
 constexpr std::size_t k_factory_vtable_size = 32;
 constexpr std::size_t k_factory2_vtable_size = 40;
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+constexpr bool k_color_diagnostics_enabled = true;
+#else
+constexpr bool k_color_diagnostics_enabled = false;
+#endif
 constexpr std::size_t k_idx_device_create_buffer = 3;
 constexpr std::size_t k_idx_device_create_texture_2d = 5;
 constexpr std::size_t k_idx_device_create_vertex_shader = 12;
@@ -90,6 +98,11 @@ constexpr std::size_t k_idx_set_fullscreen_state = k_swapchain_base_methods + 2;
 constexpr std::size_t k_idx_get_fullscreen_state = k_swapchain_base_methods + 3;
 constexpr std::size_t k_idx_resize_buffers = k_swapchain_base_methods + 5;
 constexpr std::size_t k_idx_resize_target = k_swapchain_base_methods + 6;
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+constexpr std::size_t k_idx_check_color_space_support = 37;
+constexpr std::size_t k_idx_set_color_space1 = 38;
+constexpr std::size_t k_idx_set_hdr_metadata = 40;
+#endif
 constexpr std::size_t k_idx_factory_create_swap_chain = 10;
 constexpr std::size_t k_idx_factory2_create_swap_chain_for_hwnd = 15;
 
@@ -537,6 +550,11 @@ using set_fullscreen_state_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, B
 using get_fullscreen_state_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, BOOL *, IDXGIOutput **);
 using resize_buffers_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 using resize_target_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, const DXGI_MODE_DESC *);
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+using check_color_space_support_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain3 *, DXGI_COLOR_SPACE_TYPE, UINT *);
+using set_color_space1_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain3 *, DXGI_COLOR_SPACE_TYPE);
+using set_hdr_metadata_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain4 *, DXGI_HDR_METADATA_TYPE, UINT, void *);
+#endif
 
 create_device_and_swapchain_fn g_original_create_device_and_swapchain = nullptr;
 create_device_fn g_original_create_device = nullptr;
@@ -557,6 +575,13 @@ set_fullscreen_state_fn g_original_set_fullscreen_state = nullptr;
 get_fullscreen_state_fn g_original_get_fullscreen_state = nullptr;
 resize_buffers_fn g_original_resize_buffers = nullptr;
 resize_target_fn g_original_resize_target = nullptr;
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+check_color_space_support_fn g_original_check_color_space_support = nullptr;
+set_color_space1_fn g_original_set_color_space1 = nullptr;
+set_hdr_metadata_fn g_original_set_hdr_metadata = nullptr;
+std::mutex g_fsr2_color_diagnostics_mutex;
+std::string g_last_fsr2_color_diagnostics;
+#endif
 vs_set_constant_buffers_fn g_original_vs_set_constant_buffers = nullptr;
 vs_set_shader_fn g_original_vs_set_shader = nullptr;
 ps_set_shader_resources_fn g_original_ps_set_shader_resources = nullptr;
@@ -2634,10 +2659,22 @@ void log_line(const std::string &line)
         "failed", "failure", "error", "invalid", "mismatch", "exception",
         "unavailable", "unresolved", "unsupported", "missing", "refusing"
     };
+    static constexpr std::array<std::string_view, 16> basic_terms {
+        "draw_hook_active", "draw_indexed_hook_active", "texture_create_hook_active",
+        "dxgi_color_hooks_active", "fsr2_get_proc_address_shim_ready",
+        "fsr2_translation_context_created", "fsr2_translation_context_reset",
+        "fsr2_translation_blocked", "fsr2_translation_fallback",
+        "fsr2_upscaler_stall_detected", "fsr2_gpu_queue_backlog",
+        "fsr2_dynamic_color_path_invalidated", "fsr2_color_path_switch",
+        "dlssg_dxgi_workaround auto_enabled", "optiscaler_ngx_", "render_scale_menu "
+    };
     const bool startup_marker = line.starts_with("Dx11FsrBridge active");
     const bool error_message = std::any_of(error_terms.begin(), error_terms.end(),
         [&](std::string_view term) { return line.find(term) != std::string::npos; });
-    if (!startup_marker && !error_message)
+    const bool basic_message = line.starts_with("warning ") ||
+        std::any_of(basic_terms.begin(), basic_terms.end(),
+            [&](std::string_view term) { return line.find(term) != std::string::npos; });
+    if (!startup_marker && !error_message && !basic_message)
         return;
 #endif
     std::lock_guard lock(g_log_mutex);
@@ -2658,7 +2695,7 @@ void reset_log()
     std::ofstream(g_log_path, std::ios::trunc).close();
 }
 
-#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
+#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS) || defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
 std::string module_path_from_address(void *address)
 {
     HMODULE module = nullptr;
@@ -2674,7 +2711,9 @@ std::string module_path_from_address(void *address)
     const DWORD length = GetModuleFileNameA(module, path, static_cast<DWORD>(std::size(path)));
     return length != 0 ? std::string(path, length) : "unknown";
 }
+#endif
 
+#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
 std::string describe_dxgi_swapchain_device(IUnknown *device)
 {
     if (device == nullptr)
@@ -2794,6 +2833,67 @@ std::string describe_dxgi_window(HWND hwnd)
         << " style=" << hex64(static_cast<std::uint64_t>(GetWindowLongPtrW(hwnd, GWL_STYLE)))
         << " exstyle=" << hex64(static_cast<std::uint64_t>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)));
     return out.str();
+}
+#endif
+
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+const char *dxgi_format_name(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_UNKNOWN: return "UNKNOWN";
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return "R16G16B16A16_FLOAT";
+    case DXGI_FORMAT_R10G10B10A2_UNORM: return "R10G10B10A2_UNORM";
+    case DXGI_FORMAT_R11G11B10_FLOAT: return "R11G11B10_FLOAT";
+    case DXGI_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return "R8G8B8A8_UNORM_SRGB";
+    case DXGI_FORMAT_R16G16_FLOAT: return "R16G16_FLOAT";
+    case DXGI_FORMAT_R32_FLOAT: return "R32_FLOAT";
+    case DXGI_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return "B8G8R8A8_UNORM_SRGB";
+    default: return "OTHER";
+    }
+}
+
+std::string describe_dxgi_format(DXGI_FORMAT format)
+{
+    return std::to_string(static_cast<unsigned>(format)) + "/" + dxgi_format_name(format);
+}
+
+const char *color_space_name(DXGI_COLOR_SPACE_TYPE color_space)
+{
+    switch (color_space)
+    {
+    case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709: return "RGB_FULL_G22_NONE_P709";
+    case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709: return "RGB_FULL_G10_NONE_P709";
+    case DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709: return "RGB_STUDIO_G22_NONE_P709";
+    case DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P2020: return "RGB_STUDIO_G22_NONE_P2020";
+    case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020: return "RGB_FULL_G2084_NONE_P2020";
+    case DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020: return "RGB_STUDIO_G2084_NONE_P2020";
+    case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020: return "RGB_FULL_G22_NONE_P2020";
+    case DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020: return "YCBCR_STUDIO_GHLG_TOPLEFT_P2020";
+    case DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020: return "YCBCR_FULL_GHLG_TOPLEFT_P2020";
+    default: return "OTHER";
+    }
+}
+
+const char *hdr_metadata_type_name(DXGI_HDR_METADATA_TYPE type)
+{
+    switch (type)
+    {
+    case DXGI_HDR_METADATA_TYPE_NONE: return "NONE";
+    case DXGI_HDR_METADATA_TYPE_HDR10: return "HDR10";
+    default: return "OTHER";
+    }
+}
+
+DXGI_FORMAT shader_resource_view_format(ID3D11ShaderResourceView *view)
+{
+    if (view == nullptr)
+        return DXGI_FORMAT_UNKNOWN;
+    D3D11_SHADER_RESOURCE_VIEW_DESC desc {};
+    view->GetDesc(&desc);
+    return desc.Format;
 }
 #endif
 
@@ -4242,6 +4342,73 @@ HRESULT STDMETHODCALLTYPE hooked_resize_target(IDXGISwapChain *swapchain, const 
         ? g_original_resize_target(swapchain, target_parameters)
         : DXGI_ERROR_INVALID_CALL;
 }
+
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+HRESULT STDMETHODCALLTYPE hooked_check_color_space_support(
+    IDXGISwapChain3 *swapchain,
+    DXGI_COLOR_SPACE_TYPE color_space,
+    UINT *support)
+{
+    void *const caller = _ReturnAddress();
+    const HRESULT hr = g_original_check_color_space_support != nullptr
+        ? g_original_check_color_space_support(swapchain, color_space, support)
+        : DXGI_ERROR_INVALID_CALL;
+    log_line("dxgi_color_check swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)) +
+        " caller=" + module_path_from_address(caller) +
+        " color_space=" + std::to_string(static_cast<unsigned>(color_space)) + "/" + color_space_name(color_space) +
+        " hr=" + hex32(static_cast<std::uint32_t>(hr)) +
+        " support=" + (support != nullptr ? hex32(*support) : std::string("null")));
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hooked_set_color_space1(
+    IDXGISwapChain3 *swapchain,
+    DXGI_COLOR_SPACE_TYPE color_space)
+{
+    void *const caller = _ReturnAddress();
+    const HRESULT hr = g_original_set_color_space1 != nullptr
+        ? g_original_set_color_space1(swapchain, color_space)
+        : DXGI_ERROR_INVALID_CALL;
+    log_line("dxgi_color_set swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)) +
+        " caller=" + module_path_from_address(caller) +
+        " color_space=" + std::to_string(static_cast<unsigned>(color_space)) + "/" + color_space_name(color_space) +
+        " hr=" + hex32(static_cast<std::uint32_t>(hr)));
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hooked_set_hdr_metadata(
+    IDXGISwapChain4 *swapchain,
+    DXGI_HDR_METADATA_TYPE type,
+    UINT size,
+    void *metadata)
+{
+    void *const caller = _ReturnAddress();
+    const HRESULT hr = g_original_set_hdr_metadata != nullptr
+        ? g_original_set_hdr_metadata(swapchain, type, size, metadata)
+        : DXGI_ERROR_INVALID_CALL;
+
+    std::ostringstream message;
+    message << "dxgi_hdr_metadata swapchain=" << hex64(reinterpret_cast<std::uintptr_t>(swapchain))
+        << " caller=" << module_path_from_address(caller)
+        << " type=" << static_cast<unsigned>(type) << "/" << hdr_metadata_type_name(type)
+        << " size=" << size
+        << " hr=" << hex32(static_cast<std::uint32_t>(hr));
+    if (type == DXGI_HDR_METADATA_TYPE_HDR10 && metadata != nullptr && size >= sizeof(DXGI_HDR_METADATA_HDR10))
+    {
+        const auto &hdr10 = *static_cast<const DXGI_HDR_METADATA_HDR10 *>(metadata);
+        message << " red=" << hdr10.RedPrimary[0] << "," << hdr10.RedPrimary[1]
+            << " green=" << hdr10.GreenPrimary[0] << "," << hdr10.GreenPrimary[1]
+            << " blue=" << hdr10.BluePrimary[0] << "," << hdr10.BluePrimary[1]
+            << " white=" << hdr10.WhitePoint[0] << "," << hdr10.WhitePoint[1]
+            << " max_mastering=" << hdr10.MaxMasteringLuminance
+            << " min_mastering=" << hdr10.MinMasteringLuminance
+            << " max_cll=" << hdr10.MaxContentLightLevel
+            << " max_fall=" << hdr10.MaxFrameAverageLightLevel;
+    }
+    log_line(message.str());
+    return hr;
+}
+#endif
 
 void STDMETHODCALLTYPE hooked_ps_set_shader_resources(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11ShaderResourceView *const *views)
 {
@@ -6533,6 +6700,41 @@ bool try_fsr2_translation_draw(
     frame.sharpness = static_cast<float>(g_config.fsr2_sharpness_percent) / 100.0f;
     frame.hdr10_pq_color = use_late_composed_color || g_config.fsr2_hdr10_pq_color;
     frame.use_direct_linear_color = !use_late_composed_color && !g_config.fsr2_hdr10_pq_color;
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+    {
+        ResourceInfo color_info {};
+        ResourceInfo output_info {};
+        ResourceInfo exposure_info {};
+        read_resource_info(translation_color, L"fsr2_color_diagnostics", color_info);
+        read_resource_info_from_resource(translation_output, L"fsr2_output_diagnostics", output_info);
+        read_resource_info(frame.exposure, L"fsr2_exposure_diagnostics", exposure_info);
+
+        std::ostringstream state;
+        state << "fsr2_color_state path=" << (use_late_composed_color ? "late" : "early")
+            << " render=" << frame.render_width << "x" << frame.render_height
+            << " output=" << frame.output_width << "x" << frame.output_height
+            << " color_resource_format=" << describe_dxgi_format(color_info.format)
+            << " color_view_format=" << describe_dxgi_format(shader_resource_view_format(translation_color))
+            << " output_resource_format=" << describe_dxgi_format(output_info.format)
+            << " exposure_resource_format=" << describe_dxgi_format(exposure_info.format)
+            << " exposure_view_format=" << describe_dxgi_format(shader_resource_view_format(frame.exposure))
+            << " hdr10_pq=" << (frame.hdr10_pq_color ? 1 : 0)
+            << " direct_linear=" << (frame.use_direct_linear_color ? 1 : 0)
+            << " context_hdr_flag=1";
+        const std::string current_state = state.str();
+        bool changed = false;
+        {
+            std::lock_guard lock(g_fsr2_color_diagnostics_mutex);
+            if (current_state != g_last_fsr2_color_diagnostics)
+            {
+                g_last_fsr2_color_diagnostics = current_state;
+                changed = true;
+            }
+        }
+        if (changed)
+            log_line(current_state);
+    }
+#endif
     const bool optiscaler_config_reset = consume_fsr2_optiscaler_config_reset();
     const bool optiscaler_log_reset = should_reset_for_optiscaler_log_activity();
     frame.reset =
@@ -7758,10 +7960,40 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
 
     const bool should_hook_present = g_config.hook_present;
     const bool should_hook_dlssg_dxgi = dlssg_dxgi_workaround_active();
-    if (!should_hook_present && !should_hook_dlssg_dxgi)
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+    constexpr bool should_hook_color = true;
+#else
+    constexpr bool should_hook_color = false;
+#endif
+    if (!should_hook_present && !should_hook_dlssg_dxgi && !should_hook_color)
         return;
 
-    void **vtable = *reinterpret_cast<void ***>(swapchain);
+    void *hook_instance = swapchain;
+    std::size_t hook_method_count = k_swapchain_vtable_size;
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+    IDXGISwapChain4 *swapchain4 = nullptr;
+    IDXGISwapChain3 *swapchain3 = nullptr;
+    bool supports_hdr_metadata = false;
+    if (SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain4), reinterpret_cast<void **>(&swapchain4))) && swapchain4 != nullptr)
+    {
+        hook_instance = swapchain4;
+        supports_hdr_metadata = true;
+    }
+    else if (SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3))) && swapchain3 != nullptr)
+    {
+        hook_instance = swapchain3;
+        hook_method_count = 39;
+    }
+    else
+    {
+        log_line("dxgi_color_hooks_unavailable swapchain=" +
+            hex64(reinterpret_cast<std::uintptr_t>(swapchain)) + " reason=no_IDXGISwapChain3");
+        if (!should_hook_present && !should_hook_dlssg_dxgi)
+            return;
+    }
+#endif
+
+    void **vtable = *reinterpret_cast<void ***>(hook_instance);
     if (should_hook_present && g_original_present == nullptr)
         g_original_present = reinterpret_cast<present_fn>(vtable[k_idx_present]);
     if (should_hook_dlssg_dxgi && g_original_set_fullscreen_state == nullptr)
@@ -7772,6 +8004,15 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
         g_original_resize_buffers = reinterpret_cast<resize_buffers_fn>(vtable[k_idx_resize_buffers]);
     if (should_hook_dlssg_dxgi && g_original_resize_target == nullptr)
         g_original_resize_target = reinterpret_cast<resize_target_fn>(vtable[k_idx_resize_target]);
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+    const bool has_color_interface = swapchain4 != nullptr || swapchain3 != nullptr;
+    if (has_color_interface && g_original_check_color_space_support == nullptr)
+        g_original_check_color_space_support = reinterpret_cast<check_color_space_support_fn>(vtable[k_idx_check_color_space_support]);
+    if (has_color_interface && g_original_set_color_space1 == nullptr)
+        g_original_set_color_space1 = reinterpret_cast<set_color_space1_fn>(vtable[k_idx_set_color_space1]);
+    if (supports_hdr_metadata && g_original_set_hdr_metadata == nullptr)
+        g_original_set_hdr_metadata = reinterpret_cast<set_hdr_metadata_fn>(vtable[k_idx_set_hdr_metadata]);
+#endif
     std::vector<std::pair<std::size_t, void *>> patches;
     if (should_hook_present)
         patches.emplace_back(k_idx_present, reinterpret_cast<void *>(&hooked_present));
@@ -7782,7 +8023,32 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
         patches.emplace_back(k_idx_resize_buffers, reinterpret_cast<void *>(&hooked_resize_buffers));
         patches.emplace_back(k_idx_resize_target, reinterpret_cast<void *>(&hooked_resize_target));
     }
-    clone_and_patch_vtable(swapchain, k_swapchain_vtable_size, patches);
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+    if (has_color_interface)
+    {
+        patches.emplace_back(k_idx_check_color_space_support, reinterpret_cast<void *>(&hooked_check_color_space_support));
+        patches.emplace_back(k_idx_set_color_space1, reinterpret_cast<void *>(&hooked_set_color_space1));
+        if (supports_hdr_metadata)
+            patches.emplace_back(k_idx_set_hdr_metadata, reinterpret_cast<void *>(&hooked_set_hdr_metadata));
+
+        DXGI_SWAP_CHAIN_DESC desc {};
+        if (SUCCEEDED(swapchain->GetDesc(&desc)))
+        {
+            log_line("dxgi_color_hooks_active swapchain=" +
+                hex64(reinterpret_cast<std::uintptr_t>(hook_instance)) +
+                " format=" + describe_dxgi_format(desc.BufferDesc.Format) +
+                " size=" + std::to_string(desc.BufferDesc.Width) + "x" + std::to_string(desc.BufferDesc.Height) +
+                " swapchain4=" + std::to_string(supports_hdr_metadata ? 1 : 0));
+        }
+    }
+#endif
+    clone_and_patch_vtable(hook_instance, hook_method_count, patches);
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+    if (swapchain4 != nullptr)
+        swapchain4->Release();
+    if (swapchain3 != nullptr)
+        swapchain3->Release();
+#endif
 }
 
 void set_output_size(UINT width, UINT height, const char *source)
@@ -7903,7 +8169,7 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
             DXGI_SWAP_CHAIN_DESC created_desc {};
             if (SUCCEEDED((*swapchain)->GetDesc(&created_desc)))
                 set_output_size(created_desc.BufferDesc.Width, created_desc.BufferDesc.Height, "CreateDeviceAndSwapChain");
-            if (g_config.hook_present || dlssg_dxgi_workaround_active())
+            if (g_config.hook_present || dlssg_dxgi_workaround_active() || k_color_diagnostics_enabled)
                 install_swapchain_hooks(*swapchain);
         }
         log_line("hooked D3D11CreateDeviceAndSwapChain");
@@ -7967,7 +8233,7 @@ HRESULT STDMETHODCALLTYPE hooked_factory_create_swap_chain(IDXGIFactory *factory
     {
         if (desc != nullptr)
             set_output_size(desc->BufferDesc.Width, desc->BufferDesc.Height, "CreateSwapChain");
-        if (g_config.hook_present || dlssg_dxgi_workaround_active())
+        if (g_config.hook_present || dlssg_dxgi_workaround_active() || k_color_diagnostics_enabled)
             install_swapchain_hooks(swapchain != nullptr ? *swapchain : nullptr);
         if (desc != nullptr)
             log_line("hooked CreateSwapChain size=" + std::to_string(desc->BufferDesc.Width) + "x" + std::to_string(desc->BufferDesc.Height));
@@ -8002,7 +8268,7 @@ HRESULT STDMETHODCALLTYPE hooked_factory2_create_swap_chain_for_hwnd(IDXGIFactor
     {
         if (desc != nullptr)
             set_output_size(desc->Width, desc->Height, "CreateSwapChainForHwnd");
-        if (g_config.hook_present || dlssg_dxgi_workaround_active())
+        if (g_config.hook_present || dlssg_dxgi_workaround_active() || k_color_diagnostics_enabled)
             install_swapchain_hooks(swapchain != nullptr ? *swapchain : nullptr);
         if (desc != nullptr)
             log_line("hooked CreateSwapChainForHwnd size=" + std::to_string(desc->Width) + "x" + std::to_string(desc->Height));

@@ -23,17 +23,28 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Build FPS Unlock and Fufu Lite packages
+      - name: Build release DLLs for the Lite package
         shell: pwsh
-        run: ./Build-OnlineInstaller.ps1 -Configuration Release
+        run: |
+          cmake -S .\Dx11FsrBridge -B .\build-package-bridge -G "Visual Studio 17 2022" -A x64 `
+            -DDX11FSRBRIDGE_RELEASE_RUNTIME=ON `
+            -DDX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=ON
+          cmake --build .\build-package-bridge --config Release
+          cmake -S .\AntiPlayerMosaic -B .\build-package-antiplayermosaic -G "Visual Studio 17 2022" -A x64
+          cmake --build .\build-package-antiplayermosaic --config Release
+          Copy-Item .\build-package-bridge\Release\Dx11FsrBridge.dll .\GenshinOneClick\payload\Bridge\Dx11FsrBridge.dll -Force
+          Copy-Item .\build-package-antiplayermosaic\Release\AntiPlayerMosaic.dll .\GenshinOneClick\payload\AntiPlayerMosaic\AntiPlayerMosaic.dll -Force
 
-      - name: Upload Lite packages
+      - name: Build FPS Unlock Lite package
+        shell: pwsh
+        run: ./Build-OnlineInstaller.ps1 -Configuration Release -GithubLiteOnly
+
+      - name: Upload FPS Unlock Lite package
         uses: actions/upload-artifact@v4
         with:
           name: GenshinOneClick-Lite-Packages
           path: |
             dist/原神解帧FSR插件包Lite_*.zip
-            dist/芙芙启动器插件包Lite_*.zip
           if-no-files-found: error
 
       - name: Validate release tag
@@ -50,4 +61,3 @@ jobs:
           generate_release_notes: true
           files: |
             dist/github-release/GenshinFSRBridge.Lite_v*.zip
-            dist/github-release/FuFuLauncherPlugin.Lite_v*.zip

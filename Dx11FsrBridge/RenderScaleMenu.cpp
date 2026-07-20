@@ -75,6 +75,7 @@ using graphics_option_lookup_fn = void *(__fastcall *)(void *, void *, void *);
 using graphics_index_resolver_fn = std::int32_t(__fastcall *)(void *, std::int32_t, std::int32_t, void *, std::int32_t *);
 using encoded_float_decoder_fn = float(__fastcall *)(const std::int32_t *);
 using encoded_float_encoder_fn = void(__fastcall *)(std::int32_t *, float);
+using dropdown_refresh_shown_value_fn = void(__fastcall *)(void *);
 
 HMODULE g_module = nullptr;
 build_cmd_buffers_fn g_original_build_cmd_buffers = nullptr;
@@ -85,6 +86,7 @@ graphics_option_apply_fn g_original_graphics_option_apply = nullptr;
 graphics_option_lookup_fn g_original_graphics_option_lookup = nullptr;
 graphics_index_resolver_fn g_original_graphics_index_resolver = nullptr;
 encoded_float_decoder_fn g_original_encoded_float_decoder = nullptr;
+dropdown_refresh_shown_value_fn g_original_dropdown_refresh_shown_value = nullptr;
 render_scale_menu_log_fn g_log_callback = nullptr;
 std::atomic_bool g_started { false };
 std::atomic_uint64_t g_call_count { 0 };
@@ -132,6 +134,7 @@ struct Config
     std::uintptr_t graphics_index_resolver_rva = 0xC209120;
     std::uintptr_t encoded_float_decoder_rva = 0xA3B55D0;
     std::uintptr_t encoded_float_encoder_rva = 0xA3B56E0;
+    std::uintptr_t dropdown_refresh_shown_value_rva = 0x17DE5200;
     bool field_write_watch_enabled = false;
     bool field_access_watch_enabled = false;
     bool source_scale_watch_enabled = false;
@@ -165,10 +168,10 @@ void log_line(const std::string &message)
 {
     if (g_log_callback == nullptr)
         return;
-    static constexpr std::array<std::string_view, 11> important_terms {
+    static constexpr std::array<std::string_view, 12> important_terms {
         "failed", "failure", "mismatch", "invalid", "exception", "unavailable",
         "target_not_executable", "targets_validated", "hook_ready",
-        "candidate_list_patch", "all_label_references_replaced"
+        "candidate_list_patch", "all_label_references_replaced", "dropdown_option_patch"
     };
     const bool important = std::any_of(important_terms.begin(), important_terms.end(),
         [&](std::string_view term) { return message.find(term) != std::string::npos; });
@@ -211,6 +214,8 @@ void load_config()
         read_hex_value(ini_path, L"EncodedFloatDecoderRva", g_config.encoded_float_decoder_rva);
     g_config.encoded_float_encoder_rva =
         read_hex_value(ini_path, L"EncodedFloatEncoderRva", g_config.encoded_float_encoder_rva);
+    g_config.dropdown_refresh_shown_value_rva =
+        read_hex_value(ini_path, L"DropdownRefreshShownValueRva", g_config.dropdown_refresh_shown_value_rva);
     g_config.field_write_watch_enabled =
         GetPrivateProfileIntW(L"RenderScaleMenu", L"FieldWriteWatchEnabled", 0, ini_path.c_str()) != 0;
     g_config.field_access_watch_enabled =
@@ -818,6 +823,107 @@ void *create_probe_string(void *template_string, const wchar_t *text)
     return memory;
 }
 
+enum class DropdownOptionPatchResult
+{
+    not_target,
+    already_patched,
+    patched,
+    failed
+};
+
+DropdownOptionPatchResult patch_render_scale_dropdown_options(void *dropdown)
+{
+    constexpr const wchar_t *originals[] {
+        L"0.6", L"0.8", L"0.9", L"1.0", L"1.1", L"1.2", L"1.3", L"1.4", L"1.5"
+    };
+    constexpr const wchar_t *replacements[] {
+        L"0.2", L"0.3", L"0.4", L"0.5", L"0.6", L"0.7", L"0.8", L"0.9", L"原生"
+    };
+    if (dropdown == nullptr)
+        return DropdownOptionPatchResult::not_target;
+
+    void *template_string = nullptr;
+    void *replacement_objects[std::size(replacements)] {};
+    std::uintptr_t option_array = 0;
+    __try
+    {
+        const auto dropdown_address = reinterpret_cast<std::uintptr_t>(dropdown);
+        const auto option_data_list = *reinterpret_cast<const std::uintptr_t *>(dropdown_address + 0x108);
+        if (!plausible_managed_object(option_data_list))
+            return DropdownOptionPatchResult::not_target;
+        const auto list = *reinterpret_cast<const std::uintptr_t *>(option_data_list + 0x10);
+        if (!plausible_managed_object(list) ||
+            *reinterpret_cast<const std::int32_t *>(list + 0x18) != 9)
+            return DropdownOptionPatchResult::not_target;
+        option_array = *reinterpret_cast<const std::uintptr_t *>(list + 0x10);
+        if (!plausible_managed_object(option_array))
+            return DropdownOptionPatchResult::not_target;
+        const auto capacity = *reinterpret_cast<const std::uintptr_t *>(option_array + 0x18);
+        if (capacity < 9 || capacity > 256)
+            return DropdownOptionPatchResult::not_target;
+
+        bool original_match = true;
+        bool replacement_match = true;
+        for (std::size_t index = 0; index < std::size(originals); ++index)
+        {
+            const auto item = *reinterpret_cast<const std::uintptr_t *>(
+                option_array + 0x20 + index * sizeof(void *));
+            if (!plausible_managed_object(item))
+                return DropdownOptionPatchResult::not_target;
+            void *text = *reinterpret_cast<void **>(item + 0x10);
+            original_match = original_match && il2cpp_string_equals_literal(text, originals[index]);
+            replacement_match = replacement_match && il2cpp_string_equals_literal(text, replacements[index]);
+            if (index == 0)
+                template_string = text;
+        }
+        if (replacement_match)
+            return DropdownOptionPatchResult::already_patched;
+        if (!original_match || template_string == nullptr)
+            return DropdownOptionPatchResult::not_target;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return DropdownOptionPatchResult::failed;
+    }
+
+    for (std::size_t index = 0; index < std::size(replacements); ++index)
+    {
+        replacement_objects[index] = create_probe_string(template_string, replacements[index]);
+        if (replacement_objects[index] == nullptr)
+            return DropdownOptionPatchResult::failed;
+    }
+
+    __try
+    {
+        for (std::size_t index = 0; index < std::size(replacements); ++index)
+        {
+            const auto item = *reinterpret_cast<const std::uintptr_t *>(
+                option_array + 0x20 + index * sizeof(void *));
+            *reinterpret_cast<void **>(item + 0x10) = replacement_objects[index];
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return DropdownOptionPatchResult::failed;
+    }
+    return DropdownOptionPatchResult::patched;
+}
+
+void __fastcall hooked_dropdown_refresh_shown_value(void *dropdown)
+{
+    const auto result = patch_render_scale_dropdown_options(dropdown);
+    if (result == DropdownOptionPatchResult::patched || result == DropdownOptionPatchResult::failed)
+    {
+        std::ostringstream message;
+        message << "dropdown_option_patch"
+            << " dropdown=0x" << std::hex << reinterpret_cast<std::uintptr_t>(dropdown)
+            << " success=" << std::dec << (result == DropdownOptionPatchResult::patched ? 1 : 0);
+        log_line(message.str());
+    }
+    if (g_original_dropdown_refresh_shown_value != nullptr)
+        g_original_dropdown_refresh_shown_value(dropdown);
+}
+
 bool patch_label_array(std::uintptr_t array_address)
 {
     constexpr const wchar_t *labels[] {
@@ -979,10 +1085,10 @@ bool rewrite_candidate_array(void *array, encoded_float_encoder_fn encoder)
     if (array == nullptr || encoder == nullptr)
         return false;
 
-    // Keep all nine native entries. The visible UI order is
-    // [0,1,2,3,4,5,6,7,8], so the unmodified native 1.0 mode is internal index 8.
+    // The visible dropdown resolves candidate indices as [0,1,8,2,3,4,5,6,7].
+    // Store the inverse permutation so visible labels and applied values match.
     const float scales[] {
-        0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f
+        0.2f, 0.3f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 0.4f
     };
     __try
     {
@@ -1422,8 +1528,9 @@ void * __fastcall hooked_graphics_option_lookup(void *key, void *lookup_key, voi
             patch_message << "candidate_list_patch"
                 << " array=0x" << std::hex << candidate_address
                 << " success=" << std::dec << (patched ? 1 : 0)
-                << " internal_values=0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0"
-                << " native_internal_index=8";
+                << " internal_values=0.2,0.3,0.5,0.6,0.7,0.8,0.9,1.0,0.4"
+                << " visible_index_map=0,1,8,2,3,4,5,6,7"
+                << " native_internal_index=7";
             log_line(patch_message.str());
         }
     }
@@ -1534,8 +1641,8 @@ DWORD WINAPI initialize_probe(void *)
     const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
     const auto apply_target = base + g_config.render_scale_apply_rva;
     const auto lookup_target = base + g_config.graphics_option_lookup_rva;
-    const auto resolver_target = base + g_config.graphics_index_resolver_rva;
     const auto encoder_target = base + g_config.encoded_float_encoder_rva;
+    const auto dropdown_refresh_target = base + g_config.dropdown_refresh_shown_value_rva;
     const auto is_executable = [](std::uintptr_t address) {
         MEMORY_BASIC_INFORMATION memory {};
         return VirtualQuery(reinterpret_cast<void *>(address), &memory, sizeof(memory)) == sizeof(memory) &&
@@ -1543,7 +1650,7 @@ DWORD WINAPI initialize_probe(void *)
             (memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
     };
     if (!is_executable(apply_target) || !is_executable(lookup_target) ||
-        !is_executable(resolver_target) || !is_executable(encoder_target))
+        !is_executable(encoder_target) || !is_executable(dropdown_refresh_target))
     {
         log_line("target_not_executable refusing_runtime_hooks");
         return 0;
@@ -1551,12 +1658,13 @@ DWORD WINAPI initialize_probe(void *)
 
     constexpr std::uint8_t expected_apply[] { 0x56, 0x57, 0x48, 0x83, 0xEC, 0x48, 0x0F, 0x29 };
     constexpr std::uint8_t expected_lookup[] { 0x55, 0x41, 0x56, 0x56, 0x57, 0x53, 0x48, 0x81 };
-    constexpr std::uint8_t expected_resolver[] { 0x55, 0x41, 0x57, 0x41, 0x56, 0x56, 0x57, 0x53 };
     constexpr std::uint8_t expected_encoder[] { 0x56, 0x53, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B };
+    constexpr std::uint8_t expected_dropdown_refresh[] { 0x56, 0x57, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48 };
     if (memcmp(reinterpret_cast<const void *>(apply_target), expected_apply, sizeof(expected_apply)) != 0 ||
         memcmp(reinterpret_cast<const void *>(lookup_target), expected_lookup, sizeof(expected_lookup)) != 0 ||
-        memcmp(reinterpret_cast<const void *>(resolver_target), expected_resolver, sizeof(expected_resolver)) != 0 ||
-        memcmp(reinterpret_cast<const void *>(encoder_target), expected_encoder, sizeof(expected_encoder)) != 0)
+        memcmp(reinterpret_cast<const void *>(encoder_target), expected_encoder, sizeof(expected_encoder)) != 0 ||
+        memcmp(reinterpret_cast<const void *>(dropdown_refresh_target),
+            expected_dropdown_refresh, sizeof(expected_dropdown_refresh)) != 0)
     {
         log_line("target_prefix_mismatch_refusing_runtime_hooks");
         return 0;
@@ -1567,33 +1675,16 @@ DWORD WINAPI initialize_probe(void *)
             reinterpret_cast<void **>(&g_original_render_scale_apply)) != MH_OK ||
         MH_CreateHook(reinterpret_cast<void *>(lookup_target), reinterpret_cast<void *>(&hooked_graphics_option_lookup),
             reinterpret_cast<void **>(&g_original_graphics_option_lookup)) != MH_OK ||
-        MH_CreateHook(reinterpret_cast<void *>(resolver_target), reinterpret_cast<void *>(&hooked_graphics_index_resolver),
-            reinterpret_cast<void **>(&g_original_graphics_index_resolver)) != MH_OK ||
+        MH_CreateHook(reinterpret_cast<void *>(dropdown_refresh_target),
+            reinterpret_cast<void *>(&hooked_dropdown_refresh_shown_value),
+            reinterpret_cast<void **>(&g_original_dropdown_refresh_shown_value)) != MH_OK ||
         MH_EnableHook(MH_ALL_HOOKS) != MH_OK)
     {
         log_line("runtime_hook_install_failed");
         return 0;
     }
 
-    log_line("hook_ready runtime_hooks=3");
-    while (g_config.label_array_scanner_enabled)
-    {
-        const auto now = GetTickCount64();
-        const auto pending = g_pending_label_scan_attempts.load(std::memory_order_acquire);
-        if (pending > 0 && now >= g_next_label_scan_tick.load(std::memory_order_acquire))
-        {
-            const auto patched = scan_and_patch_label_arrays(
-                0x70000000000ull, 0x80000000000ull, pending == 1);
-            if (patched != 0)
-                g_pending_label_scan_attempts.store(0, std::memory_order_release);
-            else
-            {
-                g_pending_label_scan_attempts.fetch_sub(1, std::memory_order_acq_rel);
-                g_next_label_scan_tick.store(now + 750, std::memory_order_release);
-            }
-        }
-        Sleep(100);
-    }
+    log_line("hook_ready runtime_hooks=3 label_path=dropdown_options");
     return 0;
 #else
 

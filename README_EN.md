@@ -25,15 +25,30 @@ The frame-generation feature in the `frame-generation` branch is built against `
 
 ## Lite Release Package
 
-`GenshinOneClick/` contains the complete Lite installer scripts, default configuration, the official ReShade Add-on DLL, and HDR shaders. FPS Unlocker and OptiScaler are not distributed with the Lite package or this repository; the installer downloads them from their official sources or asks the user to select them manually.
+`GenshinOneClick/` contains the complete Lite installer scripts, default configuration, the official ReShade Add-on DLL, and the RenoDX Add-on covered by explicit redistribution permission. The Lite packages no longer bundle any other ReShade shader packages; the installer can download them directly from the official ReShade, Lilium HDR shaders, and SweetFX upstream sources. FPS Unlocker and OptiScaler are likewise downloaded from official sources or selected manually. The existing contents and packaging method of local Full packages remain unchanged.
 
-The two first-party DLLs are build outputs and are not committed to the repository. To generate the same Lite ZIP files as GitHub Actions, run the following command on Windows:
+The two first-party DLLs are build outputs and are not committed to the repository. To generate the same FPS Unlock Lite ZIP as GitHub Actions, run the following command on Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release -GithubLiteOnly
+```
+
+The output is written to `dist\原神解帧FSR插件包Lite_v*.zip`, while the GitHub release directory contains only `dist\github-release\GenshinFSRBridge.Lite_v*.zip`. GitHub Actions builds and publishes only this FPS Unlock Lite package; it does not generate a FuFu package.
+
+## FuFu Launcher Plugin Source and Local Build
+
+`FufuGraphicsPlugin/` contains the FuFu Launcher plugin source, configuration templates, and the marketplace/local-test Lua installer scripts. The repository does not commit a prebuilt FuFu Launcher plugin binary. A locally built FuFu Launcher plugin package requires the user to complete the runtime components manually; it does not include scripts or resources that automatically download components. To build the local FPS Unlock Full package and FuFu Launcher plugin package, run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release
 ```
 
-The outputs are written to `dist\原神解帧FSR插件包Lite_v*.zip` and `dist\芙芙启动器插件包Lite_v*.zip`. GitHub Actions can be triggered manually from the Actions page and uploads both ZIP files as the `GenshinOneClick-Lite-Packages` artifact. When the release option is selected and a version tag is provided, it creates or updates the corresponding GitHub Release using the names `GenshinFSRBridge.Lite_v<version>.zip` and `FuFuLauncherPlugin.Lite_v<version>.zip`.
+The FuFu Launcher plugin package is written only to local `dist\FSR-Bridge-Plugin.v*.zip`; it is not included in GitHub Actions or GitHub Releases. To build the plugin DLL separately:
+
+```powershell
+cmake -S .\FufuGraphicsPlugin -B .\build-fufu-plugin -G "Visual Studio 17 2022" -A x64
+cmake --build .\build-fufu-plugin --config Release
+```
 
 ## Features
 
@@ -104,7 +119,7 @@ Do not submit game account details, login information, or screenshots containing
 
 - FSR2 ABI headers and Microsoft Detours are build dependencies only; their original licenses and notices are retained.
 - OptiScaler is an independent project: <https://github.com/optiscaler/OptiScaler>.
-- Lite resources include the official ReShade Add-on DLL (BSD-3-Clause), the RenoDX Add-on redistributed with permission from [剪刀妹丽丽](https://www.bilibili.com/video/av116861345793770/), and Lilium HDR shaders (GPL-3.0). `RenoDX-Genshin/` is the sole archived source for RenoDX and is automatically synchronized to the ReShade payload during packaging; their licenses and permission records are kept in the resource directories.
+- Lite resources bundle only the official ReShade Add-on DLL (BSD-3-Clause) and the RenoDX Add-on explicitly authorized for unmodified redistribution by [Bilibili UID 3461582765951639](https://space.bilibili.com/3461582765951639). Lilium HDR shaders (GPL-3.0), SweetFX (MIT), and the required standard ReShade effects are downloaded directly from their official upstream sources during installation. The RenoDX author's display name in the permission evidence is “卡文迪许爱吃香蕉” and was previously referenced as “剪刀妹丽丽”; the UID is the stable identity reference across name changes. `RenoDX-Genshin/` is the sole archived source for RenoDX and its permission evidence and is automatically synchronized to the ReShade payload during packaging.
 - This project does not include NVIDIA DLSS, the AMD FSR SDK, or OptiScaler runtime binaries.
 
 ## License

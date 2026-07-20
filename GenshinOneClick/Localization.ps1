@@ -63,6 +63,9 @@ function Convert-InstallerText {
         '插件名' = 'Plugin'
         '作者' = 'Author'
         '当前版本' = 'Version'
+        'OptiScaler 官方资产名称不符合预期: ' = 'Unexpected OptiScaler official asset name: '
+        'OptiScaler 官方压缩包 SHA256 校验失败。实际值: ' = 'OptiScaler official archive SHA256 verification failed. Actual value: '
+        'OptiScaler 版本不是 ' = 'OptiScaler version is not '
         '安装状态' = 'Status'
         '反虚化 / 隐藏 UID' = 'Anti-Mosaic / Hide UID'
         '语言 / Language' = 'Language / 语言'
@@ -104,6 +107,12 @@ function Convert-InstallerText {
         '启用 ReShade + RenoDX HDR' = 'Enable ReShade + RenoDX HDR'
         '已安装内置 NVIDIA DLSS 超分组件。' = 'Installed the bundled NVIDIA DLSS upscaling component.'
         '已从 NVIDIA 官方来源安装 DLSS 超分组件。' = 'Installed the DLSS upscaling component from an official NVIDIA source.'
+        '已从官方来源安装 ReShade 与效果库。' = 'Installed ReShade and shader packages from their official upstream sources.'
+        'ReShade 与效果库安装来源：' = 'ReShade and shader package source:'
+        '  1. 从 ReShade 及效果作者的官方来源下载（推荐）' = '  1. Download from the official ReShade and shader author sources (recommended)'
+        '  2. 使用安装包内置 ReShade 与效果库（支持离线安装）' = '  2. Use the bundled ReShade and shader packages (offline installation supported)'
+        '  2. 仅使用安装包内置 ReShade + RenoDX（不含效果库）' = '  2. Use only the bundled ReShade + RenoDX (shader packages not included)'
+        '请输入选项，直接回车使用官方下载' = 'Enter an option, or press Enter to download from official sources'
     }
     if ($exact.ContainsKey($text)) { return $exact[$text] }
 
@@ -188,6 +197,9 @@ function Convert-InstallerText {
         '缺少目录: ' = 'Missing folder: '
         '指定的文件或目录不存在: ' = 'The specified file or folder does not exist: '
         '无法查询 ' = 'Could not query '
+        'OptiScaler 官方资产名称不符合预期: ' = 'Unexpected OptiScaler official asset name: '
+        'OptiScaler 官方压缩包 SHA256 校验失败。实际值: ' = 'OptiScaler official archive SHA256 verification failed. Actual value: '
+        'OptiScaler 版本不是 ' = 'OptiScaler version is not '
         ' 官方发行版，请检查网络或改用手动下载。' = ' official releases. Check your network connection or use a manual download.'
         ' 的最新发行版中没有找到需要的文件。' = ' latest release does not contain the required file.'
         '下载失败，请重试或改用手动下载。' = 'Download failed. Try again or use a manual download.'

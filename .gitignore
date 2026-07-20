@@ -38,6 +38,7 @@ GenshinOneClick/payload/NVIDIA/
 GenshinOneClick/payload/ReShade/ReShade.ini
 GenshinOneClick/payload/ReShade/ReShadePreset.ini
 GenshinOneClick/payload/ReShade/Screenshots/
+SharedResources/OptiScaler/runtime/
 
 # Local research trees and diagnostic artifacts are not release sources
 experiments/

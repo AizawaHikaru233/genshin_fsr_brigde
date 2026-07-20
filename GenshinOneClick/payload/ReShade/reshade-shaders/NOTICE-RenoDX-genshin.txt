@@ -3,15 +3,25 @@ RenoDX Genshin Add-on
 File: renodx-genshin.addon64
 Version: 0.2026.0714.1910
 SHA-256: C33119583BAAB324310CD317B964BA9EB5B1D494F2228E30884462690739CE7C
-Author: 剪刀妹丽丽
-Author page and release reference: https://www.bilibili.com/video/av116861345793770/
+Author identity: Bilibili UID 3461582765951639
+Display name shown when permission was granted: 卡文迪许爱吃香蕉
+Previously referenced display name: 剪刀妹丽丽
+Author page: https://space.bilibili.com/3461582765951639
+Original release reference: https://www.bilibili.com/video/av116861345793770/
 
 Canonical repository archive: RenoDX-Genshin/renodx-genshin.addon64
+Redistribution permission evidence: NOTICE-RenoDX-genshin-permission.png
+Evidence image SHA-256: 9DFBD2D0837CC305637FDB4C2C79A013F480686332F334E7DFD926F4ADCDF672
 
 Redistribution permission: the author granted this project permission on
 2026-07-14 to redistribute the unmodified Add-on binary through this
-project's GitHub repository and Release installer package.
+project's GitHub repository and Release installer package while retaining
+the author attribution, original download/home-page reference, and any
+applicable license information. The evidence image preserves the complete
+permission request and the author's affirmative reply.
 
 This permission applies only to the unmodified binary included with this
 project. It does not transfer authorship, grant permission to modify the
-Add-on, or replace any terms separately stated by the author.
+Add-on, or replace any terms separately stated by the author. Bilibili
+display names may change; UID 3461582765951639 is the stable author identity
+reference for this authorization record.

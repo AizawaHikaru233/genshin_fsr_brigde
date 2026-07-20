@@ -25,15 +25,30 @@
 
 ## Lite 发布包
 
-`GenshinOneClick/` 包含 Lite 安装器的完整脚本、默认配置、官方 ReShade Add-on DLL 和 HDR 着色器。FPS Unlocker 与 OptiScaler 不随 Lite 包或本仓库分发，安装器会从其官方来源下载或要求用户手动选择。
+`GenshinOneClick/` 包含 Lite 安装器的完整脚本、默认配置、官方 ReShade Add-on DLL，以及获得明确再分发授权的 RenoDX Add-on。Lite 包不再内置其他 ReShade 效果库；安装时可由脚本直接从 ReShade、Lilium HDR shaders 和 SweetFX 的官方上游下载。FPS Unlocker 与 OptiScaler 同样由安装器从官方来源下载或要求用户手动选择。本地 Full 包的既有内置内容和打包方式不变。
 
-两个自有 DLL 是编译产物，不提交到仓库。要生成与 GitHub Actions 相同的 Lite ZIP，请在 Windows 上运行：
+两个自有 DLL 是编译产物，不提交到仓库。要生成与 GitHub Actions 相同的 FPS Unlock Lite ZIP，请在 Windows 上运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release -GithubLiteOnly
+```
+
+构建结果位于 `dist\原神解帧FSR插件包Lite_v*.zip`，GitHub 发布目录只生成 `dist\github-release\GenshinFSRBridge.Lite_v*.zip`。GitHub Actions 只构建和发布这个 FPS Unlock Lite 包，不生成芙芙包。
+
+## 芙芙启动器插件包源码与本地构建
+
+`FufuGraphicsPlugin/` 提供芙芙启动器插件的源码、配置模板以及商城/本地测试 Lua 安装脚本；仓库不提交芙芙启动器插件二进制包。芙芙启动器插件包的本地构建需要用户自行补齐运行组件，不包含自动下载组件的脚本和资源。要在本地编译并同时生成 FPS Unlock Full 与芙芙启动器插件包，请运行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release
 ```
 
-构建结果位于 `dist\原神解帧FSR插件包Lite_v*.zip` 和 `dist\芙芙启动器插件包Lite_v*.zip`。GitHub Actions 可从 Actions 页面手动触发，并将两个 ZIP 上传为 `GenshinOneClick-Lite-Packages` Artifact；勾选发布选项并填写版本标签时，会以 `GenshinFSRBridge.Lite_v版本号.zip` 和 `FuFuLauncherPlugin.Lite_v版本号.zip` 创建或更新对应 GitHub Release。
+芙芙启动器插件包仅写入本地 `dist\FSR-Bridge-Plugin.v*.zip`，不会进入 GitHub Actions 或 GitHub Release。也可以单独编译插件 DLL：
+
+```powershell
+cmake -S .\FufuGraphicsPlugin -B .\build-fufu-plugin -G "Visual Studio 17 2022" -A x64
+cmake --build .\build-fufu-plugin --config Release
+```
 
 ## 功能
 
@@ -104,7 +119,7 @@ Bridge、OptiScaler 和反虚化组件默认会保留错误日志。每次重新
 
 - FSR2 ABI 头文件与 Microsoft Detours 仅作为构建依赖，保留各自原始许可证与声明。
 - OptiScaler 是独立项目：<https://github.com/optiscaler/OptiScaler>。
-- Lite 资源包含官方 ReShade Add-on DLL（BSD-3-Clause）、[剪刀妹丽丽](https://www.bilibili.com/video/av116861345793770/) 授权再分发的 RenoDX Add-on，以及 Lilium HDR 着色器（GPL-3.0）。RenoDX 的唯一归档源位于 `RenoDX-Genshin/`，打包时会自动同步到 ReShade 载荷；各自许可证与授权记录位于资源目录。
+- Lite 资源只内置官方 ReShade Add-on DLL（BSD-3-Clause）和 [Bilibili UID 3461582765951639](https://space.bilibili.com/3461582765951639) 明确授权原样再分发的 RenoDX Add-on；Lilium HDR shaders（GPL-3.0）、SweetFX（MIT）和 ReShade 标准效果依赖在安装时直接从各自官方上游下载。该 RenoDX 作者在授权截图中的显示名为“卡文迪许爱吃香蕉”，此前曾以“剪刀妹丽丽”署名；UID 作为不随改名变化的身份标识。RenoDX 的唯一归档源及授权截图位于 `RenoDX-Genshin/`，打包时会自动同步到 ReShade 载荷。
 - 本项目不包含 NVIDIA DLSS、AMD FSR SDK 或 OptiScaler 运行时二进制文件。
 
 ## 许可证
