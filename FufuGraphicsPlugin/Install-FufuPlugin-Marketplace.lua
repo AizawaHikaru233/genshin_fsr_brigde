@@ -36,10 +36,9 @@ if system ~= nil and system.get_gpu ~= nil and string ~= nil then
             matches(name, "RTX%s*20%d%d") or matches(name, "RTX%s*30%d%d") or
             matches(name, "RTX%s*40%d%d") or matches(name, "RTX%s*50%d%d")
         )
-        local amd_discrete_int8 = gpu_vendor == "AMD" and matches(name, "RX%s*[67]%d%d%d")
+        local amd_discrete_int8 = gpu_vendor == "AMD" and matches(name, "RX%s*7%d%d%d")
         local amd_integrated_int8 = gpu_vendor == "AMD" and (
-            contains(name, "RADEON 610M") or contains(name, "RADEON 660M") or
-            contains(name, "RADEON 680M") or contains(name, "RADEON 740M") or
+            contains(name, "RADEON 740M") or
             contains(name, "RADEON 760M") or contains(name, "RADEON 780M") or
             contains(name, "RADEON 880M") or contains(name, "RADEON 890M") or
             contains(name, "RADEON 8050S") or contains(name, "RADEON 8060S")
@@ -85,7 +84,7 @@ install.write_config(plugin_dir, {
         Description = "支持把原神的FSR2转换为FSR4、DLSS、XESS",
         Developer = "シリアCelia",
         File = "FSR-Bridge-Plugin.dll",
-        Version = "1.1.2"
+        Version = "1.1.3"
     },
     EnableBridge = { Name = "启用 FSR Bridge", Type = "bool", Value = "1" },
     EnableOptiScaler = { Name = "启用 OptiScaler（需要 Bridge）", Type = "bool", Value = "1" },

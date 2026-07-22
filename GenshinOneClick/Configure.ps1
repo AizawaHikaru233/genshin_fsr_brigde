@@ -239,9 +239,9 @@ function Get-Fsr4GpuPolicy {
                 $mode = 'fp8'
                 $reason = 'AMD RDNA4'
             }
-            elseif ($name -match '(?i)\bRX\s*[67]\d{3}\b|\bPRO\s+W[67]\d{3}\b|\b[678]\d{2}M\b|\b80[56]0S\b' -or $pnp -match '(?i)GFX10|GFX11|GFX115') {
+            elseif ($name -match '(?i)\bRX\s*7\d{3}\b|\bPRO\s+W7\d{3}\b|\b(740|760|780|880|890)M\b|\b80[56]0S\b' -or $pnp -match '(?i)GFX11|GFX115') {
                 $mode = 'int8'
-                $reason = 'AMD RDNA2/3/3.5'
+                $reason = 'AMD RDNA3/3.5'
             }
         }
         elseif ($vendor -eq '10DE' -or $name -match '(?i)NVIDIA|GeForce') {

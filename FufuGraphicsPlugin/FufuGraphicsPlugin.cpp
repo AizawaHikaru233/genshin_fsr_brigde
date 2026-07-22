@@ -953,7 +953,7 @@ DWORD WINAPI bootstrap_thread(void *)
     g_module_directory = self_path.parent_path();
     g_log_path = g_module_directory / L"FSR-Bridge-Plugin.log";
     reset_log();
-    write_log("plugin_loaded version=1.1.2 path=" + wide_to_utf8(self_path.wstring()));
+    write_log("plugin_loaded version=1.1.3 path=" + wide_to_utf8(self_path.wstring()));
 
     if (!is_target_process())
     {
