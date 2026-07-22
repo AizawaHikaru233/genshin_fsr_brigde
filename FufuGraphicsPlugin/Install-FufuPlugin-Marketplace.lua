@@ -17,41 +17,26 @@ local fsr4_mode = "auto"
 local gpu_name = "Unknown"
 local gpu_vendor = "Unknown"
 
-local function contains(text, token)
-    return string.find(string.upper(text), token, 1, true) ~= nil
-end
+local has_system = system ~= nil
+local has_gpu_api = has_system and system.get_gpu ~= nil
 
-local function matches(text, pattern)
-    return string.match(string.upper(text), pattern) ~= nil
-end
-
-if system ~= nil and system.get_gpu ~= nil and string ~= nil then
+if has_system and has_gpu_api then
     local gpu = system.get_gpu()
     if gpu ~= nil then
         gpu_name = gpu.name or "Unknown"
         gpu_vendor = gpu.vendor or "Unknown"
-        local name = string.upper(gpu_name)
-        local amd_fp8 = gpu_vendor == "AMD" and matches(name, "RX%s*9%d%d%d")
-        local nvidia_int8 = gpu_vendor == "NVIDIA" and (
-            matches(name, "RTX%s*20%d%d") or matches(name, "RTX%s*30%d%d") or
-            matches(name, "RTX%s*40%d%d") or matches(name, "RTX%s*50%d%d")
-        )
-        local amd_discrete_int8 = gpu_vendor == "AMD" and matches(name, "RX%s*7%d%d%d")
-        local amd_integrated_int8 = gpu_vendor == "AMD" and (
-            contains(name, "RADEON 740M") or
-            contains(name, "RADEON 760M") or contains(name, "RADEON 780M") or
-            contains(name, "RADEON 880M") or contains(name, "RADEON 890M") or
-            contains(name, "RADEON 8050S") or contains(name, "RADEON 8060S")
-        )
-        local intel_int8 = gpu_vendor == "Intel" and contains(name, "ARC")
-        if amd_fp8 then
+        if gpu_vendor == "AMD" and (gpu_name == "AMD Radeon RX 9060" or gpu_name == "AMD Radeon RX 9060 XT" or gpu_name == "AMD Radeon RX 9070" or gpu_name == "AMD Radeon RX 9070 XT") then
             fsr4_update, fsr4_upscaler_index, fsr4_force_int8, fsr4_mode = "true", "0", "false", "fp8"
-        elseif nvidia_int8 or amd_discrete_int8 or amd_integrated_int8 or intel_int8 then
+        elseif gpu_vendor == "NVIDIA" and (gpu_name == "NVIDIA GeForce RTX 2060" or gpu_name == "NVIDIA GeForce RTX 2070" or gpu_name == "NVIDIA GeForce RTX 2080" or gpu_name == "NVIDIA GeForce RTX 3050" or gpu_name == "NVIDIA GeForce RTX 3060" or gpu_name == "NVIDIA GeForce RTX 3070" or gpu_name == "NVIDIA GeForce RTX 3080" or gpu_name == "NVIDIA GeForce RTX 3090" or gpu_name == "NVIDIA GeForce RTX 4060" or gpu_name == "NVIDIA GeForce RTX 4070" or gpu_name == "NVIDIA GeForce RTX 4080" or gpu_name == "NVIDIA GeForce RTX 4090" or gpu_name == "NVIDIA GeForce RTX 5060" or gpu_name == "NVIDIA GeForce RTX 5070" or gpu_name == "NVIDIA GeForce RTX 5080" or gpu_name == "NVIDIA GeForce RTX 5090") then
+            fsr4_update, fsr4_upscaler_index, fsr4_force_int8, fsr4_mode = "true", "0", "true", "int8"
+        elseif gpu_vendor == "AMD" and (gpu_name == "AMD Radeon RX 7600" or gpu_name == "AMD Radeon RX 7600 XT" or gpu_name == "AMD Radeon RX 7700 XT" or gpu_name == "AMD Radeon RX 7800 XT" or gpu_name == "AMD Radeon RX 7900 GRE" or gpu_name == "AMD Radeon RX 7900 XT" or gpu_name == "AMD Radeon RX 7900 XTX" or gpu_name == "AMD Radeon 740M" or gpu_name == "AMD Radeon 760M" or gpu_name == "AMD Radeon 780M" or gpu_name == "AMD Radeon 8050S" or gpu_name == "AMD Radeon 8060S" or gpu_name == "AMD Radeon 880M" or gpu_name == "AMD Radeon 890M") then
+            fsr4_update, fsr4_upscaler_index, fsr4_force_int8, fsr4_mode = "true", "0", "true", "int8"
+        elseif gpu_vendor == "Intel" and (gpu_name == "Intel(R) Arc(TM) A380 Graphics" or gpu_name == "Intel(R) Arc(TM) A580 Graphics" or gpu_name == "Intel(R) Arc(TM) A750 Graphics" or gpu_name == "Intel(R) Arc(TM) A770 Graphics" or gpu_name == "Intel(R) Arc(TM) B570" or gpu_name == "Intel(R) Arc(TM) B580" or gpu_name == "Intel(R) Arc(TM) Graphics" or gpu_name == "Intel(R) Arc(TM) 130V GPU" or gpu_name == "Intel(R) Arc(TM) 140V GPU") then
             fsr4_update, fsr4_upscaler_index, fsr4_force_int8, fsr4_mode = "true", "0", "true", "int8"
         end
     end
 else
-    install.log("当前启动器未提供 system/string 查询能力，FSR4 GPU 策略保持 auto")
+    install.log("当前启动器未提供 system.get_gpu，FSR4 GPU 策略保持 auto")
 end
 
 install.log("显卡: " .. gpu_name .. " (" .. gpu_vendor .. ")，FSR4 模式: " .. fsr4_mode)
@@ -89,6 +74,10 @@ install.write_config(plugin_dir, {
     EnableBridge = { Name = "启用 FSR Bridge", Type = "bool", Value = "1" },
     EnableOptiScaler = { Name = "启用 OptiScaler（需要 Bridge）", Type = "bool", Value = "1" },
     EnableReShade = { Name = "启用 ReShade", Type = "bool", Value = "1" },
+    IssueFeedback = {
+        Name = "问题反馈", Type = "string",
+        Value = "https://github.com/AizawaHikaru233/genshin_fsr_brigde/issues"
+    },
     ResetConfigurations = {
         Name = "重置所有配置文件（自行更换插件版本或出现问题时使用）",
         Type = "bool", Value = "1"
