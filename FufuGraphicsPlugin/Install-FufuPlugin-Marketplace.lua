@@ -741,7 +741,7 @@ install.write_config(plugin_dir, {
         Description = "支持把原神的FSR2转换为FSR4、DLSS、XESS",
         Developer = "シリアCelia",
         File = "FSR-Bridge-Plugin.dll",
-        Version = "1.1.3"
+        Version = "1.1.4"
     },
     EnableBridge = {
         Name = "启用 FSR Bridge",
@@ -762,6 +762,11 @@ install.write_config(plugin_dir, {
         Name = "问题反馈",
         Type = "string",
         Value = "https://github.com/AizawaHikaru233/genshin_fsr_brigde/issues"
+    },
+    CommunityGroup = {
+        Name = "交流群",
+        Type = "string",
+        Value = "928147257"
     },
     ResetConfigurations = {
         Name = "重置所有配置文件（自行更换插件版本或出现问题时使用）",

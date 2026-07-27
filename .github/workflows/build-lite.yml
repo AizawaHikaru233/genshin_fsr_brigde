@@ -42,6 +42,21 @@ jobs:
           if ($null -eq $bridgeDll -or $null -eq $antiDll) { throw 'CMake 未生成必要的 Lite DLL。' }
           Copy-Item $bridgeDll.FullName .\GenshinOneClick\payload\Bridge\Dx11FsrBridge.dll -Force
           Copy-Item $antiDll.FullName .\GenshinOneClick\payload\AntiPlayerMosaic\AntiPlayerMosaic.dll -Force
+          $manifestPath = '.\GenshinOneClick\component-manifest.json'
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+          $componentPaths = @{
+            'Dx11FsrBridge.dll' = 'Bridge\Dx11FsrBridge.dll'
+            'AntiPlayerMosaic.dll' = 'AntiPlayerMosaic\AntiPlayerMosaic.dll'
+          }
+          foreach ($component in $manifest) {
+            $relativePath = $componentPaths[$component.Name]
+            if ($null -eq $relativePath) { continue }
+            $path = Join-Path '.\GenshinOneClick\payload' $relativePath
+            $item = Get-Item -LiteralPath $path
+            $component.SHA256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+            $component.Bytes = $item.Length
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
 
       - name: Build FPS Unlock Lite package
         shell: pwsh
