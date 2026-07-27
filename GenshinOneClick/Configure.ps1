@@ -16,6 +16,7 @@
     [switch]$NonInteractive,
     [switch]$NoShortcut,
     [switch]$ResetPluginConfigsOnly,
+    [switch]$PreserveExistingConfigs,
     [ValidateSet('Auto', 'zh-CN', 'en-US')]
     [string]$Language = 'Auto'
 )
@@ -26,7 +27,7 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 $ProgressPreference = 'SilentlyContinue'
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $scriptDirectory = [IO.Path]::GetFullPath((Split-Path -Parent $PSCommandPath))
 $root = if ([IO.Path]::GetFileName($scriptDirectory) -ieq 'scripts') {
@@ -37,12 +38,7 @@ $root = if ([IO.Path]::GetFileName($scriptDirectory) -ieq 'scripts') {
 $payload = Join-Path $root 'payload'
 $bridgeDir = Join-Path $payload 'Bridge'
 $optiRootDir = Join-Path $payload 'OptiScaler'
-$optiNestedDir = Join-Path $optiRootDir 'OptiScaler'
-$optiDir = if (Test-Path -LiteralPath (Join-Path $optiNestedDir 'OptiScaler.dll') -PathType Leaf) {
-    $optiNestedDir
-} else {
-    $optiRootDir
-}
+$optiDir = $optiRootDir
 $reshadeDir = Join-Path $payload 'ReShade'
 $bridgeDll = Join-Path $bridgeDir 'Dx11FsrBridge.dll'
 $optiDll = Join-Path $optiDir 'OptiScaler.dll'
@@ -158,6 +154,35 @@ function Get-ManualPath {
     return (Resolve-Path -LiteralPath $path).Path
 }
 
+$script:GitHubProxyLatency = @{}
+
+function Get-GitHubEndpointLatency {
+    param([string]$HostName)
+    if ($script:GitHubProxyLatency.ContainsKey($HostName)) { return [double]$script:GitHubProxyLatency[$HostName] }
+    $latency = [double]::PositiveInfinity
+    try {
+        $ping = Test-Connection -ComputerName $HostName -Count 1 -ErrorAction Stop | Select-Object -First 1
+        if ($null -ne $ping -and $ping.ResponseTime -ge 0) { $latency = [double]$ping.ResponseTime }
+    }
+    catch { }
+    $script:GitHubProxyLatency[$HostName] = $latency
+    return $latency
+}
+
+function Get-GitHubFallbackUrls {
+    param([string]$Url)
+    if ($Url -notmatch '^https://(api\.)?github\.com/') { return @($Url) }
+    $proxies = @(
+        [pscustomobject]@{ Host = 'ghfast.top'; Prefix = 'https://ghfast.top/' },
+        [pscustomobject]@{ Host = 'gh-proxy.com'; Prefix = 'https://gh-proxy.com/' },
+        [pscustomobject]@{ Host = 'ghproxy.net'; Prefix = 'https://ghproxy.net/' }
+    ) | ForEach-Object {
+        [pscustomobject]@{ Host = $_.Host; Prefix = $_.Prefix; Latency = (Get-GitHubEndpointLatency -HostName $_.Host) }
+    } | Sort-Object Latency, Host
+    $proxyUrls = @($proxies | ForEach-Object { $_.Prefix + $Url })
+    return @($proxyUrls + @($Url))
+}
+
 function Get-GitHubLatestAsset {
     param([string]$Repository, [scriptblock]$AssetFilter, [string]$Tag)
     $headers = @{ 'User-Agent' = 'GenshinOneClick-Installer' }
@@ -166,31 +191,48 @@ function Get-GitHubLatestAsset {
     } else {
         "https://api.github.com/repos/$Repository/releases/tags/$Tag"
     }
-    try {
-        $release = Invoke-RestMethod -Headers $headers -Uri $releaseApi
+    $failures = [Collections.Generic.List[string]]::new()
+    foreach ($candidateUrl in @(Get-GitHubFallbackUrls -Url $releaseApi)) {
+        try {
+            $release = Invoke-RestMethod -Headers $headers -Uri $candidateUrl -TimeoutSec 20
+            $asset = @($release.assets | Where-Object $AssetFilter | Select-Object -First 1)
+            if ($asset.Count -eq 0) { throw "$Repository 的发行数据中没有需要的文件。" }
+            return [pscustomobject]@{
+                Tag = [string]$release.tag_name
+                Page = [string]$release.html_url
+                Name = [string]$asset[0].name
+                Url = [string]$asset[0].browser_download_url
+                Digest = [string]$asset[0].digest
+            }
+        }
+        catch {
+            $failures.Add("$candidateUrl : $($_.Exception.Message)")
+        }
     }
-    catch {
-        throw (Convert-InstallerText -Value "无法查询 $Repository 官方发行版，请检查网络或改用手动下载。$([Environment]::NewLine)$($_.Exception.Message)")
-    }
-    $asset = @($release.assets | Where-Object $AssetFilter | Select-Object -First 1)
-    if ($asset.Count -eq 0) { throw (Convert-InstallerText -Value "$Repository 的最新发行版中没有找到需要的文件。") }
-    return [pscustomobject]@{
-        Tag = [string]$release.tag_name
-        Page = [string]$release.html_url
-        Name = [string]$asset[0].name
-        Url = [string]$asset[0].browser_download_url
-        Digest = [string]$asset[0].digest
-    }
+    throw (Convert-InstallerText -Value "无法查询 $Repository 官方发行版。已尝试直连与全部备用下载路线。$([Environment]::NewLine)$($failures -join [Environment]::NewLine)")
 }
 
 function Invoke-OfficialDownload {
-    param([string]$Url, [string]$Destination)
-    try {
-        Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'GenshinOneClick-Installer' } -Uri $Url -OutFile $Destination
+    param([string]$Url, [string]$Destination, [string]$ExpectedSha256)
+    $failures = [Collections.Generic.List[string]]::new()
+    foreach ($candidateUrl in @(Get-GitHubFallbackUrls -Url $Url)) {
+        try {
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'GenshinOneClick-Installer' } -Uri $candidateUrl -OutFile $Destination -TimeoutSec 180
+            if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+                $expectedHash = $ExpectedSha256 -replace '^sha256:', ''
+                $actualHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash
+                if (-not [string]::Equals($actualHash, $expectedHash, [StringComparison]::OrdinalIgnoreCase)) {
+                    throw '下载文件 SHA-256 校验失败。'
+                }
+            }
+            return
+        }
+        catch {
+            $failures.Add("$candidateUrl : $($_.Exception.Message)")
+        }
     }
-    catch {
-        throw (Convert-InstallerText -Value "下载失败，请重试或改用手动下载。$([Environment]::NewLine)$($_.Exception.Message)")
-    }
+    throw (Convert-InstallerText -Value "下载失败：直连与全部备用下载路线均不可用。$([Environment]::NewLine)$($failures -join [Environment]::NewLine)")
 }
 
 function Get-NvidiaVideoControllers {
@@ -223,11 +265,13 @@ function Get-Fsr4GpuPolicy {
         }
     }
 
-    # Prefer adapters with reported dedicated memory, then fall back to name/PCI IDs.
-    $orderedControllers = @($controllers | Sort-Object @{ Expression = {
-        try { [int64]$_.AdapterRAM } catch { 0 }
-    }; Descending = $true })
-    foreach ($controller in $orderedControllers) {
+    # 遍历全部显卡取"最优"策略（fp8 优先于 int8），不依赖 AdapterRAM 排序：
+    # WMI 的 AdapterRAM 在 4GB 以上会截断，混合平台（RDNA4 独显 + RDNA3 核显）
+    # 按内存排序可能先命中核显而错发 int8。
+    # 型号匹配统一用 (?!\d) 结尾而非 \b：RX 7600M / 7700S / RTX 4090D 这类
+    # 数字后紧跟字母的型号在 \b 下会漏配。
+    $bestPolicy = $null
+    foreach ($controller in $controllers) {
         $name = [string]$controller.Name
         $pnp = [string]$controller.PNPDeviceID
         $vendor = if ($pnp -match '(?i)VEN_([0-9A-F]{4})') { $matches[1].ToUpperInvariant() } else { '' }
@@ -235,17 +279,17 @@ function Get-Fsr4GpuPolicy {
         $reason = 'unsupported'
 
         if ($vendor -eq '1002' -or $name -match '(?i)AMD|Radeon') {
-            if ($name -match '(?i)\bRX\s*9\d{3}\b|\bPRO\s+W9\d{3}\b' -or $pnp -match '(?i)GFX12') {
+            if ($name -match '(?i)\bRX\s*9\d{3}(?!\d)|\bPRO\s+W9\d{3}(?!\d)') {
                 $mode = 'fp8'
                 $reason = 'AMD RDNA4'
             }
-            elseif ($name -match '(?i)\bRX\s*7\d{3}\b|\bPRO\s+W7\d{3}\b|\b(740|760|780|880|890)M\b|\b80[56]0S\b' -or $pnp -match '(?i)GFX11|GFX115') {
+            elseif ($name -match '(?i)\bRX\s*7\d{3}(?!\d)|\bPRO\s+W7\d{3}(?!\d)|\b(7[468]0|8[4689]0)M\b|\b80[456]0S\b') {
                 $mode = 'int8'
                 $reason = 'AMD RDNA3/3.5'
             }
         }
         elseif ($vendor -eq '10DE' -or $name -match '(?i)NVIDIA|GeForce') {
-            if ($name -match '(?i)\bRTX\s*(20|30|40|50)\d{2}\b') {
+            if ($name -match '(?i)\bRTX\s*(20|30|40|50)\d{2}(?!\d)') {
                 $mode = 'int8'
                 $reason = 'NVIDIA RTX 20+'
             }
@@ -257,16 +301,19 @@ function Get-Fsr4GpuPolicy {
             }
         }
 
-        if ($mode -ne 'auto') {
-            return [pscustomobject]@{
-                Mode = $mode
-                Reason = $reason
-                Name = $name
-                Vendor = $vendor
-                PnpDeviceId = $pnp
-            }
+        if ($mode -eq 'auto') { continue }
+        $candidate = [pscustomobject]@{
+            Mode = $mode
+            Reason = $reason
+            Name = $name
+            Vendor = $vendor
+            PnpDeviceId = $pnp
+        }
+        if ($null -eq $bestPolicy -or ($mode -eq 'fp8' -and $bestPolicy.Mode -ne 'fp8')) {
+            $bestPolicy = $candidate
         }
     }
+    if ($null -ne $bestPolicy) { return $bestPolicy }
 
     return [pscustomobject]@{
         Mode = 'auto'
@@ -303,7 +350,13 @@ function Assert-NvidiaSignedFile {
 function Install-NvidiaDlssIfNeeded {
     if (-not (Test-Path -LiteralPath $optiDll -PathType Leaf)) { return }
     $nvidiaControllers = @(Get-NvidiaVideoControllers)
-    if ($nvidiaControllers.Count -eq 0) { return }
+    if ($nvidiaControllers.Count -eq 0) {
+        # WMI/CIM 不可用（沙箱、精简系统）时回退到驱动文件检测：
+        # nvapi64.dll 随 NVIDIA 显卡驱动必装，存在即说明本机有 NVIDIA GPU，
+        # 不能因为查询通道故障就静默跳过 nvngx 部署。
+        $nvapiPath = Join-Path ([Environment]::GetFolderPath('System')) 'nvapi64.dll'
+        if (-not (Test-Path -LiteralPath $nvapiPath -PathType Leaf)) { return }
+    }
     if (Test-Path -LiteralPath $installedDlss -PathType Leaf) { return }
 
     $gpuNames = @($nvidiaControllers | ForEach-Object { [string]$_.Name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
@@ -328,7 +381,7 @@ function Install-NvidiaDlssIfNeeded {
         $asset = Get-GitHubLatestAsset -Repository 'NVIDIA-RTX/Streamline' -AssetFilter { $_.name -match '^streamline-sdk-v[0-9.]+\.zip$' }
         Write-Host "正在从 NVIDIA 官方 Streamline $($asset.Tag) 下载 DLSS 组件..." -ForegroundColor Cyan
         $packagePath = Join-Path $temporaryDirectory $asset.Name
-        Invoke-OfficialDownload -Url $asset.Url -Destination $packagePath
+        Invoke-OfficialDownload -Url $asset.Url -Destination $packagePath -ExpectedSha256 $asset.Digest
         $expanded = Join-Path $temporaryDirectory 'expanded'
         Expand-ComponentPackage -PackagePath $packagePath -Destination $expanded
         $sourceDll = Get-ChildItem -LiteralPath $expanded -Recurse -File -Filter 'nvngx_dlss.dll' |
@@ -464,7 +517,13 @@ function Install-Unlocker {
             $asset = Get-GitHubLatestAsset -Repository '34736384/genshin-fps-unlock' -AssetFilter { $_.name -eq 'unlockfps_nc.exe' }
             Write-Host "正在从官方发行版下载 FPS Unlocker $($asset.Tag)..." -ForegroundColor Cyan
             $source = Join-Path $temporaryDirectory 'unlockfps_nc.exe'
-            Invoke-OfficialDownload -Url $asset.Url -Destination $source
+            Invoke-OfficialDownload -Url $asset.Url -Destination $source -ExpectedSha256 $asset.Digest
+            if ($asset.Digest -match '^sha256:(.+)$') {
+                $actualHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+                if (-not [string]::Equals($actualHash, $matches[1], [StringComparison]::OrdinalIgnoreCase)) {
+                    throw (Convert-InstallerText -Value 'FPS Unlocker 下载文件 SHA-256 校验失败。')
+                }
+            }
             Copy-Item -LiteralPath $source -Destination $unlocker -Force
             Write-Host "官方页面: $($asset.Page)"
         }
@@ -501,14 +560,16 @@ function Install-Unlocker {
 }
 
 function Install-OptiScaler {
-    param([string]$Mode, [string]$ManualPath)
+    param([string]$Mode, [string]$ManualPath, [switch]$PreserveExistingConfig)
     if ($Mode -eq 'Existing') {
         Assert-File -Path $optiDll
-        # 与芙芙插件保持一致：每次安装/配置都从发布包的官方模板恢复，
-        # 不沿用旧版本或手动生成的精简 OptiScaler.ini。
         Assert-File -Path $optiFallbackTemplate
-        Copy-Item -LiteralPath $optiFallbackTemplate -Destination $optiDefaultIni -Force
-        Copy-Item -LiteralPath $optiFallbackTemplate -Destination $optiIni -Force
+        if (-not (Test-Path -LiteralPath $optiDefaultIni -PathType Leaf)) {
+            Copy-Item -LiteralPath $optiFallbackTemplate -Destination $optiDefaultIni -Force
+        }
+        if (-not $PreserveExistingConfig -or -not (Test-Path -LiteralPath $optiIni -PathType Leaf)) {
+            Copy-Item -LiteralPath $optiFallbackTemplate -Destination $optiIni -Force
+        }
         return
     }
     $temporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) ("GenshinOneClick-OptiScaler-" + [guid]::NewGuid().ToString('N'))
@@ -521,7 +582,7 @@ function Install-OptiScaler {
                 throw (Convert-InstallerText -Value "OptiScaler 官方资产名称不符合预期: $($asset.Name)")
             }
             $packagePath = Join-Path $temporaryDirectory $asset.Name
-            Invoke-OfficialDownload -Url $asset.Url -Destination $packagePath
+            Invoke-OfficialDownload -Url $asset.Url -Destination $packagePath -ExpectedSha256 $optiArchiveSha256
             $archiveHash = (Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash
             if ($archiveHash -ne $optiArchiveSha256) {
                 throw (Convert-InstallerText -Value "OptiScaler 官方压缩包 SHA256 校验失败。实际值: $archiveHash")
@@ -568,6 +629,14 @@ function Install-OptiScaler {
         }
         $stagedConfigTemplate = Join-Path $temporaryDirectory 'OptiScaler.template.ini'
         Copy-Item -LiteralPath $configTemplate -Destination $stagedConfigTemplate -Force
+        $preservedUserConfig = Join-Path $temporaryDirectory 'preserved-OptiScaler.ini'
+        $preservedFakeNvapiConfig = Join-Path $temporaryDirectory 'preserved-fakenvapi.ini'
+        if ($PreserveExistingConfig -and (Test-Path -LiteralPath $optiIni -PathType Leaf)) {
+            Copy-Item -LiteralPath $optiIni -Destination $preservedUserConfig -Force
+        }
+        if ($PreserveExistingConfig -and (Test-Path -LiteralPath $fakeNvapiIni -PathType Leaf)) {
+            Copy-Item -LiteralPath $fakeNvapiIni -Destination $preservedFakeNvapiConfig -Force
+        }
         Get-OptiScalerUpscalingManifest | Out-Null
         $preservedNvidiaDirectory = Join-Path $temporaryDirectory 'preserved-nvidia'
         foreach ($fileName in @('nvngx_dlss.dll', 'nvngx_dlssg.dll', 'nvngx_dlssd.dll', 'nvngx_dlss.license.txt')) {
@@ -580,8 +649,16 @@ function Install-OptiScaler {
         if (Test-Path -LiteralPath $optiDir) { Remove-Item -LiteralPath $optiDir -Recurse -Force }
         Copy-CuratedOptiScaler -SourceDirectory $sourceDirectory -Destination $optiDir
         Copy-Item -LiteralPath $stagedConfigTemplate -Destination $optiDefaultIni -Force
-        Copy-Item -LiteralPath $stagedConfigTemplate -Destination $optiIni -Force
-        if (Test-Path -LiteralPath $fakeNvapiIni -PathType Leaf) {
+        if (Test-Path -LiteralPath $preservedUserConfig -PathType Leaf) {
+            Copy-Item -LiteralPath $preservedUserConfig -Destination $optiIni -Force
+        }
+        else {
+            Copy-Item -LiteralPath $stagedConfigTemplate -Destination $optiIni -Force
+        }
+        if (Test-Path -LiteralPath $preservedFakeNvapiConfig -PathType Leaf) {
+            Copy-Item -LiteralPath $preservedFakeNvapiConfig -Destination $fakeNvapiIni -Force
+        }
+        elseif (Test-Path -LiteralPath $fakeNvapiIni -PathType Leaf) {
             Copy-Item -LiteralPath $fakeNvapiIni -Destination $fakeNvapiDefaultIni -Force
         }
         if (Test-Path -LiteralPath $preservedNvidiaDirectory -PathType Container) {
@@ -1005,8 +1082,21 @@ function Reset-PluginConfigurations {
         LastVersionNotify = 0
         DllList = @($loadedDlls)
     } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $fpsConfig -Encoding UTF8
-    [ordered]@{ GamePath = $resolvedGameExe; FpsTarget = 60 } |
-        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root '.installer-state.json') -Encoding UTF8
+    $installerStatePath = Join-Path $root '.installer-state.json'
+    $savedLanguage = $null
+    if (Test-Path -LiteralPath $installerStatePath -PathType Leaf) {
+        try {
+            $existingState = Get-Content -LiteralPath $installerStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $languageProperty = $existingState.PSObject.Properties['Language']
+            if ($null -ne $languageProperty -and [string]$languageProperty.Value -in @('zh-CN', 'en-US')) {
+                $savedLanguage = [string]$languageProperty.Value
+            }
+        }
+        catch {}
+    }
+    $newState = [ordered]@{ GamePath = $resolvedGameExe; FpsTarget = 60 }
+    if ($null -ne $savedLanguage) { $newState.Language = $savedLanguage }
+    $newState | ConvertTo-Json | Set-Content -LiteralPath $installerStatePath -Encoding UTF8
 }
 
 if ($ResetPluginConfigsOnly) {
@@ -1057,7 +1147,7 @@ Install-Unlocker -Mode $unlockerMode -ManualPath $UnlockerPackagePath
 
 if (-not $DisableOptiScaler) {
     $optiMode = Select-SourceMode -Label 'OptiScaler' -RequestedMode $OptiScalerSource -ExistingAvailable (Test-Path -LiteralPath $optiDll -PathType Leaf)
-    Install-OptiScaler -Mode $optiMode -ManualPath $OptiScalerPackagePath
+    Install-OptiScaler -Mode $optiMode -ManualPath $OptiScalerPackagePath -PreserveExistingConfig:$PreserveExistingConfigs
     Install-NvidiaDlssIfNeeded
     Assert-File -Path $bridgeDll
     $ffxMainCandidates = @(
@@ -1091,25 +1181,27 @@ if ((Get-PathKind -Path $legacyRuntimeLink) -eq 'Junction') {
 }
 
 if (-not $DisableOptiScaler) {
-    Set-IniValue -Path $optiIni -Section 'Upscalers' -Key 'Dx11Upscaler' -Value 'auto'
-    Set-IniValue -Path $optiIni -Section 'Upscalers' -Key 'Dx12Upscaler' -Value 'auto'
-    Set-IniValue -Path $optiIni -Section 'Upscalers' -Key 'VulkanUpscaler' -Value 'auto'
-    Set-IniValue -Path $optiIni -Section 'Inputs' -Key 'EnableFsr2Inputs' -Value 'true'
-    Set-IniValue -Path $optiIni -Section 'Inputs' -Key 'UseFsr2Dx11Inputs' -Value 'true'
-    Set-IniValue -Path $optiIni -Section 'Inputs' -Key 'UseFsr2Inputs' -Value 'true'
-    Set-IniValue -Path $optiIni -Section 'Inputs' -Key 'EnableFsr3Inputs' -Value 'false'
-    Set-IniValue -Path $optiIni -Section 'FSR' -Key 'Fsr4Update' -Value 'true'
-    Set-IniValue -Path $optiIni -Section 'Plugins' -Key 'LoadAsiPlugins' -Value 'false'
-    Set-IniValue -Path $optiIni -Section 'Plugins' -Key 'LoadReshade' -Value 'false'
-    Set-IniValue -Path $optiIni -Section 'Plugins' -Key 'Path' -Value 'auto'
+    if (-not $PreserveExistingConfigs) {
+        Set-IniValue -Path $optiIni -Section 'Upscalers' -Key 'Dx11Upscaler' -Value 'auto'
+        Set-IniValue -Path $optiIni -Section 'Upscalers' -Key 'Dx12Upscaler' -Value 'auto'
+        Set-IniValue -Path $optiIni -Section 'Upscalers' -Key 'VulkanUpscaler' -Value 'auto'
+        Set-IniValue -Path $optiIni -Section 'Inputs' -Key 'EnableFsr2Inputs' -Value 'true'
+        Set-IniValue -Path $optiIni -Section 'Inputs' -Key 'UseFsr2Dx11Inputs' -Value 'true'
+        Set-IniValue -Path $optiIni -Section 'Inputs' -Key 'UseFsr2Inputs' -Value 'true'
+        Set-IniValue -Path $optiIni -Section 'Inputs' -Key 'EnableFsr3Inputs' -Value 'false'
+        Set-IniValue -Path $optiIni -Section 'FSR' -Key 'Fsr4Update' -Value 'true'
+        Set-IniValue -Path $optiIni -Section 'Plugins' -Key 'LoadAsiPlugins' -Value 'false'
+        Set-IniValue -Path $optiIni -Section 'Plugins' -Key 'LoadReshade' -Value 'false'
+        Set-IniValue -Path $optiIni -Section 'Plugins' -Key 'Path' -Value 'auto'
+        Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogToFile' -Value 'true'
+        Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogLevel' -Value '2'
+        Set-IniValue -Path $optiIni -Section 'Log' -Key 'SingleFile' -Value 'true'
+        Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogFileName' -Value 'OptiScaler.log'
+        Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogAsync' -Value 'false'
+        Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogAsyncThreads' -Value '1'
+        Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'FTInput' -Value 'auto'
+    }
     Set-IniValue -Path $optiIni -Section 'Libraries' -Key 'OptiDllPath' -Value ([IO.Path]::GetFullPath($optiDir).TrimEnd('\'))
-    Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogToFile' -Value 'true'
-    Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogLevel' -Value '2'
-    Set-IniValue -Path $optiIni -Section 'Log' -Key 'SingleFile' -Value 'true'
-    Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogFileName' -Value 'OptiScaler.log'
-    Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogAsync' -Value 'false'
-    Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogAsyncThreads' -Value '1'
-    Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'FTInput' -Value 'auto'
     if ($nonFrameGenerationEdition) {
         Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'Enabled' -Value 'false'
         Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'FGInput' -Value 'nofg'
@@ -1173,7 +1265,7 @@ if (-not $DisableHDR) {
         -ShaderPath (Join-Path $shaderDir 'Shaders') `
         -TexturePath (Join-Path $shaderDir 'Textures') `
         -ScreenshotPath $screenshots `
-        -Force
+        -Force:$(-not $PreserveExistingConfigs)
     Remove-Item -LiteralPath (Join-Path $reshadeDir 'ReShade.ini'), `
         (Join-Path $reshadeDir 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
 }

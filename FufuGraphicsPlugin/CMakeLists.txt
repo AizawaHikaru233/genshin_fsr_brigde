@@ -15,6 +15,7 @@ target_compile_definitions(FufuGraphicsPlugin PRIVATE
     NOMINMAX
 )
 target_compile_options(FufuGraphicsPlugin PRIVATE /utf-8)
+target_link_libraries(FufuGraphicsPlugin PRIVATE dxgi)
 set_property(TARGET FufuGraphicsPlugin PROPERTY
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set_target_properties(FufuGraphicsPlugin PROPERTIES OUTPUT_NAME "FSR-Bridge-Plugin")

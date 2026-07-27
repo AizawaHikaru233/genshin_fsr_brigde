@@ -28,13 +28,30 @@ function Assert-ReShadeResourceHash {
 }
 
 function Invoke-ReShadeResourceDownload {
-    param([string]$Url, [string]$Destination, [string]$UserAgent)
-    try {
-        Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = $UserAgent } -Uri $Url -OutFile $Destination
+    param([string]$Url, [string]$Destination, [string]$UserAgent, [string]$ExpectedSha256)
+    $candidates = if (Get-Command -Name Get-GitHubFallbackUrls -ErrorAction SilentlyContinue) {
+        @(Get-GitHubFallbackUrls -Url $Url)
+    } elseif ($Url -match '^https://(api\.)?github\.com/') {
+        @($Url, ('https://ghfast.top/' + $Url), ('https://gh-proxy.com/' + $Url), ('https://ghproxy.net/' + $Url))
+    } else {
+        @($Url)
     }
-    catch {
-        throw "Failed to download an official ReShade resource: $Url$([Environment]::NewLine)$($_.Exception.Message)"
+    $failures = [Collections.Generic.List[string]]::new()
+    foreach ($candidateUrl in $candidates) {
+        try {
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = $UserAgent } -Uri $candidateUrl -OutFile $Destination -TimeoutSec 180
+            $actualHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash
+            if (-not [string]::Equals($actualHash, $ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Downloaded file SHA-256 verification failed.'
+            }
+            return
+        }
+        catch {
+            $failures.Add("$candidateUrl : $($_.Exception.Message)")
+        }
     }
+    throw "Failed to download an official ReShade resource after all fallback routes: ${Url}$([Environment]::NewLine)$($failures -join [Environment]::NewLine)"
 }
 
 function Expand-ReShadeSetupModule {
@@ -111,7 +128,7 @@ function New-OfficialReShadePayload {
     foreach ($download in $downloads) {
         $path = Join-Path $TemporaryDirectory $download.Name
         Write-Host "Downloading $($download.Label)..." -ForegroundColor Cyan
-        Invoke-ReShadeResourceDownload -Url $download.Url -Destination $path -UserAgent $UserAgent
+        Invoke-ReShadeResourceDownload -Url $download.Url -Destination $path -UserAgent $UserAgent -ExpectedSha256 $download.Hash
         Assert-ReShadeResourceHash -Path $path -ExpectedSha256 $download.Hash -Label $download.Label
     }
 

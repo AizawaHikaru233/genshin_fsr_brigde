@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <tlhelp32.h>
+#include <dxgi.h>
 
 #include <algorithm>
 #include <array>
@@ -411,14 +412,159 @@ std::string read_policy_value(
     return wide_to_utf8(value);
 }
 
+struct DetectedFsr4Policy
+{
+    bool supported = false;
+    bool prefer_fp8 = false;
+    std::wstring gpu_name;
+};
+
+// 系列级匹配：在名称中找 marker（如 "RTX"），跳过空格后要求以某个系列前缀开头
+// 且后随数字。这样 "RTX 4070 Ti SUPER"、"RTX 4090D"、"RX 7600M XT" 等任意后缀
+// 变体都能命中，而 "RTX 3500 Ada"（35 非 30）、"RX 590"（5 非 9）不会误配。
+bool name_contains_series(
+    const std::wstring &name,
+    const wchar_t *marker,
+    std::initializer_list<const wchar_t *> series_prefixes)
+{
+    const std::size_t marker_length = wcslen(marker);
+    std::size_t position = name.find(marker);
+    while (position != std::wstring::npos)
+    {
+        if (position == 0 || !iswalnum(name[position - 1]))
+        {
+            std::size_t cursor = position + marker_length;
+            while (cursor < name.size() && name[cursor] == L' ')
+                ++cursor;
+            for (const wchar_t *prefix : series_prefixes)
+            {
+                const std::size_t prefix_length = wcslen(prefix);
+                if (name.compare(cursor, prefix_length, prefix) == 0 &&
+                    cursor + prefix_length < name.size() &&
+                    name[cursor + prefix_length] >= L'0' && name[cursor + prefix_length] <= L'9')
+                {
+                    return true;
+                }
+            }
+        }
+        position = name.find(marker, position + marker_length);
+    }
+    return false;
+}
+
+bool name_contains_amd_igpu_token(const std::wstring &name)
+{
+    static constexpr const wchar_t *tokens[] {
+        L"740M", L"760M", L"780M", L"840M", L"860M", L"880M", L"890M",
+        L"8040S", L"8050S", L"8060S",
+    };
+    for (const wchar_t *token : tokens)
+    {
+        const std::size_t token_length = wcslen(token);
+        std::size_t position = name.find(token);
+        while (position != std::wstring::npos)
+        {
+            const bool head_ok = position == 0 || !iswalnum(name[position - 1]);
+            const std::size_t tail = position + token_length;
+            const bool tail_ok = tail >= name.size() || !iswalnum(name[tail]);
+            if (head_ok && tail_ok)
+                return true;
+            position = name.find(token, position + 1);
+        }
+    }
+    return false;
+}
+
+// 用 DXGI 枚举全部物理适配器，按 PCI 厂商 ID + 系列前缀做宽松匹配，
+// 多显卡时优先 fp8（RDNA4）。安装脚本受沙箱限制只能做精确全名匹配，
+// 这里是型号变体（Ti/SUPER/Laptop 等）的最终兜底。
+DetectedFsr4Policy detect_fsr4_gpu_policy()
+{
+    DetectedFsr4Policy best {};
+    IDXGIFactory1 *factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&factory))) ||
+        factory == nullptr)
+    {
+        return best;
+    }
+
+    for (UINT adapter_index = 0;; ++adapter_index)
+    {
+        IDXGIAdapter1 *adapter = nullptr;
+        if (factory->EnumAdapters1(adapter_index, &adapter) != S_OK || adapter == nullptr)
+            break;
+        DXGI_ADAPTER_DESC1 desc {};
+        const HRESULT desc_result = adapter->GetDesc1(&desc);
+        adapter->Release();
+        if (FAILED(desc_result) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0)
+            continue;
+
+        const std::wstring name = desc.Description;
+        bool fp8 = false;
+        bool int8 = false;
+        if (desc.VendorId == 0x10DE)
+        {
+            int8 = name_contains_series(name, L"RTX", { L"20", L"30", L"40", L"50" });
+        }
+        else if (desc.VendorId == 0x1002)
+        {
+            if (name_contains_series(name, L"RX", { L"9" }))
+                fp8 = true;
+            else if (name_contains_series(name, L"RX", { L"7" }) || name_contains_amd_igpu_token(name))
+                int8 = true;
+        }
+        else if (desc.VendorId == 0x8086)
+        {
+            int8 = name.find(L"Arc") != std::wstring::npos;
+        }
+
+        if (!fp8 && !int8)
+            continue;
+        if (!best.supported || (fp8 && !best.prefer_fp8))
+        {
+            best.supported = true;
+            best.prefer_fp8 = fp8;
+            best.gpu_name = name;
+        }
+        if (best.prefer_fp8)
+            break;
+    }
+
+    factory->Release();
+    return best;
+}
+
 bool apply_optiscaler_managed_settings(
     const std::filesystem::path &ini_path,
     const std::filesystem::path &optiscaler_directory)
 {
     const std::filesystem::path policy_path = g_module_directory / L"FSR4Policy.ini";
-    const std::string fsr4_update = read_policy_value(policy_path, L"Fsr4Update", L"auto");
-    const std::string upscaler_index = read_policy_value(policy_path, L"UpscalerIndex", L"auto");
-    const std::string force_int8 = read_policy_value(policy_path, L"Fsr4ForceEnableInt8", L"auto");
+    std::string fsr4_update = read_policy_value(policy_path, L"Fsr4Update", L"auto");
+    std::string upscaler_index = read_policy_value(policy_path, L"UpscalerIndex", L"auto");
+    std::string force_int8 = read_policy_value(policy_path, L"Fsr4ForceEnableInt8", L"auto");
+
+    // 策略值为 auto（安装脚本未识别型号或策略文件缺失）时，在此按 PCI 厂商 +
+    // 系列前缀宽松匹配解析：NVIDIA RTX 20/30/40/50、AMD RX 7/RX 9 与 RDNA3/3.5
+    // 核显、Intel Arc 全部放行。非 auto 的显式值（安装脚本命中或用户手改）优先。
+    if (fsr4_update == "auto" || upscaler_index == "auto" || force_int8 == "auto")
+    {
+        const DetectedFsr4Policy detected = detect_fsr4_gpu_policy();
+        if (detected.supported)
+        {
+            if (fsr4_update == "auto")
+                fsr4_update = "true";
+            if (upscaler_index == "auto")
+                upscaler_index = "0";
+            if (force_int8 == "auto")
+                force_int8 = detected.prefer_fp8 ? "false" : "true";
+            write_log("fsr4_policy_auto_resolved gpu=" + wide_to_utf8(detected.gpu_name) +
+                " mode=" + (detected.prefer_fp8 ? "fp8" : "int8"));
+        }
+        else
+        {
+            write_log("fsr4_policy_auto_unresolved keeping_auto_defaults");
+        }
+    }
 
     const struct ManagedSetting
     {

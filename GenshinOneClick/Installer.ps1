@@ -1,12 +1,15 @@
 ﻿param(
     [string]$GamePath,
     [switch]$NoShortcut,
+    [switch]$ResumeUpdateAll,
     [ValidateSet('Auto', 'zh-CN', 'en-US')]
     [string]$Language = 'Auto'
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 [Console]::InputEncoding = [Text.Encoding]::UTF8
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $OutputEncoding = [Text.Encoding]::UTF8
@@ -20,12 +23,7 @@ $errorLogPath = Join-Path $root '.last-install-error.log'
 $unlockerPath = Join-Path $root 'unlockfps_nc.exe'
 $payloadDirectory = Join-Path $root 'payload'
 $optiRootDirectory = Join-Path $payloadDirectory 'OptiScaler'
-$optiNestedDirectory = Join-Path $optiRootDirectory 'OptiScaler'
-$optiDirectory = if (Test-Path -LiteralPath (Join-Path $optiNestedDirectory 'OptiScaler.dll') -PathType Leaf) {
-    $optiNestedDirectory
-} else {
-    $optiRootDirectory
-}
+$optiDirectory = $optiRootDirectory
 $optiPath = Join-Path $optiDirectory 'OptiScaler.dll'
 $bridgePath = Join-Path $payloadDirectory 'Bridge\Dx11FsrBridge.dll'
 $antiBlurPath = Join-Path $payloadDirectory 'AntiPlayerMosaic\AntiPlayerMosaic.dll'
@@ -88,9 +86,13 @@ function Read-State {
     try {
         $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
         $fpsTarget = 60
-        if ($null -ne $state.FpsTarget -and [int]$state.FpsTarget -gt 0) { $fpsTarget = [int]$state.FpsTarget }
-        $savedLanguage = if ([string]$state.Language -in @('zh-CN', 'en-US')) { [string]$state.Language } else { $script:Language }
-        return [pscustomobject]@{ GamePath = [string]$state.GamePath; FpsTarget = $fpsTarget; Language = $savedLanguage }
+        $fpsProperty = $state.PSObject.Properties['FpsTarget']
+        if ($null -ne $fpsProperty -and $null -ne $fpsProperty.Value -and [int]$fpsProperty.Value -gt 0) { $fpsTarget = [int]$fpsProperty.Value }
+        $languageProperty = $state.PSObject.Properties['Language']
+        $savedLanguage = if ($null -ne $languageProperty -and [string]$languageProperty.Value -in @('zh-CN', 'en-US')) { [string]$languageProperty.Value } else { $script:Language }
+        $gamePathProperty = $state.PSObject.Properties['GamePath']
+        $gamePath = if ($null -ne $gamePathProperty) { [string]$gamePathProperty.Value } else { $null }
+        return [pscustomobject]@{ GamePath = $gamePath; FpsTarget = $fpsTarget; Language = $savedLanguage }
     }
     catch {
         return [pscustomobject]@{ GamePath = $null; FpsTarget = 60; Language = $script:Language }
@@ -601,10 +603,80 @@ function Select-LocalInstallPath {
     return (Resolve-Path -LiteralPath $inputPath).Path
 }
 
+$script:GitHubProxyLatency = @{}
+
+function Get-GitHubEndpointLatency {
+    param([string]$HostName)
+    if ($script:GitHubProxyLatency.ContainsKey($HostName)) { return [double]$script:GitHubProxyLatency[$HostName] }
+    $latency = [double]::PositiveInfinity
+    try {
+        $ping = Test-Connection -ComputerName $HostName -Count 1 -ErrorAction Stop | Select-Object -First 1
+        if ($null -ne $ping -and $ping.ResponseTime -ge 0) { $latency = [double]$ping.ResponseTime }
+    }
+    catch { }
+    $script:GitHubProxyLatency[$HostName] = $latency
+    return $latency
+}
+
+function Get-GitHubFallbackUrls {
+    param([string]$Url)
+    if ($Url -notmatch '^https://(api\.)?github\.com/') { return @($Url) }
+    $proxies = @(
+        [pscustomobject]@{ Host = 'ghfast.top'; Prefix = 'https://ghfast.top/' },
+        [pscustomobject]@{ Host = 'gh-proxy.com'; Prefix = 'https://gh-proxy.com/' },
+        [pscustomobject]@{ Host = 'ghproxy.net'; Prefix = 'https://ghproxy.net/' }
+    ) | ForEach-Object {
+        [pscustomobject]@{ Host = $_.Host; Prefix = $_.Prefix; Latency = (Get-GitHubEndpointLatency -HostName $_.Host) }
+    } | Sort-Object Latency, Host
+    $proxyUrls = @($proxies | ForEach-Object { $_.Prefix + $Url })
+    return @($proxyUrls + @($Url))
+}
+
+function Invoke-GitHubRestMethodWithFallback {
+    param([string]$Url, [string]$UserAgent, [string]$RequiredProperty)
+    $failures = [Collections.Generic.List[string]]::new()
+    foreach ($candidateUrl in @(Get-GitHubFallbackUrls -Url $Url)) {
+        try {
+            $result = Invoke-RestMethod -Headers @{ 'User-Agent' = $UserAgent } -Uri $candidateUrl -TimeoutSec 20
+            if (-not [string]::IsNullOrWhiteSpace($RequiredProperty) -and $null -eq $result.PSObject.Properties[$RequiredProperty]) {
+                throw "响应缺少需要的字段: $RequiredProperty"
+            }
+            return $result
+        }
+        catch {
+            $failures.Add("$candidateUrl : $($_.Exception.Message)")
+        }
+    }
+    throw "GitHub API failed through all routes.$([Environment]::NewLine)$($failures -join [Environment]::NewLine)"
+}
+
+function Invoke-GitHubDownloadWithFallback {
+    param([string]$Url, [string]$Destination, [string]$UserAgent, [string]$ExpectedSha256)
+    $failures = [Collections.Generic.List[string]]::new()
+    foreach ($candidateUrl in @(Get-GitHubFallbackUrls -Url $Url)) {
+        try {
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = $UserAgent } -Uri $candidateUrl -OutFile $Destination -TimeoutSec 180
+            if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+                $expectedHash = $ExpectedSha256 -replace '^sha256:', ''
+                $actualHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash
+                if (-not [string]::Equals($actualHash, $expectedHash, [StringComparison]::OrdinalIgnoreCase)) {
+                    throw '下载文件 SHA-256 校验失败。'
+                }
+            }
+            return
+        }
+        catch {
+            $failures.Add("$candidateUrl : $($_.Exception.Message)")
+        }
+    }
+    throw "GitHub download failed through all routes.$([Environment]::NewLine)$($failures -join [Environment]::NewLine)"
+}
+
 function Get-LatestRelease {
     param([string]$Repository, [string]$AssetPattern)
     try {
-        $release = Invoke-RestMethod -Headers @{ 'User-Agent' = 'GenshinOneClick-Installer' } -Uri "https://api.github.com/repos/$Repository/releases/latest"
+        $release = Invoke-GitHubRestMethodWithFallback -Url "https://api.github.com/repos/$Repository/releases/latest" -UserAgent 'GenshinOneClick-Installer' -RequiredProperty 'assets'
         $asset = $release.assets | Where-Object { $_.name -match $AssetPattern } | Select-Object -First 1
         if ($null -eq $asset) { return $null }
         return [pscustomobject]@{ Tag = [string]$release.tag_name; Digest = [string]$asset.digest }
@@ -624,11 +696,17 @@ function Get-CurrentPackageVersion {
 }
 
 function Start-PackageSelfUpdate {
+    param(
+        [string]$ResumeGamePath,
+        [switch]$ResumeUpdateAll
+    )
     Write-Host ''
     Write-Host '正在检查管理脚本和发行资源更新...' -ForegroundColor Cyan
     try {
-        $release = Invoke-RestMethod -Headers @{ 'User-Agent' = 'GenshinOneClick-SelfUpdater' } `
-            -Uri "https://api.github.com/repos/$selfUpdateRepository/releases/latest"
+        $release = Invoke-GitHubRestMethodWithFallback `
+            -Url "https://api.github.com/repos/$selfUpdateRepository/releases/latest" `
+            -UserAgent 'GenshinOneClick-SelfUpdater' `
+            -RequiredProperty 'assets'
     }
     catch {
         Write-Host "检查脚本更新失败: $($_.Exception.Message)" -ForegroundColor Red
@@ -661,8 +739,11 @@ function Start-PackageSelfUpdate {
     New-Item -ItemType Directory -Force -Path $temporaryDirectory | Out-Null
     try {
         $packagePath = Join-Path $temporaryDirectory ([string]$asset.name)
-        Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'GenshinOneClick-SelfUpdater' } `
-            -Uri ([string]$asset.browser_download_url) -OutFile $packagePath
+        Invoke-GitHubDownloadWithFallback `
+            -Url ([string]$asset.browser_download_url) `
+            -Destination $packagePath `
+            -UserAgent 'GenshinOneClick-SelfUpdater' `
+            -ExpectedSha256 ([string]$asset.digest)
         if ([string]$asset.digest -match '^sha256:(.+)$') {
             $actualHash = (Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash
             if (-not [string]::Equals($actualHash, $matches[1], [StringComparison]::OrdinalIgnoreCase)) {
@@ -686,13 +767,17 @@ function Start-PackageSelfUpdate {
         }
         $helperCopy = Join-Path $temporaryDirectory 'Apply-PackageUpdate.ps1'
         Copy-Item -LiteralPath $selfUpdateHelperPath -Destination $helperCopy -Force
-        Start-Process -FilePath 'powershell.exe' -ArgumentList @(
+        $updateArguments = @(
             '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $helperCopy + '"'),
             '-ParentProcessId', $PID,
             '-SourceDirectory', ('"' + $expanded + '"'),
             '-TargetDirectory', ('"' + $root + '"'),
-            '-RelaunchScript', ('"' + (Join-Path $root 'Installer.ps1') + '"')
-        ) | Out-Null
+            '-RelaunchScript', ('"' + (Join-Path $root 'Installer.ps1') + '"'),
+            '-GamePath', ('"' + $ResumeGamePath + '"'),
+            '-Language', $script:Language
+        )
+        if ($ResumeUpdateAll) { $updateArguments += '-ResumeUpdateAll' }
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $updateArguments | Out-Null
         Write-Host "已下载管理脚本 v$latestVersion，当前窗口关闭后自动替换并重新打开。" -ForegroundColor Green
         $script:SelfUpdateStarted = $true
         return $true
@@ -945,11 +1030,28 @@ function Invoke-InstallWizard {
 }
 
 function Invoke-UpdateWizard {
-    param([string]$SelectedGamePath, [int]$FpsTarget)
+    param(
+        [string]$SelectedGamePath,
+        [int]$FpsTarget,
+        [int[]]$PreselectedModules,
+        [switch]$SkipSelfUpdate,
+        [switch]$PreserveExistingConfigs
+    )
     Write-Header -Title '更新模块'
     Write-InstallCatalog -SelectedGamePath $SelectedGamePath
-    $selection = @(Select-ModuleSet -ActionName '更新' -IncludeFoundation -IncludeSelfUpdate)
+    $selection = if ($null -ne $PreselectedModules -and $PreselectedModules.Count -gt 0) {
+        @($PreselectedModules)
+    }
+    else {
+        @(Select-ModuleSet -ActionName '更新' -IncludeFoundation -IncludeSelfUpdate)
+    }
     if ($selection.Count -eq 0) { return }
+
+    $isFullUpdateRequested = @(@(1, 2, 3, 4, 5) | Where-Object { $_ -notin $selection }).Count -eq 0
+    $shouldPreserveExistingConfigs = $PreserveExistingConfigs -or $isFullUpdateRequested
+    if ($isFullUpdateRequested -and -not $SkipSelfUpdate) {
+        if (Start-PackageSelfUpdate -ResumeGamePath $SelectedGamePath -ResumeUpdateAll) { return }
+    }
 
     $state = Get-ModuleState -SelectedGamePath $SelectedGamePath
     $installed = @{
@@ -992,7 +1094,7 @@ function Invoke-UpdateWizard {
         if ($optiSource -eq 'Retry') { $optiSource = 'Existing' }
     }
     if ($validSelection.Contains(4)) {
-        $reShadeSource = Select-ReShadeSource
+        $reShadeSource = if ($SkipSelfUpdate) { 'Auto' } else { Select-ReShadeSource }
         if ($null -eq $reShadeSource) { return }
     }
 
@@ -1011,6 +1113,7 @@ function Invoke-UpdateWizard {
         if ($desired.OptiScaler) { $arguments += @('-OptiScalerSource', $optiSource) } else { $arguments += '-DisableOptiScaler' }
         if (-not $desired.AntiBlur) { $arguments += '-DisableAntiBlur' }
         if ($desired.HDR) { $arguments += @('-ReShadeSource', $reShadeSource) } else { $arguments += '-DisableHDR' }
+        if ($shouldPreserveExistingConfigs) { $arguments += '-PreserveExistingConfigs' }
         if ($NoShortcut) { $arguments += '-NoShortcut' }
         Write-Host ''
         Write-Host '正在更新所选模块，请稍候...' -ForegroundColor Cyan
@@ -1028,7 +1131,7 @@ function Invoke-UpdateWizard {
         }
     }
 
-    if ($validSelection.Contains(5)) {
+    if ($validSelection.Contains(5) -and -not $SkipSelfUpdate -and -not $isFullUpdateRequested) {
         if (Start-PackageSelfUpdate) { return }
     }
     Pause-Menu
@@ -1057,7 +1160,7 @@ function Invoke-UninstallWizard {
     param([string]$SelectedGamePath)
     Write-Header -Title '停止加载模块'
     Write-InstallCatalog -SelectedGamePath $SelectedGamePath
-    $selection = @(Select-ModuleSet -ActionName '停止加载' -Uninstall)
+    $selection = @(Select-ModuleSet -ActionName '停止加载')
     if ($selection.Count -eq 0) { return }
     $config = Get-FpsConfig
     if (2 -in $selection) {
@@ -1159,13 +1262,22 @@ if (-not (Invoke-FoundationSetup -SelectedGamePath $selectedGamePath -FpsTarget 
 Invoke-NvidiaDlssSetup
 Save-State -SelectedGamePath $selectedGamePath -FpsTarget $fpsTarget
 
+if ($ResumeUpdateAll) {
+    Invoke-UpdateWizard `
+        -SelectedGamePath $selectedGamePath `
+        -FpsTarget $fpsTarget `
+        -PreselectedModules @(1, 2, 3, 4) `
+        -SkipSelfUpdate `
+        -PreserveExistingConfigs
+    exit 0
+}
+
 while ($true) {
     $moduleState = Get-ModuleState -SelectedGamePath $selectedGamePath
-    $installedCount = @(@($moduleState.OptiScaler, $moduleState.AntiBlur, $moduleState.HDR) | Where-Object { $_ }).Count
+    $installedCount = @(@($moduleState.Unlocker, $moduleState.OptiScaler, $moduleState.AntiBlur, $moduleState.HDR) | Where-Object { $_ }).Count
     Write-Header -Title '原神插件管理器'
     Write-Host "[√] 游戏目录: $(Split-Path -Parent $selectedGamePath)" -ForegroundColor Green
     Write-Host "[√] 插件目录: $root" -ForegroundColor Green
-    $installedCount++
     Write-Host "    已安装 $installedCount / 4" -ForegroundColor DarkGray
     Write-Host ''
     Write-ModuleLine -Number 1 -Name 'FPS Unlocker' -Installed $moduleState.Unlocker -Path $unlockerPath -Extra "当前帧率上限 $fpsTarget"

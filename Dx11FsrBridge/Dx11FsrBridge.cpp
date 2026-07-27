@@ -142,6 +142,7 @@ struct Config
     bool enable_fsr2_get_proc_address_shim = false;
     std::uint32_t fsr2_translation_mode = 0;
     bool fsr2_fast_state_tracking = false;
+    bool fsr2_mode2_on_demand_state = true;
     std::uint32_t fsr2_output_validation_target = 0;
     bool fsr2_motion_vectors_jittered = false;
     bool fsr2_positive_motion_vector_scale = false;
@@ -185,7 +186,6 @@ struct ResourceInfo
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-    std::wstring kind;
 };
 
 struct BufferInfo
@@ -427,6 +427,9 @@ std::uint32_t g_fsr2_gpu_timing_sample_count = 0;
 std::uint32_t g_fsr2_gpu_timing_unavailable_streak = 0;
 ULONGLONG g_fsr2_gpu_timing_last_recovery_tick = 0;
 std::atomic_bool g_fsr2_translation_recovery_requested = false;
+// 上次成功接管（skip_original_draw）的 tick；用于检测"翻译空窗"（切原生档、
+// 加载、过场、dispatch 失败回退）后恢复时强制重置 FSR2 历史，避免旧场景鬼影。
+std::atomic<ULONGLONG> g_fsr2_last_translation_tick { 0 };
 std::mutex g_fsr2_neutral_exposure_mutex;
 ID3D11Device *g_fsr2_neutral_exposure_device = nullptr;
 ID3D11Texture2D *g_fsr2_neutral_exposure_texture = nullptr;
@@ -447,12 +450,30 @@ std::atomic_bool g_fsr31_input_probe_complete = false;
 std::atomic_bool g_optiscaler_delayed_init_probe_started = false;
 #endif
 thread_local bool g_internal_bridge_dispatch = false;
+
+struct ScopedInternalBridgeDispatch
+{
+    ScopedInternalBridgeDispatch()
+    {
+        g_internal_bridge_dispatch = true;
+    }
+
+    ~ScopedInternalBridgeDispatch()
+    {
+        g_internal_bridge_dispatch = false;
+    }
+
+    ScopedInternalBridgeDispatch(const ScopedInternalBridgeDispatch &) = delete;
+    ScopedInternalBridgeDispatch &operator=(const ScopedInternalBridgeDispatch &) = delete;
+};
+
 std::mutex g_state_mutex;
 std::atomic_bool g_active { false };
 DispatchState g_state;
 std::mutex g_color_source_mutex;
 std::unordered_map<std::uint64_t, std::deque<ColorSourceWrite>> g_color_source_writes;
 std::atomic_uint64_t g_color_source_sequence = 0;
+std::mutex g_hook_scan_mutex;
 std::string g_last_create_hook_scan;
 std::string g_last_loader_hook_scan;
 std::mutex g_dispatch_signature_mutex;
@@ -604,6 +625,7 @@ update_subresource_fn g_original_update_subresource = nullptr;
 clear_rtv_fn g_original_clear_rtv = nullptr;
 clear_dsv_fn g_original_clear_dsv = nullptr;
 
+std::mutex g_vtable_mutex;
 std::unordered_map<void *, void **> g_cloned_vtables;
 std::unordered_map<void *, void **> g_original_vtables;
 
@@ -1155,6 +1177,18 @@ std::vector<std::uint8_t> lookup_buffer_snapshot(std::uint64_t resource_key)
     if (it == g_buffer_snapshots.end())
         return {};
     return it->second;
+}
+
+bool read_buffer_snapshot_bytes(std::uint64_t resource_key, std::size_t offset, void *destination, std::size_t size)
+{
+    if (resource_key == 0 || destination == nullptr || size == 0)
+        return false;
+    std::lock_guard lock(g_buffer_info_mutex);
+    const auto it = g_buffer_snapshots.find(resource_key);
+    if (it == g_buffer_snapshots.end() || it->second.size() < offset + size)
+        return false;
+    std::memcpy(destination, it->second.data() + offset, size);
+    return true;
 }
 
 std::string bytes_to_hex(const std::vector<std::uint8_t> &bytes)
@@ -3103,6 +3137,8 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableFsr2GetProcAddressShim", 1, config_path.c_str()) != 0;
     g_config.fsr2_translation_mode = static_cast<std::uint32_t>(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2TranslationMode", 4, config_path.c_str()));
+    g_config.fsr2_mode2_on_demand_state =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2Mode2OnDemandState", 1, config_path.c_str()) != 0;
     g_config.fsr2_motion_vectors_jittered =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2MotionVectorsJittered", 0, config_path.c_str()) != 0;
     g_config.fsr2_positive_motion_vector_scale =
@@ -3176,6 +3212,8 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2TranslationMode", 0, config_path.c_str()));
     g_config.fsr2_fast_state_tracking =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2FastStateTracking", 0, config_path.c_str()) != 0;
+    g_config.fsr2_mode2_on_demand_state =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2Mode2OnDemandState", 1, config_path.c_str()) != 0;
     g_config.fsr2_output_validation_target = static_cast<std::uint32_t>(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2OutputValidationTarget", 0, config_path.c_str()));
     g_config.fsr2_motion_vectors_jittered =
@@ -3289,7 +3327,6 @@ bool read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo &out
             out_info.width = desc.Width;
             out_info.height = desc.Height;
             out_info.format = desc.Format;
-            out_info.kind = kind;
             texture->Release();
             resource->Release();
             return true;
@@ -3321,7 +3358,6 @@ bool read_resource_info_from_resource(ID3D11Resource *resource, const wchar_t *k
     out_info.width = desc.Width;
     out_info.height = desc.Height;
     out_info.format = desc.Format;
-    out_info.kind = kind;
     texture->Release();
     return true;
 }
@@ -4018,8 +4054,15 @@ void capture_runtime_snapshot_if_requested()
         << " consumed_generations=" << consumed_producer_generations
         << " late_path_states=" << late_path_states << "\n";
 #endif
-    out << "hooks create_scan=" << g_last_create_hook_scan
-        << " loader_scan=" << g_last_loader_hook_scan << "\n";
+    std::string create_scan_copy;
+    std::string loader_scan_copy;
+    {
+        std::lock_guard hook_scan_lock(g_hook_scan_mutex);
+        create_scan_copy = g_last_create_hook_scan;
+        loader_scan_copy = g_last_loader_hook_scan;
+    }
+    out << "hooks create_scan=" << create_scan_copy
+        << " loader_scan=" << loader_scan_copy << "\n";
 
     const std::vector<HMODULE> modules = enumerate_process_modules();
     out << "modules count=" << modules.size() << "\n";
@@ -4073,9 +4116,17 @@ void install_create_hooks_for_loaded_modules()
 
     const std::string summary = "iat_scan create_device_and_swapchain_hooks=" + std::to_string(swapchain_hooks) +
         " create_device_hooks=" + std::to_string(device_hooks);
-    if (summary != g_last_create_hook_scan)
+    bool summary_changed = false;
     {
-        g_last_create_hook_scan = summary;
+        std::lock_guard lock(g_hook_scan_mutex);
+        if (summary != g_last_create_hook_scan)
+        {
+            g_last_create_hook_scan = summary;
+            summary_changed = true;
+        }
+    }
+    if (summary_changed)
+    {
         log_line(summary);
         if (swapchain_hooks == 0 && device_hooks == 0)
         {
@@ -4132,12 +4183,17 @@ void install_loader_hooks_for_loaded_modules()
         " loadlibraryexa=" + std::to_string(load_library_ex_a_hooks) +
         " loadlibraryexw=" + std::to_string(load_library_ex_w_hooks) +
         " getprocaddress=" + std::to_string(get_proc_address_hooks);
-    if (summary != g_last_loader_hook_scan)
+    bool summary_changed = false;
     {
-        g_last_loader_hook_scan = summary;
-        if (g_config.log_loader_activity)
-            log_line(summary);
+        std::lock_guard lock(g_hook_scan_mutex);
+        if (summary != g_last_loader_hook_scan)
+        {
+            g_last_loader_hook_scan = summary;
+            summary_changed = true;
+        }
     }
+    if (summary_changed && g_config.log_loader_activity)
+        log_line(summary);
 }
 
 bool clone_and_patch_vtable(void *instance, std::size_t method_count, const std::vector<std::pair<std::size_t, void *>> &patches)
@@ -4145,7 +4201,7 @@ bool clone_and_patch_vtable(void *instance, std::size_t method_count, const std:
     if (instance == nullptr)
         return false;
 
-    std::lock_guard lock(g_state_mutex);
+    std::lock_guard lock(g_vtable_mutex);
     if (g_cloned_vtables.contains(instance))
         return true;
 
@@ -4185,7 +4241,7 @@ bool set_cloned_vtable_enabled(void *instance, bool enabled)
     if (instance == nullptr)
         return false;
 
-    std::lock_guard lock(g_state_mutex);
+    std::lock_guard lock(g_vtable_mutex);
     const auto cloned = g_cloned_vtables.find(instance);
     const auto original = g_original_vtables.find(instance);
     if (cloned == g_cloned_vtables.end() || original == g_original_vtables.end())
@@ -4236,17 +4292,26 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
     }
 #endif
     DXGI_SWAP_CHAIN_DESC desc {};
-    if (SUCCEEDED(swapchain->GetDesc(&desc)))
+    const bool desc_available = SUCCEEDED(swapchain->GetDesc(&desc));
+    std::uint64_t frame_index = 0;
+    std::uint32_t backbuffer_width = 0;
+    std::uint32_t backbuffer_height = 0;
     {
         std::lock_guard lock(g_state_mutex);
-        g_state.backbuffer_width = desc.BufferDesc.Width;
-        g_state.backbuffer_height = desc.BufferDesc.Height;
-        g_state.frame_index++;
-        g_state.candidate_count = 0;
+        if (desc_available)
+        {
+            g_state.backbuffer_width = desc.BufferDesc.Width;
+            g_state.backbuffer_height = desc.BufferDesc.Height;
+            g_state.frame_index++;
+            g_state.candidate_count = 0;
+        }
+        frame_index = g_state.frame_index;
+        backbuffer_width = g_state.backbuffer_width;
+        backbuffer_height = g_state.backbuffer_height;
     }
 
-    log_line("present frame=" + std::to_string(g_state.frame_index) +
-        " size=" + std::to_string(g_state.backbuffer_width) + "x" + std::to_string(g_state.backbuffer_height));
+    log_line("present frame=" + std::to_string(frame_index) +
+        " size=" + std::to_string(backbuffer_width) + "x" + std::to_string(backbuffer_height));
     return g_original_present(swapchain, sync_interval, flags);
 }
 
@@ -4413,6 +4478,11 @@ HRESULT STDMETHODCALLTYPE hooked_set_hdr_metadata(
 void STDMETHODCALLTYPE hooked_ps_set_shader_resources(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11ShaderResourceView *const *views)
 {
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
+    {
+        g_original_ps_set_shader_resources(context, start_slot, count, views);
+        return;
+    }
     if (g_config.fsr2_fast_state_tracking && g_config.fsr2_translation_mode == 2 &&
         g_mode2_fast_target_ps_hash.load(std::memory_order_relaxed) != 0)
     {
@@ -4459,6 +4529,11 @@ void STDMETHODCALLTYPE hooked_vs_set_constant_buffers(ID3D11DeviceContext *conte
 void STDMETHODCALLTYPE hooked_ps_set_shader(ID3D11DeviceContext *context, ID3D11PixelShader *shader, ID3D11ClassInstance *const *class_instances, UINT class_instances_count)
 {
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
+    {
+        g_original_ps_set_shader(context, shader, class_instances, class_instances_count);
+        return;
+    }
     const std::uint64_t fast_target_hash = g_mode2_fast_target_ps_hash.load(std::memory_order_relaxed);
     if (g_config.fsr2_fast_state_tracking && g_config.fsr2_translation_mode == 2 && fast_target_hash != 0)
     {
@@ -4483,6 +4558,11 @@ void STDMETHODCALLTYPE hooked_ps_set_shader(ID3D11DeviceContext *context, ID3D11
 void STDMETHODCALLTYPE hooked_ps_set_constant_buffers(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11Buffer *const *buffers)
 {
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
+    {
+        g_original_ps_set_constant_buffers(context, start_slot, count, buffers);
+        return;
+    }
     if (g_config.fsr2_fast_state_tracking && g_config.fsr2_translation_mode == 2 &&
         g_mode2_fast_target_ps_hash.load(std::memory_order_relaxed) != 0)
     {
@@ -4545,6 +4625,11 @@ void STDMETHODCALLTYPE hooked_cs_set_constant_buffers(ID3D11DeviceContext *conte
 void STDMETHODCALLTYPE hooked_om_set_render_targets(ID3D11DeviceContext *context, UINT count, ID3D11RenderTargetView *const *rtvs, ID3D11DepthStencilView *dsv)
 {
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
+    {
+        g_original_om_set_render_targets(context, count, rtvs, dsv);
+        return;
+    }
     if (g_config.fsr2_fast_state_tracking && g_config.fsr2_translation_mode == 2 &&
         g_mode2_fast_target_ps_hash.load(std::memory_order_relaxed) != 0)
     {
@@ -4664,7 +4749,8 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(UINT element_
     if (g_state.current_ps_hash != g_config.target_pixel_shader_hash)
     {
         static std::atomic_bool fallback_shader_logged { false };
-        if (!fallback_shader_logged.exchange(true, std::memory_order_relaxed))
+        if (!fallback_shader_logged.load(std::memory_order_relaxed) &&
+            !fallback_shader_logged.exchange(true, std::memory_order_relaxed))
         {
             log_line("target_upscaler_signature_fallback ps=" + hex64(g_state.current_ps_hash) +
                 " configured=" + hex64(g_config.target_pixel_shader_hash));
@@ -4692,10 +4778,143 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(UINT element_
     };
 }
 
+#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
+// mode 2 的按需识别路径：不依赖 Set 钩子维护的 g_state 镜像，在候选 draw 现场直接查询
+// 状态并做完整签名校验。两段式：先用"双 RTV"预筛掉绝大多数全屏三角形（TAAU 签名要求
+// 同时绑定 output_metadata 与 output_color 两个 RTV），再对剩余候选做全量内省。
+// 不做任何 shader hash 过滤，因此技能等使用不同 shader 的 TAAU 路径同样能被识别。
+std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
+    ID3D11DeviceContext *context,
+    UINT element_count)
+{
+    if (context == nullptr || element_count != 3)
+        return std::nullopt;
+
+    std::array<ID3D11RenderTargetView *, 2> render_targets {};
+    context->OMGetRenderTargets(static_cast<UINT>(render_targets.size()), render_targets.data(), nullptr);
+    if (render_targets[0] == nullptr || render_targets[1] == nullptr)
+    {
+        for (ID3D11RenderTargetView *render_target : render_targets)
+        {
+            if (render_target != nullptr)
+                render_target->Release();
+        }
+        return std::nullopt;
+    }
+
+    std::array<ID3D11ShaderResourceView *, 7> shader_resources {};
+    ID3D11Buffer *constant_buffer = nullptr;
+    context->PSGetShaderResources(0, static_cast<UINT>(shader_resources.size()), shader_resources.data());
+    context->PSGetConstantBuffers(0, 1, &constant_buffer);
+
+    D3D11_VIEWPORT viewport {};
+    UINT viewport_count = 1;
+    context->RSGetViewports(&viewport_count, &viewport);
+
+    std::array<ResourceInfo, 7> inputs {};
+    std::array<ResourceInfo, 2> outputs {};
+    for (std::size_t index = 0; index < shader_resources.size(); ++index)
+        read_resource_info(shader_resources[index], L"fsr2_on_demand_srv", inputs[index]);
+    for (std::size_t index = 0; index < render_targets.size(); ++index)
+        read_resource_info(render_targets[index], L"fsr2_on_demand_rtv", outputs[index]);
+
+    D3D11_BUFFER_DESC constant_buffer_description {};
+    if (constant_buffer != nullptr)
+        constant_buffer->GetDesc(&constant_buffer_description);
+    const std::uint64_t constant_buffer_key =
+        reinterpret_cast<std::uint64_t>(constant_buffer);
+
+    for (ID3D11ShaderResourceView *view : shader_resources)
+    {
+        if (view != nullptr)
+            view->Release();
+    }
+    for (ID3D11RenderTargetView *render_target : render_targets)
+        render_target->Release();
+    if (constant_buffer != nullptr)
+        constant_buffer->Release();
+
+    const ResourceInfo &color = inputs[0];
+    const ResourceInfo &weights = inputs[1];
+    const ResourceInfo &depth = inputs[2];
+    const ResourceInfo &motion = inputs[3];
+    const ResourceInfo &flags = inputs[4];
+    const ResourceInfo &history_metadata = inputs[5];
+    const ResourceInfo &history_color = inputs[6];
+    const ResourceInfo &output_metadata = outputs[0];
+    const ResourceInfo &output_color = outputs[1];
+    const bool resources_present =
+        color.resource_key != 0 && weights.resource_key != 0 && depth.resource_key != 0 &&
+        motion.resource_key != 0 && flags.resource_key != 0 && history_metadata.resource_key != 0 &&
+        history_color.resource_key != 0 && output_metadata.resource_key != 0 &&
+        output_color.resource_key != 0;
+    const bool input_dimensions_match =
+        depth.width == color.width && depth.height == color.height &&
+        motion.width == color.width && motion.height == color.height &&
+        flags.width == color.width && flags.height == color.height;
+    const bool output_dimensions_match =
+        output_metadata.width == output_color.width && output_metadata.height == output_color.height &&
+        history_metadata.width == output_color.width && history_metadata.height == output_color.height &&
+        history_color.width == output_color.width && history_color.height == output_color.height &&
+        viewport_count != 0 && static_cast<std::uint32_t>(viewport.Width) == output_color.width &&
+        static_cast<std::uint32_t>(viewport.Height) == output_color.height;
+    if (!resources_present || !input_dimensions_match || !output_dimensions_match ||
+        weights.width != 16 || weights.height != 16 ||
+        color.width > output_color.width || color.height > output_color.height ||
+        constant_buffer_description.ByteWidth < 464)
+    {
+        return std::nullopt;
+    }
+
+    g_trace_ps_cb0_key.store(constant_buffer_key, std::memory_order_relaxed);
+
+    // cb0 若在钩子安装前创建则不在 g_buffer_info 中，map/unmap 快照链会静默失败，
+    // 导致 jitter 恒为零；用现场 GetDesc 结果补注册使快照链自愈。
+    if (constant_buffer_key != 0 && constant_buffer_description.ByteWidth != 0)
+    {
+        std::lock_guard lock(g_buffer_info_mutex);
+        BufferInfo &registered = g_buffer_info[constant_buffer_key];
+        if (registered.resource_key == 0)
+        {
+            registered.resource_key = constant_buffer_key;
+            registered.byte_width = constant_buffer_description.ByteWidth;
+            registered.bind_flags = constant_buffer_description.BindFlags;
+            registered.usage = constant_buffer_description.Usage;
+            log_line("mode2_on_demand_cb0_registered key=" + hex64(constant_buffer_key) +
+                " bytes=" + std::to_string(constant_buffer_description.ByteWidth));
+        }
+    }
+
+    static std::atomic_bool identified_logged { false };
+    if (!identified_logged.load(std::memory_order_relaxed) &&
+        !identified_logged.exchange(true, std::memory_order_relaxed))
+    {
+        log_line("mode2_on_demand_target_identified render=" +
+            std::to_string(color.width) + "x" + std::to_string(color.height) +
+            " output=" + std::to_string(output_color.width) + "x" + std::to_string(output_color.height) +
+            " cb0=" + hex64(constant_buffer_key));
+    }
+
+    return TargetUpscalerDrawInfo {
+        color.width,
+        color.height,
+        output_color.width,
+        output_color.height,
+        constant_buffer_key,
+        color.resource_key,
+        motion.resource_key,
+    };
+}
+#endif
+
 std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(
     ID3D11DeviceContext *context,
     UINT element_count)
 {
+#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
+    if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
+        return inspect_target_upscaler_draw_on_demand(context, element_count);
+#endif
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     const std::uint64_t fast_target_hash = g_mode2_fast_target_ps_hash.load(std::memory_order_relaxed);
     if (g_config.fsr2_fast_state_tracking && g_config.fsr2_translation_mode == 2 && fast_target_hash != 0)
@@ -4935,23 +5154,26 @@ void maybe_dump_same_frame_fsr2_inputs(ID3D11DeviceContext *context, UINT elemen
         " sequence_end=" + std::to_string(g_color_source_sequence.load(std::memory_order_relaxed)));
 }
 
-std::pair<float, float> target_jitter_pixels(const TargetUpscalerDrawInfo &draw_info)
+// 返回 nullopt 表示"jitter 不可用"（快照缺失或数据非法），调用方必须区分
+// 该情形与真实零抖动：用 (0,0) 或坏数据 dispatch 会让 FSR2 历史累积错位。
+std::optional<std::pair<float, float>> target_jitter_pixels(const TargetUpscalerDrawInfo &draw_info)
 {
     constexpr std::size_t jitter_offset = 28 * sizeof(float) * 4;
-    const std::vector<std::uint8_t> snapshot = lookup_buffer_snapshot(draw_info.constant_buffer_key);
-    if (snapshot.size() < jitter_offset + sizeof(float) * 2)
-        return {};
-
     float normalized_jitter[2] {};
-    std::memcpy(normalized_jitter, snapshot.data() + jitter_offset, sizeof(normalized_jitter));
-    if (!std::isfinite(normalized_jitter[0]) || !std::isfinite(normalized_jitter[1]) ||
-        std::abs(normalized_jitter[0]) > 1.0f || std::abs(normalized_jitter[1]) > 1.0f)
-    {
-        return {};
-    }
+    if (!read_buffer_snapshot_bytes(
+            draw_info.constant_buffer_key, jitter_offset, normalized_jitter, sizeof(normalized_jitter)))
+        return std::nullopt;
+    if (!std::isfinite(normalized_jitter[0]) || !std::isfinite(normalized_jitter[1]))
+        return std::nullopt;
 
     float jitter_x = normalized_jitter[0] * static_cast<float>(draw_info.render_width) - 0.5f;
     float jitter_y = normalized_jitter[1] * static_cast<float>(draw_info.render_height) - 0.5f;
+    // TAA jitter 换算成像素后必然落在亚像素范围（约 ±0.5px）内；超出说明 cb0
+    // 偏移 448 处并非 jitter（识别到布局不同的 pass 或快照内容错位），此时放弃
+    // 本帧翻译比把数百像素的"jitter"喂给 FSR2 安全得多。
+    constexpr float k_max_jitter_pixels = 0.6f;
+    if (std::abs(jitter_x) > k_max_jitter_pixels || std::abs(jitter_y) > k_max_jitter_pixels)
+        return std::nullopt;
     switch (g_config.fsr2_jitter_mode)
     {
     case 1:
@@ -4971,7 +5193,7 @@ std::pair<float, float> target_jitter_pixels(const TargetUpscalerDrawInfo &draw_
     default:
         break;
     }
-    return { jitter_x, jitter_y };
+    return std::pair<float, float> { jitter_x, jitter_y };
 }
 
 bool unsafe_dx11_on12_backend_selected()
@@ -5585,6 +5807,16 @@ bool acquire_fsr2_color_replay_output(
         if (FAILED(result) || g_fsr2_color_replay_output == nullptr ||
             g_fsr2_color_replay_output_view == nullptr)
         {
+            if (g_fsr2_color_replay_output_view != nullptr)
+            {
+                g_fsr2_color_replay_output_view->Release();
+                g_fsr2_color_replay_output_view = nullptr;
+            }
+            if (g_fsr2_color_replay_output != nullptr)
+            {
+                g_fsr2_color_replay_output->Release();
+                g_fsr2_color_replay_output = nullptr;
+            }
             log_line("fsr2_color_replay_output_create_failed hr=" +
                 std::to_string(static_cast<long>(result)));
             return false;
@@ -5651,6 +5883,16 @@ ID3D11ShaderResourceView *acquire_fsr2_neutral_exposure_view(ID3D11DeviceContext
         }
         if (FAILED(result) || g_fsr2_neutral_exposure_view == nullptr)
         {
+            if (g_fsr2_neutral_exposure_view != nullptr)
+            {
+                g_fsr2_neutral_exposure_view->Release();
+                g_fsr2_neutral_exposure_view = nullptr;
+            }
+            if (g_fsr2_neutral_exposure_texture != nullptr)
+            {
+                g_fsr2_neutral_exposure_texture->Release();
+                g_fsr2_neutral_exposure_texture = nullptr;
+            }
             log_line("fsr2_neutral_exposure_create_failed hr=" +
                 std::to_string(static_cast<long>(result)));
             return nullptr;
@@ -5684,6 +5926,11 @@ void maybe_track_fsr2_color_candidate(ID3D11DeviceContext *context, UINT element
     context->PSGetShaderResources(0, resource_count, shader_resources.data());
     if (shader_resources[0] == nullptr)
     {
+        for (ID3D11ShaderResourceView *view : shader_resources)
+        {
+            if (view != nullptr)
+                view->Release();
+        }
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         record_fsr2_transient_producer(*target, {}, false, "t0_unbound", UINT_MAX);
 #endif
@@ -5871,7 +6118,8 @@ void maybe_dispatch_early_output_probe(ID3D11DeviceContext *context, UINT elemen
     }
     else
     {
-        const auto [jitter_x, jitter_y] = target_jitter_pixels(*draw_info);
+        const auto [jitter_x, jitter_y] =
+            target_jitter_pixels(*draw_info).value_or(std::pair<float, float> {});
         Fsr2TranslationFrame frame;
         frame.context = context;
         frame.color = raw_color;
@@ -5892,13 +6140,12 @@ void maybe_dispatch_early_output_probe(ID3D11DeviceContext *context, UINT elemen
         else
             context->OMSetRenderTargets(0, nullptr, nullptr);
 
-        g_internal_bridge_dispatch = true;
         Fsr2TranslationOutcome outcome;
         {
+            ScopedInternalBridgeDispatch internal_dispatch_scope;
             ScopedContextVtableBypass context_vtable_bypass(context);
             outcome = dispatch_fsr2_translation(frame);
         }
-        g_internal_bridge_dispatch = false;
 
         if (g_original_om_set_render_targets != nullptr)
             g_original_om_set_render_targets(
@@ -6436,28 +6683,50 @@ bool try_fsr2_translation_draw(
     if (translation_mode == 0 || context == nullptr)
         return false;
 
-    if (g_fsr2_translation_recovery_requested.exchange(false, std::memory_order_acq_rel))
+    if (g_fsr2_translation_recovery_requested.load(std::memory_order_relaxed) &&
+        g_fsr2_translation_recovery_requested.exchange(false, std::memory_order_acq_rel))
     {
         reset_fsr2_translation_context();
+        // 上下文已重建，g_reset_next_dispatch 会处理首帧重置；
+        // 清零空窗计时避免紧接着再报一次冗余的 gap_reset。
+        g_fsr2_last_translation_tick.store(0, std::memory_order_relaxed);
         log_line("fsr2_translation_context_reset reason=upscaler_stall");
     }
 
     if (unsafe_dx11_on12_backend_selected())
     {
-        if (!g_fsr2_dx11on12_block_logged.exchange(true, std::memory_order_relaxed))
+        if (!g_fsr2_dx11on12_block_logged.load(std::memory_order_relaxed) &&
+            !g_fsr2_dx11on12_block_logged.exchange(true, std::memory_order_relaxed))
             log_line("fsr2_translation_blocked unsafe_dx11_on12_backend=1 fallback=original_draw");
         return false;
     }
-    g_fsr2_dx11on12_block_logged.store(false, std::memory_order_relaxed);
+    if (g_fsr2_dx11on12_block_logged.load(std::memory_order_relaxed))
+        g_fsr2_dx11on12_block_logged.store(false, std::memory_order_relaxed);
 
-    const auto draw_info = inspected_draw_info
-        ? inspected_draw_info
-        : inspect_target_upscaler_draw(context, element_count);
+    // 两个调用点（hooked_draw / hooked_draw_indexed）都已在本帧对该 draw inspect
+    // 过一次并传入结果；这里不再回退重查，避免按需查询模式下的重复内省。
+    const std::optional<TargetUpscalerDrawInfo> &draw_info = inspected_draw_info;
     if (!draw_info)
         return false;
     if (draw_info->render_width >= draw_info->output_width &&
         draw_info->render_height >= draw_info->output_height)
     {
+        return false;
+    }
+
+    // 在获取任何 COM 资源之前先取 jitter：不可用时本帧直接回退原生 TAAU
+    // （原生路径的 jitter 天然正确），等待 cb0 快照链在后续帧自愈。
+    const std::optional<std::pair<float, float>> jitter_pixels = target_jitter_pixels(*draw_info);
+    if (!jitter_pixels)
+    {
+        static std::atomic_uint64_t jitter_unavailable_count { 0 };
+        const std::uint64_t miss_count =
+            jitter_unavailable_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (miss_count <= 8 || miss_count % 1024 == 0)
+        {
+            log_line("fsr2_jitter_unavailable count=" + std::to_string(miss_count) +
+                " cb0=" + hex64(draw_info->constant_buffer_key) + " fallback=original_draw");
+        }
         return false;
     }
 
@@ -6675,7 +6944,7 @@ bool try_fsr2_translation_draw(
     }
 #endif
 
-    const auto [jitter_x, jitter_y] = target_jitter_pixels(*draw_info);
+    const auto [jitter_x, jitter_y] = *jitter_pixels;
     Fsr2TranslationFrame frame;
     frame.context = context;
     frame.color = translation_color;
@@ -6737,10 +7006,32 @@ bool try_fsr2_translation_draw(
 #endif
     const bool optiscaler_config_reset = consume_fsr2_optiscaler_config_reset();
     const bool optiscaler_log_reset = should_reset_for_optiscaler_log_activity();
+    // 翻译空窗后恢复：上下文里仍保留空窗前的旧历史，必须重置。250ms 在 60fps
+    // 下约 15 帧，正常连续翻译不会触发；真实的长卡顿触发一次重置也无害。
+    constexpr ULONGLONG k_translation_gap_reset_ms = 250;
+    const ULONGLONG translation_now_tick = GetTickCount64();
+    const ULONGLONG last_translation_tick =
+        g_fsr2_last_translation_tick.load(std::memory_order_relaxed);
+    const bool translation_gap_reset =
+        last_translation_tick != 0 &&
+        translation_now_tick - last_translation_tick > k_translation_gap_reset_ms;
+    if (translation_gap_reset)
+    {
+        static std::atomic_uint64_t gap_reset_count { 0 };
+        const std::uint64_t reset_count =
+            gap_reset_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (reset_count <= 8 || reset_count % 256 == 0)
+        {
+            log_line("fsr2_translation_gap_reset gap_ms=" +
+                std::to_string(translation_now_tick - last_translation_tick) +
+                " count=" + std::to_string(reset_count));
+        }
+    }
     frame.reset =
         (color_path_changed && g_config.fsr2_reset_on_color_path_change) ||
         optiscaler_config_reset ||
-        optiscaler_log_reset;
+        optiscaler_log_reset ||
+        translation_gap_reset;
     Fsr2GpuTimingSlot *gpu_timing_slot = begin_fsr2_gpu_timing(context);
     frame.gpu_timestamp_after_prepare =
         gpu_timing_slot != nullptr ? gpu_timing_slot->timestamps[1] : nullptr;
@@ -6821,13 +7112,12 @@ bool try_fsr2_translation_draw(
     else
         context->OMSetRenderTargets(0, nullptr, nullptr);
 
-    g_internal_bridge_dispatch = true;
     Fsr2TranslationOutcome outcome;
     {
+        ScopedInternalBridgeDispatch internal_dispatch_scope;
         ScopedContextVtableBypass context_vtable_bypass(context);
         outcome = dispatch_fsr2_translation(frame);
     }
-    g_internal_bridge_dispatch = false;
     if (gpu_timing_slot != nullptr)
     {
         if (!outcome.inputs_prepared)
@@ -6888,7 +7178,7 @@ bool try_fsr2_translation_draw(
 #endif
     bool metadata_updated = false;
     if (outcome.succeeded && outcome.hook_entry_detected && g_config.fsr2_fast_metadata_copy &&
-        translation_mode >= 4 && render_targets[0] != nullptr)
+        translation_mode >= 2 && render_targets[0] != nullptr)
     {
         metadata_updated = copy_fsr2_history_metadata(
             context,
@@ -6904,7 +7194,7 @@ bool try_fsr2_translation_draw(
         }
     }
     if (outcome.succeeded && outcome.hook_entry_detected && !metadata_updated &&
-        translation_mode >= 4 && render_targets[0] != nullptr)
+        translation_mode >= 2 && render_targets[0] != nullptr)
     {
         if (g_original_om_set_render_targets != nullptr)
             g_original_om_set_render_targets(context, 1, render_targets.data(), depth_stencil);
@@ -6950,6 +7240,8 @@ bool try_fsr2_translation_draw(
     const bool skip_original_draw = outcome.succeeded && outcome.hook_entry_detected &&
         ((translation_mode >= 2 && translation_mode < 4) ||
             use_late_composed_color || color_replayed);
+    if (skip_original_draw)
+        g_fsr2_last_translation_tick.store(GetTickCount64(), std::memory_order_relaxed);
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_fsr2_transient_capture_snapshot && render_targets[1] != nullptr)
     {
@@ -7239,9 +7531,11 @@ void maybe_probe_fsr31_inputs(ID3D11DeviceContext *context, UINT element_count)
 
     std::array<ID3D11ShaderResourceView *, 4> views {};
     context->PSGetShaderResources(0, static_cast<UINT>(views.size()), views.data());
-    g_internal_bridge_dispatch = true;
-    const bool prepared = fsr31_bridge().prepare_inputs(context, views[0], views[2], views[3]);
-    g_internal_bridge_dispatch = false;
+    bool prepared = false;
+    {
+        ScopedInternalBridgeDispatch internal_dispatch_scope;
+        prepared = fsr31_bridge().prepare_inputs(context, views[0], views[2], views[3]);
+    }
     for (ID3D11ShaderResourceView *view : views)
     {
         if (view != nullptr)
@@ -7447,9 +7741,12 @@ bool try_spatial_copy_draw(ID3D11DeviceContext *context, UINT element_count, Dra
 
 void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT index_count, UINT start_index_location, INT base_vertex_location)
 {
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     capture_runtime_snapshot_if_requested();
+#endif
     static std::atomic_bool hook_logged { false };
-    if (!hook_logged.exchange(true, std::memory_order_relaxed))
+    if (!hook_logged.load(std::memory_order_relaxed) &&
+        !hook_logged.exchange(true, std::memory_order_relaxed))
         log_line("draw_indexed_hook_active");
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     record_color_source_call("draw_indexed", index_count, 0, 0);
@@ -7508,9 +7805,12 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
 
 void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_count, UINT start_vertex_location)
 {
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     capture_runtime_snapshot_if_requested();
+#endif
     static std::atomic_bool hook_logged { false };
-    if (!hook_logged.exchange(true, std::memory_order_relaxed))
+    if (!hook_logged.load(std::memory_order_relaxed) &&
+        !hook_logged.exchange(true, std::memory_order_relaxed))
         log_line("draw_hook_active");
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     record_color_source_call("draw", vertex_count, 0, 0);
@@ -7598,7 +7898,7 @@ void STDMETHODCALLTYPE hooked_unmap(ID3D11DeviceContext *context, ID3D11Resource
         if (mapped_it != g_mapped_buffers.end() && mapped_it->second.data != nullptr && mapped_it->second.size != 0)
         {
             const auto *bytes = static_cast<const std::uint8_t *>(mapped_it->second.data);
-            g_buffer_snapshots[key] = std::vector<std::uint8_t>(bytes, bytes + mapped_it->second.size);
+            g_buffer_snapshots[key].assign(bytes, bytes + mapped_it->second.size);
             const auto info_it = g_buffer_info.find(key);
             if (info_it != g_buffer_info.end())
             {
@@ -7614,6 +7914,11 @@ void STDMETHODCALLTYPE hooked_unmap(ID3D11DeviceContext *context, ID3D11Resource
 void STDMETHODCALLTYPE hooked_rs_set_viewports(ID3D11DeviceContext *context, UINT count, const D3D11_VIEWPORT *viewports)
 {
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
+    {
+        g_original_rs_set_viewports(context, count, viewports);
+        return;
+    }
     if (g_config.fsr2_fast_state_tracking && g_config.fsr2_translation_mode == 2 &&
         g_mode2_fast_target_ps_hash.load(std::memory_order_relaxed) != 0)
     {
@@ -7684,7 +7989,7 @@ void STDMETHODCALLTYPE hooked_update_subresource(ID3D11DeviceContext *context, I
             it->second.last_update_size = update_size;
             it->second.last_update_hash = fnv1a64(src_data, update_size);
             const auto *bytes = static_cast<const std::uint8_t *>(src_data);
-            g_buffer_snapshots[key] = std::vector<std::uint8_t>(bytes, bytes + update_size);
+            g_buffer_snapshots[key].assign(bytes, bytes + update_size);
         }
     }
 
@@ -7796,7 +8101,12 @@ void install_context_hooks(ID3D11DeviceContext *context)
 HRESULT STDMETHODCALLTYPE hooked_create_buffer(ID3D11Device *device, const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial_data, ID3D11Buffer **buffer)
 {
     const HRESULT hr = g_original_create_buffer(device, desc, initial_data, buffer);
-    if (SUCCEEDED(hr) && desc != nullptr && buffer != nullptr && *buffer != nullptr)
+    // Only constant buffers are tracked: every consumer of g_buffer_info /
+    // g_buffer_snapshots (cb0 signature check, jitter readback, diagnostics)
+    // operates on constant buffers, and snapshotting vertex/index/structured
+    // buffers would retain their full contents for the process lifetime.
+    if (SUCCEEDED(hr) && desc != nullptr && buffer != nullptr && *buffer != nullptr &&
+        (desc->BindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0)
     {
         BufferInfo info {};
         info.resource_key = reinterpret_cast<std::uint64_t>(*buffer);

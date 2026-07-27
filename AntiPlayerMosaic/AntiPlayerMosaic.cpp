@@ -40,7 +40,7 @@ constexpr ULONGLONG k_hide_uid_retry_interval_ms = 1200;
 constexpr ULONGLONG k_hide_uid_steady_interval_ms = 8000;
 std::array<void *, k_hide_uid_paths.size()> g_hide_uid_string_cache {};
 std::array<void *, k_hide_uid_paths.size()> g_hide_uid_object_cache {};
-int g_hide_uid_exception_streak = 0;
+std::atomic_int g_hide_uid_exception_streak { 0 };
 
 using find_string_fn = void *(__fastcall *)(const char *);
 using find_object_fn = void *(__fastcall *)(void *);
@@ -153,12 +153,13 @@ bool hide_uid_once()
     const int hidden_count = hide_uid_once_unsafe();
     if (hidden_count < 0)
     {
+        g_hide_uid_string_cache.fill(nullptr);
         g_hide_uid_object_cache.fill(nullptr);
-        ++g_hide_uid_exception_streak;
+        const int streak = g_hide_uid_exception_streak.fetch_add(1, std::memory_order_relaxed) + 1;
         if (!g_hide_uid_logged_cache_reset.exchange(true))
             log_line("HideUID cache reset after exception");
 
-        if (g_hide_uid_exception_streak >= 3)
+        if (streak >= 3)
         {
             if (!g_hide_uid_logged_failure.exchange(true))
                 log_line("HideUID disabled: repeated exceptions while using cached objects");
@@ -167,7 +168,7 @@ bool hide_uid_once()
         return false;
     }
 
-    g_hide_uid_exception_streak = 0;
+    g_hide_uid_exception_streak.store(0, std::memory_order_relaxed);
     g_hide_uid_logged_cache_reset.store(false);
 
     if (hidden_count > 0)
@@ -220,8 +221,14 @@ void hide_uid_from_main_thread()
     if (g_main_base != nullptr)
     {
         const ULONGLONG now = GetTickCount64();
-        const ULONGLONG next_allowed = g_hide_uid_next_tick.load(std::memory_order_relaxed);
+        ULONGLONG next_allowed = g_hide_uid_next_tick.load(std::memory_order_relaxed);
         if (now < next_allowed)
+            return;
+
+        // Claim the time slot with a CAS so concurrent callers bail out here,
+        // keeping hide_uid_once and the cache arrays single-threaded.
+        if (!g_hide_uid_next_tick.compare_exchange_strong(
+                next_allowed, now + k_hide_uid_retry_interval_ms, std::memory_order_relaxed))
             return;
 
         const bool hidden = hide_uid_once();
@@ -274,11 +281,15 @@ void *build_player_perspective_stub(std::uint8_t *player_perspective)
     if (stub == nullptr)
         return nullptr;
 
-    std::array<std::uint8_t, 21> code {
+    // sub rsp,0x28 / mov rax,callback / call rax / add rsp,0x28 / xor eax,eax / ret
+    // The trailing xor eax,eax gives the replaced PlayerPerspective a defined
+    // return value of 0, matching the mov eax,0 used by patch_player_dive_mosaic.
+    std::array<std::uint8_t, 23> code {
         0x48, 0x83, 0xEC, 0x28,
         0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,
         0xFF, 0xD0,
         0x48, 0x83, 0xC4, 0x28,
+        0x31, 0xC0,
         0xC3
     };
 
@@ -437,6 +448,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(hModule);
+        // Pin this DLL so it can never be unloaded: PlayerPerspective is
+        // permanently patched to jump into a stub inside this module, so a
+        // FreeLibrary would make the next call land in unmapped memory.
+        HMODULE pinned = nullptr;
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            reinterpret_cast<LPCWSTR>(hModule),
+            &pinned);
         g_log_path = module_dir(hModule) / "AntiPlayerMosaic.log";
         HANDLE thread = CreateThread(nullptr, 0, worker_thread, nullptr, 0, nullptr);
         if (thread)
