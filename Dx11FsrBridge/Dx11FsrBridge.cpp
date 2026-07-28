@@ -345,6 +345,7 @@ std::atomic_uint64_t g_replacement_draw_count = 0;
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
 std::atomic_uint64_t g_fsr2_translation_dispatch_count = 0;
 std::atomic_uint32_t g_fsr2_translation_failure_count = 0;
+std::atomic_uint64_t g_fsr2_translation_candidate_count = 0;
 std::atomic_uint64_t g_fsr2_stale_producer_fallback_count = 0;
 std::atomic_uint64_t g_fsr2_late_composed_dispatch_count = 0;
 std::atomic_bool g_fsr2_dx11on12_block_logged = false;
@@ -2693,14 +2694,18 @@ void log_line(const std::string &line)
         "failed", "failure", "error", "invalid", "mismatch", "exception",
         "unavailable", "unresolved", "unsupported", "missing", "refusing"
     };
-    static constexpr std::array<std::string_view, 16> basic_terms {
+    static constexpr std::array<std::string_view, 24> basic_terms {
         "draw_hook_active", "draw_indexed_hook_active", "texture_create_hook_active",
         "dxgi_color_hooks_active", "fsr2_get_proc_address_shim_ready",
         "fsr2_translation_context_created", "fsr2_translation_context_reset",
         "fsr2_translation_blocked", "fsr2_translation_fallback",
         "fsr2_upscaler_stall_detected", "fsr2_gpu_queue_backlog",
         "fsr2_dynamic_color_path_invalidated", "fsr2_color_path_switch",
-        "dlssg_dxgi_workaround auto_enabled", "optiscaler_ngx_", "render_scale_menu "
+        "fsr2_translation_candidate", "fsr2_translation_dispatch_succeeded",
+        "fsr2_runtime_status", "fsr2_get_proc_address_shim_queries",
+        "mode2_on_demand_target_identified", "mode2_on_demand_cb0_registered",
+        "iat_scan ", "d3d11_loaded=", "dlssg_dxgi_workaround auto_enabled",
+        "optiscaler_ngx_", "render_scale_menu "
     };
     const bool startup_marker = line.starts_with("Dx11FsrBridge active");
     const bool error_message = std::any_of(error_terms.begin(), error_terms.end(),
@@ -4312,6 +4317,20 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
 
     log_line("present frame=" + std::to_string(frame_index) +
         " size=" + std::to_string(backbuffer_width) + "x" + std::to_string(backbuffer_height));
+#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME) && defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
+    static std::atomic_uint64_t last_runtime_status_tick { 0 };
+    const ULONGLONG now = GetTickCount64();
+    std::uint64_t last_tick = last_runtime_status_tick.load(std::memory_order_relaxed);
+    if (now - last_tick >= 5000 &&
+        last_runtime_status_tick.compare_exchange_strong(last_tick, now, std::memory_order_relaxed))
+    {
+        log_line("fsr2_runtime_status frame=" + std::to_string(frame_index) +
+            " candidates=" + std::to_string(g_fsr2_translation_candidate_count.load(std::memory_order_relaxed)) +
+            " dispatches=" + std::to_string(g_fsr2_translation_dispatch_count.load(std::memory_order_relaxed)) +
+            " failures=" + std::to_string(g_fsr2_translation_failure_count.load(std::memory_order_relaxed)) +
+            " shim_queries=" + hex64(fsr2_get_proc_address_shim_query_mask()));
+    }
+#endif
     return g_original_present(swapchain, sync_interval, flags);
 }
 
@@ -6714,6 +6733,16 @@ bool try_fsr2_translation_draw(
         return false;
     }
 
+    const std::uint64_t candidate_index =
+        g_fsr2_translation_candidate_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (candidate_index == 1)
+    {
+        log_line("fsr2_translation_candidate render=" +
+            std::to_string(draw_info->render_width) + "x" + std::to_string(draw_info->render_height) +
+            " output=" + std::to_string(draw_info->output_width) + "x" + std::to_string(draw_info->output_height) +
+            " mode=" + std::to_string(translation_mode));
+    }
+
     // 在获取任何 COM 资源之前先取 jitter：不可用时本帧直接回退原生 TAAU
     // （原生路径的 jitter 天然正确），等待 cb0 快照链在后续帧自愈。
     const std::optional<std::pair<float, float>> jitter_pixels = target_jitter_pixels(*draw_info);
@@ -7332,9 +7361,9 @@ bool try_fsr2_translation_draw(
         return false;
     }
 
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     const std::uint64_t dispatch_index =
         g_fsr2_translation_dispatch_count.fetch_add(1, std::memory_order_relaxed) + 1;
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (dispatch_index == 1 || dispatch_index % 1024 == 0)
     {
         log_line("fsr2_translation_dispatch_succeeded count=" + std::to_string(dispatch_index) +
@@ -7360,6 +7389,15 @@ bool try_fsr2_translation_draw(
                 (g_config.fsr2_hdr10_pq_color ? std::string("1") : std::string("0")) +
             " jitter_mode=" + std::to_string(g_config.fsr2_jitter_mode) +
             " jitter=" + std::to_string(jitter_x) + "," + std::to_string(jitter_y));
+    }
+#else
+    if (dispatch_index == 1 || dispatch_index % 4096 == 0)
+    {
+        log_line("fsr2_translation_dispatch_succeeded count=" + std::to_string(dispatch_index) +
+            " render=" + std::to_string(draw_info->render_width) + "x" +
+                std::to_string(draw_info->render_height) +
+            " output=" + std::to_string(draw_info->output_width) + "x" +
+                std::to_string(draw_info->output_height));
     }
 #endif
     return skip_original_draw;

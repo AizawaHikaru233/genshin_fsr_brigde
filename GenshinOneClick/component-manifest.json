@@ -1,9 +1,9 @@
 [
     {
         "Name":  "Dx11FsrBridge.dll",
-        "Version":  "1.1.4",
-        "SHA256":  "F844E8161AB1DD302932F07B301EEB0F3A8FEAB97D7791CE8901DB28D4CB9DC3",
-        "Bytes":  1639936
+        "Version":  "1.1.5",
+        "SHA256":  "11DA273F4BD59F9CAAE38AE9865FFEC81C7E4F810C0F19CEC7FAA385111830F9",
+        "Bytes":  289280
     },
     {
         "Name":  "OptiScaler.dll",
@@ -14,8 +14,8 @@
     {
         "Name":  "AntiPlayerMosaic.dll",
         "Version":  "1.1.0",
-        "SHA256":  "86F01FE327444DE829F22F11DE445B9AEB961CFAC0B04A2C6ED2340C6C2A2433",
-        "Bytes":  924160
+        "SHA256":  "02DF4C6CA3FC32A7CC175DD98809398818B2E81B48C0D62D47F0B6BA5E987745",
+        "Bytes":  71168
     },
     {
         "Name":  "ReShade64.dll",

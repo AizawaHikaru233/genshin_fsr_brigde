@@ -32,11 +32,13 @@ jobs:
         shell: pwsh
         run: |
           cmake -S .\Dx11FsrBridge -B .\build-package-bridge -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
             -DDX11FSRBRIDGE_RELEASE_RUNTIME=ON `
             -DDX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=ON
-          cmake --build .\build-package-bridge --config Release
-          cmake -S .\AntiPlayerMosaic -B .\build-package-antiplayermosaic -G Ninja
-          cmake --build .\build-package-antiplayermosaic --config Release
+          cmake --build .\build-package-bridge
+          cmake -S .\AntiPlayerMosaic -B .\build-package-antiplayermosaic -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build .\build-package-antiplayermosaic
           $bridgeDll = Get-ChildItem .\build-package-bridge -Recurse -File -Filter Dx11FsrBridge.dll | Select-Object -First 1
           $antiDll = Get-ChildItem .\build-package-antiplayermosaic -Recurse -File -Filter AntiPlayerMosaic.dll | Select-Object -First 1
           if ($null -eq $bridgeDll -or $null -eq $antiDll) { throw 'CMake 未生成必要的 Lite DLL。' }
