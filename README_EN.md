@@ -9,7 +9,7 @@ For the Chinese documentation, see [README.md](README.md).
 ## Support Scope and Risk Notice
 
 - Intended for the Chinese and Global Windows DX11 clients of Genshin Impact.
-- Tested only with version `6.7 (Luna VIII)`; compatibility with other game versions or client environments is not guaranteed.
+- Updated for Genshin Impact `7.0`. With the current feature-query hooks, ordinary future game updates are expected not to require another compatibility update.
 - This project is not affiliated with, endorsed by, or authorized by `HoYoverse`, `miHoYo`, `Genshin Impact`, or `原神`. All related names and trademarks belong to their respective owners.
 - Third-party DLLs, injectors, mods, and graphics plugins may violate game rules and could result in account restrictions or bans. Users must evaluate the risks themselves and accept full responsibility.
 
@@ -55,7 +55,7 @@ cmake --build .\build-fufu-plugin --config Release
 - Intercepts DX11 device and context activity to obtain the timing of Genshin Impact's FSR2 calls.
 - Exposes standard FSR2 exports so external upscaling tools can detect the FSR2 interface.
 - Prepares color, depth, motion-vector, jitter, and history resources for the external processor.
-- Extends the in-game render-scale menu to `0.2–0.9 + Native`; the `Native` preset uses the game's original `1.0` render scale.
+- Extends the in-game render-scale menu to `0.2–0.9 + 0.999`; `0.999` replaces the original highest menu slot.
 - Writes runtime logs to `Dx11FsrBridge.log` beside the DLL by default for load and hook diagnostics.
 
 ## Repository Layout

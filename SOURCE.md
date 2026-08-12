@@ -17,7 +17,7 @@
 
 ## 构建与发布
 
-- `Build-OnlineInstaller.ps1`：一次生成 FPS Unlock 与芙芙启动器两种 GitHub Lite ZIP。
+- `Build-OnlineInstaller.ps1`：本地生成 FPS Unlock Lite、Full 与芙芙启动器完整包；GitHub Actions 只构建并发布 FPS Unlock Lite ZIP。
 - `SharedResources/OptiScaler/default_config/`：两种注入方案共用的官方 OptiScaler 默认配置与超分运行文件清单。
 - `SharedResources/ReShade/default_config/`：两种注入方案共用的全新 ReShade 配置和空白 preset 模板。
 - `GenshinOneClick/`：安装脚本与发布包源树。

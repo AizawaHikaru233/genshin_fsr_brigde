@@ -104,7 +104,7 @@ install.write_config(plugin_dir, {
         Description = "支持把原神的FSR2转换为FSR4、DLSS、XESS",
         Developer = "シリアCelia",
         File = "FSR-Bridge-Plugin.dll",
-        Version = "1.2.0"
+        Version = "1.2.1"
     },
     EnableBridge = {
         Name = "启用 FSR Bridge",

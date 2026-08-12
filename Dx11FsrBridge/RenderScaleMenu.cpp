@@ -166,6 +166,48 @@ void log_line(const std::string &message)
         g_log_callback("render_scale_menu " + message);
 }
 
+std::filesystem::path selection_cache_path()
+{
+    return module_directory(g_bridge_module) / L"Dx11FsrBridge.render-scale.cache";
+}
+
+void save_selection_cache(std::int32_t index)
+{
+    if (index < 0 || index >= static_cast<std::int32_t>(k_render_scales.size()))
+        return;
+
+    std::ofstream output(selection_cache_path(), std::ios::trunc);
+    if (!output)
+        return;
+    output << "version 1\nindex " << index << "\n";
+}
+
+void load_selection_cache()
+{
+    std::ifstream input(selection_cache_path());
+    if (!input)
+        return;
+
+    std::string key;
+    std::int32_t index = -1;
+    while (input >> key)
+    {
+        if (key == "index")
+            input >> index;
+        else
+        {
+            std::string ignored;
+            input >> ignored;
+        }
+    }
+    if (index < 0 || index >= static_cast<std::int32_t>(k_render_scales.size()))
+        return;
+
+    g_selected_index.store(index, std::memory_order_release);
+    log_line("startup_selection_cache_hit index=" + std::to_string(index) +
+        " scale=" + std::to_string(k_render_scales[static_cast<std::size_t>(index)]));
+}
+
 bool is_executable_address(const void *address)
 {
     MEMORY_BASIC_INFORMATION memory {};
@@ -301,6 +343,7 @@ void record_selection(void *instance, std::int32_t index)
     if (inserted)
     {
         g_selected_index.store(index, std::memory_order_release);
+        save_selection_cache(index);
         return;
     }
     if (entry->second == static_cast<std::size_t>(index))
@@ -308,6 +351,7 @@ void record_selection(void *instance, std::int32_t index)
 
     entry->second = static_cast<std::size_t>(index);
     g_selected_index.store(index, std::memory_order_release);
+    save_selection_cache(index);
     log_line("selection_changed index=" + std::to_string(index) +
         " scale=" + std::to_string(k_render_scales[static_cast<std::size_t>(index)]));
 }
@@ -368,6 +412,7 @@ void __fastcall hooked_build_cmd_buffers(void *instance)
 
 DWORD WINAPI initialize_menu(void *)
 {
+    load_selection_cache();
     const auto game_module = GetModuleHandleW(nullptr);
     void *build_target = nullptr;
     void *get_text_target = nullptr;
