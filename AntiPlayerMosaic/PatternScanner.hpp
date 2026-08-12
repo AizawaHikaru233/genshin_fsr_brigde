@@ -33,8 +33,8 @@ inline constexpr Signature k_signatures[] {
     },
     {
         "ObjectActive",
-        "48 89 5C 24 08 57 48 83 EC 20 0F B6 FA 48 8B D9 48 85 C9 74 22 E8 06 81 FF FF 48 85 C0 74 18 40 "
-        "84 FF 48 8B C8 0F 95 C2 48 8B 5C 24 30 48 83 C4 20 5F E9 ?? ?? ?? ?? 48 8B CB E8 ?? ?? ?? ?? CC"
+        "48 89 5C 24 08 57 48 83 EC 20 0F B6 FA 48 8B D9 48 85 C9 74 22 E8 A6 7E FF FF 48 85 C0 74 18 40 "
+        "84 FF 48 8B C8 0F 95 C2 48 8B 5C 24 30 48 83 C4 20 5F E9 69 03 56 00 48 8B CB E8 D1 27 07 00 CC"
     },
     {
         "PlayerPerspective",

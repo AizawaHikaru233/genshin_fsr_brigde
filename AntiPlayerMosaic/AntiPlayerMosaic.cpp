@@ -42,6 +42,94 @@ std::array<void *, k_hide_uid_paths.size()> g_hide_uid_string_cache {};
 std::array<void *, k_hide_uid_paths.size()> g_hide_uid_object_cache {};
 std::atomic_int g_hide_uid_exception_streak { 0 };
 
+struct ModuleFingerprint
+{
+    std::uint32_t timestamp = 0;
+    std::uint32_t image_size = 0;
+    std::uint32_t checksum = 0;
+};
+
+bool get_module_fingerprint(HMODULE module, ModuleFingerprint &fingerprint)
+{
+    if (module == nullptr)
+        return false;
+    const auto *base = reinterpret_cast<const std::uint8_t *>(module);
+    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return false;
+    fingerprint.timestamp = nt->FileHeader.TimeDateStamp;
+    fingerprint.image_size = nt->OptionalHeader.SizeOfImage;
+    fingerprint.checksum = nt->OptionalHeader.CheckSum;
+    return true;
+}
+
+std::filesystem::path feature_cache_path(HMODULE module)
+{
+    wchar_t path[MAX_PATH] {};
+    const auto length = GetModuleFileNameW(module, path, static_cast<DWORD>(std::size(path)));
+    return std::filesystem::path(std::wstring(path, path + length)).parent_path() /
+        L"AntiPlayerMosaic.features.cache";
+}
+
+std::uint8_t *read_cached_signature(HMODULE module, const ModuleFingerprint &fingerprint,
+    const pattern_scanner::Signature &signature, std::uint32_t expected_rva)
+{
+    (void)fingerprint;
+    const auto base = reinterpret_cast<std::uint8_t *>(module);
+    auto *address = base + expected_rva;
+    MEMORY_BASIC_INFORMATION memory {};
+    if (VirtualQuery(address, &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_COMMIT ||
+        (memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0)
+        return nullptr;
+    const auto pattern = pattern_scanner::parse_pattern(signature.text);
+    const auto region_end = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+    if (reinterpret_cast<std::uintptr_t>(address) > region_end ||
+        !pattern_scanner::matches_at(address, region_end - reinterpret_cast<std::uintptr_t>(address), 0, pattern))
+        return nullptr;
+    return address;
+}
+
+bool read_feature_cache(HMODULE module, const ModuleFingerprint &fingerprint,
+    std::array<std::uint32_t, 5> &rvas)
+{
+    std::ifstream input(feature_cache_path(module));
+    if (!input)
+        return false;
+    std::string key;
+    std::uint64_t timestamp = 0, image_size = 0, checksum = 0;
+    std::array<bool, 5> seen {};
+    while (input >> key)
+    {
+        if (key == "timestamp") input >> timestamp;
+        else if (key == "image_size") input >> image_size;
+        else if (key == "checksum") input >> checksum;
+        else if (key.rfind("rva", 0) == 0)
+        {
+            const auto index = static_cast<std::size_t>(std::stoul(key.substr(3)));
+            if (index < rvas.size()) { input >> rvas[index]; seen[index] = true; }
+        }
+        else { std::string ignored; input >> ignored; }
+    }
+    return timestamp == fingerprint.timestamp && image_size == fingerprint.image_size &&
+        checksum == fingerprint.checksum && std::all_of(seen.begin(), seen.end(), [](bool value) { return value; });
+}
+
+void write_feature_cache(HMODULE module, const ModuleFingerprint &fingerprint,
+    const std::array<std::uint8_t *, 5> &targets)
+{
+    const auto base = reinterpret_cast<std::uintptr_t>(module);
+    std::ofstream output(feature_cache_path(module), std::ios::trunc);
+    if (!output)
+        return;
+    output << "version 1\n" << "timestamp " << fingerprint.timestamp << "\n"
+        << "image_size " << fingerprint.image_size << "\n" << "checksum " << fingerprint.checksum << "\n";
+    for (std::size_t i = 0; i < targets.size(); ++i)
+        output << "rva" << i << " " << (reinterpret_cast<std::uintptr_t>(targets[i]) - base) << "\n";
+}
+
 using find_string_fn = void *(__fastcall *)(const char *);
 using find_object_fn = void *(__fastcall *)(void *);
 using object_active_fn = void(__fastcall *)(void *, bool);
@@ -415,11 +503,42 @@ DWORD WINAPI worker_thread(void *)
     GetModuleFileNameW(main_module, executable_path, MAX_PATH);
     log_line("game executable: " + std::filesystem::path(executable_path).filename().string());
 
-    g_hide_uid_find_string = scan_unique_signature(base, size, pattern_scanner::k_signatures[0]);
-    g_hide_uid_find_object = scan_unique_signature(base, size, pattern_scanner::k_signatures[1]);
-    g_hide_uid_object_active = scan_unique_signature(base, size, pattern_scanner::k_signatures[2]);
-    auto *player_perspective = scan_unique_signature(base, size, pattern_scanner::k_signatures[3]);
-    auto *player_dive_mosaic = scan_unique_signature(base, size, pattern_scanner::k_signatures[4]);
+    std::array<std::uint8_t *, 5> targets {};
+    ModuleFingerprint fingerprint {};
+    std::array<std::uint32_t, 5> cached_rvas {};
+    bool cache_valid = get_module_fingerprint(main_module, fingerprint) &&
+        read_feature_cache(main_module, fingerprint, cached_rvas);
+    if (cache_valid)
+    {
+        for (std::size_t index = 0; index < targets.size(); ++index)
+        {
+            targets[index] = read_cached_signature(main_module, fingerprint,
+                pattern_scanner::k_signatures[index], cached_rvas[index]);
+            if (targets[index] == nullptr)
+            {
+                cache_valid = false;
+                break;
+            }
+        }
+    }
+    if (cache_valid)
+    {
+        log_line("feature cache hit");
+    }
+    else
+    {
+        for (std::size_t index = 0; index < targets.size(); ++index)
+            targets[index] = scan_unique_signature(base, size, pattern_scanner::k_signatures[index]);
+        if (std::all_of(targets.begin(), targets.end(), [](const auto *target) { return target != nullptr; }) &&
+            get_module_fingerprint(main_module, fingerprint))
+            write_feature_cache(main_module, fingerprint, targets);
+    }
+
+    g_hide_uid_find_string = targets[0];
+    g_hide_uid_find_object = targets[1];
+    g_hide_uid_object_active = targets[2];
+    auto *player_perspective = targets[3];
+    auto *player_dive_mosaic = targets[4];
 
     if (g_hide_uid_find_string == nullptr || g_hide_uid_find_object == nullptr || g_hide_uid_object_active == nullptr)
         g_hide_uid_enabled.store(false);

@@ -1013,6 +1013,7 @@ function Invoke-InstallWizard {
     if (-not $desired.AntiBlur) { $arguments += '-DisableAntiBlur' }
     if ($desired.HDR) { $arguments += @('-ReShadeSource', $reShadeSource) } else { $arguments += '-DisableHDR' }
     if ($desired.OptiScaler -and $optiSource -eq 'Manual') { $arguments += @('-OptiScalerPackagePath', $optiPackagePath) }
+    $arguments += '-PreserveExistingConfigs'
     if ($NoShortcut) { $arguments += '-NoShortcut' }
     Write-Host ''
     Write-Host '正在安装，请稍候...' -ForegroundColor Cyan

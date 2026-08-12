@@ -2,15 +2,16 @@
 #include <TlHelp32.h>
 #include <d3d11.h>
 #include <d3d11_3.h>
+#include <d3d11_4.h>
 #include <d3dcompiler.h>
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS) || defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
 #include <d3d12.h>
 #endif
 #include <dxgi.h>
 #include <dxgi1_2.h>
-#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
 #include <dxgi1_5.h>
-#endif
+#include <dxgi1_6.h>
+#include <detours/detours.h>
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS) || defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
 #include <intrin.h>
 #endif
@@ -81,6 +82,7 @@ constexpr std::size_t k_idx_unmap = k_context_base_methods + 8;
 constexpr std::size_t k_idx_draw_indexed = k_context_base_methods + 5;
 constexpr std::size_t k_idx_draw = k_context_base_methods + 6;
 constexpr std::size_t k_idx_om_set_render_targets = k_context_base_methods + 26;
+constexpr std::size_t k_idx_om_set_render_targets_and_uavs = k_context_base_methods + 27;
 constexpr std::size_t k_idx_dispatch = k_context_base_methods + 34;
 constexpr std::size_t k_idx_rs_set_viewports = k_context_base_methods + 37;
 constexpr std::size_t k_idx_copy_subresource_region = k_context_base_methods + 39;
@@ -98,13 +100,12 @@ constexpr std::size_t k_idx_set_fullscreen_state = k_swapchain_base_methods + 2;
 constexpr std::size_t k_idx_get_fullscreen_state = k_swapchain_base_methods + 3;
 constexpr std::size_t k_idx_resize_buffers = k_swapchain_base_methods + 5;
 constexpr std::size_t k_idx_resize_target = k_swapchain_base_methods + 6;
-#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
 constexpr std::size_t k_idx_check_color_space_support = 37;
 constexpr std::size_t k_idx_set_color_space1 = 38;
-constexpr std::size_t k_idx_set_hdr_metadata = 40;
-#endif
+constexpr std::size_t k_idx_set_hdr_metadata = 39;
 constexpr std::size_t k_idx_factory_create_swap_chain = 10;
 constexpr std::size_t k_idx_factory2_create_swap_chain_for_hwnd = 15;
+constexpr std::size_t k_idx_output6_get_desc1 = 27;
 
 struct Config
 {
@@ -117,7 +118,42 @@ struct Config
     bool log_loader_activity = false;
     bool log_interesting_dispatch_details = false;
     bool hook_present = false;
+    bool final_scene_probe = false;
+    std::uint32_t final_scene_probe_limit = 6;
+    std::uint32_t final_scene_probe_signature_limit = 128;
+    bool final_scene_snapshot = false;
+    std::uint32_t final_scene_snapshot_interval_frames = 240;
+    bool final_scene_optifg_input = false;
     int dlssg_dxgi_workaround = -1;
+    // Exposes HDR10 capability to the game while keeping the physical output
+    // on the SDR color space. This is an isolated experimental path.
+    bool hdr_swapchain_spoof = false;
+    // Actively requests the legacy linear HDR color space on the physical
+    // swapchain. It never rewrites swapchain or render-target formats.
+    bool hdr_swapchain_force = false;
+    // Records the system advanced-color capability query used by the engine.
+    // This diagnostic path never changes the returned display state.
+    bool hdr_environment_probe = false;
+    // Records DXGI output color capabilities without changing output objects.
+    bool hdr_output_desc_probe = false;
+    // Reports HDR output capability to the game through the DXGI output
+    // descriptor only. It does not change the physical display state.
+    bool hdr_output_desc_spoof = false;
+    // Experimental native-LDR test: request UNORM swapchain buffers instead of sRGB.
+    bool native_ldr_swapchain_unorm = false;
+    // Experimental native-LDR test: rewrite only full-resolution RTV|SRV targets.
+    bool native_ldr_final_target_unorm = false;
+    // Compresses the spoofed HDR backbuffer to the SDR display range immediately
+    // before Present. This is intentionally isolated from OptiScaler and the
+    // game's render passes.
+    bool hdr_sdr_tone_map = false;
+    bool hdr_sdr_tone_map_pq_input = true;
+    std::uint32_t hdr_sdr_tone_map_paper_white = 80;
+    std::uint32_t hdr_sdr_tone_map_peak = 100;
+    // Read-only identification of the last full-resolution draw into a known
+    // swapchain target. It is used to select a future tone-map insertion point.
+    bool hdr_composite_probe = false;
+    std::uint32_t hdr_composite_probe_limit = 32;
     bool capture_metadata_only = true;
     bool dump_compute_shaders = false;
     bool dump_pixel_shaders = false;
@@ -186,6 +222,9 @@ struct ResourceInfo
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN;
+    std::uint32_t bind_flags = 0;
+    std::uint32_t misc_flags = 0;
 };
 
 struct BufferInfo
@@ -225,6 +264,53 @@ struct DispatchState
     std::uint32_t backbuffer_width = 0;
     std::uint32_t backbuffer_height = 0;
 };
+
+#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+struct FinalSceneProbeCandidate
+{
+    std::uint64_t resource_key = 0;
+    ResourceInfo source0 {};
+    std::uint64_t pixel_shader_hash = 0;
+    std::size_t pixel_shader_size = 0;
+    std::uint64_t vertex_shader_hash = 0;
+    std::size_t vertex_shader_size = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    std::uint32_t viewport_width = 0;
+    std::uint32_t viewport_height = 0;
+    std::uint32_t render_target_count = 0;
+    std::uint32_t element_count = 0;
+    bool indexed = false;
+    bool backbuffer = false;
+    std::uint32_t display_draw_ordinal = 0;
+    std::uint32_t backbuffer_draw_ordinal = 0;
+};
+
+struct FinalSceneProbeFrame
+{
+    std::uint64_t frame_index = 0;
+    std::uint32_t display_target_draws = 0;
+    std::uint32_t backbuffer_draws = 0;
+    std::array<FinalSceneProbeCandidate, 16> candidates {};
+    std::uint32_t candidate_count = 0;
+    std::array<FinalSceneProbeCandidate, 16> tail_candidates {};
+    std::uint32_t tail_candidate_count = 0;
+};
+
+struct FinalSceneSnapshotState
+{
+    ID3D11Texture2D *texture = nullptr;
+    ID3D11Query *completion_query = nullptr;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    std::uint64_t queued_frame = 0;
+    std::uint64_t queued_count = 0;
+    std::uint64_t completed_count = 0;
+    bool pending = false;
+};
+#endif
 
 struct ColorSourceWrite
 {
@@ -325,6 +411,14 @@ std::filesystem::path g_similarity_path;
 std::filesystem::path g_ps_trace_path;
 std::filesystem::path g_texture_trace_path;
 std::mutex g_log_mutex;
+#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+std::mutex g_final_scene_probe_mutex;
+std::unordered_set<std::uint64_t> g_final_scene_probe_backbuffers;
+std::unordered_set<std::uint64_t> g_final_scene_probe_signatures;
+FinalSceneProbeFrame g_final_scene_probe_frame;
+std::mutex g_final_scene_snapshot_mutex;
+FinalSceneSnapshotState g_final_scene_snapshot;
+#endif
 std::atomic_bool g_logging_enabled = false;
 std::mutex g_ps_trace_mutex;
 std::ofstream g_ps_trace_stream;
@@ -342,6 +436,45 @@ ID3D11Device *g_replacement_device = nullptr;
 ID3D11PixelShader *g_spatial_copy_shader = nullptr;
 bool g_spatial_copy_create_failed = false;
 std::atomic_uint64_t g_replacement_draw_count = 0;
+
+struct HdrSdrToneMapResources
+{
+    ID3D11Device *device = nullptr;
+    ID3D11Texture2D *source_copy = nullptr;
+    ID3D11ShaderResourceView *source_view = nullptr;
+    ID3D11RenderTargetView *source_target_view = nullptr;
+    ID3D11RenderTargetView *target_view = nullptr;
+    ID3D11Texture2D *target_texture = nullptr;
+    ID3D11VertexShader *vertex_shader = nullptr;
+    ID3D11PixelShader *pixel_shader = nullptr;
+    ID3D11SamplerState *sampler = nullptr;
+    ID3D11Buffer *constants = nullptr;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    UINT width = 0;
+    UINT height = 0;
+    std::uint64_t target_key = 0;
+};
+
+std::mutex g_hdr_sdr_tone_map_mutex;
+HdrSdrToneMapResources g_hdr_sdr_tone_map_resources;
+struct HdrSdrToneMapDrawResources
+{
+    ID3D11Device *device = nullptr;
+    ID3D11PixelShader *pixel_shader = nullptr;
+    ID3D11Buffer *constants = nullptr;
+};
+HdrSdrToneMapDrawResources g_hdr_sdr_tone_map_draw_resources;
+std::vector<std::uint8_t> g_hdr_sdr_tone_map_vs_bytecode;
+std::vector<std::uint8_t> g_hdr_sdr_tone_map_ps_bytecode;
+bool g_hdr_sdr_tone_map_shader_compile_attempted = false;
+bool g_hdr_sdr_tone_map_shader_create_failed = false;
+std::atomic_bool g_hdr_sdr_tone_map_logged = false;
+
+std::mutex g_swapchain_backbuffer_mutex;
+std::unordered_set<std::uint64_t> g_swapchain_backbuffer_resources;
+std::mutex g_hdr_composite_probe_mutex;
+std::unordered_set<std::uint64_t> g_hdr_composite_probe_signatures;
+std::atomic_uint32_t g_hdr_composite_probe_count = 0;
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
 std::atomic_uint64_t g_fsr2_translation_dispatch_count = 0;
 std::atomic_uint32_t g_fsr2_translation_failure_count = 0;
@@ -477,6 +610,12 @@ std::atomic_uint64_t g_color_source_sequence = 0;
 std::mutex g_hook_scan_mutex;
 std::string g_last_create_hook_scan;
 std::string g_last_loader_hook_scan;
+std::string g_last_hdr_environment_hook_scan;
+std::atomic_uint32_t g_hdr_environment_probe_call_count = 0;
+std::atomic_bool g_hdr_environment_probe_suppressed_logged = false;
+std::atomic_bool g_hdr_output_desc_probe_install_started = false;
+std::atomic_uint32_t g_hdr_output_desc_probe_call_count = 0;
+std::atomic_bool g_hdr_output_desc_probe_suppressed_logged = false;
 std::mutex g_dispatch_signature_mutex;
 std::unordered_map<std::string, std::uint32_t> g_dispatch_signature_counts;
 ULONGLONG g_last_interesting_dispatch_tick = 0;
@@ -538,6 +677,9 @@ using load_library_w_fn = HMODULE(WINAPI *)(LPCWSTR);
 using load_library_ex_a_fn = HMODULE(WINAPI *)(LPCSTR, HANDLE, DWORD);
 using load_library_ex_w_fn = HMODULE(WINAPI *)(LPCWSTR, HANDLE, DWORD);
 using get_proc_address_fn = FARPROC(WINAPI *)(HMODULE, LPCSTR);
+using display_config_get_device_info_fn = LONG(WINAPI *)(DISPLAYCONFIG_DEVICE_INFO_HEADER *);
+using display_config_set_device_info_fn = LONG(WINAPI *)(DISPLAYCONFIG_DEVICE_INFO_HEADER *);
+using output_get_desc1_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGIOutput6 *, DXGI_OUTPUT_DESC1 *);
 using factory_create_swap_chain_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **);
 using factory2_create_swap_chain_for_hwnd_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGIFactory2 *, IUnknown *, HWND, const DXGI_SWAP_CHAIN_DESC1 *, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *, IDXGIOutput *, IDXGISwapChain1 **);
 using create_buffer_fn = HRESULT(STDMETHODCALLTYPE *)(ID3D11Device *, const D3D11_BUFFER_DESC *, const D3D11_SUBRESOURCE_DATA *, ID3D11Buffer **);
@@ -557,6 +699,9 @@ using cs_set_uavs_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UI
 using cs_set_shader_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11ComputeShader *, ID3D11ClassInstance *const *, UINT);
 using cs_set_constant_buffers_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT, ID3D11Buffer *const *);
 using om_set_render_targets_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, ID3D11RenderTargetView *const *, ID3D11DepthStencilView *);
+using om_set_render_targets_and_uavs_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT,
+    ID3D11RenderTargetView *const *, ID3D11DepthStencilView *, UINT, UINT,
+    ID3D11UnorderedAccessView *const *, const UINT *);
 using dispatch_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT, UINT);
 using draw_indexed_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT, INT);
 using draw_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT);
@@ -572,11 +717,9 @@ using set_fullscreen_state_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, B
 using get_fullscreen_state_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, BOOL *, IDXGIOutput **);
 using resize_buffers_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 using resize_target_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, const DXGI_MODE_DESC *);
-#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
 using check_color_space_support_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain3 *, DXGI_COLOR_SPACE_TYPE, UINT *);
 using set_color_space1_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain3 *, DXGI_COLOR_SPACE_TYPE);
 using set_hdr_metadata_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain4 *, DXGI_HDR_METADATA_TYPE, UINT, void *);
-#endif
 
 create_device_and_swapchain_fn g_original_create_device_and_swapchain = nullptr;
 create_device_fn g_original_create_device = nullptr;
@@ -585,6 +728,9 @@ load_library_w_fn g_original_load_library_w = nullptr;
 load_library_ex_a_fn g_original_load_library_ex_a = nullptr;
 load_library_ex_w_fn g_original_load_library_ex_w = nullptr;
 get_proc_address_fn g_original_get_proc_address = nullptr;
+display_config_get_device_info_fn g_original_display_config_get_device_info = nullptr;
+display_config_set_device_info_fn g_original_display_config_set_device_info = nullptr;
+output_get_desc1_fn g_original_output_get_desc1 = nullptr;
 factory_create_swap_chain_fn g_original_factory_create_swap_chain = nullptr;
 factory2_create_swap_chain_for_hwnd_fn g_original_factory2_create_swap_chain_for_hwnd = nullptr;
 create_buffer_fn g_original_create_buffer = nullptr;
@@ -597,10 +743,12 @@ set_fullscreen_state_fn g_original_set_fullscreen_state = nullptr;
 get_fullscreen_state_fn g_original_get_fullscreen_state = nullptr;
 resize_buffers_fn g_original_resize_buffers = nullptr;
 resize_target_fn g_original_resize_target = nullptr;
-#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
 check_color_space_support_fn g_original_check_color_space_support = nullptr;
 set_color_space1_fn g_original_set_color_space1 = nullptr;
 set_hdr_metadata_fn g_original_set_hdr_metadata = nullptr;
+std::mutex g_swapchain_resize_mutex;
+std::unordered_map<void *, resize_buffers_fn> g_original_resize_buffers_by_instance;
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
 std::mutex g_fsr2_color_diagnostics_mutex;
 std::string g_last_fsr2_color_diagnostics;
 #endif
@@ -614,6 +762,7 @@ cs_set_uavs_fn g_original_cs_set_uavs = nullptr;
 cs_set_shader_fn g_original_cs_set_shader = nullptr;
 cs_set_constant_buffers_fn g_original_cs_set_constant_buffers = nullptr;
 om_set_render_targets_fn g_original_om_set_render_targets = nullptr;
+om_set_render_targets_and_uavs_fn g_original_om_set_render_targets_and_uavs = nullptr;
 dispatch_fn g_original_dispatch = nullptr;
 draw_indexed_fn g_original_draw_indexed = nullptr;
 draw_fn g_original_draw = nullptr;
@@ -629,6 +778,10 @@ clear_dsv_fn g_original_clear_dsv = nullptr;
 std::mutex g_vtable_mutex;
 std::unordered_map<void *, void **> g_cloned_vtables;
 std::unordered_map<void *, void **> g_original_vtables;
+std::mutex g_context_device_hook_mutex;
+std::unordered_set<std::uint64_t> g_context_device_hook_attempts;
+std::atomic_uint32_t g_native_ldr_final_target_candidate_count { 0 };
+std::atomic_uint32_t g_native_ldr_texture_create_observed_count { 0 };
 
 HRESULT WINAPI hooked_create_device_and_swapchain(
     IDXGIAdapter *adapter,
@@ -661,19 +814,27 @@ HMODULE WINAPI hooked_load_library_w(LPCWSTR file_name);
 HMODULE WINAPI hooked_load_library_ex_a(LPCSTR file_name, HANDLE file, DWORD flags);
 HMODULE WINAPI hooked_load_library_ex_w(LPCWSTR file_name, HANDLE file, DWORD flags);
 FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR proc_name);
+LONG WINAPI hooked_display_config_get_device_info(DISPLAYCONFIG_DEVICE_INFO_HEADER *request);
+LONG WINAPI hooked_display_config_set_device_info(DISPLAYCONFIG_DEVICE_INFO_HEADER *request);
+HRESULT STDMETHODCALLTYPE hooked_output_get_desc1(IDXGIOutput6 *output, DXGI_OUTPUT_DESC1 *desc);
 HRESULT STDMETHODCALLTYPE hooked_factory_create_swap_chain(IDXGIFactory *factory, IUnknown *device, DXGI_SWAP_CHAIN_DESC *desc, IDXGISwapChain **swapchain);
 HRESULT STDMETHODCALLTYPE hooked_factory2_create_swap_chain_for_hwnd(IDXGIFactory2 *factory, IUnknown *device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1 *desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fullscreen_desc, IDXGIOutput *restrict_to_output, IDXGISwapChain1 **swapchain);
+void apply_hdr_swapchain_force(IDXGISwapChain *swapchain);
 HRESULT STDMETHODCALLTYPE hooked_create_buffer(ID3D11Device *device, const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial_data, ID3D11Buffer **buffer);
 HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D3D11_TEXTURE2D_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial_data, ID3D11Texture2D **texture);
 HRESULT STDMETHODCALLTYPE hooked_create_vertex_shader(ID3D11Device *device, const void *shader_bytecode, SIZE_T bytecode_length, ID3D11ClassLinkage *class_linkage, ID3D11VertexShader **vertex_shader);
 HRESULT STDMETHODCALLTYPE hooked_create_pixel_shader(ID3D11Device *device, const void *shader_bytecode, SIZE_T bytecode_length, ID3D11ClassLinkage *class_linkage, ID3D11PixelShader **pixel_shader);
 HRESULT STDMETHODCALLTYPE hooked_create_compute_shader(ID3D11Device *device, const void *shader_bytecode, SIZE_T bytecode_length, ID3D11ClassLinkage *class_linkage, ID3D11ComputeShader **compute_shader);
+void install_device_hooks(ID3D11Device *device);
 void log_line(const std::string &line);
 void set_osd_text(const std::wstring &text);
 void start_osd();
 void update_osd_from_dispatch(std::uint32_t phase, UINT group_x, UINT group_y, UINT group_z);
 bool dlssg_framegen_selected();
 bool dlssg_dxgi_workaround_active();
+void update_swapchain_backbuffer_resources(IDXGISwapChain *swapchain);
+void record_hdr_composite_candidate(UINT element_count, bool indexed);
+void record_hdr_composite_target_bind(const ResourceInfo &target);
 
 std::wstring current_process_name()
 {
@@ -2734,7 +2895,6 @@ void reset_log()
     std::ofstream(g_log_path, std::ios::trunc).close();
 }
 
-#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS) || defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
 std::string module_path_from_address(void *address)
 {
     HMODULE module = nullptr;
@@ -2750,7 +2910,6 @@ std::string module_path_from_address(void *address)
     const DWORD length = GetModuleFileNameA(module, path, static_cast<DWORD>(std::size(path)));
     return length != 0 ? std::string(path, length) : "unknown";
 }
-#endif
 
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
 std::string describe_dxgi_swapchain_device(IUnknown *device)
@@ -2875,7 +3034,6 @@ std::string describe_dxgi_window(HWND hwnd)
 }
 #endif
 
-#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
 const char *dxgi_format_name(DXGI_FORMAT format)
 {
     switch (format)
@@ -2934,7 +3092,6 @@ DXGI_FORMAT shader_resource_view_format(ID3D11ShaderResourceView *view)
     view->GetDesc(&desc);
     return desc.Format;
 }
-#endif
 
 void set_osd_text(const std::wstring &text)
 {
@@ -3135,13 +3292,48 @@ void load_config()
     g_logging_enabled.store(g_config.enable_logging, std::memory_order_relaxed);
     g_config.dlssg_dxgi_workaround =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"DlssgDxgiWorkaround", -1, config_path.c_str());
+    g_config.hdr_swapchain_spoof =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSwapchainSpoof", 0, config_path.c_str()) != 0;
+    g_config.hdr_swapchain_force =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSwapchainForce", 0, config_path.c_str()) != 0;
+    g_config.hdr_environment_probe =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrEnvironmentProbe", 0, config_path.c_str()) != 0;
+    g_config.hdr_output_desc_probe =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrOutputDescProbe", 0, config_path.c_str()) != 0;
+    g_config.hdr_output_desc_spoof =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrOutputDescSpoof", 0, config_path.c_str()) != 0;
+    g_config.native_ldr_swapchain_unorm =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NativeLdrSwapchainUnorm", 0, config_path.c_str()) != 0;
+    g_config.native_ldr_final_target_unorm =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NativeLdrFinalTargetUnorm", 0, config_path.c_str()) != 0;
+    g_config.hdr_sdr_tone_map =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSdrToneMap", 0, config_path.c_str()) != 0;
+    g_config.hdr_sdr_tone_map_pq_input =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSdrToneMapPqInput", 1, config_path.c_str()) != 0;
+    g_config.hdr_sdr_tone_map_paper_white = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"HdrSdrToneMapPaperWhite", 80, config_path.c_str())),
+        1u,
+        1000u);
+    g_config.hdr_sdr_tone_map_peak = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"HdrSdrToneMapPeak", 100, config_path.c_str())),
+        1u,
+        10000u);
+    g_config.hdr_composite_probe =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrCompositeProbe", 0, config_path.c_str()) != 0;
+    g_config.hdr_composite_probe_limit = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"HdrCompositeProbeLimit", 32, config_path.c_str())),
+        1u,
+        512u);
     g_config.capture_metadata_only =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"CaptureMetadataOnly", 0, config_path.c_str()) != 0;
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     g_config.enable_fsr2_get_proc_address_shim =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableFsr2GetProcAddressShim", 1, config_path.c_str()) != 0;
     g_config.fsr2_translation_mode = static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2TranslationMode", 4, config_path.c_str()));
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2TranslationMode", 2, config_path.c_str()));
     g_config.fsr2_mode2_on_demand_state =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2Mode2OnDemandState", 1, config_path.c_str()) != 0;
     g_config.fsr2_motion_vectors_jittered =
@@ -3182,7 +3374,60 @@ void load_config()
     g_config.log_loader_activity = GetPrivateProfileIntW(L"Dx11FsrBridge", L"LogLoaderActivity", 0, config_path.c_str()) != 0;
     g_config.log_interesting_dispatch_details = GetPrivateProfileIntW(L"Dx11FsrBridge", L"LogInterestingDispatchDetails", 0, config_path.c_str()) != 0;
     g_config.hook_present = GetPrivateProfileIntW(L"Dx11FsrBridge", L"HookPresent", 0, config_path.c_str()) != 0;
+    g_config.final_scene_probe = GetPrivateProfileIntW(L"Dx11FsrBridge", L"FinalSceneProbe", 0, config_path.c_str()) != 0;
+    g_config.final_scene_probe_limit = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"FinalSceneProbeLimit", 6, config_path.c_str())),
+        1u,
+        16u);
+    g_config.final_scene_probe_signature_limit = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"FinalSceneProbeSignatureLimit", 128, config_path.c_str())),
+        1u,
+        4096u);
+    g_config.final_scene_snapshot =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"FinalSceneSnapshot", 0, config_path.c_str()) != 0;
+    g_config.final_scene_snapshot_interval_frames = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"FinalSceneSnapshotIntervalFrames", 240, config_path.c_str())),
+        1u,
+        3600u);
+    g_config.final_scene_optifg_input =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"FinalSceneOptiFgInput", 0, config_path.c_str()) != 0;
     g_config.dlssg_dxgi_workaround = GetPrivateProfileIntW(L"Dx11FsrBridge", L"DlssgDxgiWorkaround", -1, config_path.c_str());
+    g_config.hdr_swapchain_spoof =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSwapchainSpoof", 0, config_path.c_str()) != 0;
+    g_config.hdr_swapchain_force =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSwapchainForce", 0, config_path.c_str()) != 0;
+    g_config.hdr_environment_probe =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrEnvironmentProbe", 0, config_path.c_str()) != 0;
+    g_config.hdr_output_desc_probe =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrOutputDescProbe", 0, config_path.c_str()) != 0;
+    g_config.hdr_output_desc_spoof =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrOutputDescSpoof", 0, config_path.c_str()) != 0;
+    g_config.native_ldr_swapchain_unorm =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NativeLdrSwapchainUnorm", 0, config_path.c_str()) != 0;
+    g_config.native_ldr_final_target_unorm =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NativeLdrFinalTargetUnorm", 0, config_path.c_str()) != 0;
+    g_config.hdr_sdr_tone_map =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSdrToneMap", 0, config_path.c_str()) != 0;
+    g_config.hdr_sdr_tone_map_pq_input =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSdrToneMapPqInput", 1, config_path.c_str()) != 0;
+    g_config.hdr_sdr_tone_map_paper_white = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"HdrSdrToneMapPaperWhite", 80, config_path.c_str())),
+        1u,
+        1000u);
+    g_config.hdr_sdr_tone_map_peak = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"HdrSdrToneMapPeak", 100, config_path.c_str())),
+        1u,
+        10000u);
+    g_config.hdr_composite_probe =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrCompositeProbe", 0, config_path.c_str()) != 0;
+    g_config.hdr_composite_probe_limit = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"HdrCompositeProbeLimit", 32, config_path.c_str())),
+        1u,
+        512u);
     g_config.capture_metadata_only = GetPrivateProfileIntW(L"Dx11FsrBridge", L"CaptureMetadataOnly", 1, config_path.c_str()) != 0;
     g_config.dump_compute_shaders = GetPrivateProfileIntW(L"Dx11FsrBridge", L"DumpComputeShaders", 0, config_path.c_str()) != 0;
     g_config.dump_pixel_shaders = GetPrivateProfileIntW(L"Dx11FsrBridge", L"DumpPixelShaders", 0, config_path.c_str()) != 0;
@@ -3332,6 +3577,28 @@ bool read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo &out
             out_info.width = desc.Width;
             out_info.height = desc.Height;
             out_info.format = desc.Format;
+            out_info.bind_flags = desc.BindFlags;
+            out_info.misc_flags = desc.MiscFlags;
+
+            ID3D11ShaderResourceView *srv = nullptr;
+            if (SUCCEEDED(view->QueryInterface(__uuidof(ID3D11ShaderResourceView), reinterpret_cast<void **>(&srv))) && srv != nullptr)
+            {
+                D3D11_SHADER_RESOURCE_VIEW_DESC view_desc {};
+                srv->GetDesc(&view_desc);
+                out_info.view_format = view_desc.Format;
+                srv->Release();
+            }
+            else
+            {
+                ID3D11RenderTargetView *rtv = nullptr;
+                if (SUCCEEDED(view->QueryInterface(__uuidof(ID3D11RenderTargetView), reinterpret_cast<void **>(&rtv))) && rtv != nullptr)
+                {
+                    D3D11_RENDER_TARGET_VIEW_DESC view_desc {};
+                    rtv->GetDesc(&view_desc);
+                    out_info.view_format = view_desc.Format;
+                    rtv->Release();
+                }
+            }
             texture->Release();
             resource->Release();
             return true;
@@ -4097,6 +4364,162 @@ bool is_d3d11_module(HMODULE module)
     return _wcsicmp(file_name.c_str(), L"d3d11.dll") == 0;
 }
 
+bool is_user32_module(HMODULE module)
+{
+    if (module == nullptr)
+        return false;
+
+    wchar_t path[MAX_PATH] {};
+    const DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+    if (length == 0)
+        return false;
+
+    const std::wstring file_name = std::filesystem::path(std::wstring(path, path + length)).filename().wstring();
+    return _wcsicmp(file_name.c_str(), L"user32.dll") == 0;
+}
+
+void install_hdr_environment_probe_for_loaded_modules()
+{
+    if (!g_config.hdr_environment_probe && !g_config.hdr_output_desc_spoof)
+        return;
+
+    std::size_t get_hook_count = 0;
+    std::size_t set_hook_count = 0;
+    for (HMODULE module : enumerate_process_modules())
+    {
+        if (hook_iat(module, "USER32.dll", "DisplayConfigGetDeviceInfo",
+                reinterpret_cast<void *>(&hooked_display_config_get_device_info),
+                reinterpret_cast<void **>(&g_original_display_config_get_device_info)))
+        {
+            ++get_hook_count;
+        }
+        if (hook_iat(module, "USER32.dll", "DisplayConfigSetDeviceInfo",
+                reinterpret_cast<void *>(&hooked_display_config_set_device_info),
+                reinterpret_cast<void **>(&g_original_display_config_set_device_info)))
+        {
+            ++set_hook_count;
+        }
+    }
+
+    const std::string summary = "hdr_environment_probe get_iat_hooks=" + std::to_string(get_hook_count) +
+        " set_iat_hooks=" + std::to_string(set_hook_count);
+    bool summary_changed = false;
+    {
+        std::lock_guard lock(g_hook_scan_mutex);
+        if (summary != g_last_hdr_environment_hook_scan)
+        {
+            g_last_hdr_environment_hook_scan = summary;
+            summary_changed = true;
+        }
+    }
+    if (summary_changed)
+        log_line(summary);
+}
+
+HRESULT STDMETHODCALLTYPE hooked_output_get_desc1(IDXGIOutput6 *output, DXGI_OUTPUT_DESC1 *desc)
+{
+    const HRESULT result = g_original_output_get_desc1 != nullptr
+        ? g_original_output_get_desc1(output, desc)
+        : E_FAIL;
+
+    const bool spoof = g_config.hdr_output_desc_spoof && SUCCEEDED(result) && desc != nullptr;
+    const DXGI_COLOR_SPACE_TYPE physical_color_space = spoof ? desc->ColorSpace : DXGI_COLOR_SPACE_CUSTOM;
+    if (spoof)
+        desc->ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+
+    if (!g_config.hdr_output_desc_probe && !spoof)
+        return result;
+
+    constexpr std::uint32_t k_log_limit = 32;
+    const std::uint32_t call_index = g_hdr_output_desc_probe_call_count.fetch_add(1, std::memory_order_relaxed);
+    if (call_index >= k_log_limit)
+    {
+        if (!g_hdr_output_desc_probe_suppressed_logged.exchange(true, std::memory_order_relaxed))
+            log_line("hdr_output_desc_probe query log limit reached");
+        return result;
+    }
+
+    std::ostringstream out;
+    out << "hdr_output_desc_probe result=" << hex64(static_cast<std::uint32_t>(result));
+    if (SUCCEEDED(result) && desc != nullptr)
+    {
+        out << " color_space=" << static_cast<std::uint32_t>(desc->ColorSpace)
+            << " bits_per_color=" << desc->BitsPerColor
+            << " min_luminance=" << desc->MinLuminance
+            << " max_luminance=" << desc->MaxLuminance
+            << " max_full_frame_luminance=" << desc->MaxFullFrameLuminance;
+        if (spoof)
+            out << " physical_color_space=" << static_cast<std::uint32_t>(physical_color_space)
+                << " spoof=1";
+    }
+    else
+    {
+        out << " response=unavailable";
+    }
+    log_line(out.str());
+    return result;
+}
+
+void install_hdr_output_desc_probe_from_adapter(IDXGIAdapter *adapter)
+{
+    if ((!g_config.hdr_output_desc_probe && !g_config.hdr_output_desc_spoof) || adapter == nullptr)
+        return;
+
+    bool expected = false;
+    if (!g_hdr_output_desc_probe_install_started.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+        return;
+
+    IDXGIOutput *output = nullptr;
+    const HRESULT enum_result = adapter->EnumOutputs(0, &output);
+    if (FAILED(enum_result) || output == nullptr)
+    {
+        log_line("hdr_output_desc_probe install_failed stage=EnumOutputs hr=" +
+            hex64(static_cast<std::uint32_t>(enum_result)));
+        return;
+    }
+
+    IDXGIOutput6 *output6 = nullptr;
+    const HRESULT query_result = output->QueryInterface(
+        __uuidof(IDXGIOutput6), reinterpret_cast<void **>(&output6));
+    output->Release();
+    if (FAILED(query_result) || output6 == nullptr)
+    {
+        log_line("hdr_output_desc_probe install_failed stage=QueryInterface hr=" +
+            hex64(static_cast<std::uint32_t>(query_result)));
+        return;
+    }
+
+    void **const vtable = *reinterpret_cast<void ***>(output6);
+    g_original_output_get_desc1 = reinterpret_cast<output_get_desc1_fn>(vtable[k_idx_output6_get_desc1]);
+    output6->Release();
+    if (g_original_output_get_desc1 == nullptr)
+    {
+        log_line("hdr_output_desc_probe install_failed stage=vtable");
+        return;
+    }
+
+    LONG status = DetourTransactionBegin();
+    if (status == NO_ERROR)
+        status = DetourUpdateThread(GetCurrentThread());
+    if (status == NO_ERROR)
+        status = DetourAttach(reinterpret_cast<PVOID *>(&g_original_output_get_desc1),
+            reinterpret_cast<PVOID>(&hooked_output_get_desc1));
+    if (status == NO_ERROR)
+        status = DetourTransactionCommit();
+    else
+        DetourTransactionAbort();
+
+    if (status == NO_ERROR)
+    {
+        log_line("hdr_output_desc_probe installed method=IDXGIOutput6.GetDesc1");
+    }
+    else
+    {
+        log_line("hdr_output_desc_probe install_failed stage=Detours error=" + std::to_string(status));
+        g_original_output_get_desc1 = nullptr;
+    }
+}
+
 void install_create_hooks_for_loaded_modules()
 {
     std::size_t swapchain_hooks = 0;
@@ -4279,6 +4702,1278 @@ class ScopedContextVtableBypass
     bool active_ = false;
 };
 
+#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+void update_final_scene_probe_backbuffers(IDXGISwapChain *swapchain)
+{
+    if ((!g_config.final_scene_probe && !g_config.final_scene_snapshot && !g_config.final_scene_optifg_input) ||
+        swapchain == nullptr)
+        return;
+
+    DXGI_SWAP_CHAIN_DESC desc {};
+    if (FAILED(swapchain->GetDesc(&desc)) || desc.BufferCount == 0)
+        return;
+
+    std::unordered_set<std::uint64_t> backbuffers;
+    for (UINT index = 0; index < desc.BufferCount; ++index)
+    {
+        ID3D11Texture2D *buffer = nullptr;
+        if (SUCCEEDED(swapchain->GetBuffer(index, IID_PPV_ARGS(&buffer))) && buffer != nullptr)
+        {
+            backbuffers.insert(reinterpret_cast<std::uint64_t>(buffer));
+            buffer->Release();
+        }
+    }
+
+    std::lock_guard lock(g_final_scene_probe_mutex);
+    g_final_scene_probe_backbuffers = std::move(backbuffers);
+}
+
+bool matches_final_scene_boundary(
+    UINT element_count,
+    bool indexed,
+    std::uint64_t &frame_index,
+    bool apply_snapshot_interval)
+{
+    if ((!g_config.final_scene_snapshot && !g_config.final_scene_optifg_input) || !indexed ||
+        element_count != 3 || g_internal_bridge_dispatch)
+        return false;
+
+    ResourceInfo target {};
+    std::uint64_t pixel_shader_hash = 0;
+    std::uint64_t vertex_shader_hash = 0;
+    std::uint32_t viewport_width = 0;
+    std::uint32_t viewport_height = 0;
+    {
+        std::lock_guard lock(g_state_mutex);
+        target = g_state.rtvs[0];
+        pixel_shader_hash = g_state.current_ps_hash;
+        vertex_shader_hash = g_state.current_vs_hash;
+        viewport_width = g_state.viewport_width;
+        viewport_height = g_state.viewport_height;
+        frame_index = g_state.frame_index + 1;
+    }
+
+    constexpr std::uint64_t k_final_scene_ps = 0x773B7BD7A2C6971Full;
+    constexpr std::uint64_t k_final_scene_vs = 0x778E7E69BB2060F5ull;
+    bool is_backbuffer = false;
+    {
+        std::lock_guard lock(g_final_scene_probe_mutex);
+        is_backbuffer = g_final_scene_probe_backbuffers.contains(target.resource_key);
+    }
+
+    const bool matches = target.resource_key != 0 && pixel_shader_hash == k_final_scene_ps &&
+        vertex_shader_hash == k_final_scene_vs && target.width != 0 && target.height != 0 &&
+        target.width == viewport_width && target.height == viewport_height && is_backbuffer &&
+        (!apply_snapshot_interval ||
+            (g_config.final_scene_snapshot &&
+                frame_index % g_config.final_scene_snapshot_interval_frames == 0));
+    if (!matches)
+    {
+        // The OptiFG handoff is opt-in; emit one diagnostic only when the known scene shader is observed.
+        static std::atomic_bool logged_expected_shader_mismatch { false };
+        if (!apply_snapshot_interval && pixel_shader_hash == k_final_scene_ps &&
+            vertex_shader_hash == k_final_scene_vs &&
+            !logged_expected_shader_mismatch.exchange(true, std::memory_order_relaxed))
+        {
+            log_line("final_scene_optifg_boundary_rejected target=" + hex64(target.resource_key) +
+                " backbuffer=" + std::to_string(is_backbuffer ? 1 : 0) +
+                " size=" + std::to_string(target.width) + "x" + std::to_string(target.height) +
+                " viewport=" + std::to_string(viewport_width) + "x" + std::to_string(viewport_height));
+        }
+        return false;
+    }
+
+    return true;
+}
+
+bool final_scene_snapshot_desc_matches(const D3D11_TEXTURE2D_DESC &desc)
+{
+    return g_final_scene_snapshot.texture != nullptr &&
+        g_final_scene_snapshot.width == desc.Width &&
+        g_final_scene_snapshot.height == desc.Height &&
+        g_final_scene_snapshot.format == desc.Format;
+}
+
+void queue_final_scene_snapshot(ID3D11DeviceContext *context, std::uint64_t frame_index)
+{
+    if (context == nullptr)
+        return;
+
+    ID3D11RenderTargetView *render_target = nullptr;
+    context->OMGetRenderTargets(1, &render_target, nullptr);
+    if (render_target == nullptr)
+        return;
+
+    ID3D11Resource *resource = nullptr;
+    render_target->GetResource(&resource);
+    render_target->Release();
+    ID3D11Texture2D *source = nullptr;
+    const HRESULT source_result = resource != nullptr
+        ? resource->QueryInterface(IID_PPV_ARGS(&source))
+        : E_POINTER;
+    if (resource != nullptr)
+        resource->Release();
+    if (FAILED(source_result) || source == nullptr)
+    {
+        log_line("final_scene_snapshot_source_failed hr=" +
+            std::to_string(static_cast<std::uint32_t>(source_result)));
+        return;
+    }
+
+    D3D11_TEXTURE2D_DESC source_desc {};
+    source->GetDesc(&source_desc);
+    if (source_desc.Width == 0 || source_desc.Height == 0)
+    {
+        source->Release();
+        return;
+    }
+
+    std::lock_guard lock(g_final_scene_snapshot_mutex);
+    if (g_final_scene_snapshot.pending)
+    {
+        source->Release();
+        return;
+    }
+
+    if (!final_scene_snapshot_desc_matches(source_desc))
+    {
+        if (g_final_scene_snapshot.texture != nullptr)
+        {
+            g_final_scene_snapshot.texture->Release();
+            g_final_scene_snapshot.texture = nullptr;
+        }
+        if (g_final_scene_snapshot.completion_query != nullptr)
+        {
+            g_final_scene_snapshot.completion_query->Release();
+            g_final_scene_snapshot.completion_query = nullptr;
+        }
+
+        D3D11_TEXTURE2D_DESC snapshot_desc = source_desc;
+        snapshot_desc.BindFlags = 0;
+        snapshot_desc.CPUAccessFlags = 0;
+        snapshot_desc.MiscFlags = 0;
+        snapshot_desc.Usage = D3D11_USAGE_DEFAULT;
+        ID3D11Device *device = nullptr;
+        context->GetDevice(&device);
+        const HRESULT texture_result = device != nullptr
+            ? device->CreateTexture2D(&snapshot_desc, nullptr, &g_final_scene_snapshot.texture)
+            : E_POINTER;
+        if (SUCCEEDED(texture_result) && device != nullptr)
+        {
+            const D3D11_QUERY_DESC query_desc { D3D11_QUERY_EVENT, 0 };
+            const HRESULT query_result = device->CreateQuery(&query_desc, &g_final_scene_snapshot.completion_query);
+            if (FAILED(query_result))
+            {
+                g_final_scene_snapshot.texture->Release();
+                g_final_scene_snapshot.texture = nullptr;
+                log_line("final_scene_snapshot_query_create_failed hr=" +
+                    std::to_string(static_cast<std::uint32_t>(query_result)));
+            }
+        }
+        if (device != nullptr)
+            device->Release();
+        if (FAILED(texture_result) || g_final_scene_snapshot.texture == nullptr ||
+            g_final_scene_snapshot.completion_query == nullptr)
+        {
+            log_line("final_scene_snapshot_texture_create_failed hr=" +
+                std::to_string(static_cast<std::uint32_t>(texture_result)));
+            source->Release();
+            return;
+        }
+        g_final_scene_snapshot.width = source_desc.Width;
+        g_final_scene_snapshot.height = source_desc.Height;
+        g_final_scene_snapshot.format = source_desc.Format;
+        log_line("final_scene_snapshot_resources_created size=" +
+            std::to_string(source_desc.Width) + "x" + std::to_string(source_desc.Height) +
+            " format=" + std::to_string(static_cast<std::uint32_t>(source_desc.Format)));
+    }
+
+    {
+        ScopedInternalBridgeDispatch internal_dispatch_scope;
+        ScopedContextVtableBypass context_vtable_bypass(context);
+        context->CopyResource(g_final_scene_snapshot.texture, source);
+        context->End(g_final_scene_snapshot.completion_query);
+    }
+    source->Release();
+
+    g_final_scene_snapshot.queued_frame = frame_index;
+    g_final_scene_snapshot.queued_count++;
+    g_final_scene_snapshot.pending = true;
+    log_line("final_scene_snapshot_queued frame=" + std::to_string(frame_index) +
+        " count=" + std::to_string(g_final_scene_snapshot.queued_count) +
+        " source=post_scene_pre_ui");
+}
+
+void submit_final_scene_to_optiscaler(ID3D11DeviceContext *context, std::uint64_t frame_index)
+{
+    if (!g_config.final_scene_optifg_input || context == nullptr)
+        return;
+
+    using submit_final_scene_fn = BOOL(WINAPI *)(ID3D11Resource *, UINT64);
+    static submit_final_scene_fn submit = nullptr;
+    static HMODULE module = nullptr;
+    static std::atomic_bool missing_export_logged { false };
+    static std::atomic_uint64_t accepted_count { 0 };
+
+    if (module == nullptr)
+    {
+        module = GetModuleHandleW(L"OptiScaler.dll");
+        if (module != nullptr)
+            submit = reinterpret_cast<submit_final_scene_fn>(
+                GetProcAddress(module, "OptiScalerSubmitFinalSceneD3D11"));
+    }
+    if (submit == nullptr)
+    {
+        if (!missing_export_logged.exchange(true, std::memory_order_relaxed))
+            log_line("final_scene_optifg_input_unavailable export=OptiScalerSubmitFinalSceneD3D11");
+        return;
+    }
+
+    ID3D11RenderTargetView *render_target = nullptr;
+    context->OMGetRenderTargets(1, &render_target, nullptr);
+    if (render_target == nullptr)
+        return;
+    ID3D11Resource *scene = nullptr;
+    render_target->GetResource(&scene);
+    render_target->Release();
+    if (scene == nullptr)
+        return;
+
+    const BOOL accepted = submit(scene, frame_index);
+    scene->Release();
+    if (accepted)
+    {
+        const std::uint64_t count = accepted_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count == 1 || count % 240 == 0)
+        {
+            log_line("final_scene_optifg_input_accepted frame=" + std::to_string(frame_index) +
+                " count=" + std::to_string(count));
+        }
+    }
+}
+
+void poll_final_scene_snapshot(IDXGISwapChain *swapchain)
+{
+    if (!g_config.final_scene_snapshot || swapchain == nullptr)
+        return;
+
+    {
+        std::lock_guard lock(g_final_scene_snapshot_mutex);
+        if (!g_final_scene_snapshot.pending || g_final_scene_snapshot.completion_query == nullptr)
+            return;
+    }
+
+    ID3D11Device *device = nullptr;
+    if (FAILED(swapchain->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
+        return;
+    ID3D11DeviceContext *context = nullptr;
+    device->GetImmediateContext(&context);
+    device->Release();
+    if (context == nullptr)
+        return;
+
+    std::lock_guard lock(g_final_scene_snapshot_mutex);
+    if (g_final_scene_snapshot.pending && g_final_scene_snapshot.completion_query != nullptr &&
+        context->GetData(g_final_scene_snapshot.completion_query, nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
+    {
+        g_final_scene_snapshot.pending = false;
+        g_final_scene_snapshot.completed_count++;
+        log_line("final_scene_snapshot_complete frame=" +
+            std::to_string(g_final_scene_snapshot.queued_frame) +
+            " queued=" + std::to_string(g_final_scene_snapshot.queued_count) +
+            " completed=" + std::to_string(g_final_scene_snapshot.completed_count));
+    }
+    context->Release();
+}
+
+void flush_final_scene_probe(std::uint64_t frame_index)
+{
+    if (!g_config.final_scene_probe)
+        return;
+
+    FinalSceneProbeFrame frame {};
+    bool should_log = false;
+    {
+        std::lock_guard lock(g_final_scene_probe_mutex);
+        if (g_final_scene_probe_frame.frame_index != frame_index)
+            return;
+        frame = g_final_scene_probe_frame;
+        g_final_scene_probe_frame = {};
+
+        std::uint64_t signature = 1469598103934665603ull;
+        const auto mix_signature = [&](std::uint64_t value)
+        {
+            signature ^= value;
+            signature *= 1099511628211ull;
+        };
+        mix_signature(frame.display_target_draws);
+        mix_signature(frame.backbuffer_draws);
+        mix_signature(frame.candidate_count);
+        mix_signature(frame.tail_candidate_count);
+        const auto mix_candidate = [&](const FinalSceneProbeCandidate &candidate)
+        {
+            mix_signature(candidate.pixel_shader_hash);
+            mix_signature(candidate.pixel_shader_size);
+            mix_signature(candidate.vertex_shader_hash);
+            mix_signature(candidate.vertex_shader_size);
+            mix_signature(candidate.source0.width);
+            mix_signature(candidate.source0.height);
+            mix_signature(static_cast<std::uint32_t>(candidate.source0.format));
+            mix_signature(candidate.width);
+            mix_signature(candidate.height);
+            mix_signature(static_cast<std::uint32_t>(candidate.format));
+            mix_signature(candidate.viewport_width);
+            mix_signature(candidate.viewport_height);
+            mix_signature(candidate.render_target_count);
+            mix_signature(candidate.element_count);
+            mix_signature(candidate.indexed ? 1u : 0u);
+            mix_signature(candidate.backbuffer ? 1u : 0u);
+            mix_signature(candidate.display_draw_ordinal);
+            mix_signature(candidate.backbuffer_draw_ordinal);
+        };
+        for (std::uint32_t index = 0; index < frame.candidate_count; ++index)
+        {
+            mix_candidate(frame.candidates[index]);
+        }
+        if (frame.display_target_draws > frame.candidate_count)
+        {
+            for (std::uint32_t index = 0; index < frame.tail_candidate_count; ++index)
+                mix_candidate(frame.tail_candidates[index]);
+        }
+        if (g_final_scene_probe_signatures.size() < g_config.final_scene_probe_signature_limit)
+            should_log = g_final_scene_probe_signatures.insert(signature).second;
+    }
+
+    if (!should_log)
+        return;
+
+    std::ostringstream out;
+    out << "final_scene_probe frame=" << frame.frame_index
+        << " display_target_draws=" << frame.display_target_draws
+        << " backbuffer_draws=" << frame.backbuffer_draws
+        << " recorded=" << frame.candidate_count
+        << " tail_recorded=" << frame.tail_candidate_count;
+    const auto append_candidate = [&](const char *label, std::uint32_t index, const FinalSceneProbeCandidate &candidate)
+    {
+        out << " " << label << index
+            << "={draw=" << (candidate.indexed ? "indexed" : "nonindexed")
+            << ",elements=" << candidate.element_count
+            << ",target=" << hex64(candidate.resource_key)
+            << ",srv0=" << hex64(candidate.source0.resource_key)
+            << ",srv0_size=" << candidate.source0.width << "x" << candidate.source0.height
+            << ",srv0_format=" << format_string(candidate.source0.format)
+            << ",ps=" << hex64(candidate.pixel_shader_hash)
+            << ",ps_size=" << candidate.pixel_shader_size
+            << ",vs=" << hex64(candidate.vertex_shader_hash)
+            << ",vs_size=" << candidate.vertex_shader_size
+            << ",size=" << candidate.width << "x" << candidate.height
+            << ",format=" << format_string(candidate.format)
+            << ",viewport=" << candidate.viewport_width << "x" << candidate.viewport_height
+            << ",rtvs=" << candidate.render_target_count
+            << ",backbuffer=" << (candidate.backbuffer ? 1 : 0)
+            << ",display_order=" << candidate.display_draw_ordinal
+            << ",backbuffer_order=" << candidate.backbuffer_draw_ordinal << "}";
+    };
+    for (std::uint32_t index = 0; index < frame.candidate_count; ++index)
+    {
+        append_candidate("candidate", index, frame.candidates[index]);
+    }
+    if (frame.display_target_draws > frame.candidate_count)
+    {
+        for (std::uint32_t index = 0; index < frame.tail_candidate_count; ++index)
+            append_candidate("tail", index, frame.tail_candidates[index]);
+    }
+    log_line(out.str());
+}
+
+void record_final_scene_probe_draw(UINT element_count, bool indexed)
+{
+    if (!g_config.final_scene_probe || g_internal_bridge_dispatch)
+        return;
+
+    FinalSceneProbeCandidate candidate {};
+    std::uint64_t frame_index = 0;
+    {
+        std::lock_guard state_lock(g_state_mutex);
+        const ResourceInfo &target = g_state.rtvs[0];
+        if (target.resource_key == 0 || target.width == 0 || target.height == 0 ||
+            g_state.backbuffer_width == 0 || g_state.backbuffer_height == 0 ||
+            target.width != g_state.backbuffer_width || target.height != g_state.backbuffer_height)
+        {
+            return;
+        }
+
+        candidate.resource_key = target.resource_key;
+        candidate.source0 = g_state.ps_srvs[0];
+        candidate.pixel_shader_hash = g_state.current_ps_hash;
+        candidate.pixel_shader_size = g_state.current_ps_size;
+        candidate.vertex_shader_hash = g_state.current_vs_hash;
+        candidate.vertex_shader_size = g_state.current_vs_size;
+        candidate.width = target.width;
+        candidate.height = target.height;
+        candidate.format = target.format;
+        candidate.viewport_width = g_state.viewport_width;
+        candidate.viewport_height = g_state.viewport_height;
+        candidate.element_count = element_count;
+        candidate.indexed = indexed;
+        for (const ResourceInfo &rtv : g_state.rtvs)
+        {
+            if (rtv.resource_key != 0)
+                ++candidate.render_target_count;
+        }
+        frame_index = g_state.frame_index + 1;
+    }
+
+    std::lock_guard probe_lock(g_final_scene_probe_mutex);
+    candidate.backbuffer = g_final_scene_probe_backbuffers.contains(candidate.resource_key);
+    if (g_final_scene_probe_frame.frame_index != frame_index)
+        g_final_scene_probe_frame = { .frame_index = frame_index };
+
+    candidate.display_draw_ordinal = ++g_final_scene_probe_frame.display_target_draws;
+    if (candidate.backbuffer)
+        candidate.backbuffer_draw_ordinal = ++g_final_scene_probe_frame.backbuffer_draws;
+    if (g_final_scene_probe_frame.candidate_count < g_config.final_scene_probe_limit)
+        g_final_scene_probe_frame.candidates[g_final_scene_probe_frame.candidate_count++] = candidate;
+    if (g_final_scene_probe_frame.tail_candidate_count < g_config.final_scene_probe_limit)
+    {
+        g_final_scene_probe_frame.tail_candidates[g_final_scene_probe_frame.tail_candidate_count++] = candidate;
+    }
+    else
+    {
+        std::move(g_final_scene_probe_frame.tail_candidates.begin() + 1,
+            g_final_scene_probe_frame.tail_candidates.begin() + g_config.final_scene_probe_limit,
+            g_final_scene_probe_frame.tail_candidates.begin());
+        g_final_scene_probe_frame.tail_candidates[g_config.final_scene_probe_limit - 1] = candidate;
+    }
+}
+#endif
+
+bool is_known_swapchain_backbuffer(std::uint64_t resource_key)
+{
+    if (resource_key == 0)
+        return false;
+    std::lock_guard lock(g_swapchain_backbuffer_mutex);
+    return g_swapchain_backbuffer_resources.contains(resource_key);
+}
+
+void record_hdr_composite_candidate(UINT element_count, bool indexed)
+{
+    if (!g_config.hdr_composite_probe || g_internal_bridge_dispatch)
+        return;
+
+    ResourceInfo target {};
+    ResourceInfo source {};
+    std::uint64_t pixel_shader_hash = 0;
+    std::uint64_t vertex_shader_hash = 0;
+    std::uint32_t viewport_width = 0;
+    std::uint32_t viewport_height = 0;
+    std::uint32_t backbuffer_width = 0;
+    std::uint32_t backbuffer_height = 0;
+    std::uint64_t frame_index = 0;
+    {
+        std::lock_guard lock(g_state_mutex);
+        target = g_state.rtvs[0];
+        source = g_state.ps_srvs[0];
+        pixel_shader_hash = g_state.current_ps_hash;
+        vertex_shader_hash = g_state.current_vs_hash;
+        viewport_width = g_state.viewport_width;
+        viewport_height = g_state.viewport_height;
+        backbuffer_width = g_state.backbuffer_width;
+        backbuffer_height = g_state.backbuffer_height;
+        frame_index = g_state.frame_index;
+    }
+
+    if (target.resource_key == 0 || target.width == 0 || target.height == 0 ||
+        (target.format != DXGI_FORMAT_R10G10B10A2_UNORM &&
+            target.format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+            target.format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) ||
+        target.width != backbuffer_width || target.height != backbuffer_height)
+        return;
+
+    const bool full_resolution_source = source.resource_key != 0 && source.resource_key != target.resource_key &&
+        source.width == target.width && source.height == target.height;
+    const bool full_resolution_viewport = viewport_width == target.width && viewport_height == target.height;
+
+    std::uint64_t signature = pixel_shader_hash;
+    signature ^= vertex_shader_hash + 0x9E3779B97F4A7C15ull + (signature << 6) + (signature >> 2);
+    signature ^= static_cast<std::uint64_t>(element_count) << 32 | (indexed ? 1u : 0u);
+    signature ^= source.resource_key + 0x9E3779B97F4A7C15ull + (signature << 6) + (signature >> 2);
+    signature ^= static_cast<std::uint64_t>(source.format) << 32 | static_cast<std::uint32_t>(target.format);
+    {
+        std::lock_guard lock(g_hdr_composite_probe_mutex);
+        if (g_hdr_composite_probe_signatures.size() >= g_config.hdr_composite_probe_limit ||
+            !g_hdr_composite_probe_signatures.insert(signature).second)
+        {
+            return;
+        }
+    }
+
+    const std::uint32_t index = g_hdr_composite_probe_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    log_line("hdr_composite_candidate index=" + std::to_string(index) +
+        " frame=" + std::to_string(frame_index) +
+        " draw=" + std::string(indexed ? "indexed" : "nonindexed") +
+        " elements=" + std::to_string(element_count) +
+        " ps=" + hex64(pixel_shader_hash) +
+        " vs=" + hex64(vertex_shader_hash) +
+        " source=" + hex64(source.resource_key) +
+        " source_size=" + std::to_string(source.width) + "x" + std::to_string(source.height) +
+        " source_format=" + describe_dxgi_format(source.format) +
+        " source_view_format=" + describe_dxgi_format(source.view_format) +
+        " source_bind_flags=" + hex64(source.bind_flags) +
+        " source_misc_flags=" + hex64(source.misc_flags) +
+        " target=" + hex64(target.resource_key) +
+        " target_format=" + describe_dxgi_format(target.format) +
+        " target_view_format=" + describe_dxgi_format(target.view_format) +
+        " target_bind_flags=" + hex64(target.bind_flags) +
+        " size=" + std::to_string(target.width) + "x" + std::to_string(target.height) +
+        " full_source=" + std::to_string(full_resolution_source ? 1 : 0) +
+        " full_viewport=" + std::to_string(full_resolution_viewport ? 1 : 0));
+}
+
+void record_hdr_composite_copy(const ResourceInfo &destination, const ResourceInfo &source, const char *kind)
+{
+    if (!g_config.hdr_composite_probe || !is_known_swapchain_backbuffer(destination.resource_key))
+        return;
+
+    std::uint64_t signature = destination.resource_key;
+    signature ^= source.resource_key + 0x9E3779B97F4A7C15ull + (signature << 6) + (signature >> 2);
+    signature ^= static_cast<std::uint64_t>(destination.format) << 32 | static_cast<std::uint32_t>(source.format);
+    {
+        std::lock_guard lock(g_hdr_composite_probe_mutex);
+        if (g_hdr_composite_probe_signatures.size() >= g_config.hdr_composite_probe_limit ||
+            !g_hdr_composite_probe_signatures.insert(signature).second)
+        {
+            return;
+        }
+    }
+
+    const std::uint32_t index = g_hdr_composite_probe_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    log_line("hdr_composite_copy index=" + std::to_string(index) +
+        " kind=" + kind +
+        " source=" + hex64(source.resource_key) +
+        " source_size=" + std::to_string(source.width) + "x" + std::to_string(source.height) +
+        " source_format=" + describe_dxgi_format(source.format) +
+        " target_format=" + describe_dxgi_format(destination.format) +
+        " size=" + std::to_string(destination.width) + "x" + std::to_string(destination.height));
+}
+
+void record_hdr_composite_target_bind(const ResourceInfo &target)
+{
+    if (!g_config.hdr_composite_probe || target.resource_key == 0 || target.width == 0 || target.height == 0)
+        return;
+
+    std::uint32_t output_width = 0;
+    std::uint32_t output_height = 0;
+    {
+        std::lock_guard lock(g_state_mutex);
+        output_width = g_state.backbuffer_width;
+        output_height = g_state.backbuffer_height;
+    }
+    if (target.width != output_width || target.height != output_height)
+        return;
+
+    std::uint64_t signature = target.resource_key;
+    signature ^= static_cast<std::uint64_t>(target.format) << 32;
+    {
+        std::lock_guard lock(g_hdr_composite_probe_mutex);
+        if (g_hdr_composite_probe_signatures.size() >= g_config.hdr_composite_probe_limit ||
+            !g_hdr_composite_probe_signatures.insert(signature).second)
+        {
+            return;
+        }
+    }
+
+    const std::uint32_t index = g_hdr_composite_probe_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    log_line("hdr_composite_target_bind index=" + std::to_string(index) +
+        " target=" + hex64(target.resource_key) +
+        " format=" + describe_dxgi_format(target.format) +
+        " size=" + std::to_string(target.width) + "x" + std::to_string(target.height) +
+        " swapchain_backbuffer=" + std::to_string(is_known_swapchain_backbuffer(target.resource_key) ? 1 : 0));
+}
+
+bool is_hdr_sdr_tone_map_composite_draw(UINT element_count)
+{
+    if (!g_config.hdr_sdr_tone_map || !g_config.hdr_swapchain_spoof || element_count != 3 ||
+        g_internal_bridge_dispatch)
+    {
+        return false;
+    }
+
+    ResourceInfo target {};
+    ResourceInfo source {};
+    std::uint32_t viewport_width = 0;
+    std::uint32_t viewport_height = 0;
+    std::uint32_t backbuffer_width = 0;
+    std::uint32_t backbuffer_height = 0;
+    {
+        std::lock_guard lock(g_state_mutex);
+        target = g_state.rtvs[0];
+        source = g_state.ps_srvs[0];
+        viewport_width = g_state.viewport_width;
+        viewport_height = g_state.viewport_height;
+        backbuffer_width = g_state.backbuffer_width;
+        backbuffer_height = g_state.backbuffer_height;
+    }
+
+    return target.format == DXGI_FORMAT_R10G10B10A2_UNORM &&
+        target.width == backbuffer_width && target.height == backbuffer_height &&
+        source.resource_key != 0 && source.resource_key != target.resource_key &&
+        source.format == DXGI_FORMAT_R8G8B8A8_TYPELESS &&
+        source.width == target.width && source.height == target.height &&
+        viewport_width == target.width && viewport_height == target.height;
+}
+
+bool hdr_sdr_tone_map_format_supported(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void release_hdr_sdr_tone_map_resources_locked()
+{
+    auto release = [](auto *&resource)
+    {
+        if (resource != nullptr)
+        {
+            resource->Release();
+            resource = nullptr;
+        }
+    };
+    release(g_hdr_sdr_tone_map_resources.source_copy);
+    release(g_hdr_sdr_tone_map_resources.source_view);
+    release(g_hdr_sdr_tone_map_resources.source_target_view);
+    release(g_hdr_sdr_tone_map_resources.target_view);
+    release(g_hdr_sdr_tone_map_resources.target_texture);
+    release(g_hdr_sdr_tone_map_resources.vertex_shader);
+    release(g_hdr_sdr_tone_map_resources.pixel_shader);
+    release(g_hdr_sdr_tone_map_resources.sampler);
+    release(g_hdr_sdr_tone_map_resources.constants);
+    release(g_hdr_sdr_tone_map_resources.device);
+    g_hdr_sdr_tone_map_resources = {};
+    g_hdr_sdr_tone_map_shader_create_failed = false;
+}
+
+bool compile_hdr_sdr_tone_map_shaders_locked()
+{
+    if (g_hdr_sdr_tone_map_shader_compile_attempted)
+        return !g_hdr_sdr_tone_map_vs_bytecode.empty() && !g_hdr_sdr_tone_map_ps_bytecode.empty();
+
+    g_hdr_sdr_tone_map_shader_compile_attempted = true;
+    static constexpr char vertex_source[] = R"(
+struct VertexOutput
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+VertexOutput main(uint vertex_id : SV_VertexID)
+{
+    VertexOutput output;
+    const float2 position = float2((vertex_id << 1) & 2, vertex_id & 2);
+    output.uv = position;
+    output.position = float4(position * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    return output;
+}
+)";
+    static constexpr char pixel_source[] = R"(
+cbuffer ToneMapConstants : register(b0)
+{
+    float paper_white_nits;
+    float peak_nits;
+    float pq_input;
+    float padding;
+};
+
+Texture2D<float4> SourceColor : register(t0);
+SamplerState LinearSampler : register(s0);
+
+float3 pq_to_nits(float3 value)
+{
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    const float3 powered = pow(max(value, 0.0), 1.0 / m2);
+    return pow(max(powered - c1, 0.0) / max(c2 - c3 * powered, 1e-5), 1.0 / m1) * 10000.0;
+}
+
+float3 bt2020_to_bt709(float3 value)
+{
+    return float3(
+        dot(value, float3(1.660491, -0.587641, -0.072850)),
+        dot(value, float3(-0.124551, 1.132900, -0.008349)),
+        dot(value, float3(-0.018151, -0.100579, 1.118730)));
+}
+
+float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target0
+{
+    const float3 sampled = max(SourceColor.SampleLevel(LinearSampler, uv, 0.0).rgb, 0.0);
+    float3 scene_linear = sampled;
+    if (pq_input > 0.5)
+    {
+        // The spoofed SDR path still carries the game's HDR10 signal in a
+        // 10-bit UNORM target: decode ST.2084, convert its Rec.2020 gamut,
+        // then normalize against the SDR paper white before encoding gamma.
+        const float3 scene_nits = pq_to_nits(sampled);
+        // The engine advertises a P2020 swapchain, but the copied composite
+        // already carries display-referred RGB primaries. Treating it as
+        // P2020 here applies a second gamut conversion and desaturates the
+        // SDR result, so retain the composite's native RGB basis.
+        scene_linear = scene_nits / max(paper_white_nits, 1.0);
+
+        // Compress against the configured content peak. This leaves headroom
+        // above scene paper white instead of hard-clipping the whole HDR
+        // range at that anchor.
+        const float white_point = max(peak_nits / max(paper_white_nits, 1.0), 1.0);
+        const float white_point_sq = white_point * white_point;
+        const float scene_luma = dot(scene_linear, float3(0.2126, 0.7152, 0.0722));
+        const float mapped_luma = scene_luma * (1.0 + scene_luma / white_point_sq) /
+            (1.0 + scene_luma);
+        const float chroma_scale = mapped_luma / max(scene_luma, 1e-5);
+        scene_linear *= chroma_scale;
+    }
+    return float4(pow(saturate(scene_linear), 1.0 / 2.2), 1.0);
+}
+)";
+
+    const auto compile = [](const char *source, const char *name, const char *entry, const char *target,
+        std::vector<std::uint8_t> &output) -> bool
+    {
+        ID3DBlob *bytecode = nullptr;
+        ID3DBlob *errors = nullptr;
+        const HRESULT result = D3DCompile(
+            source,
+            std::strlen(source),
+            name,
+            nullptr,
+            nullptr,
+            entry,
+            target,
+            D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+            0,
+            &bytecode,
+            &errors);
+        if (FAILED(result) || bytecode == nullptr)
+        {
+            std::string message = std::string("hdr_sdr_tone_map_shader_compile_failed stage=") + name +
+                " hr=" + std::to_string(static_cast<long>(result));
+            if (errors != nullptr && errors->GetBufferPointer() != nullptr)
+                message += " error=" + std::string(static_cast<const char *>(errors->GetBufferPointer()), errors->GetBufferSize());
+            log_line(message);
+            if (errors != nullptr)
+                errors->Release();
+            if (bytecode != nullptr)
+                bytecode->Release();
+            return false;
+        }
+        const auto *begin = static_cast<const std::uint8_t *>(bytecode->GetBufferPointer());
+        output.assign(begin, begin + bytecode->GetBufferSize());
+        if (errors != nullptr)
+            errors->Release();
+        bytecode->Release();
+        return true;
+    };
+
+    return compile(vertex_source, "Dx11FsrBridgeHdrSdrToneMapVS", "main", "vs_5_0", g_hdr_sdr_tone_map_vs_bytecode) &&
+        compile(pixel_source, "Dx11FsrBridgeHdrSdrToneMapPS", "main", "ps_5_0", g_hdr_sdr_tone_map_ps_bytecode);
+}
+
+void release_hdr_sdr_tone_map_draw_resources_locked()
+{
+    if (g_hdr_sdr_tone_map_draw_resources.pixel_shader != nullptr)
+    {
+        g_hdr_sdr_tone_map_draw_resources.pixel_shader->Release();
+        g_hdr_sdr_tone_map_draw_resources.pixel_shader = nullptr;
+    }
+    if (g_hdr_sdr_tone_map_draw_resources.constants != nullptr)
+    {
+        g_hdr_sdr_tone_map_draw_resources.constants->Release();
+        g_hdr_sdr_tone_map_draw_resources.constants = nullptr;
+    }
+    if (g_hdr_sdr_tone_map_draw_resources.device != nullptr)
+    {
+        g_hdr_sdr_tone_map_draw_resources.device->Release();
+        g_hdr_sdr_tone_map_draw_resources.device = nullptr;
+    }
+}
+
+bool acquire_hdr_sdr_tone_map_draw_resources(
+    ID3D11DeviceContext *context,
+    ID3D11PixelShader **pixel_shader,
+    ID3D11Buffer **constants)
+{
+    if (pixel_shader == nullptr || constants == nullptr || context == nullptr)
+        return false;
+    *pixel_shader = nullptr;
+    *constants = nullptr;
+
+    ID3D11Device *device = nullptr;
+    context->GetDevice(&device);
+    if (device == nullptr)
+        return false;
+
+    std::lock_guard lock(g_hdr_sdr_tone_map_mutex);
+    auto &resources = g_hdr_sdr_tone_map_draw_resources;
+    if (resources.device != device)
+    {
+        release_hdr_sdr_tone_map_draw_resources_locked();
+        resources.device = device;
+        device = nullptr;
+    }
+    if (device != nullptr)
+        device->Release();
+
+    if (resources.pixel_shader == nullptr || resources.constants == nullptr)
+    {
+        if (!compile_hdr_sdr_tone_map_shaders_locked())
+            return false;
+        const HRESULT shader_result = g_original_create_pixel_shader != nullptr
+            ? g_original_create_pixel_shader(
+                resources.device,
+                g_hdr_sdr_tone_map_ps_bytecode.data(),
+                g_hdr_sdr_tone_map_ps_bytecode.size(),
+                nullptr,
+                &resources.pixel_shader)
+            : resources.device->CreatePixelShader(
+                g_hdr_sdr_tone_map_ps_bytecode.data(),
+                g_hdr_sdr_tone_map_ps_bytecode.size(),
+                nullptr,
+                &resources.pixel_shader);
+        if (FAILED(shader_result) || resources.pixel_shader == nullptr)
+        {
+            log_line("hdr_sdr_tone_map_draw_shader_create_failed hr=" +
+                std::to_string(static_cast<long>(shader_result)));
+            release_hdr_sdr_tone_map_draw_resources_locked();
+            return false;
+        }
+
+        D3D11_BUFFER_DESC buffer_desc {};
+        buffer_desc.ByteWidth = 16;
+        buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+        buffer_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        const HRESULT buffer_result = g_original_create_buffer != nullptr
+            ? g_original_create_buffer(resources.device, &buffer_desc, nullptr, &resources.constants)
+            : resources.device->CreateBuffer(&buffer_desc, nullptr, &resources.constants);
+        if (FAILED(buffer_result) || resources.constants == nullptr)
+        {
+            log_line("hdr_sdr_tone_map_draw_constants_create_failed hr=" +
+                std::to_string(static_cast<long>(buffer_result)));
+            release_hdr_sdr_tone_map_draw_resources_locked();
+            return false;
+        }
+        log_line("hdr_sdr_tone_map_draw_resources_ready");
+    }
+
+    resources.pixel_shader->AddRef();
+    resources.constants->AddRef();
+    *pixel_shader = resources.pixel_shader;
+    *constants = resources.constants;
+    return true;
+}
+
+bool ensure_hdr_sdr_tone_map_resources_locked(
+    ID3D11Device *device,
+    ID3D11Texture2D *target_texture,
+    ID3D11RenderTargetView *target_view)
+{
+    if (device == nullptr || target_texture == nullptr || target_view == nullptr)
+        return false;
+
+    D3D11_TEXTURE2D_DESC target_desc {};
+    target_texture->GetDesc(&target_desc);
+    if (target_desc.Width == 0 || target_desc.Height == 0 || target_desc.SampleDesc.Count != 1 ||
+        !hdr_sdr_tone_map_format_supported(target_desc.Format))
+        return false;
+
+    const std::uint64_t target_key = reinterpret_cast<std::uint64_t>(target_texture);
+    auto &resources = g_hdr_sdr_tone_map_resources;
+    const bool device_changed = resources.device != device;
+    const bool size_changed = resources.width != target_desc.Width || resources.height != target_desc.Height ||
+        resources.format != target_desc.Format;
+    if (device_changed || size_changed)
+    {
+        release_hdr_sdr_tone_map_resources_locked();
+        device->AddRef();
+        resources.device = device;
+        resources.width = target_desc.Width;
+        resources.height = target_desc.Height;
+        resources.format = target_desc.Format;
+
+        if (!compile_hdr_sdr_tone_map_shaders_locked())
+            return false;
+
+        D3D11_TEXTURE2D_DESC source_desc = target_desc;
+        source_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        source_desc.CPUAccessFlags = 0;
+        source_desc.MiscFlags = 0;
+        source_desc.Usage = D3D11_USAGE_DEFAULT;
+        HRESULT result = device->CreateTexture2D(&source_desc, nullptr, &resources.source_copy);
+        if (FAILED(result) || resources.source_copy == nullptr)
+        {
+            log_line("hdr_sdr_tone_map_source_create_failed hr=" + std::to_string(static_cast<long>(result)) +
+                " format=" + describe_dxgi_format(target_desc.Format));
+            release_hdr_sdr_tone_map_resources_locked();
+            return false;
+        }
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC view_desc {};
+        view_desc.Format = target_desc.Format;
+        view_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        view_desc.Texture2D.MostDetailedMip = 0;
+        view_desc.Texture2D.MipLevels = 1;
+        result = device->CreateShaderResourceView(resources.source_copy, &view_desc, &resources.source_view);
+        if (FAILED(result) || resources.source_view == nullptr)
+        {
+            log_line("hdr_sdr_tone_map_srv_create_failed hr=" + std::to_string(static_cast<long>(result)));
+            release_hdr_sdr_tone_map_resources_locked();
+            return false;
+        }
+
+        D3D11_RENDER_TARGET_VIEW_DESC target_view_desc {};
+        target_view_desc.Format = target_desc.Format;
+        target_view_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        target_view_desc.Texture2D.MipSlice = 0;
+        result = device->CreateRenderTargetView(resources.source_copy, &target_view_desc, &resources.source_target_view);
+        if (FAILED(result) || resources.source_target_view == nullptr)
+        {
+            log_line("hdr_sdr_tone_map_intermediate_rtv_create_failed hr=" + std::to_string(static_cast<long>(result)));
+            release_hdr_sdr_tone_map_resources_locked();
+            return false;
+        }
+
+        result = device->CreateVertexShader(
+            g_hdr_sdr_tone_map_vs_bytecode.data(), g_hdr_sdr_tone_map_vs_bytecode.size(), nullptr,
+            &resources.vertex_shader);
+        if (SUCCEEDED(result))
+        {
+            result = device->CreatePixelShader(
+                g_hdr_sdr_tone_map_ps_bytecode.data(), g_hdr_sdr_tone_map_ps_bytecode.size(), nullptr,
+                &resources.pixel_shader);
+        }
+        if (FAILED(result) || resources.vertex_shader == nullptr || resources.pixel_shader == nullptr)
+        {
+            log_line("hdr_sdr_tone_map_shader_create_failed hr=" + std::to_string(static_cast<long>(result)));
+            release_hdr_sdr_tone_map_resources_locked();
+            return false;
+        }
+
+        D3D11_SAMPLER_DESC sampler_desc {};
+        sampler_desc.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+        sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler_desc.MinLOD = 0.0f;
+        sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+        result = device->CreateSamplerState(&sampler_desc, &resources.sampler);
+        if (SUCCEEDED(result))
+        {
+            D3D11_BUFFER_DESC buffer_desc {};
+            buffer_desc.ByteWidth = 16;
+            buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+            buffer_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            result = device->CreateBuffer(&buffer_desc, nullptr, &resources.constants);
+        }
+        if (FAILED(result) || resources.sampler == nullptr || resources.constants == nullptr)
+        {
+            log_line("hdr_sdr_tone_map_state_create_failed hr=" + std::to_string(static_cast<long>(result)));
+            release_hdr_sdr_tone_map_resources_locked();
+            return false;
+        }
+
+        log_line("hdr_sdr_tone_map_resources_created size=" +
+            std::to_string(target_desc.Width) + "x" + std::to_string(target_desc.Height) +
+            " format=" + describe_dxgi_format(target_desc.Format));
+    }
+
+    if (resources.target_key != target_key)
+    {
+        if (resources.target_view != nullptr)
+            resources.target_view->Release();
+        if (resources.target_texture != nullptr)
+            resources.target_texture->Release();
+        target_texture->AddRef();
+        target_view->AddRef();
+        resources.target_texture = target_texture;
+        resources.target_view = target_view;
+        resources.target_key = target_key;
+    }
+    return resources.source_copy != nullptr && resources.source_view != nullptr &&
+        resources.target_view != nullptr && resources.vertex_shader != nullptr &&
+        resources.pixel_shader != nullptr && resources.sampler != nullptr && resources.constants != nullptr;
+}
+
+void tone_map_hdr_backbuffer_to_sdr(IDXGISwapChain *swapchain, std::uint64_t frame_index)
+{
+    if (!g_config.hdr_sdr_tone_map || !g_config.hdr_swapchain_spoof || swapchain == nullptr || g_internal_bridge_dispatch)
+        return;
+
+    ID3D11Device *device = nullptr;
+    if (FAILED(swapchain->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
+        return;
+    ID3D11DeviceContext *context = nullptr;
+    device->GetImmediateContext(&context);
+    if (context == nullptr)
+    {
+        device->Release();
+        return;
+    }
+
+    ID3D11RenderTargetView *bound_target = nullptr;
+    context->OMGetRenderTargets(1, &bound_target, nullptr);
+    if (bound_target == nullptr)
+    {
+        context->Release();
+        device->Release();
+        return;
+    }
+    ID3D11Resource *target_resource = nullptr;
+    bound_target->GetResource(&target_resource);
+    ID3D11Texture2D *target_texture = nullptr;
+    if (target_resource != nullptr)
+        target_resource->QueryInterface(IID_PPV_ARGS(&target_texture));
+    if (target_resource != nullptr)
+        target_resource->Release();
+    if (target_texture == nullptr)
+    {
+        bound_target->Release();
+        context->Release();
+        device->Release();
+        return;
+    }
+
+    DXGI_SWAP_CHAIN_DESC swapchain_desc {};
+    bool is_swapchain_target = SUCCEEDED(swapchain->GetDesc(&swapchain_desc));
+    if (is_swapchain_target)
+    {
+        is_swapchain_target = false;
+        for (UINT index = 0; index < swapchain_desc.BufferCount; ++index)
+        {
+            ID3D11Texture2D *buffer = nullptr;
+            if (SUCCEEDED(swapchain->GetBuffer(index, IID_PPV_ARGS(&buffer))) && buffer != nullptr)
+            {
+                is_swapchain_target = buffer == target_texture;
+                buffer->Release();
+                if (is_swapchain_target)
+                    break;
+            }
+        }
+    }
+    if (!is_swapchain_target)
+    {
+        target_texture->Release();
+        bound_target->Release();
+        context->Release();
+        device->Release();
+        return;
+    }
+
+    std::lock_guard tone_map_lock(g_hdr_sdr_tone_map_mutex);
+    if (!ensure_hdr_sdr_tone_map_resources_locked(device, target_texture, bound_target))
+    {
+        target_texture->Release();
+        bound_target->Release();
+        context->Release();
+        device->Release();
+        return;
+    }
+
+    auto &resources = g_hdr_sdr_tone_map_resources;
+    ID3D11RenderTargetView *saved_render_targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] {};
+    ID3D11DepthStencilView *saved_depth_stencil = nullptr;
+    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved_render_targets, &saved_depth_stencil);
+
+    D3D11_VIEWPORT saved_viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] {};
+    UINT saved_viewport_count = static_cast<UINT>(std::size(saved_viewports));
+    context->RSGetViewports(&saved_viewport_count, saved_viewports);
+
+    ID3D11InputLayout *saved_input_layout = nullptr;
+    context->IAGetInputLayout(&saved_input_layout);
+    D3D11_PRIMITIVE_TOPOLOGY saved_topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    context->IAGetPrimitiveTopology(&saved_topology);
+    ID3D11VertexShader *saved_vertex_shader = nullptr;
+    std::array<ID3D11ClassInstance *, 256> saved_vertex_instances {};
+    UINT saved_vertex_instance_count = static_cast<UINT>(saved_vertex_instances.size());
+    context->VSGetShader(&saved_vertex_shader, saved_vertex_instances.data(), &saved_vertex_instance_count);
+    ID3D11PixelShader *saved_pixel_shader = nullptr;
+    std::array<ID3D11ClassInstance *, 256> saved_pixel_instances {};
+    UINT saved_pixel_instance_count = static_cast<UINT>(saved_pixel_instances.size());
+    context->PSGetShader(&saved_pixel_shader, saved_pixel_instances.data(), &saved_pixel_instance_count);
+    ID3D11ShaderResourceView *saved_source_view = nullptr;
+    context->PSGetShaderResources(0, 1, &saved_source_view);
+    ID3D11SamplerState *saved_sampler = nullptr;
+    context->PSGetSamplers(0, 1, &saved_sampler);
+    ID3D11Buffer *saved_constant_buffer = nullptr;
+    context->PSGetConstantBuffers(0, 1, &saved_constant_buffer);
+    ID3D11BlendState *saved_blend_state = nullptr;
+    FLOAT saved_blend_factor[4] {};
+    UINT saved_sample_mask = 0;
+    context->OMGetBlendState(&saved_blend_state, saved_blend_factor, &saved_sample_mask);
+    ID3D11DepthStencilState *saved_depth_state = nullptr;
+    UINT saved_stencil_ref = 0;
+    context->OMGetDepthStencilState(&saved_depth_state, &saved_stencil_ref);
+    ID3D11RasterizerState *saved_rasterizer_state = nullptr;
+    context->RSGetState(&saved_rasterizer_state);
+
+    struct ToneMapConstants
+    {
+        float paper_white;
+        float peak;
+        float pq_input;
+        float padding;
+    } constants {
+        static_cast<float>(g_config.hdr_sdr_tone_map_paper_white),
+        static_cast<float>(std::max(g_config.hdr_sdr_tone_map_peak, g_config.hdr_sdr_tone_map_paper_white)),
+        g_config.hdr_sdr_tone_map_pq_input ? 1.0f : 0.0f,
+        0.0f,
+    };
+
+    {
+        ScopedInternalBridgeDispatch internal_dispatch_scope;
+        ScopedContextVtableBypass context_vtable_bypass(context);
+        if (g_original_om_set_render_targets != nullptr)
+            g_original_om_set_render_targets(context, 0, nullptr, nullptr);
+        else
+            context->OMSetRenderTargets(0, nullptr, nullptr);
+        if (g_original_copy_resource != nullptr)
+            g_original_copy_resource(context, resources.source_copy, target_texture);
+        else
+            context->CopyResource(resources.source_copy, target_texture);
+        context->UpdateSubresource(resources.constants, 0, nullptr, &constants, 0, 0);
+        if (g_original_om_set_render_targets != nullptr)
+            g_original_om_set_render_targets(context, 1, &resources.target_view, nullptr);
+        else
+            context->OMSetRenderTargets(1, &resources.target_view, nullptr);
+        const D3D11_VIEWPORT viewport {
+            0.0f, 0.0f,
+            static_cast<float>(resources.width), static_cast<float>(resources.height),
+            0.0f, 1.0f,
+        };
+        if (g_original_rs_set_viewports != nullptr)
+            g_original_rs_set_viewports(context, 1, &viewport);
+        else
+            context->RSSetViewports(1, &viewport);
+        context->IASetInputLayout(nullptr);
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        if (g_original_vs_set_shader != nullptr)
+            g_original_vs_set_shader(context, resources.vertex_shader, nullptr, 0);
+        else
+            context->VSSetShader(resources.vertex_shader, nullptr, 0);
+        if (g_original_ps_set_shader != nullptr)
+            g_original_ps_set_shader(context, resources.pixel_shader, nullptr, 0);
+        else
+            context->PSSetShader(resources.pixel_shader, nullptr, 0);
+        if (g_original_ps_set_shader_resources != nullptr)
+            g_original_ps_set_shader_resources(context, 0, 1, &resources.source_view);
+        else
+            context->PSSetShaderResources(0, 1, &resources.source_view);
+        context->PSSetSamplers(0, 1, &resources.sampler);
+        context->PSSetConstantBuffers(0, 1, &resources.constants);
+        context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+        context->OMSetDepthStencilState(nullptr, 0);
+        context->RSSetState(nullptr);
+        if (g_original_draw != nullptr)
+            g_original_draw(context, 3, 0);
+        else
+            context->Draw(3, 0);
+        ID3D11ShaderResourceView *null_view = nullptr;
+        if (g_original_ps_set_shader_resources != nullptr)
+            g_original_ps_set_shader_resources(context, 0, 1, &null_view);
+        else
+            context->PSSetShaderResources(0, 1, &null_view);
+        if (g_original_om_set_render_targets != nullptr)
+            g_original_om_set_render_targets(context, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
+                saved_render_targets, saved_depth_stencil);
+        else
+            context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
+                saved_render_targets, saved_depth_stencil);
+        if (saved_viewport_count != 0)
+        {
+            if (g_original_rs_set_viewports != nullptr)
+                g_original_rs_set_viewports(context, saved_viewport_count, saved_viewports);
+            else
+                context->RSSetViewports(saved_viewport_count, saved_viewports);
+        }
+        context->IASetInputLayout(saved_input_layout);
+        context->IASetPrimitiveTopology(saved_topology);
+        if (g_original_vs_set_shader != nullptr)
+            g_original_vs_set_shader(context, saved_vertex_shader, saved_vertex_instances.data(), saved_vertex_instance_count);
+        else
+            context->VSSetShader(saved_vertex_shader, saved_vertex_instances.data(), saved_vertex_instance_count);
+        if (g_original_ps_set_shader != nullptr)
+            g_original_ps_set_shader(context, saved_pixel_shader, saved_pixel_instances.data(), saved_pixel_instance_count);
+        else
+            context->PSSetShader(saved_pixel_shader, saved_pixel_instances.data(), saved_pixel_instance_count);
+        if (g_original_ps_set_shader_resources != nullptr)
+            g_original_ps_set_shader_resources(context, 0, 1, &saved_source_view);
+        else
+            context->PSSetShaderResources(0, 1, &saved_source_view);
+        context->PSSetSamplers(0, 1, &saved_sampler);
+        context->PSSetConstantBuffers(0, 1, &saved_constant_buffer);
+        context->OMSetBlendState(saved_blend_state, saved_blend_factor, saved_sample_mask);
+        context->OMSetDepthStencilState(saved_depth_state, saved_stencil_ref);
+        context->RSSetState(saved_rasterizer_state);
+    }
+
+    if (saved_input_layout != nullptr)
+        saved_input_layout->Release();
+    if (saved_vertex_shader != nullptr)
+        saved_vertex_shader->Release();
+    for (ID3D11ClassInstance *instance : saved_vertex_instances)
+    {
+        if (instance != nullptr)
+            instance->Release();
+    }
+    if (saved_pixel_shader != nullptr)
+        saved_pixel_shader->Release();
+    for (ID3D11ClassInstance *instance : saved_pixel_instances)
+    {
+        if (instance != nullptr)
+            instance->Release();
+    }
+    if (saved_source_view != nullptr)
+        saved_source_view->Release();
+    if (saved_sampler != nullptr)
+        saved_sampler->Release();
+    if (saved_constant_buffer != nullptr)
+        saved_constant_buffer->Release();
+    if (saved_blend_state != nullptr)
+        saved_blend_state->Release();
+    if (saved_depth_state != nullptr)
+        saved_depth_state->Release();
+    if (saved_rasterizer_state != nullptr)
+        saved_rasterizer_state->Release();
+    for (ID3D11RenderTargetView *render_target : saved_render_targets)
+    {
+        if (render_target != nullptr)
+            render_target->Release();
+    }
+    if (saved_depth_stencil != nullptr)
+        saved_depth_stencil->Release();
+
+    if (!g_hdr_sdr_tone_map_logged.exchange(true, std::memory_order_relaxed))
+    {
+        log_line("hdr_sdr_tone_map_active frame=" + std::to_string(frame_index) +
+            " paper_white=" + std::to_string(g_config.hdr_sdr_tone_map_paper_white) +
+            " peak=" + std::to_string(g_config.hdr_sdr_tone_map_peak) +
+            " pq_input=" + std::to_string(g_config.hdr_sdr_tone_map_pq_input ? 1 : 0));
+    }
+
+    target_texture->Release();
+    bound_target->Release();
+    context->Release();
+    device->Release();
+}
+
 HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags)
 {
 #if defined(DX11FSRBRIDGE_SERVER_DEBUG_RUNTIME) && defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
@@ -4295,6 +5990,9 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
             " resolution=" + std::to_string((fsr2_query_mask & (1u << 4)) != 0) +
             " jitter=" + std::to_string((fsr2_query_mask & (1u << 5)) != 0));
     }
+#endif
+#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+    update_final_scene_probe_backbuffers(swapchain);
 #endif
     DXGI_SWAP_CHAIN_DESC desc {};
     const bool desc_available = SUCCEEDED(swapchain->GetDesc(&desc));
@@ -4315,6 +6013,11 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
         backbuffer_height = g_state.backbuffer_height;
     }
 
+#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+    flush_final_scene_probe(frame_index);
+    poll_final_scene_snapshot(swapchain);
+#endif
+
     log_line("present frame=" + std::to_string(frame_index) +
         " size=" + std::to_string(backbuffer_width) + "x" + std::to_string(backbuffer_height));
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME) && defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
@@ -4331,6 +6034,7 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
             " shim_queries=" + hex64(fsr2_get_proc_address_shim_query_mask()));
     }
 #endif
+    tone_map_hdr_backbuffer_to_sdr(swapchain, frame_index);
     return g_original_present(swapchain, sync_interval, flags);
 }
 
@@ -4368,6 +6072,12 @@ HRESULT STDMETHODCALLTYPE hooked_resize_buffers(
     DXGI_FORMAT format,
     UINT flags)
 {
+    DXGI_FORMAT effective_format = format;
+    if (g_config.native_ldr_swapchain_unorm && format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+    {
+        effective_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        log_line("native_ldr_resize_buffers_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM");
+    }
     if (dlssg_dxgi_workaround_active() && swapchain != nullptr)
     {
         DXGI_SWAP_CHAIN_DESC current {};
@@ -4396,9 +6106,25 @@ HRESULT STDMETHODCALLTYPE hooked_resize_buffers(
         }
     }
 
-    return g_original_resize_buffers != nullptr
-        ? g_original_resize_buffers(swapchain, buffer_count, width, height, format, flags)
+    resize_buffers_fn original_resize = nullptr;
+    {
+        std::lock_guard lock(g_swapchain_resize_mutex);
+        const auto it = g_original_resize_buffers_by_instance.find(swapchain);
+        if (it != g_original_resize_buffers_by_instance.end())
+            original_resize = it->second;
+    }
+    if (original_resize == nullptr)
+        original_resize = g_original_resize_buffers;
+
+    const HRESULT result = original_resize != nullptr
+        ? original_resize(swapchain, buffer_count, width, height, effective_format, flags)
         : DXGI_ERROR_INVALID_CALL;
+    if (SUCCEEDED(result))
+    {
+        update_swapchain_backbuffer_resources(swapchain);
+        apply_hdr_swapchain_force(swapchain);
+    }
+    return result;
 }
 
 HRESULT STDMETHODCALLTYPE hooked_resize_target(IDXGISwapChain *swapchain, const DXGI_MODE_DESC *target_parameters)
@@ -4427,22 +6153,50 @@ HRESULT STDMETHODCALLTYPE hooked_resize_target(IDXGISwapChain *swapchain, const 
         : DXGI_ERROR_INVALID_CALL;
 }
 
-#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+bool hdr_swapchain_spoof_active()
+{
+    return g_config.hdr_swapchain_spoof;
+}
+
+bool hdr_swapchain_force_active()
+{
+    return g_config.hdr_swapchain_force;
+}
+
+bool is_hdr10_color_space(DXGI_COLOR_SPACE_TYPE color_space)
+{
+    return color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+        color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020;
+}
+
 HRESULT STDMETHODCALLTYPE hooked_check_color_space_support(
     IDXGISwapChain3 *swapchain,
     DXGI_COLOR_SPACE_TYPE color_space,
     UINT *support)
 {
     void *const caller = _ReturnAddress();
-    const HRESULT hr = g_original_check_color_space_support != nullptr
+    const HRESULT physical_hr = g_original_check_color_space_support != nullptr
         ? g_original_check_color_space_support(swapchain, color_space, support)
         : DXGI_ERROR_INVALID_CALL;
-    log_line("dxgi_color_check swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)) +
-        " caller=" + module_path_from_address(caller) +
-        " color_space=" + std::to_string(static_cast<unsigned>(color_space)) + "/" + color_space_name(color_space) +
-        " hr=" + hex32(static_cast<std::uint32_t>(hr)) +
-        " support=" + (support != nullptr ? hex32(*support) : std::string("null")));
-    return hr;
+    const bool spoof = hdr_swapchain_spoof_active() && is_hdr10_color_space(color_space);
+    if (spoof && support != nullptr)
+        *support |= DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
+
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+    const bool should_log = true;
+#else
+    const bool should_log = spoof;
+#endif
+    if (should_log)
+    {
+        log_line("dxgi_color_check swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)) +
+            " caller=" + module_path_from_address(caller) +
+            " requested=" + std::to_string(static_cast<unsigned>(color_space)) + "/" + color_space_name(color_space) +
+            " physical_hr=" + hex64(static_cast<std::uint32_t>(physical_hr)) +
+            " support=" + (support != nullptr ? hex64(*support) : std::string("null")) +
+            " spoof=" + std::to_string(spoof ? 1 : 0));
+    }
+    return spoof ? S_OK : physical_hr;
 }
 
 HRESULT STDMETHODCALLTYPE hooked_set_color_space1(
@@ -4450,14 +6204,29 @@ HRESULT STDMETHODCALLTYPE hooked_set_color_space1(
     DXGI_COLOR_SPACE_TYPE color_space)
 {
     void *const caller = _ReturnAddress();
-    const HRESULT hr = g_original_set_color_space1 != nullptr
-        ? g_original_set_color_space1(swapchain, color_space)
+    const bool spoof = hdr_swapchain_spoof_active() && is_hdr10_color_space(color_space);
+    const DXGI_COLOR_SPACE_TYPE physical_color_space = spoof
+        ? DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+        : color_space;
+    const HRESULT physical_hr = g_original_set_color_space1 != nullptr
+        ? g_original_set_color_space1(swapchain, physical_color_space)
         : DXGI_ERROR_INVALID_CALL;
-    log_line("dxgi_color_set swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)) +
-        " caller=" + module_path_from_address(caller) +
-        " color_space=" + std::to_string(static_cast<unsigned>(color_space)) + "/" + color_space_name(color_space) +
-        " hr=" + hex32(static_cast<std::uint32_t>(hr)));
-    return hr;
+
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+    const bool should_log = true;
+#else
+    const bool should_log = spoof;
+#endif
+    if (should_log)
+    {
+        log_line("dxgi_color_set swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)) +
+            " caller=" + module_path_from_address(caller) +
+            " requested=" + std::to_string(static_cast<unsigned>(color_space)) + "/" + color_space_name(color_space) +
+            " physical=" + std::to_string(static_cast<unsigned>(physical_color_space)) + "/" + color_space_name(physical_color_space) +
+            " physical_hr=" + hex64(static_cast<std::uint32_t>(physical_hr)) +
+            " spoof=" + std::to_string(spoof ? 1 : 0));
+    }
+    return spoof ? S_OK : physical_hr;
 }
 
 HRESULT STDMETHODCALLTYPE hooked_set_hdr_metadata(
@@ -4467,16 +6236,20 @@ HRESULT STDMETHODCALLTYPE hooked_set_hdr_metadata(
     void *metadata)
 {
     void *const caller = _ReturnAddress();
-    const HRESULT hr = g_original_set_hdr_metadata != nullptr
-        ? g_original_set_hdr_metadata(swapchain, type, size, metadata)
-        : DXGI_ERROR_INVALID_CALL;
+    const bool spoof = hdr_swapchain_spoof_active() && type == DXGI_HDR_METADATA_TYPE_HDR10;
+    const HRESULT physical_hr = spoof
+        ? S_OK
+        : (g_original_set_hdr_metadata != nullptr
+            ? g_original_set_hdr_metadata(swapchain, type, size, metadata)
+            : DXGI_ERROR_INVALID_CALL);
 
     std::ostringstream message;
     message << "dxgi_hdr_metadata swapchain=" << hex64(reinterpret_cast<std::uintptr_t>(swapchain))
         << " caller=" << module_path_from_address(caller)
         << " type=" << static_cast<unsigned>(type) << "/" << hdr_metadata_type_name(type)
         << " size=" << size
-        << " hr=" << hex32(static_cast<std::uint32_t>(hr));
+        << " physical_hr=" << hex64(static_cast<std::uint32_t>(physical_hr))
+        << " spoof=" << (spoof ? 1 : 0);
     if (type == DXGI_HDR_METADATA_TYPE_HDR10 && metadata != nullptr && size >= sizeof(DXGI_HDR_METADATA_HDR10))
     {
         const auto &hdr10 = *static_cast<const DXGI_HDR_METADATA_HDR10 *>(metadata);
@@ -4489,10 +6262,43 @@ HRESULT STDMETHODCALLTYPE hooked_set_hdr_metadata(
             << " max_cll=" << hdr10.MaxContentLightLevel
             << " max_fall=" << hdr10.MaxFrameAverageLightLevel;
     }
-    log_line(message.str());
-    return hr;
-}
+#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+    const bool should_log = true;
+#else
+    const bool should_log = spoof;
 #endif
+    if (should_log)
+        log_line(message.str());
+    return spoof ? S_OK : physical_hr;
+}
+
+void apply_hdr_swapchain_force(IDXGISwapChain *swapchain)
+{
+    if (!hdr_swapchain_force_active() || swapchain == nullptr)
+        return;
+
+    IDXGISwapChain3 *swapchain3 = nullptr;
+    if (FAILED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3))) ||
+        swapchain3 == nullptr)
+    {
+        log_line("dxgi_hdr_force unavailable reason=no_IDXGISwapChain3");
+        return;
+    }
+
+    constexpr DXGI_COLOR_SPACE_TYPE requested_color_space = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+    UINT support = 0;
+    const HRESULT check_hr = swapchain3->CheckColorSpaceSupport(requested_color_space, &support);
+    HRESULT set_hr = S_FALSE;
+    if (SUCCEEDED(check_hr) && (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0)
+        set_hr = swapchain3->SetColorSpace1(requested_color_space);
+
+    log_line("dxgi_hdr_force requested=" + std::to_string(static_cast<unsigned>(requested_color_space)) + "/" +
+        color_space_name(requested_color_space) +
+        " check_hr=" + hex64(static_cast<std::uint32_t>(check_hr)) +
+        " support=" + hex64(support) +
+        " set_hr=" + hex64(static_cast<std::uint32_t>(set_hr)));
+    swapchain3->Release();
+}
 
 void STDMETHODCALLTYPE hooked_ps_set_shader_resources(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11ShaderResourceView *const *views)
 {
@@ -4641,8 +6447,37 @@ void STDMETHODCALLTYPE hooked_cs_set_constant_buffers(ID3D11DeviceContext *conte
     g_original_cs_set_constant_buffers(context, start_slot, count, buffers);
 }
 
+void ensure_context_device_texture_hook(ID3D11DeviceContext *context)
+{
+    if (!g_config.native_ldr_final_target_unorm || context == nullptr)
+        return;
+
+    ID3D11Device *device = nullptr;
+    context->GetDevice(&device);
+    if (device == nullptr)
+        return;
+
+    const std::uint64_t device_key = reinterpret_cast<std::uint64_t>(device);
+    bool first_attempt = false;
+    {
+        std::lock_guard lock(g_context_device_hook_mutex);
+        first_attempt = g_context_device_hook_attempts.insert(device_key).second;
+    }
+    if (first_attempt)
+    {
+        void **device_vtable = *reinterpret_cast<void ***>(device);
+        log_line("device_create_texture_entry device=" + hex64(device_key) +
+            " entry=" + hex64(reinterpret_cast<std::uintptr_t>(device_vtable[k_idx_device_create_texture_2d])) +
+            " expected=" + hex64(reinterpret_cast<std::uintptr_t>(&hooked_create_texture_2d)));
+        install_device_hooks(device);
+        log_line("context_device_texture_hook device=" + hex64(device_key));
+    }
+    device->Release();
+}
+
 void STDMETHODCALLTYPE hooked_om_set_render_targets(ID3D11DeviceContext *context, UINT count, ID3D11RenderTargetView *const *rtvs, ID3D11DepthStencilView *dsv)
 {
+    ensure_context_device_texture_hook(context);
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
     {
@@ -4656,6 +6491,7 @@ void STDMETHODCALLTYPE hooked_om_set_render_targets(ID3D11DeviceContext *context
         return;
     }
 #endif
+    ResourceInfo first_target {};
     {
         std::lock_guard lock(g_state_mutex);
         for (std::size_t i = 0; i < g_state.rtvs.size(); ++i)
@@ -4668,8 +6504,43 @@ void STDMETHODCALLTYPE hooked_om_set_render_targets(ID3D11DeviceContext *context
             read_resource_info(rtvs[i], L"rtv", g_state.rtvs[i]);
         read_resource_info(dsv, L"dsv", g_state.dsv);
 #endif
+        first_target = g_state.rtvs[0];
     }
+    record_hdr_composite_target_bind(first_target);
     g_original_om_set_render_targets(context, count, rtvs, dsv);
+}
+
+void STDMETHODCALLTYPE hooked_om_set_render_targets_and_uavs(
+    ID3D11DeviceContext *context,
+    UINT render_target_count,
+    ID3D11RenderTargetView *const *render_targets,
+    ID3D11DepthStencilView *depth_stencil,
+    UINT uav_start_slot,
+    UINT uav_count,
+    ID3D11UnorderedAccessView *const *unordered_access_views,
+    const UINT *uav_initial_counts)
+{
+    ensure_context_device_texture_hook(context);
+    ResourceInfo first_target {};
+    {
+        std::lock_guard lock(g_state_mutex);
+        for (std::size_t i = 0; i < g_state.rtvs.size(); ++i)
+            g_state.rtvs[i] = {};
+        for (UINT i = 0; i < render_target_count && i < g_state.rtvs.size(); ++i)
+            read_resource_info(render_targets[i], L"rtv_uav", g_state.rtvs[i]);
+        read_resource_info(depth_stencil, L"dsv_uav", g_state.dsv);
+        first_target = g_state.rtvs[0];
+    }
+    record_hdr_composite_target_bind(first_target);
+    g_original_om_set_render_targets_and_uavs(
+        context,
+        render_target_count,
+        render_targets,
+        depth_stencil,
+        uav_start_slot,
+        uav_count,
+        unordered_access_views,
+        uav_initial_counts);
 }
 
 void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_x, UINT group_y, UINT group_z)
@@ -7763,6 +9634,147 @@ void end_spatial_copy_draw(ID3D11DeviceContext *context, PixelShaderRestoreState
 }
 
 template <typename DrawCall>
+bool try_hdr_sdr_tone_map_draw(ID3D11DeviceContext *context, UINT element_count, DrawCall &&draw_call)
+{
+    if (!is_hdr_sdr_tone_map_composite_draw(element_count))
+        return false;
+
+    ID3D11RenderTargetView *original_target = nullptr;
+    context->OMGetRenderTargets(1, &original_target, nullptr);
+    if (original_target == nullptr)
+        return false;
+    ID3D11Resource *target_resource = nullptr;
+    ID3D11Texture2D *target_texture = nullptr;
+    original_target->GetResource(&target_resource);
+    if (target_resource != nullptr)
+        target_resource->QueryInterface(IID_PPV_ARGS(&target_texture));
+    if (target_resource != nullptr)
+        target_resource->Release();
+    if (target_texture == nullptr)
+    {
+        original_target->Release();
+        return false;
+    }
+
+    ID3D11Device *device = nullptr;
+    context->GetDevice(&device);
+    std::lock_guard tone_map_lock(g_hdr_sdr_tone_map_mutex);
+    if (device == nullptr || !ensure_hdr_sdr_tone_map_resources_locked(device, target_texture, original_target))
+    {
+        if (device != nullptr)
+            device->Release();
+        target_texture->Release();
+        original_target->Release();
+        return false;
+    }
+    device->Release();
+    auto &resources = g_hdr_sdr_tone_map_resources;
+
+    ID3D11RenderTargetView *saved_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] {};
+    ID3D11DepthStencilView *saved_dsv = nullptr;
+    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved_rtvs, &saved_dsv);
+    D3D11_VIEWPORT saved_viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] {};
+    UINT saved_viewport_count = static_cast<UINT>(std::size(saved_viewports));
+    context->RSGetViewports(&saved_viewport_count, saved_viewports);
+    ID3D11InputLayout *saved_layout = nullptr;
+    context->IAGetInputLayout(&saved_layout);
+    D3D11_PRIMITIVE_TOPOLOGY saved_topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    context->IAGetPrimitiveTopology(&saved_topology);
+    ID3D11VertexShader *saved_vs = nullptr;
+    context->VSGetShader(&saved_vs, nullptr, nullptr);
+    ID3D11PixelShader *saved_ps = nullptr;
+    context->PSGetShader(&saved_ps, nullptr, nullptr);
+    ID3D11ShaderResourceView *saved_srv0 = nullptr;
+    context->PSGetShaderResources(0, 1, &saved_srv0);
+    ID3D11SamplerState *saved_sampler = nullptr;
+    context->PSGetSamplers(0, 1, &saved_sampler);
+    ID3D11Buffer *saved_cb0 = nullptr;
+    context->PSGetConstantBuffers(0, 1, &saved_cb0);
+    ID3D11BlendState *saved_blend = nullptr;
+    FLOAT saved_blend_factor[4] {};
+    UINT saved_sample_mask = 0;
+    context->OMGetBlendState(&saved_blend, saved_blend_factor, &saved_sample_mask);
+    ID3D11DepthStencilState *saved_depth = nullptr;
+    UINT saved_stencil_ref = 0;
+    context->OMGetDepthStencilState(&saved_depth, &saved_stencil_ref);
+    ID3D11RasterizerState *saved_rasterizer = nullptr;
+    context->RSGetState(&saved_rasterizer);
+
+    const D3D11_VIEWPORT viewport { 0.0f, 0.0f, static_cast<float>(resources.width),
+        static_cast<float>(resources.height), 0.0f, 1.0f };
+    struct ToneMapConstants
+    {
+        float paper_white;
+        float peak;
+        float pq_input;
+        float padding;
+    } constants {
+        static_cast<float>(g_config.hdr_sdr_tone_map_paper_white),
+        static_cast<float>(std::max(g_config.hdr_sdr_tone_map_peak, g_config.hdr_sdr_tone_map_paper_white)),
+        g_config.hdr_sdr_tone_map_pq_input ? 1.0f : 0.0f,
+        0.0f,
+    };
+    {
+        ScopedInternalBridgeDispatch internal_dispatch_scope;
+        ScopedContextVtableBypass context_vtable_bypass(context);
+        context->OMSetRenderTargets(1, &resources.source_target_view, nullptr);
+        context->RSSetViewports(1, &viewport);
+        std::forward<DrawCall>(draw_call)();
+
+        context->OMSetRenderTargets(1, &original_target, nullptr);
+        context->IASetInputLayout(nullptr);
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context->VSSetShader(resources.vertex_shader, nullptr, 0);
+        context->PSSetShader(resources.pixel_shader, nullptr, 0);
+        context->PSSetShaderResources(0, 1, &resources.source_view);
+        context->PSSetSamplers(0, 1, &resources.sampler);
+        context->UpdateSubresource(resources.constants, 0, nullptr, &constants, 0, 0);
+        context->PSSetConstantBuffers(0, 1, &resources.constants);
+        context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+        context->OMSetDepthStencilState(nullptr, 0);
+        context->RSSetState(nullptr);
+        context->Draw(3, 0);
+
+        context->PSSetShaderResources(0, 1, &saved_srv0);
+        context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved_rtvs, saved_dsv);
+        if (saved_viewport_count != 0)
+            context->RSSetViewports(saved_viewport_count, saved_viewports);
+        context->IASetInputLayout(saved_layout);
+        context->IASetPrimitiveTopology(saved_topology);
+        context->VSSetShader(saved_vs, nullptr, 0);
+        context->PSSetShader(saved_ps, nullptr, 0);
+        context->PSSetSamplers(0, 1, &saved_sampler);
+        context->PSSetConstantBuffers(0, 1, &saved_cb0);
+        context->OMSetBlendState(saved_blend, saved_blend_factor, saved_sample_mask);
+        context->OMSetDepthStencilState(saved_depth, saved_stencil_ref);
+        context->RSSetState(saved_rasterizer);
+    }
+
+    for (auto *rtv : saved_rtvs) if (rtv != nullptr) rtv->Release();
+    if (saved_dsv != nullptr) saved_dsv->Release();
+    if (saved_layout != nullptr) saved_layout->Release();
+    if (saved_vs != nullptr) saved_vs->Release();
+    if (saved_ps != nullptr) saved_ps->Release();
+    if (saved_srv0 != nullptr) saved_srv0->Release();
+    if (saved_sampler != nullptr) saved_sampler->Release();
+    if (saved_cb0 != nullptr) saved_cb0->Release();
+    if (saved_blend != nullptr) saved_blend->Release();
+    if (saved_depth != nullptr) saved_depth->Release();
+    if (saved_rasterizer != nullptr) saved_rasterizer->Release();
+    target_texture->Release();
+    original_target->Release();
+
+    static std::atomic_uint64_t applied_count { 0 };
+    const auto count = applied_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count == 1 || count % 1024 == 0)
+        log_line("hdr_sdr_tone_map_offscreen_applied count=" + std::to_string(count) +
+            " paper_white=" + std::to_string(g_config.hdr_sdr_tone_map_paper_white) +
+            " peak=" + std::to_string(g_config.hdr_sdr_tone_map_peak) +
+            " pq_input=" + std::to_string(g_config.hdr_sdr_tone_map_pq_input ? 1 : 0));
+    return true;
+}
+
+template <typename DrawCall>
 bool try_spatial_copy_draw(ID3D11DeviceContext *context, UINT element_count, DrawCall &&draw_call)
 {
     if (g_config.pixel_shader_replacement_mode != 1 || !inspect_target_upscaler_draw(element_count))
@@ -7790,6 +9802,10 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
     record_color_source_call("draw_indexed", index_count, 0, 0);
     maybe_dump_target_color_chain(context, index_count);
 #endif
+#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+    record_final_scene_probe_draw(index_count, true);
+#endif
+    record_hdr_composite_candidate(index_count, true);
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     poll_fsr2_transient_capture_hotkey();
@@ -7827,6 +9843,14 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
         return;
 #endif
 
+    if (try_hdr_sdr_tone_map_draw(context, index_count, [&]
+        {
+            g_original_draw_indexed(context, index_count, start_index_location, base_vertex_location);
+        }))
+    {
+        return;
+    }
+
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (try_spatial_copy_draw(context, index_count, [&]
         {
@@ -7838,7 +9862,23 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
         (g_config.trace_pixel_shader_draws && g_current_ps_hash.load(std::memory_order_relaxed) == g_config.trace_pixel_shader_hash))
         record_similarity_draw("draw_indexed", index_count);
 #endif
+    bool final_scene_snapshot_boundary = false;
+    std::uint64_t final_scene_snapshot_frame = 0;
+    bool final_scene_optifg_boundary = false;
+    std::uint64_t final_scene_optifg_frame = 0;
+#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+    final_scene_snapshot_boundary =
+        matches_final_scene_boundary(index_count, true, final_scene_snapshot_frame, true);
+    final_scene_optifg_boundary =
+        matches_final_scene_boundary(index_count, true, final_scene_optifg_frame, false);
+#endif
     g_original_draw_indexed(context, index_count, start_index_location, base_vertex_location);
+#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+    if (final_scene_optifg_boundary)
+        submit_final_scene_to_optiscaler(context, final_scene_optifg_frame);
+    if (final_scene_snapshot_boundary)
+        queue_final_scene_snapshot(context, final_scene_snapshot_frame);
+#endif
 }
 
 void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_count, UINT start_vertex_location)
@@ -7854,6 +9894,10 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
     record_color_source_call("draw", vertex_count, 0, 0);
     maybe_dump_target_color_chain(context, vertex_count);
 #endif
+#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+    record_final_scene_probe_draw(vertex_count, false);
+#endif
+    record_hdr_composite_candidate(vertex_count, false);
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     poll_fsr2_transient_capture_hotkey();
@@ -7891,6 +9935,14 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
         return;
 #endif
 
+    if (try_hdr_sdr_tone_map_draw(context, vertex_count, [&]
+        {
+            g_original_draw(context, vertex_count, start_vertex_location);
+        }))
+    {
+        return;
+    }
+
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (try_spatial_copy_draw(context, vertex_count, [&]
         {
@@ -7902,7 +9954,23 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
         (g_config.trace_pixel_shader_draws && g_current_ps_hash.load(std::memory_order_relaxed) == g_config.trace_pixel_shader_hash))
         record_similarity_draw("draw", vertex_count);
 #endif
+    bool final_scene_snapshot_boundary = false;
+    std::uint64_t final_scene_snapshot_frame = 0;
+    bool final_scene_optifg_boundary = false;
+    std::uint64_t final_scene_optifg_frame = 0;
+#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+    final_scene_snapshot_boundary =
+        matches_final_scene_boundary(vertex_count, false, final_scene_snapshot_frame, true);
+    final_scene_optifg_boundary =
+        matches_final_scene_boundary(vertex_count, false, final_scene_optifg_frame, false);
+#endif
     g_original_draw(context, vertex_count, start_vertex_location);
+#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+    if (final_scene_optifg_boundary)
+        submit_final_scene_to_optiscaler(context, final_scene_optifg_frame);
+    if (final_scene_snapshot_boundary)
+        queue_final_scene_snapshot(context, final_scene_snapshot_frame);
+#endif
 }
 
 HRESULT STDMETHODCALLTYPE hooked_map(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource, D3D11_MAP map_type, UINT map_flags, D3D11_MAPPED_SUBRESOURCE *mapped)
@@ -7988,6 +10056,7 @@ void STDMETHODCALLTYPE hooked_copy_resource(ID3D11DeviceContext *context, ID3D11
     read_resource_info_from_resource(src, L"copy_src", src_info);
     if (g_config.log_resource_ops)
         log_line("copy_resource dst=" + hex64(dst_info.resource_key) + " src=" + hex64(src_info.resource_key));
+    record_hdr_composite_copy(dst_info, src_info, "copy_resource");
     record_color_source_copy(dst_info, src_info, "copy_resource");
     g_original_copy_resource(context, dst, src);
 }
@@ -8001,6 +10070,7 @@ void STDMETHODCALLTYPE hooked_copy_subresource_region(ID3D11DeviceContext *conte
     if (g_config.log_resource_ops)
         log_line("copy_subresource dst=" + hex64(dst_info.resource_key) + " src=" + hex64(src_info.resource_key) +
             " dst_sub=" + std::to_string(dst_subresource) + " src_sub=" + std::to_string(src_subresource));
+    record_hdr_composite_copy(dst_info, src_info, "copy_subresource");
     record_color_source_copy(dst_info, src_info, "copy_subresource");
     g_original_copy_subresource_region(context, dst, dst_subresource, dst_x, dst_y, dst_z, src, src_subresource, src_box);
 }
@@ -8081,6 +10151,11 @@ void install_context_hooks(ID3D11DeviceContext *context)
         g_original_cs_set_shader = reinterpret_cast<cs_set_shader_fn>(vtable[k_idx_cs_set_shader]);
     if (g_original_om_set_render_targets == nullptr)
         g_original_om_set_render_targets = reinterpret_cast<om_set_render_targets_fn>(vtable[k_idx_om_set_render_targets]);
+    if (g_original_om_set_render_targets_and_uavs == nullptr)
+    {
+        g_original_om_set_render_targets_and_uavs =
+            reinterpret_cast<om_set_render_targets_and_uavs_fn>(vtable[k_idx_om_set_render_targets_and_uavs]);
+    }
     if (g_original_dispatch == nullptr)
         g_original_dispatch = reinterpret_cast<dispatch_fn>(vtable[k_idx_dispatch]);
     if (g_original_draw_indexed == nullptr)
@@ -8111,6 +10186,7 @@ void install_context_hooks(ID3D11DeviceContext *context)
         { k_idx_ps_set_shader, reinterpret_cast<void *>(&hooked_ps_set_shader) },
         { k_idx_ps_set_constant_buffers, reinterpret_cast<void *>(&hooked_ps_set_constant_buffers) },
         { k_idx_om_set_render_targets, reinterpret_cast<void *>(&hooked_om_set_render_targets) },
+        { k_idx_om_set_render_targets_and_uavs, reinterpret_cast<void *>(&hooked_om_set_render_targets_and_uavs) },
         { k_idx_draw_indexed, reinterpret_cast<void *>(&hooked_draw_indexed) },
         { k_idx_draw, reinterpret_cast<void *>(&hooked_draw) },
         { k_idx_map, reinterpret_cast<void *>(&hooked_map) },
@@ -8170,6 +10246,57 @@ HRESULT STDMETHODCALLTYPE hooked_create_buffer(ID3D11Device *device, const D3D11
 
 HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D3D11_TEXTURE2D_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial_data, ID3D11Texture2D **texture)
 {
+    if (g_config.native_ldr_final_target_unorm && desc != nullptr)
+    {
+        const std::uint32_t observed_index = g_native_ldr_texture_create_observed_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (observed_index <= 16)
+        {
+            log_line(std::string("native_ldr_texture_create_observed index=") + std::to_string(observed_index) +
+                " device=" + hex64(reinterpret_cast<std::uintptr_t>(device)) +
+                " format=" + describe_dxgi_format(desc->Format) +
+                " size=" + std::to_string(desc->Width) + "x" + std::to_string(desc->Height) +
+                " bind=" + hex64(desc->BindFlags));
+        }
+    }
+    D3D11_TEXTURE2D_DESC effective_texture_desc {};
+    const D3D11_TEXTURE2D_DESC *effective_desc = desc;
+    const bool final_target_bind_shape = desc != nullptr &&
+        (desc->BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)) ==
+            (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE) &&
+        desc->Width >= 1280 && desc->Height >= 720;
+    if (g_config.native_ldr_final_target_unorm && desc != nullptr &&
+        desc->Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
+        final_target_bind_shape)
+    {
+        std::uint32_t output_width = 0;
+        std::uint32_t output_height = 0;
+        {
+            std::lock_guard lock(g_state_mutex);
+            output_width = g_state.backbuffer_width;
+            output_height = g_state.backbuffer_height;
+        }
+        const bool matches_known_output = output_width != 0 && output_height != 0 &&
+            desc->Width == output_width && desc->Height == output_height;
+        const std::uint32_t candidate_index = g_native_ldr_final_target_candidate_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (candidate_index <= 32)
+        {
+            log_line(std::string("native_ldr_final_target_candidate index=") + std::to_string(candidate_index) +
+                " device=" + hex64(reinterpret_cast<std::uintptr_t>(device)) +
+                " format=29/R8G8B8A8_UNORM_SRGB size=" + std::to_string(desc->Width) + "x" + std::to_string(desc->Height) +
+                " bind=" + hex64(desc->BindFlags) +
+                " known_output=" + std::to_string(matches_known_output ? 1 : 0));
+        }
+        if (matches_known_output || (output_width == 0 && output_height == 0))
+        {
+            effective_texture_desc = *desc;
+            effective_texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            effective_desc = &effective_texture_desc;
+            log_line(std::string("native_ldr_final_target_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM") +
+                " size=" + std::to_string(desc->Width) + "x" + std::to_string(desc->Height) +
+                " bind=0x" + hex64(desc->BindFlags));
+        }
+    }
+
     const ULONGLONG trace_until = g_texture_trace_until_tick.load(std::memory_order_relaxed);
     if (desc != nullptr && trace_until >= GetTickCount64() && desc->Width >= 512 && desc->Height >= 288)
     {
@@ -8198,7 +10325,16 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
             log_line(out.str());
         }
     }
-    return g_original_create_texture_2d(device, desc, initial_data, texture);
+    const HRESULT result = g_original_create_texture_2d(device, effective_desc, initial_data, texture);
+    if (SUCCEEDED(result) && effective_desc != desc && texture != nullptr && *texture != nullptr)
+    {
+        log_line(std::string("native_ldr_final_target_created device=") +
+            hex64(reinterpret_cast<std::uintptr_t>(device)) +
+            " resource=" + hex64(reinterpret_cast<std::uintptr_t>(*texture)) +
+            " requested_format=29/R8G8B8A8_UNORM_SRGB created_format=28/R8G8B8A8_UNORM" +
+            " size=" + std::to_string(desc->Width) + "x" + std::to_string(desc->Height));
+    }
+    return result;
 }
 
 HRESULT STDMETHODCALLTYPE hooked_create_pixel_shader(ID3D11Device *device, const void *shader_bytecode, SIZE_T bytecode_length, ID3D11ClassLinkage *class_linkage, ID3D11PixelShader **pixel_shader)
@@ -8287,10 +10423,9 @@ void install_device_hooks(ID3D11Device *device)
         { k_idx_device_create_buffer, reinterpret_cast<void *>(&hooked_create_buffer) },
         { k_idx_device_create_pixel_shader, reinterpret_cast<void *>(&hooked_create_pixel_shader) },
     };
-    if (g_config.trace_texture_creates)
+    if (g_config.trace_texture_creates || g_config.native_ldr_final_target_unorm)
     {
         patches.emplace_back(k_idx_device_create_texture_2d, reinterpret_cast<void *>(&hooked_create_texture_2d));
-        log_line("texture_create_hook_active");
     }
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     patches.insert(patches.end(), {
@@ -8299,6 +10434,68 @@ void install_device_hooks(ID3D11Device *device)
     });
 #endif
     clone_and_patch_vtable(device, k_device_vtable_size, patches);
+
+    if (g_config.trace_texture_creates || g_config.native_ldr_final_target_unorm)
+    {
+        const std::vector<std::pair<std::size_t, void *>> texture_patches {
+            { k_idx_device_create_texture_2d, reinterpret_cast<void *>(&hooked_create_texture_2d) },
+        };
+        auto patch_extended_interface = [&](REFIID interface_id, const char *interface_name)
+        {
+            IUnknown *extended = nullptr;
+            if (FAILED(device->QueryInterface(interface_id, reinterpret_cast<void **>(&extended))) || extended == nullptr)
+                return;
+            const auto interface_key = reinterpret_cast<std::uint64_t>(extended);
+            clone_and_patch_vtable(extended, k_device_vtable_size, texture_patches);
+            log_line(std::string("texture_device_interface_hook interface=") + interface_name +
+                " instance=" + hex64(interface_key));
+            extended->Release();
+        };
+        patch_extended_interface(__uuidof(ID3D11Device1), "ID3D11Device1");
+        patch_extended_interface(__uuidof(ID3D11Device2), "ID3D11Device2");
+        patch_extended_interface(__uuidof(ID3D11Device3), "ID3D11Device3");
+        patch_extended_interface(__uuidof(ID3D11Device4), "ID3D11Device4");
+        patch_extended_interface(__uuidof(ID3D11Device5), "ID3D11Device5");
+    }
+}
+
+void update_swapchain_backbuffer_resources(IDXGISwapChain *swapchain)
+{
+    if ((!g_config.hdr_composite_probe && !g_config.hdr_sdr_tone_map) || swapchain == nullptr)
+        return;
+
+    DXGI_SWAP_CHAIN_DESC desc {};
+    if (FAILED(swapchain->GetDesc(&desc)) || desc.BufferCount == 0)
+        return;
+
+    std::unordered_set<std::uint64_t> resources;
+    for (UINT index = 0; index < desc.BufferCount; ++index)
+    {
+        ID3D11Texture2D *buffer = nullptr;
+        if (SUCCEEDED(swapchain->GetBuffer(index, IID_PPV_ARGS(&buffer))) && buffer != nullptr)
+        {
+            resources.insert(reinterpret_cast<std::uint64_t>(static_cast<ID3D11Resource *>(buffer)));
+            buffer->Release();
+        }
+    }
+    if (resources.empty())
+        return;
+
+    {
+        std::lock_guard lock(g_swapchain_backbuffer_mutex);
+        g_swapchain_backbuffer_resources.insert(resources.begin(), resources.end());
+    }
+    std::string resource_keys;
+    for (const std::uint64_t resource_key : resources)
+    {
+        if (!resource_keys.empty())
+            resource_keys += ",";
+        resource_keys += hex64(resource_key);
+    }
+    log_line("hdr_composite_backbuffers_registered count=" + std::to_string(resources.size()) +
+        " resources=" + resource_keys +
+        " format=" + describe_dxgi_format(desc.BufferDesc.Format) +
+        " size=" + std::to_string(desc.BufferDesc.Width) + "x" + std::to_string(desc.BufferDesc.Height));
 }
 
 void install_swapchain_hooks(IDXGISwapChain *swapchain)
@@ -8306,53 +10503,61 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
     if (swapchain == nullptr)
         return;
 
-    const bool should_hook_present = g_config.hook_present;
+    update_swapchain_backbuffer_resources(swapchain);
+
+    const bool should_hook_present = g_config.hook_present || g_config.final_scene_probe ||
+        g_config.final_scene_snapshot || g_config.final_scene_optifg_input;
     const bool should_hook_dlssg_dxgi = dlssg_dxgi_workaround_active();
-#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
-    constexpr bool should_hook_color = true;
-#else
-    constexpr bool should_hook_color = false;
-#endif
-    if (!should_hook_present && !should_hook_dlssg_dxgi && !should_hook_color)
+    const bool should_hook_general_swapchain_controls = should_hook_dlssg_dxgi || hdr_swapchain_force_active();
+    const bool should_hook_native_ldr_resize = g_config.native_ldr_swapchain_unorm;
+    const bool should_hook_swapchain_controls = should_hook_general_swapchain_controls || should_hook_native_ldr_resize;
+    const bool should_hook_color = k_color_diagnostics_enabled || hdr_swapchain_spoof_active() ||
+        hdr_swapchain_force_active();
+    if (!should_hook_present && !should_hook_swapchain_controls && !should_hook_color)
         return;
 
     void *hook_instance = swapchain;
     std::size_t hook_method_count = k_swapchain_vtable_size;
-#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
     IDXGISwapChain4 *swapchain4 = nullptr;
     IDXGISwapChain3 *swapchain3 = nullptr;
     bool supports_hdr_metadata = false;
-    if (SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain4), reinterpret_cast<void **>(&swapchain4))) && swapchain4 != nullptr)
+    if (should_hook_color)
     {
-        hook_instance = swapchain4;
-        supports_hdr_metadata = true;
+        if (SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain4), reinterpret_cast<void **>(&swapchain4))) && swapchain4 != nullptr)
+        {
+            hook_instance = swapchain4;
+            supports_hdr_metadata = true;
+        }
+        else if (SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3))) && swapchain3 != nullptr)
+        {
+            hook_instance = swapchain3;
+            hook_method_count = 39;
+        }
+        else
+        {
+            log_line("dxgi_color_hooks_unavailable swapchain=" +
+                hex64(reinterpret_cast<std::uintptr_t>(swapchain)) + " reason=no_IDXGISwapChain3");
+            if (!should_hook_present && !should_hook_swapchain_controls)
+                return;
+        }
     }
-    else if (SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3))) && swapchain3 != nullptr)
-    {
-        hook_instance = swapchain3;
-        hook_method_count = 39;
-    }
-    else
-    {
-        log_line("dxgi_color_hooks_unavailable swapchain=" +
-            hex64(reinterpret_cast<std::uintptr_t>(swapchain)) + " reason=no_IDXGISwapChain3");
-        if (!should_hook_present && !should_hook_dlssg_dxgi)
-            return;
-    }
-#endif
 
     void **vtable = *reinterpret_cast<void ***>(hook_instance);
     if (should_hook_present && g_original_present == nullptr)
         g_original_present = reinterpret_cast<present_fn>(vtable[k_idx_present]);
-    if (should_hook_dlssg_dxgi && g_original_set_fullscreen_state == nullptr)
+    if (should_hook_general_swapchain_controls && g_original_set_fullscreen_state == nullptr)
         g_original_set_fullscreen_state = reinterpret_cast<set_fullscreen_state_fn>(vtable[k_idx_set_fullscreen_state]);
-    if (should_hook_dlssg_dxgi && g_original_get_fullscreen_state == nullptr)
+    if (should_hook_general_swapchain_controls && g_original_get_fullscreen_state == nullptr)
         g_original_get_fullscreen_state = reinterpret_cast<get_fullscreen_state_fn>(vtable[k_idx_get_fullscreen_state]);
-    if (should_hook_dlssg_dxgi && g_original_resize_buffers == nullptr)
+    if (should_hook_general_swapchain_controls && g_original_resize_buffers == nullptr)
         g_original_resize_buffers = reinterpret_cast<resize_buffers_fn>(vtable[k_idx_resize_buffers]);
-    if (should_hook_dlssg_dxgi && g_original_resize_target == nullptr)
+    if (should_hook_native_ldr_resize)
+    {
+        std::lock_guard lock(g_swapchain_resize_mutex);
+        g_original_resize_buffers_by_instance.try_emplace(hook_instance, reinterpret_cast<resize_buffers_fn>(vtable[k_idx_resize_buffers]));
+    }
+    if (should_hook_general_swapchain_controls && g_original_resize_target == nullptr)
         g_original_resize_target = reinterpret_cast<resize_target_fn>(vtable[k_idx_resize_target]);
-#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
     const bool has_color_interface = swapchain4 != nullptr || swapchain3 != nullptr;
     if (has_color_interface && g_original_check_color_space_support == nullptr)
         g_original_check_color_space_support = reinterpret_cast<check_color_space_support_fn>(vtable[k_idx_check_color_space_support]);
@@ -8360,19 +10565,21 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
         g_original_set_color_space1 = reinterpret_cast<set_color_space1_fn>(vtable[k_idx_set_color_space1]);
     if (supports_hdr_metadata && g_original_set_hdr_metadata == nullptr)
         g_original_set_hdr_metadata = reinterpret_cast<set_hdr_metadata_fn>(vtable[k_idx_set_hdr_metadata]);
-#endif
     std::vector<std::pair<std::size_t, void *>> patches;
     if (should_hook_present)
         patches.emplace_back(k_idx_present, reinterpret_cast<void *>(&hooked_present));
-    if (should_hook_dlssg_dxgi)
+    if (should_hook_general_swapchain_controls)
     {
         patches.emplace_back(k_idx_set_fullscreen_state, reinterpret_cast<void *>(&hooked_set_fullscreen_state));
         patches.emplace_back(k_idx_get_fullscreen_state, reinterpret_cast<void *>(&hooked_get_fullscreen_state));
         patches.emplace_back(k_idx_resize_buffers, reinterpret_cast<void *>(&hooked_resize_buffers));
         patches.emplace_back(k_idx_resize_target, reinterpret_cast<void *>(&hooked_resize_target));
     }
-#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
-    if (has_color_interface)
+    else if (should_hook_native_ldr_resize)
+    {
+        patches.emplace_back(k_idx_resize_buffers, reinterpret_cast<void *>(&hooked_resize_buffers));
+    }
+    if (should_hook_color && has_color_interface)
     {
         patches.emplace_back(k_idx_check_color_space_support, reinterpret_cast<void *>(&hooked_check_color_space_support));
         patches.emplace_back(k_idx_set_color_space1, reinterpret_cast<void *>(&hooked_set_color_space1));
@@ -8389,14 +10596,11 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
                 " swapchain4=" + std::to_string(supports_hdr_metadata ? 1 : 0));
         }
     }
-#endif
     clone_and_patch_vtable(hook_instance, hook_method_count, patches);
-#if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
     if (swapchain4 != nullptr)
         swapchain4->Release();
     if (swapchain3 != nullptr)
         swapchain3->Release();
-#endif
 }
 
 void set_output_size(UINT width, UINT height, const char *source)
@@ -8475,6 +10679,7 @@ void install_factory_hooks_from_device(ID3D11Device *device)
         factory->Release();
     }
 
+    install_hdr_output_desc_probe_from_adapter(adapter);
     adapter->Release();
     dxgi_device->Release();
 }
@@ -8493,6 +10698,17 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
     D3D_FEATURE_LEVEL *feature_level,
     ID3D11DeviceContext **context)
 {
+    DXGI_SWAP_CHAIN_DESC effective_swapchain_desc {};
+    const DXGI_SWAP_CHAIN_DESC *effective_desc = swapchain_desc;
+    if (g_config.native_ldr_swapchain_unorm && swapchain_desc != nullptr &&
+        swapchain_desc->BufferDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+    {
+        effective_swapchain_desc = *swapchain_desc;
+        effective_swapchain_desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        effective_desc = &effective_swapchain_desc;
+        log_line("native_ldr_swapchain_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM api=CreateDeviceAndSwapChain");
+    }
+
     const HRESULT hr = g_original_create_device_and_swapchain(
         adapter,
         driver_type,
@@ -8501,7 +10717,7 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
         feature_levels,
         feature_levels_count,
         sdk_version,
-        swapchain_desc,
+        effective_desc,
         swapchain,
         device,
         feature_level,
@@ -8517,7 +10733,9 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
             DXGI_SWAP_CHAIN_DESC created_desc {};
             if (SUCCEEDED((*swapchain)->GetDesc(&created_desc)))
                 set_output_size(created_desc.BufferDesc.Width, created_desc.BufferDesc.Height, "CreateDeviceAndSwapChain");
-            if (g_config.hook_present || dlssg_dxgi_workaround_active() || k_color_diagnostics_enabled)
+            if (g_config.hook_present || g_config.final_scene_probe || g_config.final_scene_snapshot ||
+                g_config.final_scene_optifg_input || dlssg_dxgi_workaround_active() ||
+                k_color_diagnostics_enabled || hdr_swapchain_spoof_active() || hdr_swapchain_force_active())
                 install_swapchain_hooks(*swapchain);
         }
         log_line("hooked D3D11CreateDeviceAndSwapChain");
@@ -8571,7 +10789,18 @@ HRESULT STDMETHODCALLTYPE hooked_factory_create_swap_chain(IDXGIFactory *factory
         describe_dxgi_swapchain_desc(desc));
 #endif
 
-    const HRESULT hr = g_original_factory_create_swap_chain(factory, device, desc, swapchain);
+    DXGI_SWAP_CHAIN_DESC effective_swapchain_desc {};
+    DXGI_SWAP_CHAIN_DESC *effective_desc = desc;
+    if (g_config.native_ldr_swapchain_unorm && desc != nullptr &&
+        desc->BufferDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+    {
+        effective_swapchain_desc = *desc;
+        effective_swapchain_desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        effective_desc = &effective_swapchain_desc;
+        log_line("native_ldr_swapchain_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM api=CreateSwapChain");
+    }
+
+    const HRESULT hr = g_original_factory_create_swap_chain(factory, device, effective_desc, swapchain);
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
     log_line("dxgi_swapchain_result id=" + std::to_string(request_id) +
         " api=CreateSwapChain hr=" + hex32(static_cast<std::uint32_t>(hr)) +
@@ -8581,7 +10810,9 @@ HRESULT STDMETHODCALLTYPE hooked_factory_create_swap_chain(IDXGIFactory *factory
     {
         if (desc != nullptr)
             set_output_size(desc->BufferDesc.Width, desc->BufferDesc.Height, "CreateSwapChain");
-        if (g_config.hook_present || dlssg_dxgi_workaround_active() || k_color_diagnostics_enabled)
+        if (g_config.hook_present || g_config.final_scene_probe || g_config.final_scene_snapshot ||
+            g_config.final_scene_optifg_input || g_config.hdr_composite_probe || dlssg_dxgi_workaround_active() ||
+            k_color_diagnostics_enabled || hdr_swapchain_spoof_active() || hdr_swapchain_force_active())
             install_swapchain_hooks(swapchain != nullptr ? *swapchain : nullptr);
         if (desc != nullptr)
             log_line("hooked CreateSwapChain size=" + std::to_string(desc->BufferDesc.Width) + "x" + std::to_string(desc->BufferDesc.Height));
@@ -8606,7 +10837,18 @@ HRESULT STDMETHODCALLTYPE hooked_factory2_create_swap_chain_for_hwnd(IDXGIFactor
         describe_dxgi_window(hwnd));
 #endif
 
-    const HRESULT hr = g_original_factory2_create_swap_chain_for_hwnd(factory, device, hwnd, desc, fullscreen_desc, restrict_to_output, swapchain);
+    DXGI_SWAP_CHAIN_DESC1 effective_swapchain_desc {};
+    const DXGI_SWAP_CHAIN_DESC1 *effective_desc = desc;
+    if (g_config.native_ldr_swapchain_unorm && desc != nullptr &&
+        desc->Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+    {
+        effective_swapchain_desc = *desc;
+        effective_swapchain_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        effective_desc = &effective_swapchain_desc;
+        log_line("native_ldr_swapchain_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM api=CreateSwapChainForHwnd");
+    }
+
+    const HRESULT hr = g_original_factory2_create_swap_chain_for_hwnd(factory, device, hwnd, effective_desc, fullscreen_desc, restrict_to_output, swapchain);
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
     log_line("dxgi_swapchain_result id=" + std::to_string(request_id) +
         " api=CreateSwapChainForHwnd hr=" + hex32(static_cast<std::uint32_t>(hr)) +
@@ -8616,7 +10858,9 @@ HRESULT STDMETHODCALLTYPE hooked_factory2_create_swap_chain_for_hwnd(IDXGIFactor
     {
         if (desc != nullptr)
             set_output_size(desc->Width, desc->Height, "CreateSwapChainForHwnd");
-        if (g_config.hook_present || dlssg_dxgi_workaround_active() || k_color_diagnostics_enabled)
+        if (g_config.hook_present || g_config.final_scene_probe || g_config.final_scene_snapshot ||
+            g_config.final_scene_optifg_input || g_config.hdr_composite_probe || dlssg_dxgi_workaround_active() ||
+            k_color_diagnostics_enabled || hdr_swapchain_spoof_active() || hdr_swapchain_force_active())
             install_swapchain_hooks(swapchain != nullptr ? *swapchain : nullptr);
         if (desc != nullptr)
             log_line("hooked CreateSwapChainForHwnd size=" + std::to_string(desc->Width) + "x" + std::to_string(desc->Height));
@@ -8633,6 +10877,7 @@ void on_module_activity(const char *source, HMODULE module)
 
     install_create_hooks_for_loaded_modules();
     install_loader_hooks_for_loaded_modules();
+    install_hdr_environment_probe_for_loaded_modules();
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     static std::uint32_t last_fsr2_query_mask = 0;
     const std::uint32_t fsr2_query_mask = fsr2_get_proc_address_shim_query_mask();
@@ -8675,6 +10920,91 @@ HMODULE WINAPI hooked_load_library_ex_w(LPCWSTR file_name, HANDLE file, DWORD fl
     return module;
 }
 
+LONG WINAPI hooked_display_config_get_device_info(DISPLAYCONFIG_DEVICE_INFO_HEADER *request)
+{
+    const LONG result = g_original_display_config_get_device_info != nullptr
+        ? g_original_display_config_get_device_info(request)
+        : ERROR_PROC_NOT_FOUND;
+
+    if (!g_config.hdr_environment_probe || request == nullptr)
+        return result;
+
+    constexpr std::uint32_t k_advanced_color_info_2 = 15;
+    const std::uint32_t query_type = static_cast<std::uint32_t>(request->type);
+    if (query_type != DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO && query_type != k_advanced_color_info_2)
+        return result;
+
+    constexpr std::uint32_t k_log_limit = 32;
+    const std::uint32_t call_index = g_hdr_environment_probe_call_count.fetch_add(1, std::memory_order_relaxed);
+    if (call_index >= k_log_limit)
+    {
+        if (!g_hdr_environment_probe_suppressed_logged.exchange(true, std::memory_order_relaxed))
+            log_line("hdr_environment_probe query log limit reached");
+        return result;
+    }
+
+    std::ostringstream out;
+    out << "hdr_environment_probe query=" << query_type
+        << " result=" << result
+        << " adapter=" << request->adapterId.HighPart << ":" << request->adapterId.LowPart
+        << " target=" << request->id;
+
+    if (result != ERROR_SUCCESS || request->size < sizeof(DISPLAYCONFIG_DEVICE_INFO_HEADER) + sizeof(std::uint32_t))
+    {
+        out << " response=unavailable size=" << request->size;
+        log_line(out.str());
+        return result;
+    }
+
+    const auto *flags = reinterpret_cast<const std::uint32_t *>(
+        reinterpret_cast<const std::uint8_t *>(request) + sizeof(DISPLAYCONFIG_DEVICE_INFO_HEADER));
+    const std::uint32_t value = *flags;
+    if (query_type == DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO)
+    {
+        out << " advanced_supported=" << ((value & (1u << 0)) != 0 ? 1 : 0)
+            << " advanced_enabled=" << ((value & (1u << 1)) != 0 ? 1 : 0)
+            << " policy_disabled=" << ((value & (1u << 3)) != 0 ? 1 : 0);
+    }
+    else
+    {
+        out << " advanced_supported=" << ((value & (1u << 0)) != 0 ? 1 : 0)
+            << " advanced_active=" << ((value & (1u << 1)) != 0 ? 1 : 0)
+            << " hdr_supported=" << ((value & (1u << 4)) != 0 ? 1 : 0)
+            << " hdr_user_enabled=" << ((value & (1u << 5)) != 0 ? 1 : 0);
+    }
+    log_line(out.str());
+    return result;
+}
+
+LONG WINAPI hooked_display_config_set_device_info(DISPLAYCONFIG_DEVICE_INFO_HEADER *request)
+{
+    constexpr std::uint32_t k_set_advanced_color_state = 10;
+    constexpr std::uint32_t k_set_hdr_state = 16;
+    const std::uint32_t request_type = request != nullptr
+        ? static_cast<std::uint32_t>(request->type)
+        : UINT32_MAX;
+    const bool is_hdr_state_request = request_type == k_set_advanced_color_state ||
+        request_type == k_set_hdr_state;
+
+    if (g_config.hdr_output_desc_spoof && is_hdr_state_request)
+    {
+        std::uint32_t requested_enabled = 0;
+        if (request->size >= sizeof(DISPLAYCONFIG_DEVICE_INFO_HEADER) + sizeof(std::uint32_t))
+        {
+            const auto *value = reinterpret_cast<const std::uint32_t *>(
+                reinterpret_cast<const std::uint8_t *>(request) + sizeof(DISPLAYCONFIG_DEVICE_INFO_HEADER));
+            requested_enabled = *value & 1u;
+        }
+        log_line("hdr_output_desc_spoof blocked_system_hdr_change query=" +
+            std::to_string(request_type) + " enabled=" + std::to_string(requested_enabled));
+        return ERROR_SUCCESS;
+    }
+
+    return g_original_display_config_set_device_info != nullptr
+        ? g_original_display_config_set_device_info(request)
+        : ERROR_PROC_NOT_FOUND;
+}
+
 FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR proc_name)
 {
     FARPROC address = g_original_get_proc_address(module, proc_name);
@@ -8698,6 +11028,24 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR proc_name)
             log_line("GetProcAddress intercepted D3D11CreateDevice");
             return reinterpret_cast<FARPROC>(&hooked_create_device);
         }
+    }
+
+    if ((g_config.hdr_environment_probe || g_config.hdr_output_desc_spoof) && is_user32_module(module) &&
+        std::strcmp(proc_name, "DisplayConfigGetDeviceInfo") == 0)
+    {
+        if (g_original_display_config_get_device_info == nullptr)
+            g_original_display_config_get_device_info = reinterpret_cast<display_config_get_device_info_fn>(address);
+        log_line("GetProcAddress intercepted DisplayConfigGetDeviceInfo");
+        return reinterpret_cast<FARPROC>(&hooked_display_config_get_device_info);
+    }
+
+    if (g_config.hdr_output_desc_spoof && is_user32_module(module) &&
+        std::strcmp(proc_name, "DisplayConfigSetDeviceInfo") == 0)
+    {
+        if (g_original_display_config_set_device_info == nullptr)
+            g_original_display_config_set_device_info = reinterpret_cast<display_config_set_device_info_fn>(address);
+        log_line("GetProcAddress intercepted DisplayConfigSetDeviceInfo");
+        return reinterpret_cast<FARPROC>(&hooked_display_config_set_device_info);
     }
 
     return address;
@@ -8779,6 +11127,7 @@ void initialize()
     log_line(std::string("d3d11_loaded=") + (GetModuleHandleW(L"d3d11.dll") != nullptr ? "1" : "0"));
     install_create_hooks_for_loaded_modules();
     install_loader_hooks_for_loaded_modules();
+    install_hdr_environment_probe_for_loaded_modules();
 #if defined(DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL)
     scan_optiscaler_ngx_exports("initialize", true);
 #endif

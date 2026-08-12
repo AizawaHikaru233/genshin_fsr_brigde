@@ -856,6 +856,46 @@ function Set-IniValue {
     [IO.File]::WriteAllLines($Path, $lines, [Text.UTF8Encoding]::new($false))
 }
 
+function Get-IniValue {
+    param(
+        [string]$Path,
+        [string]$Section,
+        [string]$Key
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    $inSection = $false
+    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
+        if ($line -match '^\s*\[(.+)\]\s*$') {
+            $inSection = $matches[1] -ieq $Section
+            continue
+        }
+        if ($inSection -and $line -match ('^\s*' + [regex]::Escape($Key) + '\s*=\s*(.*)$')) {
+            return $matches[1].Trim()
+        }
+    }
+    return $null
+}
+
+function Test-ReShadeIniHasEffectFiles {
+    param([string]$IniPath)
+    $effectSearchPaths = Get-IniValue -Path $IniPath -Section 'GENERAL' -Key 'EffectSearchPaths'
+    if ([string]::IsNullOrWhiteSpace($effectSearchPaths)) { return $false }
+
+    $iniDirectory = Split-Path -Parent ([IO.Path]::GetFullPath($IniPath))
+    foreach ($path in $effectSearchPaths -split ';') {
+        $candidate = [Environment]::ExpandEnvironmentVariables($path.Trim().Trim('"'))
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        if (-not [IO.Path]::IsPathRooted($candidate)) {
+            $candidate = Join-Path $iniDirectory $candidate
+        }
+        if (-not (Test-Path -LiteralPath $candidate -PathType Container)) { continue }
+        if (Get-ChildItem -LiteralPath $candidate -Filter '*.fx' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function New-ReShadeConfig {
     param(
         [string]$AddonPath,
@@ -941,7 +981,9 @@ function Initialize-ReShadeConfiguration {
         [string]$ShaderPath,
         [string]$TexturePath,
         [string]$ScreenshotPath,
-        [switch]$Force
+        [switch]$Force,
+        [switch]$ForceOverwriteIni,
+        [switch]$PreservePreset
     )
     # ReShade.ini lives beside the game executable while effects stay with ReShade64.dll.
     $configAddonPath = [IO.Path]::GetFullPath($AddonPath)
@@ -949,7 +991,8 @@ function Initialize-ReShadeConfiguration {
     $configTexturePath = [IO.Path]::GetFullPath($TexturePath)
     $configPresetPath = [IO.Path]::GetFullPath($PresetPath)
     $configScreenshotPath = [IO.Path]::GetFullPath($ScreenshotPath)
-    if ($Force -or -not (Test-Path -LiteralPath $IniPath -PathType Leaf)) {
+    $preserveExistingIni = -not $ForceOverwriteIni -and (Test-ReShadeIniHasEffectFiles -IniPath $IniPath)
+    if (-not $preserveExistingIni) {
         if (Test-Path -LiteralPath $reshadeIniTemplate -PathType Leaf) {
             Copy-Item -LiteralPath $reshadeIniTemplate -Destination $IniPath -Force
         }
@@ -968,7 +1011,7 @@ function Initialize-ReShadeConfiguration {
         Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'PresetPath' -Value $configPresetPath
         Set-IniValue -Path $IniPath -Section 'SCREENSHOT' -Key 'SavePath' -Value $configScreenshotPath
     }
-    if ($Force -or -not (Test-Path -LiteralPath $PresetPath -PathType Leaf)) {
+    if (-not $PreservePreset -and ($Force -or -not (Test-Path -LiteralPath $PresetPath -PathType Leaf))) {
         if (Test-Path -LiteralPath $reshadePresetTemplate -PathType Leaf) {
             Copy-Item -LiteralPath $reshadePresetTemplate -Destination $PresetPath -Force
         }
@@ -1055,7 +1098,8 @@ function Reset-PluginConfigurations {
             -ShaderPath (Join-Path $shaderDir 'Shaders') `
             -TexturePath (Join-Path $shaderDir 'Textures') `
             -ScreenshotPath $screenshotsPath `
-            -Force
+            -Force `
+            -ForceOverwriteIni
         Remove-Item -LiteralPath (Join-Path $reshadeDir 'ReShade.ini'), `
             (Join-Path $reshadeDir 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
     }
@@ -1265,7 +1309,8 @@ if (-not $DisableHDR) {
         -ShaderPath (Join-Path $shaderDir 'Shaders') `
         -TexturePath (Join-Path $shaderDir 'Textures') `
         -ScreenshotPath $screenshots `
-        -Force:$(-not $PreserveExistingConfigs)
+        -Force:$(-not $PreserveExistingConfigs) `
+        -PreservePreset
     Remove-Item -LiteralPath (Join-Path $reshadeDir 'ReShade.ini'), `
         (Join-Path $reshadeDir 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
 }

@@ -10,6 +10,8 @@ option(DX11FSRBRIDGE_GPU_PROFILE_RUNTIME "Use the GPU profiling runtime configur
 option(DX11FSRBRIDGE_SERVER_DEBUG_RUNTIME "Build server-agnostic diagnostics for FSR hook discovery" OFF)
 option(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS "Log DXGI swapchain creation inputs for the frame-generation test build" OFF)
 option(DX11FSRBRIDGE_COLOR_DIAGNOSTICS "Log swapchain color spaces, HDR metadata, and FSR2 color resources" OFF)
+option(DX11FSRBRIDGE_HDR_SPOOF_TEST "Build the isolated HDR swapchain capability spoof test" OFF)
+option(DX11FSRBRIDGE_FINAL_SCENE_PROBE "Build the read-only final-scene boundary probe" OFF)
 option(DX11FSRBRIDGE_ASI "Build the bridge as an OptiScaler ASI plugin (.asi)" OFF)
 
 add_library(Dx11FsrBridge SHARED
@@ -72,6 +74,14 @@ if(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
     target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_COLOR_DIAGNOSTICS=1)
 endif()
 
+if(DX11FSRBRIDGE_HDR_SPOOF_TEST)
+    target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_HDR_SPOOF_TEST=1)
+endif()
+
+if(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+    target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_FINAL_SCENE_PROBE=1)
+endif()
+
 target_compile_features(Dx11FsrBridge PRIVATE cxx_std_20)
 if(MSVC)
     target_compile_options(Dx11FsrBridge PRIVATE /utf-8)
@@ -105,7 +115,11 @@ if(DX11FSRBRIDGE_ENABLE_FSR31_EXPERIMENTAL)
 endif()
 
 set(DX11FSRBRIDGE_INI_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/Dx11FsrBridge.ini")
-if(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
+if(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+    set(DX11FSRBRIDGE_INI_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/Dx11FsrBridge.final-scene-probe.ini")
+elseif(DX11FSRBRIDGE_HDR_SPOOF_TEST)
+    set(DX11FSRBRIDGE_INI_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/Dx11FsrBridge.hdr-spoof.ini")
+elseif(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
     set(DX11FSRBRIDGE_INI_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/Dx11FsrBridge.color-diagnostics.ini")
 elseif(DX11FSRBRIDGE_GPU_PROFILE_RUNTIME)
     set(DX11FSRBRIDGE_INI_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/Dx11FsrBridge.profile.ini")
