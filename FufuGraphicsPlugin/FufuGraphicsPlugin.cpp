@@ -535,6 +535,44 @@ DetectedFsr4Policy detect_fsr4_gpu_policy()
     return best;
 }
 
+// DLSS Runtime 仅在 RTX 上自动补齐。GTX 16 可以运行 FSR4 INT8，
+// 但不能以此推断它需要或支持 DLSS，因此不复用 FSR4 的策略判断。
+bool has_nvidia_rtx_adapter()
+{
+    IDXGIFactory1 *factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&factory))) ||
+        factory == nullptr)
+    {
+        return false;
+    }
+
+    bool has_rtx = false;
+    for (UINT adapter_index = 0;; ++adapter_index)
+    {
+        IDXGIAdapter1 *adapter = nullptr;
+        if (factory->EnumAdapters1(adapter_index, &adapter) != S_OK || adapter == nullptr)
+            break;
+
+        DXGI_ADAPTER_DESC1 desc {};
+        const HRESULT desc_result = adapter->GetDesc1(&desc);
+        adapter->Release();
+        if (FAILED(desc_result) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 ||
+            desc.VendorId != 0x10DE)
+        {
+            continue;
+        }
+
+        if (lower(desc.Description).find(L"rtx") != std::wstring::npos)
+        {
+            has_rtx = true;
+            break;
+        }
+    }
+
+    factory->Release();
+    return has_rtx;
+}
+
 bool apply_optiscaler_managed_settings(
     const std::filesystem::path &ini_path,
     const std::filesystem::path &optiscaler_directory)
@@ -642,7 +680,8 @@ bool ensure_missing_component_configurations(const BootstrapConfig &config)
         const std::filesystem::path nvidia_directory =
             g_module_directory / L"payload" / L"NVIDIA" / L"DLSS";
         const std::filesystem::path dlss_destination = optiscaler_directory / L"nvngx_dlss.dll";
-        if (!file_exists(dlss_destination) && file_exists(nvidia_directory / L"nvngx_dlss.dll"))
+        if (has_nvidia_rtx_adapter() && !file_exists(dlss_destination) &&
+            file_exists(nvidia_directory / L"nvngx_dlss.dll"))
         {
             copy_file_replace(nvidia_directory / L"nvngx_dlss.dll", dlss_destination);
             if (file_exists(nvidia_directory / L"nvngx_dlss.license.txt"))
@@ -704,12 +743,19 @@ bool reset_all_configurations(const BootstrapConfig &config)
             g_module_directory / L"payload" / L"NVIDIA" / L"DLSS";
         const std::filesystem::path dlss_dll = nvidia_directory / L"nvngx_dlss.dll";
         const std::filesystem::path dlss_license = nvidia_directory / L"nvngx_dlss.license.txt";
-        if (file_exists(dlss_dll))
-            reset_file(dlss_dll, optiscaler_directory / L"nvngx_dlss.dll", "nvidia_dlss");
+        if (!has_nvidia_rtx_adapter())
+        {
+            write_log("config_reset_nvidia_skipped reason=rtx_not_detected");
+        }
         else
-            write_log("config_reset_nvidia_skipped reason=nvngx_dlss_missing");
-        if (file_exists(dlss_license))
-            reset_file(dlss_license, optiscaler_directory / L"nvngx_dlss.license.txt", "nvidia_dlss_license");
+        {
+            if (file_exists(dlss_dll))
+                reset_file(dlss_dll, optiscaler_directory / L"nvngx_dlss.dll", "nvidia_dlss");
+            else
+                write_log("config_reset_nvidia_skipped reason=nvngx_dlss_missing");
+            if (file_exists(dlss_license))
+                reset_file(dlss_license, optiscaler_directory / L"nvngx_dlss.license.txt", "nvidia_dlss_license");
+        }
     }
 
     reset_file(default_directory / L"ReShade.ini", game_directory / L"ReShade.ini", "reshade");

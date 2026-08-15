@@ -351,18 +351,21 @@ function Assert-NvidiaSignedFile {
 
 function Install-NvidiaDlssIfNeeded {
     if (-not (Test-Path -LiteralPath $optiDll -PathType Leaf)) { return }
-    $nvidiaControllers = @(Get-NvidiaVideoControllers)
-    if ($nvidiaControllers.Count -eq 0) {
-        # WMI/CIM 不可用（沙箱、精简系统）时回退到驱动文件检测：
-        # nvapi64.dll 随 NVIDIA 显卡驱动必装，存在即说明本机有 NVIDIA GPU，
-        # 不能因为查询通道故障就静默跳过 nvngx 部署。
-        $nvapiPath = Join-Path ([Environment]::GetFolderPath('System')) 'nvapi64.dll'
-        if (-not (Test-Path -LiteralPath $nvapiPath -PathType Leaf)) { return }
+    # GTX 16 也可能使用 FSR4 INT8，但不应自动部署 DLSS Runtime。
+    # 不使用 nvapi64.dll 回退：该驱动文件无法区分 RTX 与 GTX。
+    $rtxControllers = @(
+        Get-NvidiaVideoControllers | Where-Object {
+            [string]$_.Name -match '(?i)\bRTX\b'
+        }
+    )
+    if ($rtxControllers.Count -eq 0) {
+        Write-Host '未检测到 RTX 显卡，跳过 DLSS 超分组件补齐。' -ForegroundColor DarkGray
+        return
     }
     if (Test-Path -LiteralPath $installedDlss -PathType Leaf) { return }
 
-    $gpuNames = @($nvidiaControllers | ForEach-Object { [string]$_.Name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
-    $gpuLabel = if ($gpuNames.Count -gt 0) { $gpuNames -join ' / ' } else { 'NVIDIA GPU' }
+    $gpuNames = @($rtxControllers | ForEach-Object { [string]$_.Name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    $gpuLabel = if ($gpuNames.Count -gt 0) { $gpuNames -join ' / ' } else { 'NVIDIA RTX GPU' }
     Write-Host "检测到 $gpuLabel，正在补齐 DLSS 超分组件..." -ForegroundColor Cyan
     New-Item -ItemType Directory -Force -Path $optiDir | Out-Null
 

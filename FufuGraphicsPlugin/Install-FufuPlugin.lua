@@ -31,6 +31,16 @@ local int8_rules = {
     { vendor = "Intel", family = "Arc" },
 }
 
+-- DLSS is only useful on RTX hardware. GTX 16 is allowed to use FSR4 INT8,
+-- but must not receive NVIDIA DLSS runtime files during installation.
+local dlss_rules = {
+    { vendor = "NVIDIA", family = "RTX", series = "20" },
+    { vendor = "NVIDIA", family = "RTX", series = "30" },
+    { vendor = "NVIDIA", family = "RTX", series = "40" },
+    { vendor = "NVIDIA", family = "RTX", series = "50" },
+}
+local install_dlss_runtime = false
+
 local function apply_fsr4_policy(mode)
     fsr4_update = "true"
     fsr4_upscaler_index = "0"
@@ -63,6 +73,7 @@ local function detect_fsr4_policy()
     else
         install.log("未识别的 GPU 型号，FSR4 策略保持 auto: " .. gpu_name .. " (" .. gpu_vendor .. ")")
     end
+    install_dlss_runtime = system.gpu_matches_any(dlss_rules)
 end
 
 detect_fsr4_policy()
@@ -164,12 +175,14 @@ install.delete(config_stage_dir)
 
 local bundled_dlss = payload_dir .. "\\NVIDIA\\DLSS\\nvngx_dlss.dll"
 local bundled_dlss_license = payload_dir .. "\\NVIDIA\\DLSS\\nvngx_dlss.license.txt"
-if install.file_exists(bundled_dlss) then
+if install_dlss_runtime and install.file_exists(bundled_dlss) then
     install.copy_file(bundled_dlss, opti_dir .. "\\nvngx_dlss.dll")
     if install.file_exists(bundled_dlss_license) then
         install.copy_file(bundled_dlss_license, opti_dir .. "\\nvngx_dlss.license.txt")
     end
     install.log("已将 NVIDIA DLSS 组件复制到 OptiScaler 运行目录")
+elseif not install_dlss_runtime then
+    install.log("当前显卡不是已识别的 RTX，跳过 NVIDIA DLSS 组件复制")
 else
     install.log("插件包未包含 NVIDIA DLSS 组件，跳过复制")
 end
