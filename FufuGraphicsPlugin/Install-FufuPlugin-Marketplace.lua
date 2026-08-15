@@ -12,6 +12,7 @@ local amd_fp8_rules = {
 }
 
 local int8_rules = {
+    { vendor = "NVIDIA", family = "GTX", series = "16" },
     { vendor = "NVIDIA", family = "RTX", series = "20" },
     { vendor = "NVIDIA", family = "RTX", series = "30" },
     { vendor = "NVIDIA", family = "RTX", series = "40" },

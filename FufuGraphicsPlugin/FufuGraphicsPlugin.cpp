@@ -504,7 +504,8 @@ DetectedFsr4Policy detect_fsr4_gpu_policy()
         bool int8 = false;
         if (desc.VendorId == 0x10DE)
         {
-            int8 = name_contains_series(name, L"RTX", { L"20", L"30", L"40", L"50" });
+            int8 = name_contains_series(name, L"RTX", { L"20", L"30", L"40", L"50" }) ||
+                name_contains_series(name, L"GTX", { L"16" });
         }
         else if (desc.VendorId == 0x1002)
         {
@@ -586,6 +587,9 @@ bool apply_optiscaler_managed_settings(
         { "FSR", "UpscalerIndex", upscaler_index },
         { "FSR", "Fsr4Update", fsr4_update },
         { "FSR", "Fsr4ForceEnableInt8", force_int8 },
+        // FSR4 uses the verified non-linear input path on every GPU.
+        // This setting is inert for DLSS/XeSS and other backends.
+        { "FSR", "FsrNonLinearColorSpace", "true" },
         { "Libraries", "OptiDllPath", wide_to_utf8(optiscaler_directory.wstring()) },
         { "Plugins", "Path", "auto" },
         { "Plugins", "LoadAsiPlugins", "false" },

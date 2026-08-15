@@ -289,9 +289,10 @@ function Get-Fsr4GpuPolicy {
             }
         }
         elseif ($vendor -eq '10DE' -or $name -match '(?i)NVIDIA|GeForce') {
-            if ($name -match '(?i)\bRTX\s*(20|30|40|50)\d{2}(?!\d)') {
+            if ($name -match '(?i)\bRTX\s*(20|30|40|50)\d{2}(?!\d)' -or
+                $name -match '(?i)\bGTX\s*16\d{2}(?!\d)') {
                 $mode = 'int8'
-                $reason = 'NVIDIA RTX 20+'
+                $reason = 'NVIDIA RTX 20+ / GTX 16 Turing'
             }
         }
         elseif ($vendor -eq '8086' -or $name -match '(?i)Intel') {
@@ -331,6 +332,7 @@ function Set-Fsr4GpuPolicy {
     Set-IniValue -Path $Path -Section 'FSR' -Key 'Fsr4Update' -Value ($(if ($supported) { 'true' } else { 'false' }))
     Set-IniValue -Path $Path -Section 'FSR' -Key 'UpscalerIndex' -Value ($(if ($supported) { '0' } else { 'auto' }))
     Set-IniValue -Path $Path -Section 'FSR' -Key 'Fsr4ForceEnableInt8' -Value ($(if ($policy.Mode -eq 'int8') { 'true' } else { 'false' }))
+    Set-IniValue -Path $Path -Section 'FSR' -Key 'FsrNonLinearColorSpace' -Value 'true'
     $name = if ([string]::IsNullOrWhiteSpace($policy.Name)) { 'unknown' } else { $policy.Name }
     Write-Host "FSR4 GPU policy: $($policy.Mode) / $($policy.Reason) / $name" -ForegroundColor Cyan
     return $policy
