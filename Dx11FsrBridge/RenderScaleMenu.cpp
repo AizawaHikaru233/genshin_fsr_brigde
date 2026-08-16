@@ -96,6 +96,7 @@ std::uint64_t g_recent_object_snapshot_tick = 0;
 std::mutex g_recent_object_snapshot_mutex;
 
 bool is_executable_address(const void *address);
+bool read_float_value(const void *address, float &value);
 
 struct ScaleFieldInstruction
 {
@@ -380,8 +381,11 @@ void record_selection(void *instance, std::int32_t index)
     const auto [entry, inserted] = g_last_label_by_object.emplace(object, static_cast<std::size_t>(index));
     if (inserted)
     {
-        g_selected_index.store(index, std::memory_order_release);
-        save_selection_cache(index);
+        // get_text is also called while the menu enumerates every available
+        // label.  A first observation only identifies an option object; it is
+        // not evidence that the player selected that option.  Persisting it
+        // here made the final enumerated label (often 0.7) become the startup
+        // render scale on the next launch.
         return;
     }
     if (entry->second == static_cast<std::size_t>(index))
@@ -392,6 +396,39 @@ void record_selection(void *instance, std::int32_t index)
     save_selection_cache(index);
     log_line("selection_changed index=" + std::to_string(index) +
         " scale=" + std::to_string(k_render_scales[static_cast<std::size_t>(index)]));
+}
+
+bool seed_selection_from_native_scale(void *instance)
+{
+    if (instance == nullptr)
+        return false;
+
+    const auto field = reinterpret_cast<std::uintptr_t>(instance) + k_render_scale_member_offset;
+    float native_scale = 0.0f;
+    if (!read_float_value(reinterpret_cast<const void *>(field), native_scale))
+        return false;
+
+    std::int32_t index = -1;
+    for (std::size_t candidate = 0; candidate < k_native_scales.size(); ++candidate)
+    {
+        if (std::fabs(native_scale - k_native_scales[candidate]) <= 0.0001f)
+        {
+            index = static_cast<std::int32_t>(candidate);
+            break;
+        }
+    }
+    if (index < 0)
+        return false;
+
+    std::int32_t expected = -1;
+    if (!g_selected_index.compare_exchange_strong(expected, index, std::memory_order_acq_rel))
+        return true;
+
+    save_selection_cache(index);
+    log_line("startup_selection_seed native=" + std::to_string(native_scale) +
+        " index=" + std::to_string(index) +
+        " scale=" + std::to_string(k_render_scales[static_cast<std::size_t>(index)]));
+    return true;
 }
 
 bool is_writable_address(const void *address, std::size_t length)
@@ -630,7 +667,10 @@ void * __fastcall hooked_get_text(void *instance)
 
 bool apply_selected_render_scale(void *instance, const char *source)
 {
-    const auto index = g_selected_index.load(std::memory_order_acquire);
+    auto index = g_selected_index.load(std::memory_order_acquire);
+    if (index < 0 && !seed_selection_from_native_scale(instance))
+        return false;
+    index = g_selected_index.load(std::memory_order_acquire);
     if (instance == nullptr || index < 0 || index >= static_cast<std::int32_t>(k_render_scales.size()))
         return false;
 
