@@ -1,9 +1,9 @@
 [
     {
         "Name":  "Dx11FsrBridge.dll",
-        "Version":  "1.2.1",
-        "SHA256":  "EC5C6C0C15A7D50370E5D5C0DA66F25C6F991D32AB72E885AED595AB7EE4FE1B",
-        "Bytes":  375808
+        "Version":  "1.2.2",
+        "SHA256":  "CE5A208CD283729A8EEDBFB241FC8244446B0EE3078132C1F8A77A56727BE55A",
+        "Bytes":  376832
     },
     {
         "Name":  "OptiScaler.dll",
