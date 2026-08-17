@@ -34,6 +34,8 @@ SharedResources/NVIDIA/
 SharedResources/ReShade/runtime/ReShade.ini
 SharedResources/ReShade/runtime/ReShadePreset.ini
 SharedResources/ReShade/runtime/Screenshots/
+SharedResources/ReShade/runtime/reshade-shaders/Shaders/
+SharedResources/ReShade/runtime/reshade-shaders/Textures/
 SharedResources/OptiScaler/runtime/
 
 # Local research trees and diagnostic artifacts are not release sources
