@@ -265,7 +265,22 @@ function Repair-RuntimePaths {
                     $changed = $true
                 }
             }
-            $config.DllList = @($repairedList)
+            # ReShade must receive the D3D initialization callbacks before
+            # Bridge/OptiScaler.  Keep external DLLs and the remaining managed
+            # entries in their current order after moving ReShade to the front.
+            $orderedList = [Collections.Generic.List[string]]::new()
+            foreach ($entry in $repairedList) {
+                if ([string]::Equals($entry, $reShadePath, [StringComparison]::OrdinalIgnoreCase)) {
+                    $orderedList.Add($entry)
+                }
+            }
+            foreach ($entry in $repairedList) {
+                if (-not [string]::Equals($entry, $reShadePath, [StringComparison]::OrdinalIgnoreCase)) {
+                    $orderedList.Add($entry)
+                }
+            }
+            if (-not (@($config.DllList) -join "`n" -ceq @($orderedList) -join "`n")) { $changed = $true }
+            $config.DllList = @($orderedList)
         }
         $hdrEnabled = Test-ConfiguredDll -Config $config -Path $reShadePath
         if (Set-JsonPropertyValue -Object $config -Name 'UseHDR' -Value $hdrEnabled) { $changed = $true }

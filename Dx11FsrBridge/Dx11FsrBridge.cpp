@@ -4,25 +4,14 @@
 #include <d3d11_3.h>
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
-#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS) || defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
-#include <d3d12.h>
-#endif
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <dxgi1_5.h>
 #include <dxgi1_6.h>
 #include <detours/detours.h>
-#if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS) || defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
-#include <intrin.h>
-#endif
-
-#include "Fsr31Bridge.h"
 #include "RenderScaleMenu.h"
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
 #include "Fsr2TranslationLayer.h"
-#endif
-#if defined(DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL)
-#include "OptiScalerNgxBridge.h"
 #endif
 
 #include <algorithm>
@@ -166,14 +155,6 @@ struct Config
     std::uint32_t pixel_shader_trace_limit = 512;
     std::uint64_t target_pixel_shader_hash = 0x78057A29AF6C2D99ull;
     std::uint32_t pixel_shader_replacement_mode = 0;
-    bool enable_fsr31_context_probe = false;
-    bool enable_fsr31_input_probe = false;
-#if defined(DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL)
-    bool enable_optiscaler_ngx_probe = false;
-    bool enable_optiscaler_ngx_init_probe = false;
-    bool enable_optiscaler_ngx_capability_probe = false;
-    bool enable_optiscaler_ngx_delayed_init_probe = false;
-#endif
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     bool enable_fsr2_get_proc_address_shim = false;
     std::uint32_t fsr2_translation_mode = 0;
@@ -577,11 +558,6 @@ thread_local std::uint32_t g_fsr2_transient_capture_current_session = 0;
 thread_local std::uint32_t g_fsr2_transient_capture_current_sample = 0;
 thread_local bool g_fsr2_transient_capture_snapshot = false;
 thread_local bool g_fsr2_transient_capture_result_recorded = false;
-#endif
-std::atomic_bool g_fsr31_probe_complete = false;
-std::atomic_bool g_fsr31_input_probe_complete = false;
-#if defined(DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL)
-std::atomic_bool g_optiscaler_delayed_init_probe_started = false;
 #endif
 thread_local bool g_internal_bridge_dispatch = false;
 
@@ -3448,14 +3424,6 @@ void load_config()
     wchar_t *target_hash_end = nullptr;
     g_config.target_pixel_shader_hash = std::wcstoull(target_hash_buffer, &target_hash_end, 16);
     g_config.pixel_shader_replacement_mode = static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"PixelShaderReplacementMode", 0, config_path.c_str()));
-    g_config.enable_fsr31_context_probe = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableFsr31ContextProbe", 0, config_path.c_str()) != 0;
-    g_config.enable_fsr31_input_probe = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableFsr31InputProbe", 0, config_path.c_str()) != 0;
-#if defined(DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL)
-    g_config.enable_optiscaler_ngx_probe = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableOptiScalerNgxProbe", 0, config_path.c_str()) != 0;
-    g_config.enable_optiscaler_ngx_init_probe = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableOptiScalerNgxInitProbe", 0, config_path.c_str()) != 0;
-    g_config.enable_optiscaler_ngx_capability_probe = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableOptiScalerNgxCapabilityProbe", 0, config_path.c_str()) != 0;
-    g_config.enable_optiscaler_ngx_delayed_init_probe = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableOptiScalerNgxDelayedInitProbe", 0, config_path.c_str()) != 0;
-#endif
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     g_config.enable_fsr2_get_proc_address_shim = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableFsr2GetProcAddressShim", 0, config_path.c_str()) != 0;
     g_config.fsr2_translation_mode = static_cast<std::uint32_t>(
@@ -9219,6 +9187,7 @@ bool try_fsr2_translation_draw(
         log_line("fsr2_translation_context_created render=" +
             std::to_string(draw_info->render_width) + "x" + std::to_string(draw_info->render_height) +
             " output=" + std::to_string(draw_info->output_width) + "x" + std::to_string(draw_info->output_height) +
+            " hdr10_pq=" + (frame.hdr10_pq_color ? std::string("1") : std::string("0")) +
             " detoured=" + (outcome.hook_entry_detected ? std::string("1") : std::string("0")));
     }
     if (!outcome.succeeded)
@@ -9274,189 +9243,6 @@ bool try_fsr2_translation_draw(
     return skip_original_draw;
 }
 #endif
-
-Fsr31Bridge &fsr31_bridge()
-{
-    static Fsr31Bridge *bridge = new Fsr31Bridge();
-    return *bridge;
-}
-
-#if defined(DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL)
-OptiScalerNgxBridge &optiscaler_ngx_bridge()
-{
-    static OptiScalerNgxBridge *bridge = new OptiScalerNgxBridge();
-    return *bridge;
-}
-
-void scan_optiscaler_ngx_exports(const char *source, bool always_log_summary)
-{
-    if (!g_config.enable_optiscaler_ngx_probe)
-        return;
-
-    const OptiScalerNgxBridge::ScanResult scan = optiscaler_ngx_bridge().scan_loaded_modules();
-    for (const std::string &message : scan.messages)
-        log_line(message);
-
-    if (always_log_summary || (scan.newly_scanned_modules != 0 && !scan.exports_ready && g_config.log_loader_activity))
-    {
-        log_line(std::string("optiscaler_ngx_probe_scan source=") + source +
-            " newly_scanned=" + std::to_string(scan.newly_scanned_modules) +
-            " ready=" + (scan.exports_ready ? std::string("1") : std::string("0")));
-    }
-}
-
-std::string hex32(std::uint32_t value)
-{
-    char buffer[16] {};
-    std::snprintf(buffer, sizeof(buffer), "0x%08X", value);
-    return buffer;
-}
-
-void maybe_probe_optiscaler_ngx_initialization(ID3D11Device *device)
-{
-    if (!g_config.enable_optiscaler_ngx_init_probe || device == nullptr)
-        return;
-
-    const OptiScalerNgxBridge::InitializationProbeResult result =
-        optiscaler_ngx_bridge().probe_initialization(device, g_module_dir.wstring());
-    if (!result.attempted)
-        return;
-
-    log_line("optiscaler_ngx_init_probe initializer=" + result.initializer_name +
-        " init=" + hex32(result.initialize_result) +
-        " capability=" + hex32(result.capability_result) +
-        " destroy=" + hex32(result.destroy_parameters_result) +
-        " success=" + (result.succeeded ? std::string("1") : std::string("0")));
-}
-
-void maybe_probe_optiscaler_ngx_capabilities(UINT element_count)
-{
-    if (!g_config.enable_optiscaler_ngx_capability_probe || !inspect_target_upscaler_draw(element_count))
-        return;
-
-    const OptiScalerNgxBridge::CapabilityProbeResult result =
-        optiscaler_ngx_bridge().probe_capability_parameters();
-    if (!result.attempted)
-        return;
-
-    log_line("optiscaler_ngx_capability_probe capability=" + hex32(result.capability_result) +
-        " destroy=" + hex32(result.destroy_parameters_result) +
-        " success=" + (result.succeeded ? std::string("1") : std::string("0")));
-}
-
-void maybe_probe_optiscaler_ngx_delayed_initialization(ID3D11DeviceContext *context, UINT element_count)
-{
-    if (!g_config.enable_optiscaler_ngx_delayed_init_probe || context == nullptr ||
-        !inspect_target_upscaler_draw(element_count))
-    {
-        return;
-    }
-    if (g_optiscaler_delayed_init_probe_started.exchange(true, std::memory_order_relaxed))
-        return;
-
-    ID3D11Device *device = nullptr;
-    context->GetDevice(&device);
-    if (device == nullptr)
-        return;
-
-    log_line("optiscaler_ngx_delayed_init_probe_begin trigger=target_upscaler_draw");
-    const OptiScalerNgxBridge::InitializationProbeResult result =
-        optiscaler_ngx_bridge().probe_initialization(device, g_module_dir.wstring());
-    device->Release();
-    if (!result.attempted)
-        return;
-
-    log_line("optiscaler_ngx_delayed_init_probe initializer=" + result.initializer_name +
-        " init=" + hex32(result.initialize_result) +
-        " capability=" + hex32(result.capability_result) +
-        " destroy=" + hex32(result.destroy_parameters_result) +
-        " success=" + (result.succeeded ? std::string("1") : std::string("0")));
-}
-#endif
-
-void maybe_probe_fsr31_context(ID3D11DeviceContext *context, UINT element_count)
-{
-    if (!g_config.enable_fsr31_context_probe || g_fsr31_probe_complete.load(std::memory_order_relaxed))
-        return;
-
-    const auto draw_info = inspect_target_upscaler_draw(element_count);
-    if (!draw_info)
-        return;
-
-    ID3D11Device *device = nullptr;
-    context->GetDevice(&device);
-    if (device == nullptr)
-        return;
-
-    const Fsr31Bridge::EnsureResult result = fsr31_bridge().ensure_context(
-        device,
-        draw_info->render_width,
-        draw_info->render_height,
-        draw_info->output_width,
-        draw_info->output_height);
-    device->Release();
-
-    if (result == Fsr31Bridge::EnsureResult::created)
-    {
-        log_line("fsr31_context_probe_success render=" +
-            std::to_string(draw_info->render_width) + "x" + std::to_string(draw_info->render_height) +
-            " output=" + std::to_string(draw_info->output_width) + "x" + std::to_string(draw_info->output_height));
-        g_fsr31_probe_complete.store(true, std::memory_order_relaxed);
-    }
-    else if (result == Fsr31Bridge::EnsureResult::failed)
-    {
-        log_line("fsr31_context_probe_failed error=" + fsr31_bridge().last_error());
-        g_fsr31_probe_complete.store(true, std::memory_order_relaxed);
-    }
-}
-
-void maybe_probe_fsr31_inputs(ID3D11DeviceContext *context, UINT element_count)
-{
-    if (!g_config.enable_fsr31_input_probe || g_fsr31_input_probe_complete.load(std::memory_order_relaxed))
-        return;
-
-    const auto draw_info = inspect_target_upscaler_draw(element_count);
-    if (!draw_info)
-        return;
-
-    ID3D11Device *device = nullptr;
-    context->GetDevice(&device);
-    if (device == nullptr)
-        return;
-
-    const Fsr31Bridge::EnsureResult context_result = fsr31_bridge().ensure_context(
-        device,
-        draw_info->render_width,
-        draw_info->render_height,
-        draw_info->output_width,
-        draw_info->output_height);
-    device->Release();
-    if (context_result == Fsr31Bridge::EnsureResult::failed)
-    {
-        log_line("fsr31_input_probe_failed error=" + fsr31_bridge().last_error());
-        g_fsr31_input_probe_complete.store(true, std::memory_order_relaxed);
-        return;
-    }
-
-    std::array<ID3D11ShaderResourceView *, 4> views {};
-    context->PSGetShaderResources(0, static_cast<UINT>(views.size()), views.data());
-    bool prepared = false;
-    {
-        ScopedInternalBridgeDispatch internal_dispatch_scope;
-        prepared = fsr31_bridge().prepare_inputs(context, views[0], views[2], views[3]);
-    }
-    for (ID3D11ShaderResourceView *view : views)
-    {
-        if (view != nullptr)
-            view->Release();
-    }
-
-    if (prepared)
-        log_line("fsr31_input_probe_success color=rgba16f depth=r32f motion=rg16f encoding=signed_square_uv");
-    else
-        log_line("fsr31_input_probe_failed error=" + fsr31_bridge().last_error());
-    g_fsr31_input_probe_complete.store(true, std::memory_order_relaxed);
-}
 
 bool compile_spatial_copy_bytecode_locked()
 {
@@ -9822,15 +9608,6 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
     maybe_dispatch_early_output_probe(context, index_count);
 #endif
 #endif
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-#if defined(DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL)
-    maybe_probe_optiscaler_ngx_delayed_initialization(context, index_count);
-    maybe_probe_optiscaler_ngx_capabilities(index_count);
-#endif
-    maybe_probe_fsr31_context(context, index_count);
-    maybe_probe_fsr31_inputs(context, index_count);
-#endif
-
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     const bool fsr2_translation_handled = try_fsr2_translation_draw(context, index_count, target_draw_info, [&]
         {
@@ -9914,15 +9691,6 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
     maybe_dispatch_early_output_probe(context, vertex_count);
 #endif
 #endif
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-#if defined(DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL)
-    maybe_probe_optiscaler_ngx_delayed_initialization(context, vertex_count);
-    maybe_probe_optiscaler_ngx_capabilities(vertex_count);
-#endif
-    maybe_probe_fsr31_context(context, vertex_count);
-    maybe_probe_fsr31_inputs(context, vertex_count);
-#endif
-
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     const bool fsr2_translation_handled = try_fsr2_translation_draw(context, vertex_count, target_draw_info, [&]
         {
@@ -10887,9 +10655,6 @@ void on_module_activity(const char *source, HMODULE module)
         log_line("fsr2_get_proc_address_shim_queries mask=" + hex64(fsr2_query_mask));
     }
 #endif
-#if defined(DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL)
-    scan_optiscaler_ngx_exports(source, false);
-#endif
 }
 
 HMODULE WINAPI hooked_load_library_a(LPCSTR file_name)
@@ -11128,9 +10893,6 @@ void initialize()
     install_create_hooks_for_loaded_modules();
     install_loader_hooks_for_loaded_modules();
     install_hdr_environment_probe_for_loaded_modules();
-#if defined(DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL)
-    scan_optiscaler_ngx_exports("initialize", true);
-#endif
 }
 
 void initialize_once()
@@ -11138,16 +10900,6 @@ void initialize_once()
     std::call_once(g_initialize_once, []() { initialize(); });
 }
 }
-
-#if defined(DX11FSRBRIDGE_ASI)
-extern "C" __declspec(dllexport) void InitializeASI()
-{
-    // OptiScaler calls this optional entry point immediately after loading an
-    // ASI.  DllMain already calls initialize_once(), so this is intentionally
-    // idempotent and also works with generic ASI loaders.
-    initialize_once();
-}
-#endif
 
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
 {

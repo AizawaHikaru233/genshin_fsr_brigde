@@ -2,7 +2,8 @@
 param(
     [ValidateSet('Debug', 'Release', 'RelWithDebInfo', 'MinSizeRel')]
     [string]$Configuration = 'Release',
-    [switch]$GithubLiteOnly
+    [switch]$GithubLiteOnly,
+    [string]$SevenZipPath
 )
 
 Set-StrictMode -Version Latest
@@ -10,24 +11,28 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
 $root = [IO.Path]::GetFullPath((Split-Path -Parent $PSCommandPath))
-$source = Join-Path $root 'GenshinOneClick'
+$installerSource = Join-Path $root 'tools\FpsUnlockInstaller'
+$packageAssets = Join-Path $root 'assets\FpsUnlockPackage'
 $fufuSource = Join-Path $root 'FufuGraphicsPlugin'
 $fufuBuild = Join-Path $root 'build-package-fufu-graphics'
 $fufuDll = Join-Path $fufuBuild "$Configuration\FSR-Bridge-Plugin.dll"
 $dist = Join-Path $root 'dist'
-$manifestPath = Join-Path $source 'component-manifest.json'
 $optiRuntime = Join-Path $root 'SharedResources\OptiScaler\runtime'
-$optiDefaults = Join-Path $root 'SharedResources\OptiScaler\default_config'
-$reshadeDefaults = Join-Path $root 'SharedResources\ReShade\default_config'
-$bridgeDefaults = Join-Path $root 'SharedResources\Bridge\default_config'
+$dlssRuntime = Join-Path $root 'SharedResources\NVIDIA\DLSS'
+$unlockerRuntime = Join-Path $root 'SharedResources\FpsUnlocker\runtime'
+$reshadeRuntime = Join-Path $root 'SharedResources\ReShade\runtime'
+$bridgePackageConfig = Join-Path $root 'Dx11FsrBridge\Dx11FsrBridge.package.ini'
+$bridgeBuild = Join-Path $root 'build-package-bridge'
+$antiBuild = Join-Path $root 'build-package-antiplayermosaic'
+$script:bridgeDll = $null
+$script:antiDll = $null
 
 function Get-BridgeVersion {
-    $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    $bridge = @($manifest | Where-Object { $_.Name -eq 'Dx11FsrBridge.dll' } | Select-Object -First 1)
-    if ($bridge.Count -ne 1 -or [string]$bridge[0].Version -notmatch '^\d+\.\d+\.\d+$') {
-        throw '组件清单缺少有效的 Dx11FsrBridge.dll 版本。'
+    $version = [string](Get-Item -LiteralPath $bridgeDll).VersionInfo.FileVersion
+    if ($version -notmatch '^(\d+\.\d+\.\d+)') {
+        throw "编译产物 Dx11FsrBridge.dll 缺少有效文件版本：$version"
     }
-    return [string]$bridge[0].Version
+    return $matches[1]
 }
 
 function Invoke-Cmake {
@@ -45,6 +50,69 @@ function Invoke-Cmake {
     if ($null -eq $cmakePath) { throw '没有找到 CMake。' }
     & $cmakePath @Arguments | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "CMake 命令失败: $($Arguments -join ' ')" }
+}
+
+function Build-PackageComponents {
+    Invoke-Cmake @(
+        '-S', (Join-Path $root 'Dx11FsrBridge'), '-B', $bridgeBuild, '-A', 'x64',
+        "-DCMAKE_BUILD_TYPE=$Configuration",
+        '-DDX11FSRBRIDGE_RELEASE_RUNTIME=ON',
+        '-DDX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=ON'
+    )
+    Invoke-Cmake @('--build', $bridgeBuild, '--config', $Configuration)
+    Invoke-Cmake @('-S', (Join-Path $root 'AntiPlayerMosaic'), '-B', $antiBuild, '-A', 'x64', "-DCMAKE_BUILD_TYPE=$Configuration")
+    Invoke-Cmake @('--build', $antiBuild, '--config', $Configuration)
+
+    $script:bridgeDll = Get-ChildItem -LiteralPath $bridgeBuild -Recurse -File -Filter 'Dx11FsrBridge.dll' |
+        Select-Object -First 1 -ExpandProperty FullName
+    $script:antiDll = Get-ChildItem -LiteralPath $antiBuild -Recurse -File -Filter 'AntiPlayerMosaic.dll' |
+        Select-Object -First 1 -ExpandProperty FullName
+    if ([string]::IsNullOrWhiteSpace($script:bridgeDll) -or [string]::IsNullOrWhiteSpace($script:antiDll)) {
+        throw 'CMake 未生成必要的 FPS Unlock 包 DLL。'
+    }
+}
+
+function Assert-OptiConfigMatchesRuntime {
+    $configPath = Join-Path $optiRuntime 'OptiScaler.ini'
+    $runtimePath = Join-Path $optiRuntime 'OptiScaler.dll'
+    $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
+    $marker = [regex]::Match($config, '(?m)^;\s*FSR Bridge OptiScalerRuntimeVersion\s*=\s*([^\r\n;]+)\s*$')
+    if (-not $marker.Success) {
+        throw 'OptiScaler.ini 缺少 FSR Bridge OptiScalerRuntimeVersion 标记。更新 OptiScaler 时必须同步配置模板。'
+    }
+    $expectedVersion = $marker.Groups[1].Value.Trim()
+    $actualVersion = [string](Get-Item -LiteralPath $runtimePath).VersionInfo.FileVersion
+    if (-not [string]::Equals($expectedVersion, $actualVersion, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "OptiScaler.ini 适配版本为 $expectedVersion，但当前 OptiScaler.dll 为 $actualVersion。请同步更新配置模板。"
+    }
+}
+
+function New-PackageComponentManifest {
+    param(
+        [Parameter(Mandatory)][string]$PackageRoot,
+        [switch]$Full
+    )
+
+    $componentPaths = [ordered]@{
+        'Dx11FsrBridge.dll' = 'payload\Bridge\Dx11FsrBridge.dll'
+        'AntiPlayerMosaic.dll' = 'payload\AntiPlayerMosaic\AntiPlayerMosaic.dll'
+        'ReShade64.dll' = 'payload\ReShade\ReShade64.dll'
+    }
+    if ($Full) { $componentPaths['OptiScaler.dll'] = 'payload\OptiScaler\OptiScaler.dll' }
+
+    $manifest = foreach ($name in $componentPaths.Keys) {
+        $relativePath = $componentPaths[$name]
+        $item = Get-Item -LiteralPath (Join-Path $PackageRoot $relativePath)
+        $fileVersion = [string]$item.VersionInfo.FileVersion
+        if ([string]::IsNullOrWhiteSpace($fileVersion)) { $fileVersion = 'unknown' }
+        [pscustomobject]@{
+            Name = $name
+            Version = $fileVersion
+            SHA256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash
+            Bytes = $item.Length
+        }
+    }
+    $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $PackageRoot 'component-manifest.json') -Encoding UTF8
 }
 
 function Reset-Stage {
@@ -110,33 +178,73 @@ function New-ZipArchive {
         $false)
 }
 
+function Find-SevenZip {
+    if (-not [string]::IsNullOrWhiteSpace($SevenZipPath)) {
+        if (-not (Test-Path -LiteralPath $SevenZipPath -PathType Leaf)) {
+            throw "指定的 7-Zip 路径不存在: $SevenZipPath"
+        }
+        return (Resolve-Path -LiteralPath $SevenZipPath).Path
+    }
+
+    foreach ($commandName in @('7z.exe', '7zz.exe', '7za.exe')) {
+        $command = Get-Command $commandName -ErrorAction SilentlyContinue
+        if ($null -ne $command) { return $command.Source }
+    }
+
+    foreach ($candidate in @(
+        (Join-Path $root 'tools\7zip\7z.exe'),
+        'C:\Program Files\7-Zip\7z.exe',
+        'C:\Program Files (x86)\7-Zip\7z.exe',
+        (Join-Path $env:LOCALAPPDATA 'Programs\7-Zip\7z.exe')
+    )) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+
+    throw '本地 FPS Unlock 包使用 7z 格式。请安装 7-Zip，或使用 -SevenZipPath 指定 7z.exe。'
+}
+
+function New-SevenZipArchive {
+    param([string]$SourceDirectory, [string]$ArchivePath)
+    $sevenZip = Find-SevenZip
+    if (Test-Path -LiteralPath $ArchivePath) { Remove-Item -LiteralPath $ArchivePath -Force }
+
+    Push-Location -LiteralPath $SourceDirectory
+    try {
+        # 固实压缩配合 LZMA2 优先减小完整本地包的体积，便于提交蓝奏云 100 MB 限制。
+        & $sevenZip a -t7z -mx=9 -m0=lzma2 -ms=on -mmt=on $ArchivePath '.\*' | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "7-Zip 打包失败: $ArchivePath" }
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+function Assert-LanzouUploadSize {
+    param([Parameter(Mandatory)][string]$ArchivePath)
+    $limit = [long]100000000
+    $size = (Get-Item -LiteralPath $ArchivePath).Length
+    if ($size -gt $limit) {
+        throw "本地 7z 包仍为 $size bytes，超过蓝奏云 100 MB 限制。请进一步精简组件后再发布。"
+    }
+}
+
 function Prepare-FpsStage {
     param([string]$Stage, [switch]$Full, [Parameter(Mandatory)][string]$Version)
     Reset-Stage -Path $Stage
-    $rootExcludes = @(
-        'fps_config.json', '.installer-state.json', '.last-install-error.log', 'backups',
-        'payload', 'README.md', 'Configure-Launcher.bat', 'Configure-Launcher.en.bat',
-        'Configure.ps1', 'Localization.ps1', 'ReShadeResources.ps1', 'Apply-PackageUpdate.ps1',
-        'unlockfps_nc.exe', 'UnlockerStub.dll'
-    )
-    Get-ChildItem -LiteralPath $source -Force |
-        Where-Object { $_.Name -notin $rootExcludes } |
-        Copy-Item -Destination $Stage -Recurse -Force
-
-    Copy-Item -LiteralPath (Join-Path $source 'Configure-Launcher.bat') -Destination (Join-Path $Stage '一键配置.bat') -Force
-    Copy-Item -LiteralPath (Join-Path $source 'Configure-Launcher.en.bat') -Destination (Join-Path $Stage 'GenshinFSRBridgeTools.bat') -Force
+    Copy-Item -LiteralPath (Join-Path $installerSource 'Installer.ps1'), (Join-Path $installerSource 'README.md') -Destination $Stage -Force
+    Copy-Item -LiteralPath (Join-Path $installerSource 'Configure-Launcher.bat') -Destination (Join-Path $Stage '一键配置.bat') -Force
+    Copy-Item -LiteralPath (Join-Path $installerSource 'Configure-Launcher.en.bat') -Destination (Join-Path $Stage 'GenshinFSRBridgeTools.bat') -Force
     $stageScripts = Join-Path $Stage 'scripts'
     New-Item -ItemType Directory -Path $stageScripts -Force | Out-Null
     foreach ($scriptName in @('Configure.ps1', 'Localization.ps1', 'ReShadeResources.ps1', 'Apply-PackageUpdate.ps1')) {
-        Copy-Item -LiteralPath (Join-Path $source $scriptName) -Destination (Join-Path $stageScripts $scriptName) -Force
+        Copy-Item -LiteralPath (Join-Path $installerSource $scriptName) -Destination (Join-Path $stageScripts $scriptName) -Force
     }
-    Copy-Item -LiteralPath (Join-Path $source 'Feedback.txt') -Destination $Stage -Force
+    Copy-Item -LiteralPath (Join-Path $packageAssets 'Feedback.txt') -Destination $Stage -Force
     [IO.File]::WriteAllText((Join-Path $Stage 'Package-Version.txt'), "$Version`r`n", [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $Stage 'NonFrameGeneration.edition'), "`r`n", [Text.UTF8Encoding]::new($false))
 
     if ($Full) {
-        Copy-Item -LiteralPath (Join-Path $source 'unlockfps_nc.exe') -Destination $Stage -Force
-        Copy-Item -LiteralPath (Join-Path $source 'UnlockerStub.dll') -Destination $Stage -Force
+        Copy-Item -LiteralPath (Join-Path $unlockerRuntime 'unlockfps_nc.exe'), (Join-Path $unlockerRuntime 'UnlockerStub.dll') -Destination $Stage -Force
     }
 
     $payload = Join-Path $Stage 'payload'
@@ -145,27 +253,34 @@ function Prepare-FpsStage {
     $stagePayloadReShade = Join-Path $payload 'ReShade'
     $stageDefaults = Join-Path $payload 'default_config'
     New-Item -ItemType Directory -Path $payload, $stagePayloadBridge, $stagePayloadAnti, $stagePayloadReShade, $stageDefaults -Force | Out-Null
-    Copy-DirectoryContents -Source (Join-Path $source 'payload\Bridge') -Destination $stagePayloadBridge
-    Copy-DirectoryContents -Source (Join-Path $source 'payload\AntiPlayerMosaic') -Destination $stagePayloadAnti
-    Copy-DirectoryContents -Source (Join-Path $source 'payload\ReShade') -Destination $stagePayloadReShade
+    Copy-Item -LiteralPath $bridgeDll -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.dll') -Force
+    Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.ini') -Force
+    Copy-Item -LiteralPath $antiDll -Destination (Join-Path $stagePayloadAnti 'AntiPlayerMosaic.dll') -Force
+    Copy-DirectoryContents -Source $reshadeRuntime -Destination $stagePayloadReShade
     Remove-NonBundledReShadeEffects -ReShadeDirectory $stagePayloadReShade
     Remove-Item -LiteralPath (Join-Path $stagePayloadReShade 'ReShade.ini'), (Join-Path $stagePayloadReShade 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
-    Copy-DirectoryContents -Source $optiDefaults -Destination $stageDefaults
-    Copy-DirectoryContents -Source $reshadeDefaults -Destination $stageDefaults
-    Copy-DirectoryContents -Source $bridgeDefaults -Destination $stageDefaults
+    # The package defaults are generated from the exact component resources used in this build.
+    Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $stageDefaults 'Dx11FsrBridge.ini') -Force
+    Copy-Item -LiteralPath (Join-Path $optiRuntime 'OptiScaler.ini'), (Join-Path $optiRuntime 'OptiScaler-UpscalingFiles.json') -Destination $stageDefaults -Force
+    Copy-Item -LiteralPath (Join-Path $reshadeRuntime 'ReShade.ini'), (Join-Path $reshadeRuntime 'ReShadePreset.ini') -Destination $stageDefaults -Force
 
     if ($Full) {
         $stageOpti = Join-Path $payload 'OptiScaler'
         $stageNvidia = Join-Path $payload 'NVIDIA\DLSS'
         New-Item -ItemType Directory -Path $stageOpti, $stageNvidia -Force | Out-Null
         Copy-DirectoryContents -Source $optiRuntime -Destination $stageOpti
-        Copy-Item -LiteralPath (Join-Path $source 'payload\NVIDIA\DLSS\nvngx_dlss.dll') -Destination $stageNvidia -Force
-        Copy-Item -LiteralPath (Join-Path $source 'payload\NVIDIA\DLSS\nvngx_dlss.license.txt') -Destination $stageNvidia -Force
+        Copy-Item -LiteralPath (Join-Path $dlssRuntime 'nvngx_dlss.dll') -Destination $stageNvidia -Force
+        Copy-Item -LiteralPath (Join-Path $dlssRuntime 'nvngx_dlss.license.txt') -Destination $stageNvidia -Force
     }
+    New-PackageComponentManifest -PackageRoot $Stage -Full:$Full
 }
 
 function Build-FpsPackage {
-    param([string]$PackageKind, [Parameter(Mandatory)][string]$Version)
+    param(
+        [string]$PackageKind,
+        [Parameter(Mandatory)][string]$Version,
+        [ValidateSet('Zip', 'SevenZip')][string]$ArchiveFormat = 'Zip'
+    )
     $full = $PackageKind -eq 'Full'
     $stageName = if ($full) { '.fps-full-stage' } else { '.fps-lite-stage' }
     $stage = Join-Path $dist $stageName
@@ -195,9 +310,16 @@ function Build-FpsPackage {
         }
         Assert-RequiredFiles -Path $stage -RelativePaths $required
         Assert-CleanPackage -Path $stage
-        $name = if ($full) { "原神解帧FSR插件包Full_v$Version.zip" } else { "原神解帧FSR插件包Lite_v$Version.zip" }
+        $extension = if ($ArchiveFormat -eq 'SevenZip') { '7z' } else { 'zip' }
+        $name = if ($full) { "原神解帧FSR插件包Full_v$Version.$extension" } else { "原神解帧FSR插件包Lite_v$Version.$extension" }
         $archive = Join-Path $dist $name
-        New-ZipArchive -SourceDirectory $stage -ArchivePath $archive
+        if ($ArchiveFormat -eq 'SevenZip') {
+            New-SevenZipArchive -SourceDirectory $stage -ArchivePath $archive
+            Assert-LanzouUploadSize -ArchivePath $archive
+        }
+        else {
+            New-ZipArchive -SourceDirectory $stage -ArchivePath $archive
+        }
         return $archive
     }
     finally {
@@ -222,7 +344,7 @@ $stage = Join-Path $dist '.fufu-marketplace-stage'
 Reset-Stage -Path $stage
 try {
     Copy-Item -LiteralPath $fufuDll -Destination (Join-Path $stage 'FSR-Bridge-Plugin.dll') -Force
-    Copy-Item -LiteralPath (Join-Path $source 'Feedback.txt') -Destination $stage -Force
+    Copy-Item -LiteralPath (Join-Path $packageAssets 'Feedback.txt') -Destination $stage -Force
     [IO.File]::WriteAllText((Join-Path $stage 'Package-Version.txt'), "$version`r`n", [Text.UTF8Encoding]::new($false))
 
     $config = Get-Content -LiteralPath (Join-Path $fufuSource 'config.ini') -Raw -Encoding UTF8
@@ -239,16 +361,16 @@ try {
     $defaults = Join-Path $payload 'default_config'
 
     New-Item -ItemType Directory -Path $bridge, $opti, $nvidia, $reshade, $defaults -Force | Out-Null
-    Copy-Item -LiteralPath (Join-Path $source 'payload\Bridge\Dx11FsrBridge.dll') -Destination $bridge -Force
-    Copy-Item -LiteralPath (Join-Path $source 'payload\Bridge\Dx11FsrBridge.ini') -Destination $bridge -Force
+    Copy-Item -LiteralPath $bridgeDll -Destination (Join-Path $bridge 'Dx11FsrBridge.dll') -Force
+    Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $bridge 'Dx11FsrBridge.ini') -Force
     Copy-DirectoryContents -Source $optiRuntime -Destination $opti
-    Copy-Item -LiteralPath (Join-Path $source 'payload\NVIDIA\DLSS\nvngx_dlss.dll') -Destination $nvidia -Force
-    Copy-Item -LiteralPath (Join-Path $source 'payload\NVIDIA\DLSS\nvngx_dlss.license.txt') -Destination $nvidia -Force
-    Copy-DirectoryContents -Source (Join-Path $source 'payload\ReShade') -Destination $reshade
+    Copy-Item -LiteralPath (Join-Path $dlssRuntime 'nvngx_dlss.dll') -Destination $nvidia -Force
+    Copy-Item -LiteralPath (Join-Path $dlssRuntime 'nvngx_dlss.license.txt') -Destination $nvidia -Force
+    Copy-DirectoryContents -Source $reshadeRuntime -Destination $reshade
     Remove-NonBundledReShadeEffects -ReShadeDirectory $reshade
-    Copy-DirectoryContents -Source $optiDefaults -Destination $defaults
-    Copy-DirectoryContents -Source $reshadeDefaults -Destination $defaults
-    Copy-DirectoryContents -Source $bridgeDefaults -Destination $defaults
+    Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $defaults 'Dx11FsrBridge.ini') -Force
+    Copy-Item -LiteralPath (Join-Path $optiRuntime 'OptiScaler.ini'), (Join-Path $optiRuntime 'OptiScaler-UpscalingFiles.json') -Destination $defaults -Force
+    Copy-Item -LiteralPath (Join-Path $reshadeRuntime 'ReShade.ini'), (Join-Path $reshadeRuntime 'ReShadePreset.ini') -Destination $defaults -Force
     Remove-Item -LiteralPath (Join-Path $reshade 'ReShade.ini'), (Join-Path $reshade 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
 
     Assert-RequiredFiles -Path $stage -RelativePaths @(
@@ -282,23 +404,30 @@ finally {
 return (Join-Path $dist "FSR-Bridge-Plugin.v$version.zip")
 }
 
+Build-PackageComponents
+Assert-OptiConfigMatchesRuntime
 $version = Get-BridgeVersion
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
-foreach ($pattern in @(
-    '原神解帧FSR插件包Lite_*.zip',
-    '原神解帧FSR插件包Full_*.zip',
-    '芙芙启动器插件包Lite_*.zip',
-    '芙芙启动器插件包Full_*.zip',
-    'FSR-Bridge-Plugin.v*.zip'
-)) {
-    Get-ChildItem -LiteralPath $dist -File -Filter $pattern -ErrorAction SilentlyContinue | Remove-Item -Force
+if (-not $GithubLiteOnly) {
+    foreach ($pattern in @(
+        '原神解帧FSR插件包Lite_*.zip',
+        '原神解帧FSR插件包Full_*.zip',
+        '原神解帧FSR插件包Lite_*.7z',
+        '原神解帧FSR插件包Full_*.7z',
+        '芙芙启动器插件包Lite_*.zip',
+        '芙芙启动器插件包Full_*.zip',
+        'FSR-Bridge-Plugin.v*.zip'
+    )) {
+        Get-ChildItem -LiteralPath $dist -File -Filter $pattern -ErrorAction SilentlyContinue | Remove-Item -Force
+    }
 }
 
-$fpsLiteArchive = Build-FpsPackage -PackageKind Lite -Version $version
+$fpsLiteArchive = $null
 $fpsFullArchive = $null
 $fufuArchive = $null
 if (-not $GithubLiteOnly) {
-    $fpsFullArchive = Build-FpsPackage -PackageKind Full -Version $version
+    $fpsLiteArchive = Build-FpsPackage -PackageKind Lite -Version $version -ArchiveFormat SevenZip
+    $fpsFullArchive = Build-FpsPackage -PackageKind Full -Version $version -ArchiveFormat SevenZip
     $fufuArchive = Build-FufuMarketplacePackage -Version $version
 }
 
@@ -306,7 +435,9 @@ $githubReleaseDist = Join-Path $dist 'github-release'
 if (Test-Path -LiteralPath $githubReleaseDist) { Remove-Item -LiteralPath $githubReleaseDist -Recurse -Force }
 New-Item -ItemType Directory -Path $githubReleaseDist -Force | Out-Null
 $githubLiteArchive = Join-Path $githubReleaseDist "GenshinFSRBridge.Lite_v$version.zip"
-Copy-Item -LiteralPath $fpsLiteArchive -Destination $githubLiteArchive -Force
+$githubLiteSourceArchive = Build-FpsPackage -PackageKind Lite -Version $version -ArchiveFormat Zip
+Copy-Item -LiteralPath $githubLiteSourceArchive -Destination $githubLiteArchive -Force
+if (-not $GithubLiteOnly) { Remove-Item -LiteralPath $githubLiteSourceArchive -Force }
 
 Write-Host ''
 if ($GithubLiteOnly) {

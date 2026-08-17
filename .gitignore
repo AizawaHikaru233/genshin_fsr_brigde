@@ -29,15 +29,11 @@ publish-staging/
 local-only/
 
 # Runtime state and third-party release files kept only for local Full builds
-GenshinOneClick/.installer-state.json
-GenshinOneClick/fps_config.json
-GenshinOneClick/UnlockerStub.dll
-GenshinOneClick/unlockfps_nc.exe
-GenshinOneClick/payload/OptiScaler/
-GenshinOneClick/payload/NVIDIA/
-GenshinOneClick/payload/ReShade/ReShade.ini
-GenshinOneClick/payload/ReShade/ReShadePreset.ini
-GenshinOneClick/payload/ReShade/Screenshots/
+SharedResources/FpsUnlocker/runtime/
+SharedResources/NVIDIA/
+SharedResources/ReShade/runtime/ReShade.ini
+SharedResources/ReShade/runtime/ReShadePreset.ini
+SharedResources/ReShade/runtime/Screenshots/
 SharedResources/OptiScaler/runtime/
 
 # Local research trees and diagnostic artifacts are not release sources

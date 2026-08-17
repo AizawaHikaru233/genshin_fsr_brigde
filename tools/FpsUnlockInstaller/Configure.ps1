@@ -1059,6 +1059,27 @@ function Reset-PluginConfigurations {
         }
         catch {}
     }
+    # ReShade must initialize its D3D hooks before Bridge and OptiScaler.
+    # Preserve every existing non-ReShade entry, but move the managed ReShade
+    # module to the front whenever configurations are reset.
+    $orderedDlls = [Collections.Generic.List[string]]::new()
+    foreach ($entry in $loadedDlls) {
+        try {
+            if ([string]::Equals([IO.Path]::GetFullPath($entry), [IO.Path]::GetFullPath($reshadeDll), [StringComparison]::OrdinalIgnoreCase)) {
+                Add-UniquePath -List $orderedDlls -Path $entry
+            }
+        }
+        catch {}
+    }
+    foreach ($entry in $loadedDlls) {
+        try {
+            if (-not [string]::Equals([IO.Path]::GetFullPath($entry), [IO.Path]::GetFullPath($reshadeDll), [StringComparison]::OrdinalIgnoreCase)) {
+                Add-UniquePath -List $orderedDlls -Path $entry
+            }
+        }
+        catch { Add-UniquePath -List $orderedDlls -Path $entry }
+    }
+    $loadedDlls = $orderedDlls
 
     if (Test-Path -LiteralPath $optiDll -PathType Leaf) {
         Assert-File -Path $optiDefaultIni
@@ -1260,15 +1281,15 @@ if (-not $DisableOptiScaler) {
 }
 
 $dllList = [System.Collections.Generic.List[string]]::new()
+if (-not $DisableHDR) {
+    $dllList.Add($reshadeDll)
+}
 if (-not $DisableOptiScaler) {
     $dllList.Add($bridgeDll)
     $dllList.Add($optiDll)
 }
 if (-not $DisableAntiBlur) {
     $dllList.Add($antiBlurDll)
-}
-if (-not $DisableHDR) {
-    $dllList.Add($reshadeDll)
 }
 
 $config = $null

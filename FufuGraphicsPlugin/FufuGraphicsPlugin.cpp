@@ -427,27 +427,31 @@ bool name_contains_series(
     const wchar_t *marker,
     std::initializer_list<const wchar_t *> series_prefixes)
 {
-    const std::size_t marker_length = wcslen(marker);
-    std::size_t position = name.find(marker);
+    const std::wstring normalized_name = lower(name);
+    const std::wstring normalized_marker = lower(marker);
+    const std::size_t marker_length = normalized_marker.size();
+    std::size_t position = normalized_name.find(normalized_marker);
     while (position != std::wstring::npos)
     {
-        if (position == 0 || !iswalnum(name[position - 1]))
+        if (position == 0 || !iswalnum(normalized_name[position - 1]))
         {
             std::size_t cursor = position + marker_length;
-            while (cursor < name.size() && name[cursor] == L' ')
+            while (cursor < normalized_name.size() && normalized_name[cursor] == L' ')
                 ++cursor;
             for (const wchar_t *prefix : series_prefixes)
             {
-                const std::size_t prefix_length = wcslen(prefix);
-                if (name.compare(cursor, prefix_length, prefix) == 0 &&
-                    cursor + prefix_length < name.size() &&
-                    name[cursor + prefix_length] >= L'0' && name[cursor + prefix_length] <= L'9')
+                const std::wstring normalized_prefix = lower(prefix);
+                const std::size_t prefix_length = normalized_prefix.size();
+                if (normalized_name.compare(cursor, prefix_length, normalized_prefix) == 0 &&
+                    cursor + prefix_length < normalized_name.size() &&
+                    normalized_name[cursor + prefix_length] >= L'0' &&
+                    normalized_name[cursor + prefix_length] <= L'9')
                 {
                     return true;
                 }
             }
         }
-        position = name.find(marker, position + marker_length);
+        position = normalized_name.find(normalized_marker, position + marker_length);
     }
     return false;
 }
@@ -458,18 +462,20 @@ bool name_contains_amd_igpu_token(const std::wstring &name)
         L"740M", L"760M", L"780M", L"840M", L"860M", L"880M", L"890M",
         L"8040S", L"8050S", L"8060S",
     };
+    const std::wstring normalized_name = lower(name);
     for (const wchar_t *token : tokens)
     {
-        const std::size_t token_length = wcslen(token);
-        std::size_t position = name.find(token);
+        const std::wstring normalized_token = lower(token);
+        const std::size_t token_length = normalized_token.size();
+        std::size_t position = normalized_name.find(normalized_token);
         while (position != std::wstring::npos)
         {
-            const bool head_ok = position == 0 || !iswalnum(name[position - 1]);
+            const bool head_ok = position == 0 || !iswalnum(normalized_name[position - 1]);
             const std::size_t tail = position + token_length;
-            const bool tail_ok = tail >= name.size() || !iswalnum(name[tail]);
+            const bool tail_ok = tail >= normalized_name.size() || !iswalnum(normalized_name[tail]);
             if (head_ok && tail_ok)
                 return true;
-            position = name.find(token, position + 1);
+            position = normalized_name.find(normalized_token, position + 1);
         }
     }
     return false;
@@ -502,21 +508,29 @@ DetectedFsr4Policy detect_fsr4_gpu_policy()
         const std::wstring name = desc.Description;
         bool fp8 = false;
         bool int8 = false;
-        if (desc.VendorId == 0x10DE)
+        const std::wstring normalized_name = lower(name);
+        if (desc.VendorId == 0x10DE ||
+            normalized_name.find(L"nvidia") != std::wstring::npos ||
+            normalized_name.find(L"geforce") != std::wstring::npos)
         {
             int8 = name_contains_series(name, L"RTX", { L"20", L"30", L"40", L"50" }) ||
                 name_contains_series(name, L"GTX", { L"16" });
         }
-        else if (desc.VendorId == 0x1002)
+        else if (desc.VendorId == 0x1002 ||
+            normalized_name.find(L"amd") != std::wstring::npos ||
+            normalized_name.find(L"radeon") != std::wstring::npos)
         {
-            if (name_contains_series(name, L"RX", { L"9" }))
+            if (name_contains_series(name, L"RX", { L"9" }) ||
+                name_contains_series(name, L"PRO", { L"W9" }))
                 fp8 = true;
-            else if (name_contains_series(name, L"RX", { L"7" }) || name_contains_amd_igpu_token(name))
+            else if (name_contains_series(name, L"RX", { L"7" }) ||
+                name_contains_series(name, L"PRO", { L"W7" }) ||
+                name_contains_amd_igpu_token(name))
                 int8 = true;
         }
-        else if (desc.VendorId == 0x8086)
+        else if (desc.VendorId == 0x8086 || normalized_name.find(L"intel") != std::wstring::npos)
         {
-            int8 = name.find(L"Arc") != std::wstring::npos;
+            int8 = lower(name).find(L"arc") != std::wstring::npos;
         }
 
         if (!fp8 && !int8)
@@ -557,7 +571,9 @@ bool has_nvidia_rtx_adapter()
         const HRESULT desc_result = adapter->GetDesc1(&desc);
         adapter->Release();
         if (FAILED(desc_result) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 ||
-            desc.VendorId != 0x10DE)
+            (desc.VendorId != 0x10DE &&
+             lower(desc.Description).find(L"nvidia") == std::wstring::npos &&
+             lower(desc.Description).find(L"geforce") == std::wstring::npos))
         {
             continue;
         }
@@ -1204,6 +1220,23 @@ DWORD WINAPI bootstrap_thread(void *)
         return 7;
     }
 
+    // ReShade must install its graphics hooks before the Bridge/OptiScaler
+    // chain.  In particular, loading it afterwards can make NVIDIA + FSR4
+    // fail to negotiate the expected D3D interception path.
+    if (config.enable_reshade)
+    {
+        if (GetModuleHandleW(L"ReShade64.dll") != nullptr)
+        {
+            write_log("plugin_stopped reason=reshade_already_loaded");
+            return 14;
+        }
+        if (!prepare_reshade_game_configuration(config))
+            return 15;
+        HMODULE reshade = load_module("reshade", config.reshade_path);
+        if (reshade == nullptr)
+            return 16;
+    }
+
     HMODULE bridge = nullptr;
     if (config.enable_bridge)
     {
@@ -1239,24 +1272,10 @@ DWORD WINAPI bootstrap_thread(void *)
         }
     }
 
-    if (config.enable_reshade)
-    {
-        if (GetModuleHandleW(L"ReShade64.dll") != nullptr)
-        {
-            write_log("plugin_stopped reason=reshade_already_loaded");
-            return 14;
-        }
-        if (!prepare_reshade_game_configuration(config))
-            return 15;
-        HMODULE reshade = load_module("reshade", config.reshade_path);
-        if (reshade == nullptr)
-            return 16;
-    }
-
     write_log(std::string("plugin_success bridge=") + (config.enable_bridge ? "1" : "0") +
         " optiscaler=" + (config.enable_optiscaler ? "1" : "0") +
         " reshade=" + (config.enable_reshade ? "1" : "0") +
-        " order=bridge,optiscaler,reshade");
+        " order=reshade,bridge,optiscaler");
     return 0;
 }
 } // namespace

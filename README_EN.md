@@ -25,7 +25,7 @@ The frame-generation feature in the `frame-generation` branch is built against `
 
 ## Lite Release Package
 
-`GenshinOneClick/` contains the complete Lite installer scripts, default configuration, the official ReShade Add-on DLL, and the RenoDX Add-on covered by explicit redistribution permission. The Lite packages no longer bundle any other ReShade shader packages; the installer can download them directly from the official ReShade, Lilium HDR shaders, and SweetFX upstream sources. FPS Unlocker and OptiScaler are likewise downloaded from official sources or selected manually. The existing contents and packaging method of local Full packages remain unchanged.
+Lite packages are assembled directly by the build script: installer scripts live in `tools/FpsUnlockInstaller/`, package feedback and component metadata live in `assets/FpsUnlockPackage/`, and runtime resources and default configuration live in `SharedResources/`. Lite packages no longer bundle any other ReShade shader packages; the installer can download them directly from the official ReShade, Lilium HDR shaders, and SweetFX upstream sources. FPS Unlocker and OptiScaler are likewise downloaded from official sources or selected manually. The existing contents and packaging method of local Full packages remain unchanged.
 
 The two first-party DLLs are build outputs and are not committed to the repository. To generate the same FPS Unlock Lite ZIP as GitHub Actions, run the following command on Windows:
 
@@ -75,12 +75,12 @@ Other DLL injection tools may also be used, but they must support stable ordered
 
 Recommended loading order:
 
-1. `Dx11FsrBridge.dll`
-2. `OptiScaler.dll`
-3. `AntiPlayerMosaic.dll` (optional)
-4. `ReShade64.dll` (optional)
+1. `ReShade64.dll` (optional; must load first)
+2. `Dx11FsrBridge.dll`
+3. `OptiScaler.dll`
+4. `AntiPlayerMosaic.dll` (optional)
 
-When using only the upscaling bridge, the first two items must remain in this order: load Bridge first, then let [OptiScaler](https://github.com/optiscaler/OptiScaler), or a comparable tool, scan and take over the standard FSR2 exports at startup. Bridge does not directly load, modify, or bundle OptiScaler. Backend selection, FSR3/FSR4 models, and other OptiScaler settings are managed by the user's own tool installation.
+When ReShade is enabled, it must load first. Then keep Bridge before [OptiScaler](https://github.com/optiscaler/OptiScaler), or a comparable tool, so it can scan and take over the standard FSR2 exports at startup. This order avoids an initialization compatibility issue with FSR4 on NVIDIA GPUs. Bridge does not directly load, modify, or bundle OptiScaler. Backend selection, FSR3/FSR4 models, and other OptiScaler settings are managed by the user's own tool installation.
 
 OptiScaler and ReShade runtime configurations are located in their respective component directories. OptiScaler DLL and log paths, as well as ReShade shader, texture, preset, and screenshot paths, use relative paths. This prevents third-party configuration-saving logic from incorrectly transcoding installation paths that contain Chinese characters. Only the game-directory `[INSTALL] BasePath`, which locates the external ReShade directory, must use a dynamically generated absolute path when installed across directories or drives.
 
@@ -95,9 +95,7 @@ cmake -S .\Dx11FsrBridge -B .\build-package-bridge -G "Visual Studio 17 2022" -A
 cmake --build .\build-package-bridge --config Release
 ```
 
-The DLL and `Dx11FsrBridge.release.ini` are written to `build-package-bridge\Release`. The release configuration requires the repository's `Dx11FsrBridge\third_party` directory, which contains FSR2-compatible ABI headers and the Microsoft Detours build dependency.
-
-`DX11FSRBRIDGE_ENABLE_FSR31_EXPERIMENTAL`, `DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL`, and related CMake options are experimental only and are not part of the supported release path.
+The DLL is written to `build-package-bridge\Release`; configuration files are generated into the release package by `Build-OnlineInstaller.ps1` from the current component resources. The release configuration requires the repository's `Dx11FsrBridge\third_party` directory, which contains FSR2-compatible ABI headers and the Microsoft Detours build dependency.
 
 ## Logs and Issue Feedback
 

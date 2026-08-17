@@ -25,7 +25,7 @@
 
 ## Lite 发布包
 
-`GenshinOneClick/` 包含 Lite 安装器的完整脚本、默认配置、官方 ReShade Add-on DLL，以及获得明确再分发授权的 RenoDX Add-on。Lite 包不再内置其他 ReShade 效果库；安装时可由脚本直接从 ReShade、Lilium HDR shaders 和 SweetFX 的官方上游下载。FPS Unlocker 与 OptiScaler 同样由安装器从官方来源下载或要求用户手动选择。本地 Full 包的既有内置内容和打包方式不变。
+Lite 包由构建脚本直接组装：安装器脚本位于 `tools/FpsUnlockInstaller/`，反馈与组件清单位于 `assets/FpsUnlockPackage/`，运行资源和默认配置位于 `SharedResources/`。Lite 包不再内置其他 ReShade 效果库；安装时可由脚本直接从 ReShade、Lilium HDR shaders 和 SweetFX 的官方上游下载。FPS Unlocker 与 OptiScaler 同样由安装器从官方来源下载或要求用户手动选择。本地 Full 包的既有内置内容和打包方式不变。
 
 两个自有 DLL 是编译产物，不提交到仓库。要生成与 GitHub Actions 相同的 FPS Unlock Lite ZIP，请在 Windows 上运行：
 
@@ -75,12 +75,12 @@ cmake --build .\build-fufu-plugin --config Release
 
 推荐加载顺序：
 
-1. `Dx11FsrBridge.dll`
-2. `OptiScaler.dll`
-3. `AntiPlayerMosaic.dll`（可选）
-4. `ReShade64.dll`（可选）
+1. `ReShade64.dll`（可选，必须最先加载）
+2. `Dx11FsrBridge.dll`
+3. `OptiScaler.dll`
+4. `AntiPlayerMosaic.dll`（可选）
 
-仅使用超分桥接时，前两项必须保持该顺序：Bridge 先加载，随后由 [OptiScaler](https://github.com/optiscaler/OptiScaler)（或同类工具）在启动时扫描标准 FSR2 导出并接管。Bridge 不直接加载、修改或捆绑 OptiScaler；后端选择、FSR3/FSR4 模型和其他 OptiScaler 配置均由用户自己的工具安装负责。
+启用 ReShade 时必须首先加载；随后保持 Bridge 在 [OptiScaler](https://github.com/optiscaler/OptiScaler)（或同类工具）之前，使其在启动时扫描标准 FSR2 导出并接管。该顺序避免 NVIDIA 显卡使用 FSR4 时的初始化兼容性问题。Bridge 不直接加载、修改或捆绑 OptiScaler；后端选择、FSR3/FSR4 模型和其他 OptiScaler 配置均由用户自己的工具安装负责。
 
 OptiScaler 和 ReShade 的运行配置位于各自组件目录。OptiScaler 的 DLL 与日志路径、ReShade 的着色器、纹理、Preset 和截图路径均使用相对路径，避免安装目录含中文时被第三方配置保存逻辑错误转码。只有游戏目录中用于定位外置 ReShade 目录的 `[INSTALL] BasePath` 在跨目录或跨盘安装时必须使用动态生成的绝对路径。
 
@@ -95,9 +95,7 @@ cmake -S .\Dx11FsrBridge -B .\build-package-bridge -G "Visual Studio 17 2022" -A
 cmake --build .\build-package-bridge --config Release
 ```
 
-生成的 DLL 与 `Dx11FsrBridge.release.ini` 会位于 `build-package-bridge\Release`。发布配置需要仓库内的 `Dx11FsrBridge\third_party` 目录，其中包含 FSR2 兼容 ABI 头文件和 Microsoft Detours 构建依赖。
-
-`DX11FSRBRIDGE_ENABLE_FSR31_EXPERIMENTAL`、`DX11FSRBRIDGE_ENABLE_OPTISCALER_NGX_EXPERIMENTAL` 等 CMake 选项仅用于实验，不属于正式运行链路。
+生成的 DLL 会位于 `build-package-bridge\Release`；配置由 `Build-OnlineInstaller.ps1` 从当前资源生成到发行包。发布配置需要仓库内的 `Dx11FsrBridge\third_party` 目录，其中包含 FSR2 兼容 ABI 头文件和 Microsoft Detours 构建依赖。
 
 ## 日志与问题反馈
 

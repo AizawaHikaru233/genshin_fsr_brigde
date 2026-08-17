@@ -49,10 +49,10 @@ Bridge 将原神渲染精度菜单扩展为 `0.2 / 0.3 / 0.4 / 0.5 / 0.6 / 0.7 /
 
 DLL 加载顺序固定为：
 
-1. `Dx11FsrBridge.dll`
-2. `OptiScaler.dll`
-3. `AntiPlayerMosaic.dll`
-4. `ReShade64.dll`
+1. `ReShade64.dll`
+2. `Dx11FsrBridge.dll`
+3. `OptiScaler.dll`
+4. `AntiPlayerMosaic.dll`
 
 安装器不会读取、修改或清理游戏登录信息，也不会写入原神登录注册表。已有 `fps_config.json` 时，只更新游戏路径、帧率上限和 DLL 列表，其他兼容设置会尽量保留。
 

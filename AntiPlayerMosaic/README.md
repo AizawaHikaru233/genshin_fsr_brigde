@@ -26,7 +26,7 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
-输出 DLL 位于 `build\Release`。`scan_test` 是离线签名扫描辅助程序，不是运行时依赖。
+输出 DLL 位于 `build\Release`。
 
 ## 边界
 
