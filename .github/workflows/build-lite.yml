@@ -12,6 +12,10 @@ on:
         description: Release tag to create or update when publishing (for example v1.0.9)
         required: false
         type: string
+      release_notes:
+        description: Release notes body (Markdown). Used as-is when publishing.
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -51,6 +55,7 @@ jobs:
         with:
           tag_name: ${{ inputs.release_tag }}
           target_commitish: ${{ github.sha }}
-          generate_release_notes: true
+          generate_release_notes: false
+          body: ${{ inputs.release_notes }}
           files: |
             dist/github-release/GenshinFSRBridge.Lite_v*.zip
