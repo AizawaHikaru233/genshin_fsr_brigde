@@ -75,6 +75,10 @@ function Build-PackageComponents {
 function Assert-OptiConfigMatchesRuntime {
     $configPath = Join-Path $optiRuntime 'OptiScaler.ini'
     $runtimePath = Join-Path $optiRuntime 'OptiScaler.dll'
+    if (-not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
+        Write-Host 'OptiScaler.dll 未随仓库提供（Lite 包不内置，安装时从上游下载），跳过 OptiScaler 运行时版本校验。'
+        return
+    }
     $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
     $marker = [regex]::Match($config, '(?m)^;\s*FSR Bridge OptiScalerRuntimeVersion\s*=\s*([^\r\n;]+)\s*$')
     if (-not $marker.Success) {
