@@ -460,6 +460,57 @@ static std::string g_route_arch_name;
 static std::string g_route_sdk_path;
 static bool g_route_use_402c = false;
 static std::string g_route_sim_mark; // 第一百二十六轮：模拟分类标记（测试用）
+
+// 第一百三十三轮：OptiScaler 输出定向修复——XeSS/DLSS 的 jitter 需 ≤±0.5（像素/归一化），
+// FSR 输出保持原样（互不干扰）。运行时按 OptiScaler.ini 的 Dx11Upscaler/Dx12Upscaler 判定
+// （用户菜单切换会写回 INI；限频刷新）。
+enum class OptiOutput
+{
+    Fsr,   // FSR 系（fsr21/22/31/31_12 等）——不干预
+    XeSS,  // xess / xess_12
+    Dlss,  // dlss
+    Unknown
+};
+static std::atomic<OptiOutput> g_opti_output { OptiOutput::Unknown };
+static std::atomic_uint64_t g_opti_output_check_tick { 0 };
+
+static bool contains_ci(const std::wstring &hay, const wchar_t *needle); // 定义在后（classify 区）
+
+static OptiOutput read_optiscaler_output_state()
+{
+    OptiOutput out = OptiOutput::Fsr; // 默认 FSR（不干预）
+    const std::filesystem::path opti_ini =
+        g_module_dir.parent_path() / L"OptiScaler" / L"OptiScaler.ini";
+    if (!std::filesystem::exists(opti_ini))
+        return out;
+    wchar_t buf[64] {};
+    const auto ini_path = opti_ini.c_str();
+    // 当前 Bridge 的 dx11on12 输出由 Dx12Upscaler 决定（用户菜单切换写回该键）；
+    // Dx11Upscaler 不参与判定。
+    GetPrivateProfileStringW(L"Upscalers", L"Dx12Upscaler", L"", buf,
+                             static_cast<DWORD>(std::size(buf)), ini_path);
+    const std::wstring sel = buf;
+    if (contains_ci(sel, L"xess"))
+        out = OptiOutput::XeSS;
+    else if (contains_ci(sel, L"dlss"))
+        out = OptiOutput::Dlss;
+    return out;
+}
+
+// 限频刷新（每 500ms——切换输出后快速跟随，避免 FSR/XeSS 参数互相污染）
+static OptiOutput opti_output_current()
+{
+    const std::uint64_t now = GetTickCount64();
+    const std::uint64_t last = g_opti_output_check_tick.load(std::memory_order_relaxed);
+    if (last == 0 || now - last >= 500)
+    {
+        g_opti_output_check_tick.store(now, std::memory_order_relaxed);
+        const OptiOutput fresh = read_optiscaler_output_state();
+        g_opti_output.store(fresh, std::memory_order_relaxed);
+        return fresh;
+    }
+    return g_opti_output.load(std::memory_order_relaxed);
+}
 // 第一百一十轮：显卡路由（定义于 initialize 之前；设备创建 hook 先于定义处使用，需前置声明）
 static void apply_adapter_route(std::uint32_t vendor, std::uint32_t device, const std::wstring &desc,
                                 const char *source);
@@ -3118,11 +3169,12 @@ void log_line(const std::string &line)
         "failed", "failure", "error", "invalid", "mismatch", "exception",
         "unavailable", "unresolved", "unsupported", "missing", "refusing"
     };
-    static constexpr std::array<std::string_view, 7> basic_terms {
+    static constexpr std::array<std::string_view, 9> basic_terms {
         // 第一百二十轮：正式版日志精简——只保留：接管结果(ffx12_result/failed)、
         // 显卡型号(ffx12_gpu)、SDK 路径(ffx12_sdk)、FSR 实际版本(ffx12_version)、渲染精度菜单状态。
         // hook 数据状态（draw_hook_active/iat_scan/fsr2_translation_candidate/ffx12_path 等）一律不写。
         "ffx12_gpu", "ffx12_sdk", "ffx12_version", "ffx12_result", "ffx12_failed",
+        "jit_norm", "jitter_px",
         "render_scale_menu hook_ready", "render_scale_menu render_scale_written"
     };
     const bool startup_marker = line.starts_with("Dx11FsrBridge active");
@@ -9932,10 +9984,33 @@ bool try_fsr2_translation_draw(
                 }
                 st->prev_jx = jit_src_x;
                 st->prev_jy = jit_src_y;
+                // 第一百三十三轮：OptiScaler 输出定向修复——XeSS/DLSS 的 jitter 需 ≤±0.5
+                // （xessD3D12Execute 报 Invalid Argument：jitterOffset 超界）。仅 XeSS/DLSS
+                // 激活时把像素 jitter 夹紧到 ±0.5（子像素），FSR 输出保持原样（互不干扰）。
+                const OptiOutput opti_out = opti_output_current();
+                const bool xess_or_dlss = opti_out == OptiOutput::XeSS || opti_out == OptiOutput::Dlss;
+                // 第一百三十三轮：XeSS/DLSS 定向——jitter 夹紧 ±0.5（xessD3D12Execute 校验，
+                // 静态 AA 生效）；motion 方向/缩放/depth 归一化均实测无效果（OptiScaler 的
+                // XeSS 输出链路内部限制）→ 全部回退默认。FSR 输出完全不读取此分支（参数隔离）。
+                ffx12::set_motion_flip(1.0f);
+                ffx12::set_depth_scale(1.0f);
+                if (xess_or_dlss)
+                {
+                    // XeSS/DLSS 定向——jitter 需 ≤±0.5（xessD3D12Execute 校验）。
+                    // FSR 输出完全不读取此分支（参数隔离：opti_out 判定限频 500ms，切换后快速跟随）。
+                    auto clamp_half = [](float v) -> float {
+                        if (v > 0.5f) return 0.5f;
+                        if (v < -0.5f) return -0.5f;
+                        return v;
+                    };
+                    sdk_in.jitter_x = clamp_half(sdk_in.jitter_x);
+                    sdk_in.jitter_y = clamp_half(sdk_in.jitter_y);
+                }
                 // motion scale：FSR2 约定 = ±render 尺寸，符号 = 游戏原生运动方向约定。
                 // 2026-08-25 依据游戏 accumulate 反汇编（history_uv = UV − mv_g, mv_g=正向）：
                 // FSR2 需要反向运动 → 本桥 −sign 解码已反向 → scale 必须 +renderSize（Fsr2MotionVectorScaleMode=1）。
                 const float mv_sign = g_config.fsr2_positive_motion_vector_scale ? 1.0f : -1.0f;
+                // motionScale：FSR2/DLSS/XeSS 均按 render 尺寸（输入分辨率像素；display 尺寸已试无变化）。
                 sdk_in.motion_scale_x = mv_sign * static_cast<float>(sdk_in.render_w) *
                                         g_config.ffx12_motion_scale;
                 sdk_in.motion_scale_y = mv_sign * static_cast<float>(sdk_in.render_h) *

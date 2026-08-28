@@ -53,6 +53,8 @@ void set_sdk_dll_path(const wchar_t *path);
 //    后端用 compute pass 解码为 R16G16_FLOAT 再交给 FSR2（否则 FSR2 按 UNORM 读出 0.5px 假位移）。
 void set_depth_inverted(bool inverted);
 void set_decode_motion(bool decode);
+void set_motion_flip(float flip); // 第一百三十三轮：XeSS/DLSS 定向——motion 方向翻转（±1）
+void set_depth_scale(float scale); // 第一百三十三轮：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
 // 运动矢量是否已经包含投影 jitter。仅在已包含时启用 SDK 的 jitter cancellation。
 void set_motion_vectors_jittered(bool jittered);
 // 输入颜色为 HDR（10-bit 线性 HDR 管线）时置 true（FSR2 需按 HDR 处理颜色/曝光）。

@@ -206,6 +206,9 @@ ComPtr<ID3D11UnorderedAccessView> g_reactive_share_uav;
 // 运行期配置（桥 load_config 时设置；启动后固定）
 bool g_depth_inverted = true;   // 游戏深度逆方向（0=far）—— 2026-08-23 采样验证
 bool g_decode_motion = true;    // 游戏 motion 为 R10G10B10A2 平方编码
+float g_motion_flip = 1.0f;     // 第一百三十三轮：XeSS/DLSS 定向——motion 方向翻转（默认 +1 = FSR 方向）
+float g_depth_scale = 1.0f;     // 第一百三十三轮：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
+ComPtr<ID3D11Buffer> g_motion_cb;   // MotionParams 常数缓冲（b0: g_flip）
 bool g_motion_vectors_jittered = false; // 游戏配置：motion 是否已包含投影 jitter
 bool g_hdr_input = true;        // 游戏 10-bit HDR 管线（useRealType）
 bool g_auto_exposure = true;    // 自动曝光（OptiScaler 日志 initFlags 实证：AutoExposure=true）
@@ -346,13 +349,20 @@ void main(uint3 id : SV_DispatchThreadID)
 // R32G8X24 不能建 D3D11 SHARED/NTHANDLE 共享纹理（CreateTexture2D E_INVALIDARG，probe 实证），
 // 因此必须先在 D3D11 侧把深度提取为可共享的 R32_FLOAT（恰好是 FFX12 期望的深度 SRV 格式）。
 // 提取在游戏的 immediate context 上执行（注入 compute pass，样式同旧 Mode-2 翻译层）。
+// 第一百三十三轮：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]；游戏逆深度实际 [0,~0.03]，
+// 不归一化则 XeSS 深度感知/低分辨率 MV 上采样失真 → 视角移动残影。b0: g_depth_scale，XeSS 时 >1）。
 static const char *g_depth_extract_hlsl = R"(
+cbuffer DepthParams : register(b0)
+{
+    float g_depth_scale;
+    float3 g_pad;
+};
 Texture2D<float4> in_depth : register(t0);
 RWTexture2D<float> out_depth : register(u0);
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
-    out_depth[id.xy] = in_depth.Load(int3(id.xy, 0)).x;
+    out_depth[id.xy] = in_depth.Load(int3(id.xy, 0)).x * g_depth_scale;
 }
 )";
 
@@ -362,6 +372,11 @@ void main(uint3 id : SV_DispatchThreadID)
 // 用 compute 直接解码：t0=游戏 motion（R10G10B10A2 平方编码）→ u0=共享 R16G16_FLOAT
 // （probe 已验证该格式可跨 API 共享；与深度提取同机制，写入确定性可控）。
 static const char *g_motion_decode_d11_hlsl = R"(
+cbuffer MotionParams : register(b0)
+{
+    float g_flip; // 第一百三十三轮：XeSS/DLSS 定向——motion 方向翻转（XeSS-SR 约定 prev→curr，与 FSR 相反）
+    float3 g_pad;
+};
 Texture2D<float4> in_mv : register(t0);
 RWTexture2D<float2> out_mv : register(u0);
 RWTexture2D<float> out_reactive : register(u1);
@@ -370,7 +385,7 @@ void main(uint3 id : SV_DispatchThreadID)
 {
     float4 c = in_mv.Load(int3(id.xy, 0));
     float2 d = c.rg - 0.498039;
-    float2 mv = -sign(d) * (4.0 * d * d);
+    float2 mv = -sign(d) * (4.0 * d * d) * g_flip;
     #if defined(FFX12_MOTION_DEADZONE)
     // 第一百零贰轮：静止死区——|mv| 低于阈值归零，让 FSR 进入静止锁定（lock），
     // 消除静止时残余 motion 驱动的时间累积网格（竖纹/云刺）。阈值 0.0005 UV ≈ 1px@1920。
@@ -1724,6 +1739,14 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
         }
         if (g_depth_src_srv)
         {
+            if (g_motion_cb)
+            {
+                // 复用 16B 常数缓冲（b0）：depth 提取用 g_depth_scale（XeSS 激活时归一化 [0,1]）
+                const float dscale[4] = {g_depth_scale, 0.0f, 0.0f, 0.0f};
+                game_context->UpdateSubresource(g_motion_cb.Get(), 0, nullptr, dscale, 0, 0);
+                ID3D11Buffer *cbs[] = {g_motion_cb.Get()};
+                game_context->CSSetConstantBuffers(0, 1, cbs);
+            }
             game_context->CSSetShader(g_depth_extract_cs.Get(), nullptr, 0);
             ID3D11ShaderResourceView *srvs[] = { g_depth_src_srv.Get() };
             game_context->CSSetShaderResources(0, 1, srvs);
@@ -1754,6 +1777,13 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
         }
         if (g_motion_src_srv)
         {
+            if (g_motion_cb)
+            {
+                const float flip[4] = {g_motion_flip, 0.0f, 0.0f, 0.0f};
+                game_context->UpdateSubresource(g_motion_cb.Get(), 0, nullptr, flip, 0, 0);
+                ID3D11Buffer *cbs[] = {g_motion_cb.Get()};
+                game_context->CSSetConstantBuffers(0, 1, cbs);
+            }
             game_context->CSSetShader(
                 g_motion_deadzone && g_motion_decode_dz_cs ? g_motion_decode_dz_cs.Get()
                                                            : g_motion_decode_cs.Get(),
@@ -2057,6 +2087,15 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
         }
         if (setup_ok)
         {
+            // 第一百三十三轮：motion 解码 CS 常数缓冲（b0: g_flip——XeSS/DLSS 方向翻转）
+            D3D11_BUFFER_DESC mcb {};
+            mcb.ByteWidth = 16;
+            mcb.Usage = D3D11_USAGE_DEFAULT;
+            mcb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            const float mcb_init[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+            D3D11_SUBRESOURCE_DATA mcb_data { mcb_init, 0, 0 };
+            if (FAILED(g_d11dev->CreateBuffer(&mcb, &mcb_data, &g_motion_cb)))
+                g_motion_cb.Reset();
             g_gpu_interop_ready = true;
             g_shared_fence_value = 0;
             sdk_note(L"gpu interop ready stage=init (NT shared handles + D3D11.4 fence)");
@@ -2511,6 +2550,16 @@ void set_depth_inverted(bool inverted)
 void set_decode_motion(bool decode)
 {
     g_decode_motion = decode;
+}
+
+void set_motion_flip(float flip) // 第一百三十三轮：XeSS/DLSS 定向——motion 方向翻转（±1）
+{
+    g_motion_flip = flip;
+}
+
+void set_depth_scale(float scale) // 第一百三十三轮：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
+{
+    g_depth_scale = scale;
 }
 
 void set_motion_vectors_jittered(bool jittered)
