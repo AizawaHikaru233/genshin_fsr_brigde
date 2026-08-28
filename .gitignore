@@ -58,6 +58,7 @@ vendor/
 hutao*.disasm.txt
 tools/*
 !tools/Test-FpsUnlockLocalization.ps1
+!tools/Update-UpstreamComponents.ps1
 !tools/FpsUnlockInstaller/
 !tools/FpsUnlockInstaller/**
 Dx11FsrBridge/Dx11FsrBridge.server-debug.ini
