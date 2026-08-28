@@ -1934,6 +1934,13 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
 
 } // namespace
 
+// 第一百三十七轮：OptiScaler 存在检测——加载 OptiScaler 即需要它接管桥的 FFX 输入。
+// 标准加载名（OptiScaler.dll）；改名加载场景可扩展模块扫描。
+static bool is_optiscaler_loaded()
+{
+    return ::GetModuleHandleW(L"OptiScaler.dll") != nullptr;
+}
+
 bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
 {
     if (g_active.load(std::memory_order_relaxed))
@@ -2147,6 +2154,9 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
     else
     {
         HMODULE target = nullptr;
+        // 第一百二十三轮起：候选缓存优先（preload 的干净句柄，防 OptiScaler hook 劫持 err=18），
+        // 缓存未命中才 LoadLibrary 兜底（Auto402c=0 手动路径场景：与 OptiScaler 模块对齐）。
+        // 第一百三十七轮曾尝试统一 LoadLibrary——破坏手动接管，回滚恢复本逻辑。
         for (const PreloadEntry &e : g_preloaded)
         {
             if (e.path == sdk_dll_path)

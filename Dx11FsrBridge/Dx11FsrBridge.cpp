@@ -13546,8 +13546,13 @@ static void apply_adapter_route(std::uint32_t vendor, std::uint32_t device, cons
                               (g_module_dir / L"Dx11FsrBridge.ini").c_str()) != 0;
     // 第一百二十八轮修正：402c 组 = RDNA2 + RDNA3/3.5 核显（官方 FSR4 仅 dGPU 支持）
     // + NVIDIA 16-50 + Intel Arc；RDNA3/RDNA4 dGPU 走默认 4.1.1（官方支持）。
-    const bool use_402c = auto_402c && (arch == GpuArch::Rdna2 || arch == GpuArch::Rdna3Igpu ||
-                                        arch == GpuArch::Nvidia16_50 || arch == GpuArch::IntelArc);
+    // 第一百三十八轮：加载 OptiScaler 即需要它接管——自动等效手动方案（不启用 402c 自动路由，
+    // 走 Ffx12DllPath 默认路径 → init 缓存未命中 → LoadLibrary 与 OptiScaler 的 provider 模块对齐
+    // → FFX 输入接管；Auto402c=1 下同样生效，无需手动关路由）。
+    const bool opti_present = ::GetModuleHandleW(L"OptiScaler.dll") != nullptr;
+    const bool use_402c = !opti_present && auto_402c &&
+                          (arch == GpuArch::Rdna2 || arch == GpuArch::Rdna3Igpu ||
+                           arch == GpuArch::Nvidia16_50 || arch == GpuArch::IntelArc);
     char vendor_hex[16] {};
     std::snprintf(vendor_hex, sizeof(vendor_hex), "0x%04X", vendor);
     const std::string vendor_label = vendor_hex;
@@ -13577,6 +13582,8 @@ static void apply_adapter_route(std::uint32_t vendor, std::uint32_t device, cons
     g_route_vendor_label = vendor_label;
     g_route_arch_name = gpu_arch_name(arch);
     g_route_use_402c = use_402c;
+    // 第一百三十七轮曾尝试 OptiScaler 路径覆盖（统一为 OptiScaler 目录）——破坏手动接管，
+    // 已回滚；OptiScaler 接管方案另议（手动关自动路由 Auto402c=0 可用）。
     g_route_sdk_path = narrow(g_config.ffx12_dll_path.c_str());
     g_route_applied = true;
     // 第一百二十一轮：焦点框由首次接管成功/失败统一输出（保证 显卡/SDK/版本 三行相邻）

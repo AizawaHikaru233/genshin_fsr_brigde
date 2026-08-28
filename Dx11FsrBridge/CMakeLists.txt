@@ -45,9 +45,6 @@ if(DX11FSRBRIDGE_RELEASE_RUNTIME)
     )
 endif()
 
-# Debug 构建静态链接 CRT（/MTd）：目标机无需安装 VS 调试运行库即可加载
-set_property(TARGET Dx11FsrBridge PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-
 target_compile_features(Dx11FsrBridge PRIVATE cxx_std_20)
 if(MSVC)
     target_compile_options(Dx11FsrBridge PRIVATE /utf-8 /EHsc)
