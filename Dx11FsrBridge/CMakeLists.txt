@@ -1,21 +1,38 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(Dx11FsrBridge LANGUAGES CXX RC)
+project(Dx11FsrBridge LANGUAGES C CXX RC)
 
 option(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL "Build the standard FSR2 translation exports" OFF)
 option(DX11FSRBRIDGE_RELEASE_RUNTIME "Build the release runtime" ON)
+option(DX11FSRBRIDGE_BUILD_FAMILY_TEST "Build the Fsr2FamilyTakeover state-machine test" OFF)
+option(DX11FSRBRIDGE_BUILD_GPU_INTEROP_PROBE "Build the D3D12-owned shared-resource interop probe" OFF)
+option(DX11FSRBRIDGE_BUILD_DX11ON12_SWAPCHAIN_TEST "Build the D3D11On12 flip-swapchain end-to-end test" OFF)
+
+# The bridge deliberately uses the deployed ffx-api runtime provider.  The
+# static open-SDK host was tested in-game and produced a black output, while
+# this provider has a known-good render path and exposes 2.3.4/3.1.5/4.1.1.
+set(FFX_API_INCLUDE_ROOT
+    "D:/DLSSG2FSR4/dependencies/FidelityFX-SDK/ffx-api/include/ffx_api"
+    CACHE PATH "Path to the FidelityFX ffx-api include directory")
+if(NOT EXISTS "${FFX_API_INCLUDE_ROOT}/ffx_api.h")
+    message(FATAL_ERROR "FidelityFX ffx-api headers were not found: ${FFX_API_INCLUDE_ROOT}")
+endif()
 
 add_library(Dx11FsrBridge SHARED
     Dx11FsrBridge.cpp
     Dx11FsrBridge.rc
     RenderScaleMenu.cpp
+    Fsr2FamilyTakeover.cpp
+    Il2CppCallSiteHook.cpp
+    Ffx12Backend.cpp
 )
 
+# 第一百零六轮：旧方案彻底隔离——
+#  Fsr2TranslationLayer（旧 OptiScaler+FRS2 翻译层）与 Dx11On12Swapchain（On12 引导）
+#  不再编译进 DLL；OptiScaler 未来将以新 ffx12 链路为基底重新接入。
+#  宏保留（sdk234 接管块在该宏内），但不再编译翻译层模块。
 if(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
-    target_sources(Dx11FsrBridge PRIVATE
-        Fsr2TranslationLayer.cpp
-        Fsr2TranslationLayer.def
-    )
+    # Fsr2TranslationLayer.cpp / Fsr2TranslationLayer.def 已从构建中移除（旧方案隔离）。
     target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=1)
 endif()
 
@@ -40,10 +57,52 @@ target_compile_definitions(Dx11FsrBridge PRIVATE
 target_include_directories(Dx11FsrBridge PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/detours"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
+    "${FFX_API_INCLUDE_ROOT}"
 )
 target_link_libraries(Dx11FsrBridge PRIVATE
     d3d11
+    d3d12
     d3dcompiler
     dxgi
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/detours/detours.lib"
 )
+
+if(DX11FSRBRIDGE_BUILD_FAMILY_TEST)
+    add_executable(Fsr2FamilyTakeoverTest
+        Fsr2FamilyTakeoverTest.cpp
+        Fsr2FamilyTakeover.cpp
+    )
+    target_compile_features(Fsr2FamilyTakeoverTest PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(Fsr2FamilyTakeoverTest PRIVATE /utf-8 /W3)
+    endif()
+    target_compile_definitions(Fsr2FamilyTakeoverTest PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        UNICODE
+        _UNICODE
+    )
+endif()
+
+if(DX11FSRBRIDGE_BUILD_GPU_INTEROP_PROBE)
+    add_executable(GpuInteropProbe GpuInteropProbe.cpp)
+    target_compile_features(GpuInteropProbe PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(GpuInteropProbe PRIVATE /utf-8 /W3)
+    endif()
+    target_compile_definitions(GpuInteropProbe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(GpuInteropProbe PRIVATE d3d11 d3d12 dxgi)
+endif()
+
+if(DX11FSRBRIDGE_BUILD_DX11ON12_SWAPCHAIN_TEST)
+    add_executable(Dx11On12SwapchainTest
+        Dx11On12SwapchainTest.cpp
+        Dx11On12Swapchain.cpp
+    )
+    target_compile_features(Dx11On12SwapchainTest PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(Dx11On12SwapchainTest PRIVATE /utf-8 /W3)
+    endif()
+    target_compile_definitions(Dx11On12SwapchainTest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    target_link_libraries(Dx11On12SwapchainTest PRIVATE d3d11 d3d12 dxgi)
+endif()

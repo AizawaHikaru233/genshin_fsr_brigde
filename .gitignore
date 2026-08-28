@@ -76,3 +76,22 @@ vendor/OptiScaler-v0.9.3-release/
 .vscode/
 Thumbs.db
 Desktop.ini
+
+# FSR4/INT8 research trees and local test artifacts (not release sources)
+OptiScaler-src/
+Amdxc64Proxy/
+RuntimeProbe/
+enumadapters/
+gpuroutetest/
+versionprobe2/
+ffx202-dl/
+Dx11FsrBridge/bin/
+*.raw
+*.i
+scan-exe.mjs
+.agent-teams/
+.team-audit/
+AI智能体任务规划*.md
+bridge-sdk234-param-audit.md
+fsr2_sdk_params_enumeration.md
+reconcile-threeway-gap.md
