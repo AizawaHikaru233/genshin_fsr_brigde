@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$GamePath,
     [switch]$NoShortcut,
     [switch]$ResumeUpdateAll,

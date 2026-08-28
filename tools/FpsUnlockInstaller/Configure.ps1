@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$GamePath,
     [int]$FpsTarget = 0,
     [switch]$DisableOptiScaler,

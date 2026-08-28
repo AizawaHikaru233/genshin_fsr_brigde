@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$WorkspaceRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $PSCommandPath) '..')),
     [ValidateSet('All', 'OptiScaler', 'Dlss', 'ReShade', 'FpsUnlocker')]

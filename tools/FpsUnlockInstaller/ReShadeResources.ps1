@@ -1,4 +1,4 @@
-Set-StrictMode -Version Latest
+﻿Set-StrictMode -Version Latest
 
 function Get-ReShadeResourceSpec {
     # 版本基线优先取自包内 upstream-versions.json（由 tools\Update-UpstreamComponents.ps1 生成并同步）；
