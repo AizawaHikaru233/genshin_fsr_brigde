@@ -155,19 +155,6 @@ else
 end
 install.log("OptiScaler 运行目录: " .. opti_dir)
 
--- 第一百三十一轮：402c 组 → 移走 4.1.1 标准名（OptiScaler FFX 输入按名识别 402c 的前提）
-if bridge_uses_402c then
-    local amd_dir = payload_dir .. "\\AMD"
-    local v411 = amd_dir .. "\\amd_fidelityfx_upscaler_dx12.dll"
-    local v411_bak = amd_dir .. "\\amd_fidelityfx_upscaler_dx12.4.1.1.bak"
-    if install.file_exists(v411) and not install.file_exists(v411_bak) then
-        install.move_file(v411, v411_bak)
-        install.log("402c 组：已移走 4.1.1 标准名 -> .4.1.1.bak（OptiScaler FFX 输入将按名识别 FSR4.0.2c）")
-    else
-        install.log("402c 组：4.1.1 已移走或不存在，跳过")
-    end
-end
-
 install.set_progress(82, "正在写入插件配置")
 install.write_config(plugin_dir, {
     General = {

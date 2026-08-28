@@ -13540,24 +13540,75 @@ void initialize()
 #endif
     load_config();
 
-    // 第一百二十轮：多 GPU 环境下以游戏实际运行的显卡为准——路由不再用 EnumAdapters1(0)
-    // （第一个适配器可能不是游戏渲染 GPU），全部由 D3D11 设备创建 hook 的
-    // route_from_d3d11_device（ID3D11Device→IDXGIDevice::GetAdapter，即游戏渲染设备关联的
-    // 适配器）决定。
-    // 第一百二十三轮：preload 提前装载**全部候选** provider（默认 4.1.1 + 402c）——本模块
-    // attach 阶段 OptiScaler 尚未注入其 loader hook，此时 LoadLibrary 不被劫持；实测 OptiScaler
-    // 会劫持任意 ffx-api 文件名（含 402c，4070 Super err=18），候选必须全部提前装载缓存，
-    // init_locked 按最终路由路径从缓存取句柄（不再走 LoadLibrary）。
-    ffx12::preload(g_config.ffx12_dll_path.c_str()); // 默认 4.1.1
+    // 第一百二十轮：多 GPU 环境下以游戏实际运行的显卡为准——正式路由由 D3D11 设备创建 hook 的
+    // route_from_d3d11_device（ID3D11Device→IDXGIDevice::GetAdapter，即游戏渲染设备关联的适配器）决定。
+    // 第一百三十一轮：preload **按需加载**——只提前装载路由组对应的唯一标准名 provider：
+    //   402c 组 → AMD\FSR4.0.2c\amd_fidelityfx_upscaler_dx12.dll（标准名 402c）
+    //   默认组 → AMD\amd_fidelityfx_upscaler_dx12.dll（标准名 4.1.1）
+    // 保证进程内"标准名"模块唯一 = 实际使用的 provider → OptiScaler 的 FFX 输入 hook（LdrLoadDll
+    // 按名合并）拿到桥的模块 → 识别。不再预载全部候选（两个标准名并存会让 OptiScaler 按名
+    // 拿到非路由组的那个，FFX 输入断开）。early 判定（EnumAdapters1(0)）仅用于 preload 选择，
+    // 正式路由仍以设备补检为准（两者一致是常态；不一致时该场景退化，不改变路由正确性）。
+    // 本模块 attach 阶段 OptiScaler 尚未注入其 loader hook，此时 LoadLibrary 不被劫持。
     {
-        wchar_t dll402_buf[520] {};
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Dll402c", L"", dll402_buf,
-                                 static_cast<DWORD>(std::size(dll402_buf)),
+        std::uint32_t early_vendor = 0, early_device = 0;
+        std::wstring early_desc;
+        IDXGIFactory1 *early_factory = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&early_factory))) && early_factory)
+        {
+            IDXGIAdapter1 *early_adapter = nullptr;
+            if (SUCCEEDED(early_factory->EnumAdapters1(0, &early_adapter)) && early_adapter)
+            {
+                DXGI_ADAPTER_DESC1 early_desc1 {};
+                if (SUCCEEDED(early_adapter->GetDesc1(&early_desc1)))
+                {
+                    early_vendor = early_desc1.VendorId;
+                    early_device = early_desc1.DeviceId;
+                    early_desc = early_desc1.Description;
+                }
+                early_adapter->Release();
+            }
+            early_factory->Release();
+        }
+        GpuArch early_arch = early_vendor != 0
+            ? classify_gpu_arch(early_vendor, early_device, early_desc)
+            : GpuArch::Other;
+        // 测试键（Ffx12SimulateArch）同样作用于 early 判定（模拟 402c 组验证）
+        wchar_t sim_buf[32] {};
+        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12SimulateArch", L"", sim_buf,
+                                 static_cast<DWORD>(std::size(sim_buf)),
                                  (g_module_dir / L"Dx11FsrBridge.ini").c_str());
-        std::filesystem::path dll402 =
-            dll402_buf[0] != L'\0' ? std::filesystem::path(dll402_buf)
-                                   : (g_module_dir.parent_path() / L"AMD" / L"FSR4.0.2c" / L"amd_fidelityfx_upscaler_dx12.dll");
-        ffx12::preload(dll402.c_str()); // 402c 候选（标准名子目录：OptiScaler FFX 输入可识别）
+        if (sim_buf[0] != L'\0')
+        {
+            const std::wstring sim = sim_buf;
+            if (sim == L"rdna2")
+                early_arch = GpuArch::Rdna2;
+            else if (sim == L"rdna3_igpu")
+                early_arch = GpuArch::Rdna3Igpu;
+            else if (sim == L"nvidia16_50")
+                early_arch = GpuArch::Nvidia16_50;
+            else if (sim == L"intel_arc")
+                early_arch = GpuArch::IntelArc;
+        }
+        const bool early_402c = early_arch == GpuArch::Rdna2 ||
+                                early_arch == GpuArch::Rdna3Igpu ||
+                                early_arch == GpuArch::Nvidia16_50 ||
+                                early_arch == GpuArch::IntelArc;
+        if (early_402c)
+        {
+            wchar_t dll402_buf[520] {};
+            GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Dll402c", L"", dll402_buf,
+                                     static_cast<DWORD>(std::size(dll402_buf)),
+                                     (g_module_dir / L"Dx11FsrBridge.ini").c_str());
+            std::filesystem::path dll402 =
+                dll402_buf[0] != L'\0' ? std::filesystem::path(dll402_buf)
+                                       : (g_module_dir.parent_path() / L"AMD" / L"FSR4.0.2c" / L"amd_fidelityfx_upscaler_dx12.dll");
+            ffx12::preload(dll402.c_str()); // 402c 组：唯一标准名 = 402c
+        }
+        else
+        {
+            ffx12::preload(g_config.ffx12_dll_path.c_str()); // 默认组：唯一标准名 = 4.1.1
+        }
     }
 
     if (!process_matches())
