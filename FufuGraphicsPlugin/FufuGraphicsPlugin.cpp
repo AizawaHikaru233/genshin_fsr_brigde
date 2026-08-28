@@ -456,34 +456,6 @@ bool name_contains_series(
     return false;
 }
 
-bool name_contains_amd_igpu_token(const std::wstring &name)
-{
-    static constexpr const wchar_t *tokens[] {
-        L"740M", L"760M", L"780M", L"840M", L"860M", L"880M", L"890M",
-        L"8040S", L"8050S", L"8060S",
-    };
-    const std::wstring normalized_name = lower(name);
-    for (const wchar_t *token : tokens)
-    {
-        const std::wstring normalized_token = lower(token);
-        const std::size_t token_length = normalized_token.size();
-        std::size_t position = normalized_name.find(normalized_token);
-        while (position != std::wstring::npos)
-        {
-            const bool head_ok = position == 0 || !iswalnum(normalized_name[position - 1]);
-            const std::size_t tail = position + token_length;
-            const bool tail_ok = tail >= normalized_name.size() || !iswalnum(normalized_name[tail]);
-            if (head_ok && tail_ok)
-                return true;
-            position = normalized_name.find(normalized_token, position + 1);
-        }
-    }
-    return false;
-}
-
-// 用 DXGI 枚举全部物理适配器，按 PCI 厂商 ID + 系列前缀做宽松匹配，
-// 多显卡时优先 fp8（RDNA4）。安装脚本受沙箱限制只能做精确全名匹配，
-// 这里是型号变体（Ti/SUPER/Laptop 等）的最终兜底。
 // 第一百三十九轮：增加按 Device ID 精确分类（核显名字通常只是
 // "AMD Radeon(TM) Graphics"，不含型号，名字匹配识别不到——Device ID 才是权威）。
 enum class Fsr4GpuClass { Unsupported, Fp8, Int8 };
@@ -635,8 +607,7 @@ DetectedFsr4Policy detect_fsr4_gpu_policy()
             {
                 if (name_contains_series(name, L"RX", { L"9" }) || name_contains_series(name, L"PRO", { L"W9" }))
                     fp8 = true;
-                else if (name_contains_series(name, L"RX", { L"7" }) || name_contains_series(name, L"PRO", { L"W7" }) ||
-                    name_contains_amd_igpu_token(name))
+                else if (name_contains_series(name, L"RX", { L"7" }) || name_contains_series(name, L"PRO", { L"W7" }))
                     int8 = true;
             }
         }

@@ -18,16 +18,6 @@ local int8_rules = {
     { vendor = "NVIDIA", family = "RTX", series = "40" },
     { vendor = "NVIDIA", family = "RTX", series = "50" },
     { vendor = "AMD", family = "RX", series = "7000" },
-    { vendor = "AMD", name = "740M" },
-    { vendor = "AMD", name = "760M" },
-    { vendor = "AMD", name = "780M" },
-    { vendor = "AMD", name = "8040S" },
-    { vendor = "AMD", name = "8050S" },
-    { vendor = "AMD", name = "8060S" },
-    { vendor = "AMD", name = "840M" },
-    { vendor = "AMD", name = "860M" },
-    { vendor = "AMD", name = "880M" },
-    { vendor = "AMD", name = "890M" },
     { vendor = "Intel", family = "Arc" },
 }
 
