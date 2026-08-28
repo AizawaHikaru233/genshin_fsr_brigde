@@ -6,6 +6,7 @@ local fsr4_force_int8 = "auto"
 local fsr4_mode = "auto"
 local gpu_name = "Unknown"
 local gpu_vendor = "Unknown"
+local bridge_uses_402c = false
 
 local amd_fp8_rules = {
     { vendor = "AMD", family = "RX", series = "9000" },
@@ -20,6 +21,35 @@ local int8_rules = {
     { vendor = "NVIDIA", family = "RTX", series = "50" },
     { vendor = "AMD", family = "RX", series = "7000" },
     { vendor = "AMD", family = "PRO", series = "W7" },
+    { vendor = "AMD", name = "740M" },
+    { vendor = "AMD", name = "760M" },
+    { vendor = "AMD", name = "780M" },
+    { vendor = "AMD", name = "8040S" },
+    { vendor = "AMD", name = "8050S" },
+    { vendor = "AMD", name = "8060S" },
+    { vendor = "AMD", name = "840M" },
+    { vendor = "AMD", name = "860M" },
+    { vendor = "AMD", name = "880M" },
+    { vendor = "AMD", name = "890M" },
+    { vendor = "Intel", family = "Arc" },
+}
+
+-- 第一百三十一轮：桥的 402c 组（自动路由到 4.0.2c 的 GPU）：
+--   AMD RDNA2（RX 6xxx + RDNA2 核显型号）、RDNA3/3.5 核显（740M~890M/80x0S，官方 FSR4 仅支持独显）、
+--   NVIDIA 16-50 系、Intel Arc。
+-- 402c 组安装时必须把 payload\AMD\amd_fidelityfx_upscaler_dx12.dll（4.1.1 标准名）移走，
+-- 使进程内标准名唯一 = FSR4.0.2c\ 子目录的 402c ——否则 OptiScaler 的 FFX 输入 hook 按名
+-- 会拿到 4.1.1，与桥实际加载的 402c 不匹配（FFX 输入通道断开 → OptiScaler 不识别）。
+local bridge_402c_rules = {
+    { vendor = "AMD", family = "RX", series = "6" },
+    { vendor = "AMD", name = "610M" },
+    { vendor = "AMD", name = "660M" },
+    { vendor = "AMD", name = "680M" },
+    { vendor = "NVIDIA", family = "GTX", series = "16" },
+    { vendor = "NVIDIA", family = "RTX", series = "20" },
+    { vendor = "NVIDIA", family = "RTX", series = "30" },
+    { vendor = "NVIDIA", family = "RTX", series = "40" },
+    { vendor = "NVIDIA", family = "RTX", series = "50" },
     { vendor = "AMD", name = "740M" },
     { vendor = "AMD", name = "760M" },
     { vendor = "AMD", name = "780M" },
@@ -76,6 +106,10 @@ local function detect_fsr4_policy()
         install.log("未识别的 GPU 型号，FSR4 策略保持 auto: " .. gpu_name .. " (" .. gpu_vendor .. ")")
     end
     install_dlss_runtime = system.gpu_matches_any(dlss_rules)
+
+    -- 第一百三十一轮：桥 402c 组 → 安装后移走 4.1.1 标准名（详情见 bridge_402c_rules 注释）
+    bridge_uses_402c = system.gpu_matches_any(bridge_402c_rules)
+    install.log("桥 402c 组: " .. tostring(bridge_uses_402c) .. "（" .. gpu_name .. "）")
 end
 
 detect_fsr4_policy()
@@ -120,6 +154,19 @@ else
     return
 end
 install.log("OptiScaler 运行目录: " .. opti_dir)
+
+-- 第一百三十一轮：402c 组 → 移走 4.1.1 标准名（OptiScaler FFX 输入按名识别 402c 的前提）
+if bridge_uses_402c then
+    local amd_dir = payload_dir .. "\\AMD"
+    local v411 = amd_dir .. "\\amd_fidelityfx_upscaler_dx12.dll"
+    local v411_bak = amd_dir .. "\\amd_fidelityfx_upscaler_dx12.4.1.1.bak"
+    if install.file_exists(v411) and not install.file_exists(v411_bak) then
+        install.move_file(v411, v411_bak)
+        install.log("402c 组：已移走 4.1.1 标准名 -> .4.1.1.bak（OptiScaler FFX 输入将按名识别 FSR4.0.2c）")
+    else
+        install.log("402c 组：4.1.1 已移走或不存在，跳过")
+    end
+end
 
 install.set_progress(82, "正在写入插件配置")
 install.write_config(plugin_dir, {

@@ -13477,7 +13477,7 @@ static void apply_adapter_route(std::uint32_t vendor, std::uint32_t device, cons
                                  (g_module_dir / L"Dx11FsrBridge.ini").c_str());
         std::filesystem::path dll402 =
             dll402_buf[0] != L'\0' ? std::filesystem::path(dll402_buf)
-                                   : (g_module_dir.parent_path() / L"AMD" / L"amd_fidelityfx_upscaler_dx12_402c.dll");
+                                   : (g_module_dir.parent_path() / L"AMD" / L"FSR4.0.2c" / L"amd_fidelityfx_upscaler_dx12.dll");
         g_config.ffx12_dll_path = dll402;
         ffx12::set_sdk_dll_path(dll402.c_str());
         ffx12::set_sdk_version("ffx12-fsr4.x"); // 大版本前缀（4.x 命中 4.0.2c），SDK 更新免适配
@@ -13556,8 +13556,8 @@ void initialize()
                                  (g_module_dir / L"Dx11FsrBridge.ini").c_str());
         std::filesystem::path dll402 =
             dll402_buf[0] != L'\0' ? std::filesystem::path(dll402_buf)
-                                   : (g_module_dir.parent_path() / L"AMD" / L"amd_fidelityfx_upscaler_dx12_402c.dll");
-        ffx12::preload(dll402.c_str()); // 402c 候选
+                                   : (g_module_dir.parent_path() / L"AMD" / L"FSR4.0.2c" / L"amd_fidelityfx_upscaler_dx12.dll");
+        ffx12::preload(dll402.c_str()); // 402c 候选（标准名子目录：OptiScaler FFX 输入可识别）
     }
 
     if (!process_matches())
