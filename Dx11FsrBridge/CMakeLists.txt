@@ -47,7 +47,10 @@ endif()
 
 target_compile_features(Dx11FsrBridge PRIVATE cxx_std_20)
 if(MSVC)
-    target_compile_options(Dx11FsrBridge PRIVATE /utf-8 /EHsc)
+    # /EHsc 仅 Debug 配置开（异常展开——排查用，消除 C4530）；
+    # Release 不开（异常展开表使 DLL +184KB；桥自身不抛 C++ 异常，catch 为防御，
+    # 无 /EHsc 时异常直接 terminate（fail-fast），与旧版 762KB 行为一致）。
+    target_compile_options(Dx11FsrBridge PRIVATE /utf-8 $<$<CONFIG:Debug>:/EHsc>)
     if(DX11FSRBRIDGE_RELEASE_RUNTIME)
         target_compile_options(Dx11FsrBridge PRIVATE $<$<CONFIG:Release>:/GL>)
         target_link_options(Dx11FsrBridge PRIVATE $<$<CONFIG:Release>:/LTCG>)
