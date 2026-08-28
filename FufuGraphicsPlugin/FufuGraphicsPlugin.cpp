@@ -484,6 +484,101 @@ bool name_contains_amd_igpu_token(const std::wstring &name)
 // 用 DXGI 枚举全部物理适配器，按 PCI 厂商 ID + 系列前缀做宽松匹配，
 // 多显卡时优先 fp8（RDNA4）。安装脚本受沙箱限制只能做精确全名匹配，
 // 这里是型号变体（Ti/SUPER/Laptop 等）的最终兜底。
+// 第一百三十九轮：增加按 Device ID 精确分类（核显名字通常只是
+// "AMD Radeon(TM) Graphics"，不含型号，名字匹配识别不到——Device ID 才是权威）。
+enum class Fsr4GpuClass { Unsupported, Fp8, Int8 };
+
+// AMD（VEN_1002）FSR4 分类：RDNA4 独显 → FP8；RDNA3/3.5 独显与核显 → INT8。
+// RDNA2 暂不处理（FSR4.0.2c 文件在线获取渠道尚未就绪）。
+// Device ID 来源于 GPU 硬件 ID 汇总表（AMD RDNA2-4）。
+static Fsr4GpuClass classify_amd_fsr4(std::uint32_t device_id)
+{
+    static constexpr std::uint32_t fp8_ids[] = {
+        0x7550, 0x7551, 0x7590, // RDNA4 Navi 48/44: RX 9070/9070 XT/9060 XT/9050, AI PRO R9700
+    };
+    static constexpr std::uint32_t int8_ids[] = {
+        // RDNA3 dGPU (RX 7000, Navi 3x)
+        0x744C, 0x7448, 0x7449, 0x744A, 0x744B, 0x745E, 0x7460, 0x7461,
+        0x7470, 0x747E, 0x73F0, 0x7480, 0x7481, 0x7483, 0x7487, 0x748B,
+        0x7489, 0x7499, 0x749F,
+        // RDNA3 iGPU (740M/760M/780M)
+        0x15BF, 0x15C8, 0x164F, 0x1900, 0x1901,
+        // RDNA3.5 iGPU (840M/860M/880M/890M/8050S/8060S)
+        0x150E, 0x1586, 0x1114, 0x1902,
+    };
+    for (const std::uint32_t id : fp8_ids)
+        if (device_id == id)
+            return Fsr4GpuClass::Fp8;
+    for (const std::uint32_t id : int8_ids)
+        if (device_id == id)
+            return Fsr4GpuClass::Int8;
+    return Fsr4GpuClass::Unsupported;
+}
+
+// NVIDIA（VEN_10DE）16-50 系（GTX 16 + RTX 20/30/40/50）→ INT8。
+// Device ID 来源于 GPU 硬件 ID 汇总表（NVIDIA RTX 16-50 系）。
+static bool is_nvidia_int8_device(std::uint32_t device_id)
+{
+    static constexpr std::uint32_t ids[] = {
+        // Turing: RTX 20 / GTX 16
+        0x1E02, 0x1E03, 0x1E04, 0x1E07, 0x1E81, 0x1E82, 0x1E84, 0x1E87, 0x1E89,
+        0x1EC2, 0x1EC7, 0x1F02, 0x1F03, 0x1F06, 0x1F07, 0x1F08, 0x1F42, 0x1F47,
+        0x2182, 0x2184, 0x2187, 0x2188, 0x21C4, 0x1F82, 0x1F83,
+        0x1E90, 0x1ED0, 0x1E91, 0x1ED1, 0x1E93, 0x1ED3, 0x1F10, 0x1F50, 0x1F54,
+        0x1F11, 0x1F15, 0x1F51, 0x1F55, 0x1F12, 0x1F14,
+        0x2191, 0x21D1, 0x2192, 0x1F91, 0x1F92, 0x1F94, 0x1F96, 0x1F99, 0x1F9D,
+        0x1F95, 0x1FD9, 0x1FDD, 0x1F97, 0x1F98, 0x1F9C, 0x1F9F, 0x1FA0,
+        0x1E30, 0x1FB0, 0x1FF0, 0x1FB1, 0x1FB2, 0x1FF2, 0x1FB6, 0x1FBA, 0x1FB7,
+        0x1FBB, 0x1FBC, 0x1FB8, 0x1FB9, 0x1FF9,
+        // Ampere: RTX 30
+        0x2203, 0x2204, 0x2205, 0x2206, 0x2207, 0x2208, 0x220A, 0x2216,
+        0x2414, 0x2482, 0x2484, 0x2486, 0x2487, 0x2488, 0x2489, 0x248C, 0x248D, 0x248E,
+        0x24C7, 0x24C8, 0x24C9, 0x2501, 0x2503, 0x2509, 0x2544, 0x2508,
+        0x2582, 0x2583, 0x2584, 0x25A7, 0x25A9, 0x25AD, 0x25ED, 0x25A6, 0x25AA,
+        0x2420, 0x2460, 0x249C, 0x24DC, 0x249D, 0x24DD, 0x2520, 0x2521, 0x2560, 0x2561,
+        0x2523, 0x2563, 0x25A0, 0x25E0, 0x25A2, 0x25A5, 0x25E2, 0x25E5, 0x25AB, 0x25AC, 0x25EC,
+        0x2230, 0x2231, 0x2232, 0x2233, 0x24B0, 0x2531, 0x2571, 0x25B0, 0x25B2, 0x25B6,
+        0x2438, 0x24B6, 0x24B7, 0x24B8, 0x24B9, 0x24BB, 0x24BA, 0x25B8, 0x25B9, 0x25BA,
+        0x25BB, 0x25BD, 0x25BC,
+        // Ada: RTX 40
+        0x2684, 0x2685, 0x2702, 0x2704, 0x2705, 0x2709, 0x2782, 0x2783, 0x2786, 0x2788,
+        0x2803, 0x2805, 0x2808, 0x2882, 0x2717, 0x2757, 0x27A0, 0x27E0,
+        0x2820, 0x2860, 0x28A0, 0x28E0, 0x28A1, 0x28E1, 0x2822, 0x28A3, 0x28E3,
+        0x26B1, 0x26B2, 0x26B3, 0x27B0, 0x27B1, 0x27B2, 0x28B0,
+        0x2730, 0x27BA, 0x27BB, 0x28B8, 0x28B9, 0x28BA, 0x28BB,
+        // Blackwell: RTX 50
+        0x2B85, 0x2B87, 0x2B8C, 0x2C02, 0x2C05, 0x2F04, 0x2F06, 0x2D04, 0x2D05, 0x2D83,
+        0x2C18, 0x2C58, 0x2C19, 0x2C59, 0x2F18, 0x2F58, 0x2D18, 0x2D58, 0x2D19, 0x2D59,
+        0x2D98, 0x2DD8, 0x2BB1, 0x2BB4,
+    };
+    for (const std::uint32_t id : ids)
+        if (device_id == id)
+            return true;
+    return false;
+}
+
+// NVIDIA RTX（20/30/40/50，不含 GTX 16）：DLSS Runtime 只对 RTX 部署。
+static bool is_nvidia_rtx_device(std::uint32_t device_id)
+{
+    // GTX 16（Turing TU116/TU117，含 MX450/MX550）不算 RTX。
+    static constexpr std::uint32_t gtx16_ids[] = {
+        0x2182, 0x2184, 0x2187, 0x2188, 0x21C4, 0x1F82, 0x1F83,
+        0x2191, 0x21D1, 0x2192, 0x1F91, 0x1F92, 0x1F94, 0x1F96, 0x1F99, 0x1F9D,
+        0x1F95, 0x1FD9, 0x1FDD, 0x1F97, 0x1F98, 0x1F9C, 0x1F9F, 0x1FA0,
+    };
+    for (const std::uint32_t id : gtx16_ids)
+        if (device_id == id)
+            return false;
+    return is_nvidia_int8_device(device_id);
+}
+
+// Intel Arc 独显（VEN_8086）：Alchemist 0x5600-0x56FF + Battlemage 0xE200-0xE2FF。
+static bool is_intel_arc_device(std::uint32_t device_id)
+{
+    return (device_id >= 0x5600 && device_id <= 0x56FF) ||
+           (device_id >= 0xE200 && device_id <= 0xE2FF);
+}
+
 DetectedFsr4Policy detect_fsr4_gpu_policy()
 {
     DetectedFsr4Policy best {};
@@ -508,29 +603,42 @@ DetectedFsr4Policy detect_fsr4_gpu_policy()
         const std::wstring name = desc.Description;
         bool fp8 = false;
         bool int8 = false;
-        const std::wstring normalized_name = lower(name);
-        if (desc.VendorId == 0x10DE ||
-            normalized_name.find(L"nvidia") != std::wstring::npos ||
-            normalized_name.find(L"geforce") != std::wstring::npos)
+        // Device ID 精确分类优先（核显/独显都覆盖），名字匹配仅作变体兜底。
+        if (desc.VendorId == 0x10DE)
         {
-            int8 = name_contains_series(name, L"RTX", { L"20", L"30", L"40", L"50" }) ||
-                name_contains_series(name, L"GTX", { L"16" });
+            int8 = is_nvidia_int8_device(desc.DeviceId);
         }
-        else if (desc.VendorId == 0x1002 ||
-            normalized_name.find(L"amd") != std::wstring::npos ||
-            normalized_name.find(L"radeon") != std::wstring::npos)
+        else if (desc.VendorId == 0x1002)
         {
-            if (name_contains_series(name, L"RX", { L"9" }) ||
-                name_contains_series(name, L"PRO", { L"W9" }))
-                fp8 = true;
-            else if (name_contains_series(name, L"RX", { L"7" }) ||
-                name_contains_series(name, L"PRO", { L"W7" }) ||
-                name_contains_amd_igpu_token(name))
-                int8 = true;
+            const Fsr4GpuClass cls = classify_amd_fsr4(desc.DeviceId);
+            fp8 = (cls == Fsr4GpuClass::Fp8);
+            int8 = (cls == Fsr4GpuClass::Int8);
         }
-        else if (desc.VendorId == 0x8086 || normalized_name.find(L"intel") != std::wstring::npos)
+        else if (desc.VendorId == 0x8086)
         {
-            int8 = lower(name).find(L"arc") != std::wstring::npos;
+            int8 = is_intel_arc_device(desc.DeviceId) ||
+                   lower(name).find(L"arc") != std::wstring::npos;
+        }
+
+        // 名字兜底：Device ID 未命中时按系列前缀宽松匹配（型号变体/未收录 ID）。
+        if (!fp8 && !int8)
+        {
+            const std::wstring normalized_name = lower(name);
+            if (desc.VendorId == 0x10DE || normalized_name.find(L"nvidia") != std::wstring::npos ||
+                normalized_name.find(L"geforce") != std::wstring::npos)
+            {
+                int8 = name_contains_series(name, L"RTX", { L"20", L"30", L"40", L"50" }) ||
+                    name_contains_series(name, L"GTX", { L"16" });
+            }
+            else if (desc.VendorId == 0x1002 || normalized_name.find(L"amd") != std::wstring::npos ||
+                normalized_name.find(L"radeon") != std::wstring::npos)
+            {
+                if (name_contains_series(name, L"RX", { L"9" }) || name_contains_series(name, L"PRO", { L"W9" }))
+                    fp8 = true;
+                else if (name_contains_series(name, L"RX", { L"7" }) || name_contains_series(name, L"PRO", { L"W7" }) ||
+                    name_contains_amd_igpu_token(name))
+                    int8 = true;
+            }
         }
 
         if (!fp8 && !int8)
@@ -571,13 +679,19 @@ bool has_nvidia_rtx_adapter()
         const HRESULT desc_result = adapter->GetDesc1(&desc);
         adapter->Release();
         if (FAILED(desc_result) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 ||
-            (desc.VendorId != 0x10DE &&
-             lower(desc.Description).find(L"nvidia") == std::wstring::npos &&
-             lower(desc.Description).find(L"geforce") == std::wstring::npos))
+            desc.VendorId != 0x10DE)
         {
             continue;
         }
 
+        // RTX 精确判定：Device ID 属 RTX 20/30/40/50（排除 GTX 16）。
+        // 非 RTX 的 NVIDIA（GTX 16）不部署 DLSS Runtime。
+        if (is_nvidia_rtx_device(desc.DeviceId))
+        {
+            has_rtx = true;
+            break;
+        }
+        // 名字兜底（未收录 Device ID 的变体）。
         if (lower(desc.Description).find(L"rtx") != std::wstring::npos)
         {
             has_rtx = true;

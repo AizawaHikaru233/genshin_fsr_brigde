@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$GamePath,
     [int]$FpsTarget = 0,
     [switch]$DisableOptiScaler,
@@ -250,6 +250,33 @@ function Get-NvidiaVideoControllers {
     })
 }
 
+# 第一百三十九轮：Device ID 精确分类（核显名字通常只是 "AMD Radeon(TM) Graphics"，
+# 不含型号，名字匹配识别不到）。Device ID 来源于 GPU 硬件 ID 汇总表。
+$script:AmdFp8DevIds = @('7550', '7551', '7590')
+$script:AmdInt8DevIds = @(
+    '744C','7448','7449','744A','744B','745E','7460','7461','7470','747E','73F0','7480','7481','7483','7487','748B','7489','7499','749F',
+    '15BF','15C8','164F','1900','1901',
+    '150E','1586','1114','1902'
+)
+$script:NvidiaInt8DevIds = @(
+    '1E02','1E03','1E04','1E07','1E81','1E82','1E84','1E87','1E89','1EC2','1EC7','1F02','1F03','1F06','1F07','1F08','1F42','1F47',
+    '2182','2184','2187','2188','21C4','1F82','1F83',
+    '1E90','1ED0','1E91','1ED1','1E93','1ED3','1F10','1F50','1F54','1F11','1F15','1F51','1F55','1F12','1F14',
+    '2191','21D1','2192','1F91','1F92','1F94','1F96','1F99','1F9D','1F95','1FD9','1FDD','1F97','1F98','1F9C','1F9F','1FA0',
+    '1E30','1FB0','1FF0','1FB1','1FB2','1FF2','1FB6','1FBA','1FB7','1FBB','1FBC','1FB8','1FB9','1FF9',
+    '2203','2204','2205','2206','2207','2208','220A','2216','2414','2482','2484','2486','2487','2488','2489','248C','248D','248E',
+    '24C7','24C8','24C9','2501','2503','2509','2544','2508','2582','2583','2584','25A7','25A9','25AD','25ED','25A6','25AA',
+    '2420','2460','249C','24DC','249D','24DD','2520','2521','2560','2561','2523','2563','25A0','25E0','25A2','25A5','25E2','25E5','25AB','25AC','25EC',
+    '2230','2231','2232','2233','24B0','2531','2571','25B0','25B2','25B6','2438','24B6','24B7','24B8','24B9','24BB','24BA','25B8','25B9','25BA','25BB','25BD','25BC',
+    '2684','2685','2702','2704','2705','2709','2782','2783','2786','2788','2803','2805','2808','2882','2717','2757','27A0','27E0',
+    '2820','2860','28A0','28E0','28A1','28E1','2822','28A3','28E3','26B1','26B2','26B3','27B0','27B1','27B2','28B0','2730','27BA','27BB','28B8','28B9','28BA','28BB',
+    '2B85','2B87','2B8C','2C02','2C05','2F04','2F06','2D04','2D05','2D83','2C18','2C58','2C19','2C59','2F18','2F58','2D18','2D58','2D19','2D59','2D98','2DD8','2BB1','2BB4'
+)
+$script:NvidiaGtx16DevIds = @(
+    '2182','2184','2187','2188','21C4','1F82','1F83',
+    '2191','21D1','2192','1F91','1F92','1F94','1F96','1F99','1F9D','1F95','1FD9','1FDD','1F97','1F98','1F9C','1F9F','1FA0'
+)
+
 function Get-Fsr4GpuPolicy {
     param([object[]]$InputControllers)
     if ($null -ne $InputControllers) {
@@ -279,26 +306,38 @@ function Get-Fsr4GpuPolicy {
         $reason = 'unsupported'
 
         if ($vendor -eq '1002' -or $name -match '(?i)AMD|Radeon') {
-            if ($name -match '(?i)\bRX\s*9\d{3}(?!\d)|\bPRO\s+W9\d{3}(?!\d)') {
-                $mode = 'fp8'
-                $reason = 'AMD RDNA4'
+            $dev = if ($pnp -match '(?i)DEV_([0-9A-F]{4})') { $matches[1].ToUpperInvariant() } else { '' }
+            if ($dev -in $script:AmdFp8DevIds) {
+                $mode = 'fp8'; $reason = 'AMD RDNA4'
+            }
+            elseif ($dev -in $script:AmdInt8DevIds) {
+                $mode = 'int8'; $reason = 'AMD RDNA3/3.5'
+            }
+            elseif ($name -match '(?i)\bRX\s*9\d{3}(?!\d)|\bPRO\s+W9\d{3}(?!\d)') {
+                $mode = 'fp8'; $reason = 'AMD RDNA4'
             }
             elseif ($name -match '(?i)\bRX\s*7\d{3}(?!\d)|\bPRO\s+W7\d{3}(?!\d)|\b(7[468]0|8[4689]0)M\b|\b80[456]0S\b') {
-                $mode = 'int8'
-                $reason = 'AMD RDNA3/3.5'
+                $mode = 'int8'; $reason = 'AMD RDNA3/3.5'
             }
         }
         elseif ($vendor -eq '10DE' -or $name -match '(?i)NVIDIA|GeForce') {
-            if ($name -match '(?i)\bRTX\s*(20|30|40|50)\d{2}(?!\d)' -or
+            $dev = if ($pnp -match '(?i)DEV_([0-9A-F]{4})') { $matches[1].ToUpperInvariant() } else { '' }
+            if ($dev -in $script:NvidiaInt8DevIds) {
+                $mode = 'int8'; $reason = 'NVIDIA 16-50 系'
+            }
+            elseif ($name -match '(?i)\bRTX\s*(20|30|40|50)\d{2}(?!\d)' -or
                 $name -match '(?i)\bGTX\s*16\d{2}(?!\d)') {
-                $mode = 'int8'
-                $reason = 'NVIDIA RTX 20+ / GTX 16 Turing'
+                $mode = 'int8'; $reason = 'NVIDIA RTX 20+ / GTX 16 Turing'
             }
         }
         elseif ($vendor -eq '8086' -or $name -match '(?i)Intel') {
-            if ($name -match '(?i)\bArc\b') {
-                $mode = 'int8'
-                $reason = 'Intel Arc'
+            $dev = if ($pnp -match '(?i)DEV_([0-9A-F]{4})') { $matches[1].ToUpperInvariant() } else { '' }
+            $devInt = if ($dev -ne '') { [Convert]::ToInt32($dev, 16) } else { -1 }
+            if (($devInt -ge 0x5600 -and $devInt -le 0x56FF) -or ($devInt -ge 0xE200 -and $devInt -le 0xE2FF)) {
+                $mode = 'int8'; $reason = 'Intel Arc'
+            }
+            elseif ($name -match '(?i)\bArc\b') {
+                $mode = 'int8'; $reason = 'Intel Arc'
             }
         }
 
@@ -352,9 +391,12 @@ function Assert-NvidiaSignedFile {
 function Install-NvidiaDlssIfNeeded {
     if (-not (Test-Path -LiteralPath $optiDll -PathType Leaf)) { return }
     # GTX 16 也可能使用 FSR4 INT8，但不应自动部署 DLSS Runtime。
-    # 不使用 nvapi64.dll 回退：该驱动文件无法区分 RTX 与 GTX。
+    # RTX 精确判定：Device ID 属 16-50 且非 GTX 16；名字匹配仅兜底。
     $rtxControllers = @(
         Get-NvidiaVideoControllers | Where-Object {
+            $pnp = [string]$_.PNPDeviceID
+            $dev = if ($pnp -match '(?i)DEV_([0-9A-F]{4})') { $matches[1].ToUpperInvariant() } else { '' }
+            ($dev -in $script:NvidiaInt8DevIds -and $dev -notin $script:NvidiaGtx16DevIds) -or
             [string]$_.Name -match '(?i)\bRTX\b'
         }
     )
