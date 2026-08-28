@@ -74,11 +74,27 @@ $unlocker = Join-Path $root 'unlockfps_nc.exe'
 $fpsConfig = Join-Path $root 'fps_config.json'
 $reShadeResourcesScript = Join-Path $scriptDirectory 'ReShadeResources.ps1'
 $nonFrameGenerationEdition = Test-Path -LiteralPath (Join-Path $root 'NonFrameGeneration.edition') -PathType Leaf
+# 上游版本基线：由 tools\Update-UpstreamComponents.ps1 在构建时生成并随包内置。
+# 安装脚本按同一基线下载缺失组件；旧包无此文件时回退内置默认值。
+$script:UpstreamVersions = $null
+$upstreamVersionsPath = Join-Path $root 'upstream-versions.json'
+if (Test-Path -LiteralPath $upstreamVersionsPath -PathType Leaf) {
+    try { $script:UpstreamVersions = Get-Content -LiteralPath $upstreamVersionsPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $script:UpstreamVersions = $null }
+}
 $optiRepository = 'optiscaler/OptiScaler'
-$optiTag = 'v0.9.4'
-$optiAssetName = 'Optiscaler_0.9.4-final.20260718._MM.7z'
-$optiArchiveSha256 = '575CB4DF866116093DF75AF607E37FD70E10F5163E0F23FD5C804142E80EF0AD'
-$optiFileVersion = '0.9.4.0'
+if ($null -ne $script:UpstreamVersions -and $null -ne $script:UpstreamVersions.optiscaler -and
+    -not [string]::IsNullOrWhiteSpace([string]$script:UpstreamVersions.optiscaler.tag)) {
+    $optiTag = [string]$script:UpstreamVersions.optiscaler.tag
+    $optiAssetName = [string]$script:UpstreamVersions.optiscaler.asset
+    $optiArchiveSha256 = [string]$script:UpstreamVersions.optiscaler.archiveSha256
+    $optiFileVersion = [string]$script:UpstreamVersions.optiscaler.fileVersion
+}
+else {
+    $optiTag = 'v0.9.4'
+    $optiAssetName = 'Optiscaler_0.9.4-final.20260718._MM.7z'
+    $optiArchiveSha256 = '575CB4DF866116093DF75AF607E37FD70E10F5163E0F23FD5C804142E80EF0AD'
+    $optiFileVersion = '0.9.4.0'
+}
 
 . (Join-Path $scriptDirectory 'Localization.ps1')
 . $reShadeResourcesScript
@@ -425,10 +441,24 @@ function Install-NvidiaDlssIfNeeded {
     $temporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) ("GenshinOneClick-DLSS-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
     try {
-        $asset = Get-GitHubLatestAsset -Repository 'NVIDIA-RTX/Streamline' -AssetFilter { $_.name -match '^streamline-sdk-v[0-9.]+\.zip$' }
+        # 构建基线：Streamline 版本与 SHA 取自包内 upstream-versions.json（与 Update-UpstreamComponents.ps1 同步）。
+        $dlssTag = $null
+        $dlssExpectedSha = $null
+        if ($null -ne $script:UpstreamVersions -and $null -ne $script:UpstreamVersions.dlss -and
+            -not [string]::IsNullOrWhiteSpace([string]$script:UpstreamVersions.dlss.tag)) {
+            $dlssTag = [string]$script:UpstreamVersions.dlss.tag
+            $dlssExpectedSha = [string]$script:UpstreamVersions.dlss.archiveSha256
+        }
+        $asset = if ([string]::IsNullOrWhiteSpace($dlssTag)) {
+            Get-GitHubLatestAsset -Repository 'NVIDIA-RTX/Streamline' -AssetFilter { $_.name -match '^streamline-sdk-v[0-9.]+\.zip$' }
+        }
+        else {
+            Get-GitHubLatestAsset -Repository 'NVIDIA-RTX/Streamline' -Tag $dlssTag -AssetFilter { $_.name -match '^streamline-sdk-v[0-9.]+\.zip$' }
+        }
         Write-Host "正在从 NVIDIA 官方 Streamline $($asset.Tag) 下载 DLSS 组件..." -ForegroundColor Cyan
         $packagePath = Join-Path $temporaryDirectory $asset.Name
-        Invoke-OfficialDownload -Url $asset.Url -Destination $packagePath -ExpectedSha256 $asset.Digest
+        $expectedSha = if (-not [string]::IsNullOrWhiteSpace($dlssExpectedSha)) { $dlssExpectedSha } else { $asset.Digest }
+        Invoke-OfficialDownload -Url $asset.Url -Destination $packagePath -ExpectedSha256 $expectedSha
         $expanded = Join-Path $temporaryDirectory 'expanded'
         Expand-ComponentPackage -PackagePath $packagePath -Destination $expanded
         $sourceDll = Get-ChildItem -LiteralPath $expanded -Recurse -File -Filter 'nvngx_dlss.dll' |
@@ -561,11 +591,25 @@ function Install-Unlocker {
     New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
     try {
         if ($Mode -eq 'Auto') {
-            $asset = Get-GitHubLatestAsset -Repository '34736384/genshin-fps-unlock' -AssetFilter { $_.name -eq 'unlockfps_nc.exe' }
+            # 构建基线：版本与 SHA 取自包内 upstream-versions.json（与 Update-UpstreamComponents.ps1 同步）。
+            $unlockTag = $null
+            $unlockExpectedSha = $null
+            if ($null -ne $script:UpstreamVersions -and $null -ne $script:UpstreamVersions.fpsunlock -and
+                -not [string]::IsNullOrWhiteSpace([string]$script:UpstreamVersions.fpsunlock.tag)) {
+                $unlockTag = [string]$script:UpstreamVersions.fpsunlock.tag
+                $unlockExpectedSha = [string]$script:UpstreamVersions.fpsunlock.sha256
+            }
+            $asset = if ([string]::IsNullOrWhiteSpace($unlockTag)) {
+                Get-GitHubLatestAsset -Repository '34736384/genshin-fps-unlock' -AssetFilter { $_.name -eq 'unlockfps_nc.exe' }
+            }
+            else {
+                Get-GitHubLatestAsset -Repository '34736384/genshin-fps-unlock' -Tag $unlockTag -AssetFilter { $_.name -eq 'unlockfps_nc.exe' }
+            }
             Write-Host "正在从官方发行版下载 FPS Unlocker $($asset.Tag)..." -ForegroundColor Cyan
             $source = Join-Path $temporaryDirectory 'unlockfps_nc.exe'
-            Invoke-OfficialDownload -Url $asset.Url -Destination $source -ExpectedSha256 $asset.Digest
-            if ($asset.Digest -match '^sha256:(.+)$') {
+            $expectedSha = if (-not [string]::IsNullOrWhiteSpace($unlockExpectedSha)) { $unlockExpectedSha } else { $asset.Digest }
+            Invoke-OfficialDownload -Url $asset.Url -Destination $source -ExpectedSha256 $expectedSha
+            if ($expectedSha -match '^sha256:(.+)$') {
                 $actualHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
                 if (-not [string]::Equals($actualHash, $matches[1], [StringComparison]::OrdinalIgnoreCase)) {
                     throw (Convert-InstallerText -Value 'FPS Unlocker 下载文件 SHA-256 校验失败。')

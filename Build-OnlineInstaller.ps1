@@ -3,6 +3,7 @@ param(
     [ValidateSet('Debug', 'Release', 'RelWithDebInfo', 'MinSizeRel')]
     [string]$Configuration = 'Release',
     [switch]$GithubOnly,
+    [switch]$FetchUpstream,
     [string]$SevenZipPath
 )
 
@@ -94,14 +95,17 @@ function Assert-OptiConfigMatchesRuntime {
 }
 
 function New-PackageComponentManifest {
-    param([Parameter(Mandatory)][string]$PackageRoot)
+    param(
+        [Parameter(Mandatory)][string]$PackageRoot,
+        [switch]$LocalFull
+    )
 
     $componentPaths = [ordered]@{
         'Dx11FsrBridge.dll' = 'payload\Bridge\Dx11FsrBridge.dll'
         'AntiPlayerMosaic.dll' = 'payload\AntiPlayerMosaic\AntiPlayerMosaic.dll'
-        'ReShade64.dll' = 'payload\ReShade\ReShade64.dll'
         'OptiScaler.dll' = 'payload\OptiScaler\OptiScaler.dll'
     }
+    if ($LocalFull) { $componentPaths['ReShade64.dll'] = 'payload\ReShade\ReShade64.dll' }
 
     $manifest = foreach ($name in $componentPaths.Keys) {
         $relativePath = $componentPaths[$name]
@@ -232,7 +236,7 @@ function Assert-LanzouUploadSize {
 }
 
 function Prepare-FpsStage {
-    param([string]$Stage, [switch]$IncludeDlss, [Parameter(Mandatory)][string]$Version)
+    param([string]$Stage, [switch]$LocalFull, [Parameter(Mandatory)][string]$Version)
     Reset-Stage -Path $Stage
     Copy-Item -LiteralPath (Join-Path $installerSource 'Installer.ps1'), (Join-Path $installerSource 'README.md') -Destination $Stage -Force
     Copy-Item -LiteralPath (Join-Path $installerSource 'Configure-Launcher.bat') -Destination (Join-Path $Stage '一键配置.bat') -Force
@@ -245,6 +249,11 @@ function Prepare-FpsStage {
     Copy-Item -LiteralPath (Join-Path $packageAssets 'Feedback.txt') -Destination $Stage -Force
     [IO.File]::WriteAllText((Join-Path $Stage 'Package-Version.txt'), "$Version`r`n", [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $Stage 'NonFrameGeneration.edition'), "`r`n", [Text.UTF8Encoding]::new($false))
+    # 上游版本基线（Configure.ps1 / ReShadeResources.ps1 按此下载缺失组件，保持构建基线一致）。
+    $upstreamVersions = Join-Path $root 'SharedResources\upstream-versions.json'
+    if (Test-Path -LiteralPath $upstreamVersions -PathType Leaf) {
+        Copy-Item -LiteralPath $upstreamVersions -Destination (Join-Path $Stage 'upstream-versions.json') -Force
+    }
     # FPS Unlocker（MIT 许可，随包分发合规）。UnlockerStub.dll 由 unlockfps 运行时自动生成，不随包。
     Copy-Item -LiteralPath (Join-Path $unlockerRuntime 'unlockfps_nc.exe') -Destination $Stage -Force
 
@@ -259,7 +268,35 @@ function Prepare-FpsStage {
     Copy-Item -LiteralPath $bridgeDll -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.dll') -Force
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.ini') -Force
     Copy-Item -LiteralPath $antiDll -Destination (Join-Path $stagePayloadAnti 'AntiPlayerMosaic.dll') -Force
-    Copy-DirectoryContents -Source $reshadeRuntime -Destination $stagePayloadReShade
+    # ReShade：本地/国内完整包内置 ReShade64.dll；GitHub 合规包不内置（ReShade 官方指引
+    # "Do NOT share the binaries"，由 Configure.ps1 在用户机器上从 reshade.me 官方下载）。
+    # 两种包都携带 renodx Add-on（作者书面授权）与 ReShade BSD-3 许可文本。
+    if ($LocalFull) {
+        Copy-DirectoryContents -Source $reshadeRuntime -Destination $stagePayloadReShade
+    }
+    else {
+        $stageShaderRoot = Join-Path $stagePayloadReShade 'reshade-shaders'
+        $stageAddons = Join-Path $stageShaderRoot 'Addons'
+        New-Item -ItemType Directory -Path $stageAddons -Force | Out-Null
+        foreach ($name in @('renodx-genshin.addon64')) {
+            $source = Join-Path $reshadeRuntime "reshade-shaders\Addons\$name"
+            if (Test-Path -LiteralPath $source -PathType Leaf) {
+                Copy-Item -LiteralPath $source -Destination (Join-Path $stageAddons $name) -Force
+            }
+        }
+        foreach ($name in @('NOTICE-RenoDX-genshin.txt', 'NOTICE-RenoDX-genshin-permission.png')) {
+            $source = Join-Path $reshadeRuntime "reshade-shaders\$name"
+            if (Test-Path -LiteralPath $source -PathType Leaf) {
+                Copy-Item -LiteralPath $source -Destination (Join-Path $stageShaderRoot $name) -Force
+            }
+        }
+        foreach ($name in @('LICENSE-ReShade-BSD-3-Clause.txt')) {
+            $source = Join-Path $reshadeRuntime $name
+            if (Test-Path -LiteralPath $source -PathType Leaf) {
+                Copy-Item -LiteralPath $source -Destination (Join-Path $stagePayloadReShade $name) -Force
+            }
+        }
+    }
     Remove-NonBundledReShadeEffects -ReShadeDirectory $stagePayloadReShade
     Remove-Item -LiteralPath (Join-Path $stagePayloadReShade 'ReShade.ini'), (Join-Path $stagePayloadReShade 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
     # 完整组件包：OptiScaler 运行时全家桶（FFX SDK / XeSS / XeLL / D3D12Core / Licenses）始终内置。
@@ -273,32 +310,32 @@ function Prepare-FpsStage {
 
     # NVIDIA DLSS Runtime：仅本地/国内完整包内置；GitHub 合规包不内置（Configure.ps1 首次配置时从
     # NVIDIA 官方 Streamline 发行版下载，分发主体为 NVIDIA 自身，避免第三方分发灰色）。
-    if ($IncludeDlss) {
+    if ($LocalFull) {
         $stageNvidia = Join-Path $payload 'NVIDIA\DLSS'
         New-Item -ItemType Directory -Path $stageNvidia -Force | Out-Null
         Copy-Item -LiteralPath (Join-Path $dlssRuntime 'nvngx_dlss.dll') -Destination $stageNvidia -Force
         Copy-Item -LiteralPath (Join-Path $dlssRuntime 'nvngx_dlss.license.txt') -Destination $stageNvidia -Force
     }
-    New-PackageComponentManifest -PackageRoot $Stage
+    New-PackageComponentManifest -PackageRoot $Stage -LocalFull:$LocalFull
 }
 
 function Build-FpsPackage {
     param(
-        [switch]$IncludeDlss,
+        [switch]$LocalFull,
         [Parameter(Mandatory)][string]$Version,
         [ValidateSet('Zip', 'SevenZip')][string]$ArchiveFormat = 'Zip'
     )
-    $stageName = if ($IncludeDlss) { '.fps-full-stage' } else { '.fps-github-stage' }
+    $stageName = if ($LocalFull) { '.fps-full-stage' } else { '.fps-github-stage' }
     $stage = Join-Path $dist $stageName
-    Prepare-FpsStage -Stage $stage -IncludeDlss:$IncludeDlss -Version $Version
+    Prepare-FpsStage -Stage $stage -LocalFull:$LocalFull -Version $Version
     try {
         $required = @(
             '一键配置.bat', 'GenshinFSRBridgeTools.bat', 'scripts\Configure.ps1', 'scripts\ReShadeResources.ps1',
             'scripts\Apply-PackageUpdate.ps1', 'scripts\Localization.ps1', 'component-manifest.json',
-            'Feedback.txt', 'Package-Version.txt', 'NonFrameGeneration.edition',
+            'Feedback.txt', 'Package-Version.txt', 'NonFrameGeneration.edition', 'upstream-versions.json',
             'unlockfps_nc.exe',
             'payload\Bridge\Dx11FsrBridge.dll', 'payload\Bridge\Dx11FsrBridge.ini',
-            'payload\AntiPlayerMosaic\AntiPlayerMosaic.dll', 'payload\ReShade\ReShade64.dll',
+            'payload\AntiPlayerMosaic\AntiPlayerMosaic.dll',
             'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64',
             'payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin.txt',
             'payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin-permission.png',
@@ -311,15 +348,16 @@ function Build-FpsPackage {
             'payload\OptiScaler\libxess_dx11.dll', 'payload\OptiScaler\D3D12_Optiscaler\D3D12Core.dll',
             'payload\AMD\amd_fidelityfx_upscaler_dx12.dll'
         )
-        if ($IncludeDlss) {
+        if ($LocalFull) {
             $required += @(
+                'payload\ReShade\ReShade64.dll',
                 'payload\NVIDIA\DLSS\nvngx_dlss.dll', 'payload\NVIDIA\DLSS\nvngx_dlss.license.txt'
             )
         }
         Assert-RequiredFiles -Path $stage -RelativePaths $required
         Assert-CleanPackage -Path $stage
         $extension = if ($ArchiveFormat -eq 'SevenZip') { '7z' } else { 'zip' }
-        $name = if ($IncludeDlss) { "原神解帧FSR插件包_v$Version.$extension" } else { "GenshinFSRBridge_v$Version.$extension" }
+        $name = if ($LocalFull) { "原神解帧FSR插件包_v$Version.$extension" } else { "GenshinFSRBridge_v$Version.$extension" }
         $archive = Join-Path $dist $name
         if ($ArchiveFormat -eq 'SevenZip') {
             New-SevenZipArchive -SourceDirectory $stage -ArchivePath $archive
@@ -415,6 +453,12 @@ finally {
 return (Join-Path $dist "FSR-Bridge-Plugin.v$version.zip")
 }
 
+if ($FetchUpstream) {
+    Write-Host '正在更新上游组件（构建基线）...' -ForegroundColor Cyan
+    & (Join-Path $root 'tools\Update-UpstreamComponents.ps1') -WorkspaceRoot $root
+    if ($LASTEXITCODE -ne 0) { throw '上游组件更新失败。' }
+}
+
 Build-PackageComponents
 Assert-OptiConfigMatchesRuntime
 $version = Get-BridgeVersion
@@ -436,13 +480,14 @@ foreach ($pattern in @(
 $localArchive = $null
 $fufuArchive = $null
 if (-not $GithubOnly) {
-    # 本地/国内完整包：内置全部组件（含 NVIDIA DLSS Runtime）。
-    $localArchive = Build-FpsPackage -Version $version -IncludeDlss -ArchiveFormat SevenZip
+    # 本地/国内完整包：内置全部组件（含 NVIDIA DLSS Runtime 与 ReShade64.dll）。
+    $localArchive = Build-FpsPackage -Version $version -LocalFull -ArchiveFormat SevenZip
     $fufuArchive = Build-FufuMarketplacePackage -Version $version
 }
 
-# GitHub 合规包：完整组件但内置不包含 DLSS（NVIDIA DLSS 分发属灰色地带，GitHub 公开渠道
-# 保持合规，由 Configure.ps1 首次配置时从 NVIDIA 官方 Streamline 发行版下载）。
+# GitHub 合规包：完整组件但内置不包含 NVIDIA DLSS 与 ReShade64.dll（两者分发均为灰色地带：
+# DLSS 由 Configure.ps1 从 NVIDIA 官方 Streamline 下载；ReShade 官方指引 "Do NOT share the
+# binaries"，由 Configure.ps1 从 reshade.me 官方下载）。
 $githubReleaseDist = Join-Path $dist 'github-release'
 if (Test-Path -LiteralPath $githubReleaseDist) { Remove-Item -LiteralPath $githubReleaseDist -Recurse -Force }
 New-Item -ItemType Directory -Path $githubReleaseDist -Force | Out-Null

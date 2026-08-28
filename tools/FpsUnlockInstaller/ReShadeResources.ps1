@@ -1,6 +1,27 @@
 Set-StrictMode -Version Latest
 
 function Get-ReShadeResourceSpec {
+    # 版本基线优先取自包内 upstream-versions.json（由 tools\Update-UpstreamComponents.ps1 生成并同步）；
+    # 旧包无此文件时回退内置默认值。
+    if ($null -ne $script:UpstreamVersions -and $null -ne $script:UpstreamVersions.reshade -and
+        -not [string]::IsNullOrWhiteSpace([string]$script:UpstreamVersions.reshade.version)) {
+        $r = $script:UpstreamVersions.reshade
+        return [pscustomobject]@{
+            ReShadeVersion   = [string]$r.version
+            ReShadeSetupUrl  = [string]$r.setupUrl
+            ReShadeSetupSha256 = [string]$r.setupSha256
+            ReShadeDllSha256 = [string]$r.dllSha256
+            StandardCommit   = [string]$r.standard.commit
+            StandardUrl      = [string]$r.standard.url
+            StandardSha256   = [string]$r.standard.sha256
+            LiliumCommit     = [string]$r.lilium.commit
+            LiliumUrl        = [string]$r.lilium.url
+            LiliumSha256     = [string]$r.lilium.sha256
+            SweetFxCommit    = [string]$r.sweetfx.commit
+            SweetFxUrl       = [string]$r.sweetfx.url
+            SweetFxSha256    = [string]$r.sweetfx.sha256
+        }
+    }
     return [pscustomobject]@{
         ReShadeVersion = '6.7.3'
         ReShadeSetupUrl = 'https://reshade.me/downloads/ReShade_Setup_6.7.3_Addon.exe'
@@ -120,7 +141,7 @@ function New-OfficialReShadePayload {
     New-Item -ItemType Directory -Force -Path $shaderDestination, $textureDestination, $addonDestination | Out-Null
 
     $downloads = @(
-        [pscustomobject]@{ Name = 'ReShade_Setup_6.7.3_Addon.exe'; Url = $spec.ReShadeSetupUrl; Hash = $spec.ReShadeSetupSha256; Label = 'ReShade 6.7.3 Add-on setup' },
+        [pscustomobject]@{ Name = "ReShade_Setup_$($spec.ReShadeVersion)_Addon.exe"; Url = $spec.ReShadeSetupUrl; Hash = $spec.ReShadeSetupSha256; Label = "ReShade $($spec.ReShadeVersion) Add-on setup" },
         [pscustomobject]@{ Name = 'reshade-shaders.zip'; Url = $spec.StandardUrl; Hash = $spec.StandardSha256; Label = 'ReShade standard effects' },
         [pscustomobject]@{ Name = 'lilium-hdr.zip'; Url = $spec.LiliumUrl; Hash = $spec.LiliumSha256; Label = 'Lilium HDR shaders' },
         [pscustomobject]@{ Name = 'sweetfx.zip'; Url = $spec.SweetFxUrl; Hash = $spec.SweetFxSha256; Label = 'SweetFX shaders' }
@@ -133,7 +154,7 @@ function New-OfficialReShadePayload {
     }
 
     $reshadeDll = Join-Path $DestinationDirectory 'ReShade64.dll'
-    Expand-ReShadeSetupModule -SetupPath (Join-Path $TemporaryDirectory 'ReShade_Setup_6.7.3_Addon.exe') -Destination $reshadeDll
+    Expand-ReShadeSetupModule -SetupPath (Join-Path $TemporaryDirectory "ReShade_Setup_$($spec.ReShadeVersion)_Addon.exe") -Destination $reshadeDll
     Assert-ReShadeResourceHash -Path $reshadeDll -ExpectedSha256 $spec.ReShadeDllSha256 -Label 'ReShade64.dll'
 
     $standardExpanded = Join-Path $TemporaryDirectory 'standard-expanded'

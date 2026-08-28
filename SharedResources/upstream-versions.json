@@ -1,0 +1,31 @@
+{
+  "generatedAt": "2026-08-28T23:19:10.4076387Z",
+  "optiscaler": {
+    "Tag": "v0.9.4",
+    "Asset": "Optiscaler_0.9.4-final.20260718._MM.7z",
+    "ArchiveSha256": "575CB4DF866116093DF75AF607E37FD70E10F5163E0F23FD5C804142E80EF0AD",
+    "FileVersion": "0.9.4.0"
+  },
+  "dlss": {
+    "Tag": "v2.12.0",
+    "Asset": "streamline-sdk-v2.12.0.zip",
+    "ArchiveSha256": "F5C0A3D870707DDDC3570FB4BCD3655CF48A8A68C3A9D342910CFA21B77DCF48",
+    "DllSha256": "BE6E434A94CA32499515EB62CA0E6C274526055D568D0426E4C652DCDFB6EE6E"
+  },
+  "fpsunlock": {
+    "Tag": "v3.5.0",
+    "Asset": "unlockfps_nc.exe",
+    "Sha256": "AB383E989A6EA0EA58024889BE36E622FC2DC75B0A3F84230DC907716A990C10"
+  },
+  "reshade": {
+    "Version": "6.8.0",
+    "SetupUrl": "https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe",
+    "SetupSha256": "AFE4C8F13048306307983B8B3D41D5BF00A86820440B0E57DEA10950E1176445",
+    "DllSha256": "0CEE63F9C9F13F3AC909C5B4903F4DBB4B719A7AB3B4F13B0DEAF83C814B94F7",
+    "DllVersion": "6.8.0.2155"
+  },
+  "renodx": {
+    "Version": "0.2026.0714.1910",
+    "Source": "authorized-redistribution"
+  }
+}
