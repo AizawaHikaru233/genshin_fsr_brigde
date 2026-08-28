@@ -37,12 +37,20 @@ if(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
 endif()
 
 if(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_RELEASE_RUNTIME=1)
+    # Debug 配置（--config Debug）不定义正式版过滤宏：log_line 全量输出（排查日志等级提升）。
+    # Release 保持白名单精简（error_terms + basic_terms）。
+    target_compile_definitions(Dx11FsrBridge PRIVATE
+        $<$<NOT:$<CONFIG:Debug>>:DX11FSRBRIDGE_RELEASE_RUNTIME=1>
+        $<$<CONFIG:Debug>:DX11FSRBRIDGE_DEBUG_RUNTIME=1>
+    )
 endif()
+
+# Debug 构建静态链接 CRT（/MTd）：目标机无需安装 VS 调试运行库即可加载
+set_property(TARGET Dx11FsrBridge PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 target_compile_features(Dx11FsrBridge PRIVATE cxx_std_20)
 if(MSVC)
-    target_compile_options(Dx11FsrBridge PRIVATE /utf-8)
+    target_compile_options(Dx11FsrBridge PRIVATE /utf-8 /EHsc)
     if(DX11FSRBRIDGE_RELEASE_RUNTIME)
         target_compile_options(Dx11FsrBridge PRIVATE $<$<CONFIG:Release>:/GL>)
         target_link_options(Dx11FsrBridge PRIVATE $<$<CONFIG:Release>:/LTCG>)

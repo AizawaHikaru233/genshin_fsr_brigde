@@ -213,6 +213,7 @@ struct Config
     bool ffx12 = false;
     std::wstring ffx12_dll_path;
     bool ffx12_fail_closed = false; // 第一百二十四轮：禁止回退原生（测试/故障显式暴露）
+    bool ffx12_full_logging = false; // 第一百三十四轮：Release 下日志全开（排查用；log_line 不过滤）
     bool ffx12_probe = false; // 一次性槽位/cb0 探测（诊断用，默认关）
     std::uint32_t ffx12_jitter_mode = 4; // 0=+norm*width-0.5, 1=+norm*width(符号反→整体抖), 2=raw, 3=-norm*width+0.5, 4=-norm*width(FSR4实测:符号正确), 5=零
     bool ffx12_depth_inverted = true; // 游戏深度逆方向（0=far）；FSR2 默认 0=near
@@ -3165,6 +3166,9 @@ void log_line(const std::string &line)
     if (!g_logging_enabled.load(std::memory_order_relaxed))
         return;
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    // 第一百三十四轮：Ffx12FullLogging=1 时跳过白名单过滤（全量日志——排查切换渲染精度卡死等）
+    if (!g_config.ffx12_full_logging)
+    {
     static constexpr std::array<std::string_view, 11> error_terms {
         "failed", "failure", "error", "invalid", "mismatch", "exception",
         "unavailable", "unresolved", "unsupported", "missing", "refusing"
@@ -3185,6 +3189,7 @@ void log_line(const std::string &line)
             [&](std::string_view term) { return line.find(term) != std::string::npos; });
     if (!startup_marker && !error_message && !basic_message)
         return;
+    }
 #endif
     std::lock_guard lock(g_log_mutex);
     std::ofstream out(g_log_path, std::ios::app);
@@ -3912,6 +3917,8 @@ void load_config()
     }
     g_config.ffx12_fail_closed =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FailClosed", 0, config_path.c_str()) != 0;
+    g_config.ffx12_full_logging =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FullLogging", 0, config_path.c_str()) != 0;
 #endif
 #else
     g_config.enabled = GetPrivateProfileIntW(L"Dx11FsrBridge", L"Enabled", 1, config_path.c_str()) != 0;
@@ -7032,6 +7039,7 @@ void STDMETHODCALLTYPE hooked_om_set_render_targets(ID3D11DeviceContext *context
 {
     ensure_context_device_texture_hook(context);
     if (g_config.dx11_on12_swapchain)
+    {
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
     {
@@ -7045,6 +7053,7 @@ void STDMETHODCALLTYPE hooked_om_set_render_targets(ID3D11DeviceContext *context
         return;
     }
 #endif
+    }
     ResourceInfo first_target {};
     {
         std::lock_guard lock(g_state_mutex);
