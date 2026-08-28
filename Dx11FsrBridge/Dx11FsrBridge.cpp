@@ -457,10 +457,7 @@ static bool g_route_applied = false; // 路由已应用（防止设备补检重�
 // 第一百二十一轮：路由信息（apply 时保存，焦点框首次成功/失败时输出，保证三行相邻）
 static std::string g_route_gpu_name;
 static std::string g_route_vendor_label;
-static std::string g_route_arch_name;
 static std::string g_route_sdk_path;
-static bool g_route_use_402c = false;
-static std::string g_route_sim_mark; // 第一百二十六轮：模拟分类标记（测试用）
 
 // 第一百三十三轮：OptiScaler 输出定向修复——XeSS/DLSS 的 jitter 需 ≤±0.5（像素/归一化），
 // FSR 输出保持原样（互不干扰）。运行时按 OptiScaler.ini 的 Dx11Upscaler/Dx12Upscaler 判定
@@ -3234,8 +3231,7 @@ static void log_focus_block(const char *state)
         g_route_sdk_path.empty() ? std::string("unknown") : g_route_sdk_path;
     log_focus_line("");
     log_focus_line("====================================================");
-    log_focus_line("  GPU : " + gpu + " (vendor=" + g_route_vendor_label +
-                   ", arch=" + g_route_arch_name + ")" + g_route_sim_mark);
+    log_focus_line("  GPU : " + gpu + " (vendor=" + g_route_vendor_label + ")");
     log_focus_line("  SDK : " + sdk);
     log_focus_line("  FSR : FSR" + std::string(ffx12::matched_version_name()) +
                    "  [" + state + "]");
@@ -3897,7 +3893,9 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DumpFrames", 0, config_path.c_str())));
     {
         wchar_t ver_buf[32] {};
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Version", L"2.3.4", ver_buf,
+        // 第一百四十轮：默认请求最高版本前缀（4.x）——provider 的 GET_VERSIONS 按 GPU
+        // 能力过滤，降级链 4→3→2 自动兜底；无需按显卡分类强制降级。
+        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Version", L"ffx12-fsr4.x", ver_buf,
                                  static_cast<DWORD>(std::size(ver_buf)), config_path.c_str());
         ffx12::set_sdk_version(narrow(ver_buf).c_str());
     }
@@ -13381,25 +13379,10 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR proc_name)
 // 早期 CreateDXGIFactory1/EnumAdapters1 在 loader lock 内可能失败（vendor=0），此时不标记
 // applied，留给设备创建 hook 用 IDXGIDevice::GetAdapter 补检——保证 RDNA2 4.0.2c 路由可靠生效。
 // 第一百一十三轮：passthrough 机制已整体移除（实测让 OptiScaler 丢失 FFX 输入识别）——
-// 所有显卡统一桥直连；N/Intel 上 OptiScaler 用于提供 DLSS/XeSS（共存并行，不依赖让路）。
-// 第一百一十六轮：GPU 架构分类——决定 402c（4.0.2c provider）还是默认 SDK（4.1.1）。
-// 采用**名称模糊匹配**（对齐芙芙启动器 Install-FufuPlugin.lua 的 gpu_matches_any 规则，
-// 设备 ID 段匹配太严格已弃用）：
-//   402c 组（无强 GPU 校验，可跑真 FSR4）：AMD RX 6xxx（RDNA2）、未列型号的 AMD 核显（按 RDNA2）、
-//     **RDNA3/3.5 核显（官方 FSR4 仅支持独立显卡）**、NVIDIA GTX 16 / RTX 20-50 系、Intel Arc（核显+独显）
-//   默认组（4.1.1，RDNA4→FP8 / RDNA3 dGPU→INT8 自动，其余靠降级链兜底）：
-//     AMD RX 9xxx（RDNA4 dGPU）、RX 7xxx（RDNA3 dGPU）、AMD PRO W9/W7、其他未识别
-enum class GpuArch
-{
-    Rdna4,       // AMD RDNA4 dGPU（RX 9000 / PRO W9）——官方 FSR4 支持
-    Rdna3,       // AMD RDNA3 dGPU（RX 7000 / PRO W7）——官方 FSR4 支持
-    Rdna3Igpu,   // AMD RDNA3/3.5 核显（740M-890M / Phoenix/Strix/Hawk）——官方不支持，走 402c
-    Rdna2,       // AMD RDNA2（RX 6000 / RDNA2 核显）
-    Nvidia16_50, // NVIDIA GTX16~RTX50 消费级
-    IntelArc,    // Intel Arc（独显+核显）
-    Other
-};
-
+// 第一百四十轮：不再做 GPU 架构分类与 402c 双路径——所有显卡统一默认 provider
+// （Ffx12DllPath，payload\AMD\amd_fidelityfx_upscaler_dx12.dll），provider 的
+// ffxQueryDescGetVersions 按 GPU 能力返回最高支持版本，降级链 4→3→2 兜底；
+// RDNA2 等需要 4.0.2c 的用户自行替换 SDK 文件（见 ini 备注）。
 static bool contains_ci(const std::wstring &hay, const wchar_t *needle)
 {
     const std::size_t n = std::wcslen(needle);
@@ -13422,171 +13405,26 @@ static bool contains_ci(const std::wstring &hay, const wchar_t *needle)
     return false;
 }
 
-static GpuArch classify_gpu_arch(std::uint32_t vendor, std::uint32_t device, const std::wstring &desc)
-{
-    // ---------- name-based fuzzy match (preferred) ----------
-    if (vendor == 0x1002u) // AMD
-    {
-        if (contains_ci(desc, L"RX 9") || contains_ci(desc, L"RX9") || contains_ci(desc, L"PRO W9"))
-            return GpuArch::Rdna4;
-        if (contains_ci(desc, L"RX 7") || contains_ci(desc, L"RX7") || contains_ci(desc, L"PRO W7"))
-            return GpuArch::Rdna3;
-        if (contains_ci(desc, L"RX 6") || contains_ci(desc, L"RX6"))
-            return GpuArch::Rdna2;
-        // RDNA3/3.5 iGPU model names -> Rdna3Igpu (official FSR4 is dGPU-only)
-        if (contains_ci(desc, L"740M") || contains_ci(desc, L"760M") || contains_ci(desc, L"780M") ||
-            contains_ci(desc, L"8040S") || contains_ci(desc, L"8050S") || contains_ci(desc, L"8060S") ||
-            contains_ci(desc, L"840M") || contains_ci(desc, L"860M") || contains_ci(desc, L"880M") ||
-            contains_ci(desc, L"890M"))
-            return GpuArch::Rdna3Igpu;
-        // RDNA2 iGPU model names -> Rdna2 (610M/660M/680M)
-        if (contains_ci(desc, L"610M") || contains_ci(desc, L"660M") || contains_ci(desc, L"680M"))
-            return GpuArch::Rdna2;
-
-        // ---------- iGPU: description usually just "AMD Radeon(TM) Graphics" -> DeviceId fallback ----------
-        if (contains_ci(desc, L"Graphics"))
-        {
-            // RDNA2 iGPU (table 1.2): Van Gogh 163F, Rembrandt 164D/1681, Raphael 164E,
-            // Mendocino 1506, Granite Ridge 13C0 (Ryzen 9000 desktop, Radeon 610M)
-            if (device == 0x13C0u || device == 0x1506u || device == 0x163Fu ||
-                device == 0x164Du || device == 0x164Eu || device == 0x1681u)
-                return GpuArch::Rdna2;
-            // RDNA3 iGPU (table 1.4): Phoenix 15BF/15C8/164F, Hawk Point 1900/1901
-            if (device == 0x15BFu || device == 0x15C8u || device == 0x164Fu ||
-                device == 0x1900u || device == 0x1901u)
-                return GpuArch::Rdna3Igpu;
-            // RDNA3.5 iGPU (table 1.5): Strix 150E, Strix Halo 1586, Krackan 1114/1902
-            if (device == 0x150Eu || device == 0x1586u || device == 0x1114u || device == 0x1902u)
-                return GpuArch::Rdna3Igpu;
-            return GpuArch::Rdna2; // unknown iGPU -> Rdna2 bucket (conservative 402c)
-        }
-
-        // ---------- dGPU without model name -> DeviceId fallback ----------
-        if (device == 0x73F0u)
-            return GpuArch::Rdna3; // Navi 33 (RX 7600M XT) sits inside the RDNA2 id range
-        if (device >= 0x7500u && device <= 0x75FFu)
-            return GpuArch::Rdna4; // Navi 48/44 (RX 9000: 7550/7551/7590)
-        if (device >= 0x7440u && device <= 0x74FFu)
-            return GpuArch::Rdna3; // Navi 31/32/33 dGPU (7448-749F, 747E, 7480...)
-        if ((device >= 0x73A0u && device <= 0x73FFu) || (device >= 0x7420u && device <= 0x743Fu))
-            return GpuArch::Rdna2; // Navi 21/22/23/24 dGPU (73A1-73FF, 7420-743F)
-        return GpuArch::Other;
-    }
-    else if (vendor == 0x10DEu) // NVIDIA: GTX16 + RTX20-50 (lua int8_rules)
-    {
-        if (contains_ci(desc, L"GTX 16") || contains_ci(desc, L"RTX 2") || contains_ci(desc, L"RTX 3") ||
-            contains_ci(desc, L"RTX 4") || contains_ci(desc, L"RTX 5"))
-            return GpuArch::Nvidia16_50;
-        // DeviceId fallback (table 2): Turing 1E00-1FFF/2180-21FF, Ampere 2200-25FF,
-        // Ada 2600-28FF, Blackwell 2B00-2FFF (incl. GB205 2Fxx)
-        if ((device >= 0x1E00u && device <= 0x1FFFu) ||
-            (device >= 0x2180u && device <= 0x21FFu) ||
-            (device >= 0x2200u && device <= 0x25FFu) ||
-            (device >= 0x2600u && device <= 0x28FFu) ||
-            (device >= 0x2B00u && device <= 0x2FFFu))
-            return GpuArch::Nvidia16_50;
-        return GpuArch::Other;
-    }
-    else if (vendor == 0x8086u) // Intel
-    {
-        if (contains_ci(desc, L"Arc"))
-            return GpuArch::IntelArc;
-        if ((device >= 0x5600u && device <= 0x56FFu) || // Alchemist dGPU (A380/A750/A770)
-            (device >= 0xE200u && device <= 0xE2FFu))   // Battlemage dGPU (B580)
-            return GpuArch::IntelArc;
-        return GpuArch::Other;
-    }
-    return GpuArch::Other;
-}
-
-static const char *gpu_arch_name(GpuArch arch)
-{
-    switch (arch)
-    {
-    case GpuArch::Rdna4: return "rdna4";
-    case GpuArch::Rdna3: return "rdna3";
-    case GpuArch::Rdna3Igpu: return "rdna3_igpu";
-    case GpuArch::Rdna2: return "rdna2";
-    case GpuArch::Nvidia16_50: return "nvidia16_50";
-    case GpuArch::IntelArc: return "intel_arc";
-    default: return "other";
-    }
-}
-
 static void apply_adapter_route(std::uint32_t vendor, std::uint32_t device, const std::wstring &desc,
                                 const char *source)
 {
+    // 第一百四十轮：不再做显卡型号识别与 402c 双路径——所有显卡统一走默认 provider
+    // （Ffx12DllPath，默认 payload\AMD\amd_fidelityfx_upscaler_dx12.dll）。
+    // provider 的 ffxQueryDescGetVersions 按 GPU 能力返回最高支持版本，降级链 4→3→2 兜底；
+    // RDNA2 等需要 4.0.2c 的用户自行替换 SDK 文件（见 ini 备注）。
+    // 本函数仅保留焦点框的显卡/SDK 记录。
+    (void)device;
+    (void)source;
     if (g_route_applied)
         return;
     if (vendor == 0)
         return; // 检测失败：留给后续补检（设备创建后）
-    GpuArch arch = classify_gpu_arch(vendor, device, desc);
-    // 第一百二十六轮：测试键——模拟 GPU 分类（验证自动路由完整路径，非手动指定 DLL）。
-    // 空=正常；rdna2/nvidia16_50/intel_arc=模拟对应组（Ffx12DllPath 保持默认，由自动路由决定）。
-    wchar_t sim_buf[32] {};
-    GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12SimulateArch", L"", sim_buf,
-                             static_cast<DWORD>(std::size(sim_buf)),
-                             (g_module_dir / L"Dx11FsrBridge.ini").c_str());
-    const bool simulated = sim_buf[0] != L'\0';
-    if (simulated)
-    {
-        const std::wstring sim = sim_buf;
-        if (sim == L"rdna2")
-            arch = GpuArch::Rdna2;
-        else if (sim == L"rdna3_igpu")
-            arch = GpuArch::Rdna3Igpu;
-        else if (sim == L"nvidia16_50")
-            arch = GpuArch::Nvidia16_50;
-        else if (sim == L"intel_arc")
-            arch = GpuArch::IntelArc;
-    }
-    g_route_sim_mark = simulated ? std::string(" (simulated)") : std::string();
-    const bool auto_402c =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12Auto402c", 1,
-                              (g_module_dir / L"Dx11FsrBridge.ini").c_str()) != 0;
-    // 第一百二十八轮修正：402c 组 = RDNA2 + RDNA3/3.5 核显（官方 FSR4 仅 dGPU 支持）
-    // + NVIDIA 16-50 + Intel Arc；RDNA3/RDNA4 dGPU 走默认 4.1.1（官方支持）。
-    // 第一百三十八轮：加载 OptiScaler 即需要它接管——自动等效手动方案（不启用 402c 自动路由，
-    // 走 Ffx12DllPath 默认路径 → init 缓存未命中 → LoadLibrary 与 OptiScaler 的 provider 模块对齐
-    // → FFX 输入接管；Auto402c=1 下同样生效，无需手动关路由）。
-    const bool opti_present = ::GetModuleHandleW(L"OptiScaler.dll") != nullptr;
-    const bool use_402c = !opti_present && auto_402c &&
-                          (arch == GpuArch::Rdna2 || arch == GpuArch::Rdna3Igpu ||
-                           arch == GpuArch::Nvidia16_50 || arch == GpuArch::IntelArc);
     char vendor_hex[16] {};
     std::snprintf(vendor_hex, sizeof(vendor_hex), "0x%04X", vendor);
-    const std::string vendor_label = vendor_hex;
-    const std::string gpu_name = narrow(desc.c_str());
-    if (use_402c)
-    {
-        // 402c（4.0.2c）provider：内嵌模型 + 无强 GPU 校验，RDNA2 可跑 FSR4
-        wchar_t dll402_buf[520] {};
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Dll402c", L"", dll402_buf,
-                                 static_cast<DWORD>(std::size(dll402_buf)),
-                                 (g_module_dir / L"Dx11FsrBridge.ini").c_str());
-        std::filesystem::path dll402 =
-            dll402_buf[0] != L'\0' ? std::filesystem::path(dll402_buf)
-                                   : (g_module_dir.parent_path() / L"AMD" / L"FSR4.0.2c" / L"amd_fidelityfx_upscaler_dx12.dll");
-        g_config.ffx12_dll_path = dll402;
-        ffx12::set_sdk_dll_path(dll402.c_str());
-        ffx12::set_sdk_version("ffx12-fsr4.x"); // 大版本前缀（4.x 命中 4.0.2c），SDK 更新免适配
-    }
-    else if (arch == GpuArch::Other)
-    {
-        // 第一百二十三轮：Other 组（RDNA1/GTX10 及更老/未知）默认请求 FSR3——太老的卡
-        // 不一定支持 INT8 FSR4（已统计架构 RDNA2-4/N 卡 16-50/Arc 均确认可跑 INT8 版 FSR4）；
-        // 即使 provider 列表误含 4.x 也不会强跑 FSR4。降级链仍兜底（3→2）。
-        ffx12::set_sdk_version("ffx12-fsr3.x");
-    }
-    g_route_gpu_name = gpu_name;
-    g_route_vendor_label = vendor_label;
-    g_route_arch_name = gpu_arch_name(arch);
-    g_route_use_402c = use_402c;
-    // 第一百三十七轮曾尝试 OptiScaler 路径覆盖（统一为 OptiScaler 目录）——破坏手动接管，
-    // 已回滚；OptiScaler 接管方案另议（手动关自动路由 Auto402c=0 可用）。
+    g_route_vendor_label = vendor_hex;
+    g_route_gpu_name = narrow(desc.c_str());
     g_route_sdk_path = narrow(g_config.ffx12_dll_path.c_str());
     g_route_applied = true;
-    // 第一百二十一轮：焦点框由首次接管成功/失败统一输出（保证 显卡/SDK/版本 三行相邻）
 }
 
 // D3D11 设备就绪后的可靠补检（IDXGIDevice::GetAdapter 不受 loader lock 影响）
@@ -13631,75 +13469,14 @@ void initialize()
 #endif
     load_config();
 
-    // 第一百二十轮：多 GPU 环境下以游戏实际运行的显卡为准——正式路由由 D3D11 设备创建 hook 的
-    // route_from_d3d11_device（ID3D11Device→IDXGIDevice::GetAdapter，即游戏渲染设备关联的适配器）决定。
-    // 第一百三十一轮：preload **按需加载**——只提前装载路由组对应的唯一标准名 provider：
-    //   402c 组 → AMD\FSR4.0.2c\amd_fidelityfx_upscaler_dx12.dll（标准名 402c）
-    //   默认组 → AMD\amd_fidelityfx_upscaler_dx12.dll（标准名 4.1.1）
-    // 保证进程内"标准名"模块唯一 = 实际使用的 provider → OptiScaler 的 FFX 输入 hook（LdrLoadDll
-    // 按名合并）拿到桥的模块 → 识别。不再预载全部候选（两个标准名并存会让 OptiScaler 按名
-    // 拿到非路由组的那个，FFX 输入断开）。early 判定（EnumAdapters1(0)）仅用于 preload 选择，
-    // 正式路由仍以设备补检为准（两者一致是常态；不一致时该场景退化，不改变路由正确性）。
+    // 第一百四十轮：不再做显卡型号识别/402c 双路径——所有显卡统一 preload 默认 provider
+    // （Ffx12DllPath，默认 payload\AMD\amd_fidelityfx_upscaler_dx12.dll），
+    // provider 的 ffxQueryDescGetVersions 按 GPU 能力返回最高支持版本，降级链 4→3→2 兜底。
+    // preload 保证进程内"标准名"模块唯一 = 实际使用的 provider → OptiScaler 的 FFX 输入
+    // hook（LdrLoadDll 按名合并）拿到桥的模块 → 识别。
     // 本模块 attach 阶段 OptiScaler 尚未注入其 loader hook，此时 LoadLibrary 不被劫持。
     {
-        std::uint32_t early_vendor = 0, early_device = 0;
-        std::wstring early_desc;
-        IDXGIFactory1 *early_factory = nullptr;
-        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&early_factory))) && early_factory)
-        {
-            IDXGIAdapter1 *early_adapter = nullptr;
-            if (SUCCEEDED(early_factory->EnumAdapters1(0, &early_adapter)) && early_adapter)
-            {
-                DXGI_ADAPTER_DESC1 early_desc1 {};
-                if (SUCCEEDED(early_adapter->GetDesc1(&early_desc1)))
-                {
-                    early_vendor = early_desc1.VendorId;
-                    early_device = early_desc1.DeviceId;
-                    early_desc = early_desc1.Description;
-                }
-                early_adapter->Release();
-            }
-            early_factory->Release();
-        }
-        GpuArch early_arch = early_vendor != 0
-            ? classify_gpu_arch(early_vendor, early_device, early_desc)
-            : GpuArch::Other;
-        // 测试键（Ffx12SimulateArch）同样作用于 early 判定（模拟 402c 组验证）
-        wchar_t sim_buf[32] {};
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12SimulateArch", L"", sim_buf,
-                                 static_cast<DWORD>(std::size(sim_buf)),
-                                 (g_module_dir / L"Dx11FsrBridge.ini").c_str());
-        if (sim_buf[0] != L'\0')
-        {
-            const std::wstring sim = sim_buf;
-            if (sim == L"rdna2")
-                early_arch = GpuArch::Rdna2;
-            else if (sim == L"rdna3_igpu")
-                early_arch = GpuArch::Rdna3Igpu;
-            else if (sim == L"nvidia16_50")
-                early_arch = GpuArch::Nvidia16_50;
-            else if (sim == L"intel_arc")
-                early_arch = GpuArch::IntelArc;
-        }
-        const bool early_402c = early_arch == GpuArch::Rdna2 ||
-                                early_arch == GpuArch::Rdna3Igpu ||
-                                early_arch == GpuArch::Nvidia16_50 ||
-                                early_arch == GpuArch::IntelArc;
-        if (early_402c)
-        {
-            wchar_t dll402_buf[520] {};
-            GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Dll402c", L"", dll402_buf,
-                                     static_cast<DWORD>(std::size(dll402_buf)),
-                                     (g_module_dir / L"Dx11FsrBridge.ini").c_str());
-            std::filesystem::path dll402 =
-                dll402_buf[0] != L'\0' ? std::filesystem::path(dll402_buf)
-                                       : (g_module_dir.parent_path() / L"AMD" / L"FSR4.0.2c" / L"amd_fidelityfx_upscaler_dx12.dll");
-            ffx12::preload(dll402.c_str()); // 402c 组：唯一标准名 = 402c
-        }
-        else
-        {
-            ffx12::preload(g_config.ffx12_dll_path.c_str()); // 默认组：唯一标准名 = 4.1.1
-        }
+        ffx12::preload(g_config.ffx12_dll_path.c_str()); // 唯一标准名 = 默认 provider
     }
 
     if (!process_matches())
