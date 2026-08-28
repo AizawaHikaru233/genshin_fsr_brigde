@@ -1,14 +1,15 @@
 # 原神 FSR Bridge 交互安装器
 
-这是 FPS Unlock 注入方案的联网 Lite 安装器。GitHub 发布包名为 `GenshinFSRBridge.Lite_v版本号.zip`，不内置 FPS Unlocker、OptiScaler、NVIDIA DLSS 或 RenoDX 以外的 ReShade 效果库；安装时从官方来源下载，或在支持的组件上由用户选择本地压缩包、可执行文件或已解压目录。
+这是 FPS Unlock 注入方案的完整组件安装器。GitHub 发布包名为 `GenshinFSRBridge_v版本号.zip`，内置全部组件（桥、反虚化、ReShade 与 RenoDX Add-on、OptiScaler 全家桶、FPS Unlocker、默认配置模板），仅 NVIDIA DLSS Runtime 不随包内置——首次配置时从 NVIDIA 官方 Streamline 发行版下载（GitHub 公开渠道保持合规）。本地/国内完整包 `原神解帧FSR插件包_v版本号.7z` 则连 DLSS 一并内置。
 
-Lite 包内置：
+完整包内置：
 
 1. `Dx11FsrBridge.dll`
 2. `AntiPlayerMosaic.dll`（反虚化、隐藏 UID 与水下马赛克修复）
-3. 官方 ReShade Add-on 版与获得明确再分发授权的 RenoDX Add-on；HDR 着色器与依赖由安装器从官方上游下载
-4. OptiScaler 与 ReShade 的全新默认配置模板
-5. 交互安装、卸载、组件更新和脚本自更新功能
+3. 官方 ReShade Add-on 版与获得明确再分发授权的 RenoDX Add-on（闭源，授权凭据随包归档）
+4. OptiScaler 0.9.4 及随包 FFX 2.3 SDK（FSR 4.1.1）/ XeSS / XeLL / D3D12Core 运行时与各自许可文件
+5. OptiScaler 与 ReShade 的全新默认配置模板
+6. 交互安装、卸载、组件更新和脚本自更新功能
 
 ## 使用方法
 
@@ -27,11 +28,7 @@ Lite 包内置：
 - OptiScaler 0.9.4：<https://github.com/optiscaler/OptiScaler/releases/tag/v0.9.4>
 - NVIDIA DLSS 超分组件：<https://github.com/NVIDIA-RTX/Streamline/releases>
 
-自动下载通过 GitHub API 获取官方发布包。FPS Unlocker 与 NVIDIA DLSS 获取对应官方正式版，非帧生成包固定使用 OptiScaler 0.9.4。下载文件只保存在系统临时目录，安装完成后删除。
-
-如果无法访问 GitHub，可以先在浏览器中下载，再在安装器里选择本地 `exe`、`zip`、`7z` 或完整解压目录。手动来源必须是独立资源，不能选择当前安装目录里的 `payload/OptiScaler` 作为来源。
-
-检测到 NVIDIA 显卡且用户启用相应后端时，安装器可从 NVIDIA 官方 Streamline 包提取生产版 `nvngx_dlss.dll`，验证 NVIDIA 数字签名后安装并保留许可证。已有有效文件时不会覆盖；`nvngx_dlssg.dll` 和 `nvngx_dlssd.dll` 不在自动下载范围内。
+完整包内置 OptiScaler 0.9.4（含 FFX 2.3 SDK 等运行时）与 FPS Unlocker 官方正式版。NVIDIA DLSS Runtime 在本地/国内完整包中随包内置（含许可文件），在 GitHub 合规包中不内置：首次配置检测到 RTX 显卡时从 NVIDIA 官方 Streamline 发行版下载，验证 NVIDIA 数字签名后安装并保留许可证。已有有效文件时不会覆盖；`nvngx_dlssg.dll` 和 `nvngx_dlssd.dll` 不在自动下载范围内。
 
 ## 配置与目录
 

@@ -1,4 +1,4 @@
-﻿Set-StrictMode -Version Latest
+Set-StrictMode -Version Latest
 
 function Get-InstallerDefaultLanguage {
     $cultures = @(
@@ -86,7 +86,7 @@ function Convert-InstallerText {
         '一键配置完成。' = 'Configuration complete.'
         'DLL 加载顺序:' = 'DLL load order:'
         'FPS Unlocker 尚未安装。' = 'FPS Unlocker is not installed.'
-        '最新 Release 中没有找到 FPS Unlock Lite 更新包。' = 'The latest release does not contain an FPS Unlock Lite package.'
+        '最新 Release 中没有找到 FPS Unlock 更新包。' = 'The latest release does not contain an FPS Unlock package.'
         '当前包缺少自更新替换程序，请手动下载最新发布包。' = 'The self-update helper is missing. Download the latest package manually.'
         '模块更新失败，请查看错误日志。' = 'Module update failed. Check the error log.'
         '反虚化组件已同步为当前发布包版本。' = 'The anti-mosaic component now matches the current package.'

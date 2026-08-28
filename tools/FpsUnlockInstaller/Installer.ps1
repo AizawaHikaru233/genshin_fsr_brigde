@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$GamePath,
     [switch]$NoShortcut,
     [switch]$ResumeUpdateAll,
@@ -728,16 +728,15 @@ function Start-PackageSelfUpdate {
         return $false
     }
     $assets = @($release.assets | Where-Object {
-        $_.name -match '^(GenshinFSRBridge\.Lite_v|原神解帧FSR插件包Lite_|FSR\.Lite_v).+\.zip$'
+        $_.name -match '^(GenshinFSRBridge_v|原神解帧FSR插件包_v).+\.zip$'
     })
     if ($assets.Count -eq 0) {
-        Write-Host '最新 Release 中没有找到 FPS Unlock Lite 更新包。' -ForegroundColor Red
+        Write-Host '最新 Release 中没有找到 FPS Unlock 更新包。' -ForegroundColor Red
         return $false
     }
     $asset = @($assets | Sort-Object @{ Expression = {
-        if ($_.name -like 'GenshinFSRBridge.Lite_v*') { 0 }
-        elseif ($_.name -like '原神解帧FSR插件包Lite_*') { 1 }
-        else { 2 }
+        if ($_.name -like 'GenshinFSRBridge_v*') { 0 }
+        else { 1 }
     } } | Select-Object -First 1)[0]
     $currentVersion = Get-CurrentPackageVersion
     $latestVersion = ([string]$release.tag_name).TrimStart('v')
