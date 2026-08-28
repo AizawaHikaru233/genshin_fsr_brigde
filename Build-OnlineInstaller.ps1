@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release', 'RelWithDebInfo', 'MinSizeRel')]
     [string]$Configuration = 'Release',
@@ -53,15 +53,17 @@ function Invoke-Cmake {
 }
 
 function Build-PackageComponents {
+    # 第一百三十九轮：VS 18 的 MSBuild 编译器检测与 CMake 4.3 不兼容（最小项目也复现
+    # "compiler identification unknown"），改用 Ninja 生成器（cl 直连，不依赖 MSBuild）。
     Invoke-Cmake @(
-        '-S', (Join-Path $root 'Dx11FsrBridge'), '-B', $bridgeBuild, '-A', 'x64',
+        '-S', (Join-Path $root 'Dx11FsrBridge'), '-B', $bridgeBuild, '-G', 'Ninja',
         "-DCMAKE_BUILD_TYPE=$Configuration",
         '-DDX11FSRBRIDGE_RELEASE_RUNTIME=ON',
         '-DDX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=ON'
     )
-    Invoke-Cmake @('--build', $bridgeBuild, '--config', $Configuration)
-    Invoke-Cmake @('-S', (Join-Path $root 'AntiPlayerMosaic'), '-B', $antiBuild, '-A', 'x64', "-DCMAKE_BUILD_TYPE=$Configuration")
-    Invoke-Cmake @('--build', $antiBuild, '--config', $Configuration)
+    Invoke-Cmake @('--build', $bridgeBuild)
+    Invoke-Cmake @('-S', (Join-Path $root 'AntiPlayerMosaic'), '-B', $antiBuild, '-G', 'Ninja', "-DCMAKE_BUILD_TYPE=$Configuration")
+    Invoke-Cmake @('--build', $antiBuild)
 
     $script:bridgeDll = Get-ChildItem -LiteralPath $bridgeBuild -Recurse -File -Filter 'Dx11FsrBridge.dll' |
         Select-Object -First 1 -ExpandProperty FullName
