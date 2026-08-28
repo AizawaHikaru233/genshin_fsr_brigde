@@ -52,8 +52,12 @@ if(MSVC)
     # 无 /EHsc 时异常直接 terminate（fail-fast），与旧版 762KB 行为一致）。
     target_compile_options(Dx11FsrBridge PRIVATE /utf-8 $<$<CONFIG:Debug>:/EHsc>)
     if(DX11FSRBRIDGE_RELEASE_RUNTIME)
+        
+        
+        # 链接映射文件（模块大小分析用；仅构建产物，不部署）
         target_compile_options(Dx11FsrBridge PRIVATE $<$<CONFIG:Release>:/GL>)
         target_link_options(Dx11FsrBridge PRIVATE $<$<CONFIG:Release>:/LTCG>)
+        target_link_options(Dx11FsrBridge PRIVATE $<$<CONFIG:Release>:/MAP:$<TARGET_FILE_DIR:Dx11FsrBridge>/Dx11FsrBridge.map>)
     endif()
 endif()
 target_compile_definitions(Dx11FsrBridge PRIVATE

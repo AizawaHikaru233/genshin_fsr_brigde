@@ -95,3 +95,26 @@ AI智能体任务规划*.md
 bridge-sdk234-param-audit.md
 fsr2_sdk_params_enumeration.md
 reconcile-threeway-gap.md
+
+# 交接/计划/报告类文档（不进入仓库——本地保留）
+交接文档*.md
+AI智能体任务计划*.md
+**/NEXT-TEST-CHECKLIST*.md
+**/Feedback.txt
+docs/01-*.md
+docs/02-*.md
+docs/03-*.md
+
+# 本地工作目录（不进入仓库）
+archify/
+backups/
+Amdxc64Proxy/
+OptiScaler-src/
+vendor/
+enumadapters/
+gpuroutetest/
+RuntimeProbe/
+versionprobe2/
+ffx202-dl/
+.team-audit/
+.agent-teams/
