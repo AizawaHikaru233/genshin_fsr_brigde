@@ -706,23 +706,15 @@ bool apply_optiscaler_managed_settings(
         }
     }
 
+    // 与 FPS 安装脚本（Configure.ps1 Set-OptiScalerManagedSettings）保持同一收敛集：
+    // FSR4 策略 + OptiDllPath + Log 三项 + 帧生成版型（芙芙场景固定非帧生成）。
+    // Upscalers/Inputs/Plugins 等其余设置由 default_config 模板自足，不再由脚本覆写。
     const struct ManagedSetting
     {
         const char *section;
         const char *key;
         std::string value;
     } settings[] {
-        { "Upscalers", "Dx11Upscaler", "auto" },
-        { "Upscalers", "Dx12Upscaler", "auto" },
-        { "Upscalers", "VulkanUpscaler", "auto" },
-        { "FrameGen", "Enabled", "false" },
-        { "FrameGen", "FGInput", "nofg" },
-        { "FrameGen", "FGOutput", "nofg" },
-        { "FrameGen", "FTInput", "auto" },
-        { "Inputs", "EnableFsr2Inputs", "true" },
-        { "Inputs", "UseFsr2Dx11Inputs", "true" },
-        { "Inputs", "UseFsr2Inputs", "true" },
-        { "Inputs", "EnableFsr3Inputs", "false" },
         { "FSR", "UpscalerIndex", upscaler_index },
         { "FSR", "Fsr4Update", fsr4_update },
         { "FSR", "Fsr4ForceEnableInt8", force_int8 },
@@ -730,15 +722,12 @@ bool apply_optiscaler_managed_settings(
         // This setting is inert for DLSS/XeSS and other backends.
         { "FSR", "FsrNonLinearColorSpace", "true" },
         { "Libraries", "OptiDllPath", wide_to_utf8(optiscaler_directory.wstring()) },
-        { "Plugins", "Path", "auto" },
-        { "Plugins", "LoadAsiPlugins", "false" },
-        { "Plugins", "LoadReshade", "false" },
         { "Log", "LogToFile", "true" },
         { "Log", "LogLevel", "2" },
-        { "Log", "SingleFile", "true" },
         { "Log", "LogFileName", "OptiScaler.log" },
-        { "Log", "LogAsync", "false" },
-        { "Log", "LogAsyncThreads", "1" },
+        { "FrameGen", "Enabled", "false" },
+        { "FrameGen", "FGInput", "nofg" },
+        { "FrameGen", "FGOutput", "nofg" },
     };
 
     for (const auto &setting : settings)

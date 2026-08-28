@@ -393,6 +393,31 @@ function Set-Fsr4GpuPolicy {
     return $policy
 }
 
+function Set-OptiScalerManagedSettings {
+    param([string]$Path)
+    # OptiScaler.ini 托管设置（与芙芙 bootstrap 保持一致）：
+    #   - FSR4 策略（Fsr4Update/UpscalerIndex/Fsr4ForceEnableInt8/FsrNonLinearColorSpace）
+    #   - Libraries.OptiDllPath 绝对路径
+    #   - Log：LogToFile=true / LogLevel=2 / LogFileName=OptiScaler.log
+    #   - FrameGen 版型（非帧生成版强制关闭）
+    # Upscalers/Inputs/Plugins 等其余设置由 default_config 模板自足，脚本不覆写。
+    Set-Fsr4GpuPolicy -Path $Path | Out-Null
+    Set-IniValue -Path $Path -Section 'Libraries' -Key 'OptiDllPath' -Value ([IO.Path]::GetFullPath($optiDir).TrimEnd('\'))
+    Set-IniValue -Path $Path -Section 'Log' -Key 'LogToFile' -Value 'true'
+    Set-IniValue -Path $Path -Section 'Log' -Key 'LogLevel' -Value '2'
+    Set-IniValue -Path $Path -Section 'Log' -Key 'LogFileName' -Value 'OptiScaler.log'
+    if ($nonFrameGenerationEdition) {
+        Set-IniValue -Path $Path -Section 'FrameGen' -Key 'Enabled' -Value 'false'
+        Set-IniValue -Path $Path -Section 'FrameGen' -Key 'FGInput' -Value 'nofg'
+        Set-IniValue -Path $Path -Section 'FrameGen' -Key 'FGOutput' -Value 'nofg'
+    }
+    else {
+        Set-IniValue -Path $Path -Section 'FrameGen' -Key 'Enabled' -Value 'auto'
+        Set-IniValue -Path $Path -Section 'FrameGen' -Key 'FGInput' -Value 'auto'
+        Set-IniValue -Path $Path -Section 'FrameGen' -Key 'FGOutput' -Value 'auto'
+    }
+}
+
 function Assert-NvidiaSignedFile {
     param([string]$Path)
     Assert-File -Path $Path
@@ -1096,12 +1121,14 @@ function Initialize-ReShadeConfiguration {
                 -ScreenshotPath $configScreenshotPath
             Set-Content -LiteralPath $IniPath -Value $generated -Encoding UTF8
         }
-        Set-IniValue -Path $IniPath -Section 'ADDON' -Key 'AddonPath' -Value $configAddonPath
-        Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'EffectSearchPaths' -Value $configShaderPath
-        Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'TextureSearchPaths' -Value $configTexturePath
-        Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'PresetPath' -Value $configPresetPath
-        Set-IniValue -Path $IniPath -Section 'SCREENSHOT' -Key 'SavePath' -Value $configScreenshotPath
     }
+    # 路径键每次运行都覆写：组件目录/安装位置可能移动，必须刷新到当前实际路径。
+    # （preserveExistingIni 只决定是否从模板重置整份 ini，不再保护路径键。）
+    Set-IniValue -Path $IniPath -Section 'ADDON' -Key 'AddonPath' -Value $configAddonPath
+    Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'EffectSearchPaths' -Value $configShaderPath
+    Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'TextureSearchPaths' -Value $configTexturePath
+    Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'PresetPath' -Value $configPresetPath
+    Set-IniValue -Path $IniPath -Section 'SCREENSHOT' -Key 'SavePath' -Value $configScreenshotPath
     if (-not $PreservePreset -and ($Force -or -not (Test-Path -LiteralPath $PresetPath -PathType Leaf))) {
         if (Test-Path -LiteralPath $reshadePresetTemplate -PathType Leaf) {
             Copy-Item -LiteralPath $reshadePresetTemplate -Destination $PresetPath -Force
@@ -1170,33 +1197,8 @@ function Reset-PluginConfigurations {
     if (Test-Path -LiteralPath $optiDll -PathType Leaf) {
         Assert-File -Path $optiDefaultIni
         Copy-Item -LiteralPath $optiDefaultIni -Destination $optiIni -Force
-        foreach ($setting in @(
-            @{ Section = 'Upscalers'; Key = 'Dx11Upscaler'; Value = 'auto' },
-            @{ Section = 'Upscalers'; Key = 'Dx12Upscaler'; Value = 'auto' },
-            @{ Section = 'Upscalers'; Key = 'VulkanUpscaler'; Value = 'auto' },
-            @{ Section = 'FrameGen'; Key = 'Enabled'; Value = $(if ($nonFrameGenerationEdition) { 'false' } else { 'auto' }) },
-            @{ Section = 'FrameGen'; Key = 'FGInput'; Value = $(if ($nonFrameGenerationEdition) { 'nofg' } else { 'auto' }) },
-            @{ Section = 'FrameGen'; Key = 'FGOutput'; Value = $(if ($nonFrameGenerationEdition) { 'nofg' } else { 'auto' }) },
-            @{ Section = 'FrameGen'; Key = 'FTInput'; Value = 'auto' },
-            @{ Section = 'Inputs'; Key = 'EnableFsr2Inputs'; Value = 'true' },
-            @{ Section = 'Inputs'; Key = 'UseFsr2Dx11Inputs'; Value = 'true' },
-            @{ Section = 'Inputs'; Key = 'UseFsr2Inputs'; Value = 'true' },
-            @{ Section = 'Inputs'; Key = 'EnableFsr3Inputs'; Value = 'false' },
-            @{ Section = 'FSR'; Key = 'Fsr4Update'; Value = 'true' },
-            @{ Section = 'Log'; Key = 'LogToFile'; Value = 'true' },
-            @{ Section = 'Log'; Key = 'LogLevel'; Value = '2' },
-            @{ Section = 'Log'; Key = 'SingleFile'; Value = 'true' },
-            @{ Section = 'Log'; Key = 'LogFileName'; Value = 'OptiScaler.log' },
-            @{ Section = 'Log'; Key = 'LogAsync'; Value = 'false' },
-            @{ Section = 'Log'; Key = 'LogAsyncThreads'; Value = '1' },
-            @{ Section = 'Libraries'; Key = 'OptiDllPath'; Value = $([IO.Path]::GetFullPath($optiDir).TrimEnd('\')) },
-            @{ Section = 'Plugins'; Key = 'Path'; Value = 'auto' },
-            @{ Section = 'Plugins'; Key = 'LoadAsiPlugins'; Value = 'false' },
-            @{ Section = 'Plugins'; Key = 'LoadReshade'; Value = 'false' }
-        )) {
-            Set-IniValue -Path $optiIni -Section $setting.Section -Key $setting.Key -Value $setting.Value
-        }
-        Set-Fsr4GpuPolicy -Path $optiIni | Out-Null
+        # 恢复默认 = 与首次安装相同的托管写法（FSR4 策略 + OptiDllPath + Log + 帧生成版型）。
+        Set-OptiScalerManagedSettings -Path $optiIni
         if (Test-Path -LiteralPath $fakeNvapiDefaultIni -PathType Leaf) {
             Copy-Item -LiteralPath $fakeNvapiDefaultIni -Destination $fakeNvapiIni -Force
         }
@@ -1337,33 +1339,9 @@ if ((Get-PathKind -Path $legacyRuntimeLink) -eq 'Junction') {
 }
 
 if (-not $DisableOptiScaler) {
-    if (-not $PreserveExistingConfigs) {
-        Set-IniValue -Path $optiIni -Section 'Upscalers' -Key 'Dx11Upscaler' -Value 'auto'
-        Set-IniValue -Path $optiIni -Section 'Upscalers' -Key 'Dx12Upscaler' -Value 'auto'
-        Set-IniValue -Path $optiIni -Section 'Upscalers' -Key 'VulkanUpscaler' -Value 'auto'
-        Set-IniValue -Path $optiIni -Section 'Inputs' -Key 'EnableFsr2Inputs' -Value 'true'
-        Set-IniValue -Path $optiIni -Section 'Inputs' -Key 'UseFsr2Dx11Inputs' -Value 'true'
-        Set-IniValue -Path $optiIni -Section 'Inputs' -Key 'UseFsr2Inputs' -Value 'true'
-        Set-IniValue -Path $optiIni -Section 'Inputs' -Key 'EnableFsr3Inputs' -Value 'false'
-        Set-IniValue -Path $optiIni -Section 'FSR' -Key 'Fsr4Update' -Value 'true'
-        Set-IniValue -Path $optiIni -Section 'Plugins' -Key 'LoadAsiPlugins' -Value 'false'
-        Set-IniValue -Path $optiIni -Section 'Plugins' -Key 'LoadReshade' -Value 'false'
-        Set-IniValue -Path $optiIni -Section 'Plugins' -Key 'Path' -Value 'auto'
-        Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogToFile' -Value 'true'
-        Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogLevel' -Value '2'
-        Set-IniValue -Path $optiIni -Section 'Log' -Key 'SingleFile' -Value 'true'
-        Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogFileName' -Value 'OptiScaler.log'
-        Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogAsync' -Value 'false'
-        Set-IniValue -Path $optiIni -Section 'Log' -Key 'LogAsyncThreads' -Value '1'
-        Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'FTInput' -Value 'auto'
-    }
-    Set-IniValue -Path $optiIni -Section 'Libraries' -Key 'OptiDllPath' -Value ([IO.Path]::GetFullPath($optiDir).TrimEnd('\'))
-    if ($nonFrameGenerationEdition) {
-        Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'Enabled' -Value 'false'
-        Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'FGInput' -Value 'nofg'
-        Set-IniValue -Path $optiIni -Section 'FrameGen' -Key 'FGOutput' -Value 'nofg'
-    }
-    Set-Fsr4GpuPolicy -Path $optiIni | Out-Null
+    # 每次运行都覆写 OptiScaler 托管设置（FSR4 策略 + OptiDllPath + Log + 帧生成版型），
+    # 保证路径与策略与当前安装一致；其余设置由模板自足。
+    Set-OptiScalerManagedSettings -Path $optiIni
 }
 
 $dllList = [System.Collections.Generic.List[string]]::new()
