@@ -9,7 +9,6 @@ local gpu_vendor = "Unknown"
 
 local amd_fp8_rules = {
     { vendor = "AMD", family = "RX", series = "9000" },
-    { vendor = "AMD", family = "PRO", series = "W9" },
 }
 
 local int8_rules = {
@@ -19,7 +18,6 @@ local int8_rules = {
     { vendor = "NVIDIA", family = "RTX", series = "40" },
     { vendor = "NVIDIA", family = "RTX", series = "50" },
     { vendor = "AMD", family = "RX", series = "7000" },
-    { vendor = "AMD", family = "PRO", series = "W7" },
     { vendor = "AMD", name = "740M" },
     { vendor = "AMD", name = "760M" },
     { vendor = "AMD", name = "780M" },

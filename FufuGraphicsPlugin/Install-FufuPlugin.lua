@@ -10,7 +10,6 @@ local bridge_uses_402c = false
 
 local amd_fp8_rules = {
     { vendor = "AMD", family = "RX", series = "9000" },
-    { vendor = "AMD", family = "PRO", series = "W9" },
 }
 
 local int8_rules = {
@@ -20,7 +19,6 @@ local int8_rules = {
     { vendor = "NVIDIA", family = "RTX", series = "40" },
     { vendor = "NVIDIA", family = "RTX", series = "50" },
     { vendor = "AMD", family = "RX", series = "7000" },
-    { vendor = "AMD", family = "PRO", series = "W7" },
     { vendor = "AMD", name = "740M" },
     { vendor = "AMD", name = "760M" },
     { vendor = "AMD", name = "780M" },
@@ -35,16 +33,12 @@ local int8_rules = {
 }
 
 -- 第一百三十一轮：桥的 402c 组（自动路由到 4.0.2c 的 GPU）：
---   AMD RDNA2（RX 6xxx + RDNA2 核显型号）、RDNA3/3.5 核显（740M~890M/80x0S，官方 FSR4 仅支持独显）、
---   NVIDIA 16-50 系、Intel Arc。
+--   RDNA3/3.5 核显（740M~890M/80x0S，官方 FSR4 仅支持独显）、NVIDIA 16-50 系、Intel Arc。
+--   （RDNA2 暂不列入——FSR4.0.2c 文件在线获取渠道尚未就绪。）
 -- 402c 组安装时必须把 payload\AMD\amd_fidelityfx_upscaler_dx12.dll（4.1.1 标准名）移走，
 -- 使进程内标准名唯一 = FSR4.0.2c\ 子目录的 402c ——否则 OptiScaler 的 FFX 输入 hook 按名
 -- 会拿到 4.1.1，与桥实际加载的 402c 不匹配（FFX 输入通道断开 → OptiScaler 不识别）。
 local bridge_402c_rules = {
-    { vendor = "AMD", family = "RX", series = "6" },
-    { vendor = "AMD", name = "610M" },
-    { vendor = "AMD", name = "660M" },
-    { vendor = "AMD", name = "680M" },
     { vendor = "NVIDIA", family = "GTX", series = "16" },
     { vendor = "NVIDIA", family = "RTX", series = "20" },
     { vendor = "NVIDIA", family = "RTX", series = "30" },
