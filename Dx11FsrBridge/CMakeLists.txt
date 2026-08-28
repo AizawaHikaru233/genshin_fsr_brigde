@@ -5,7 +5,6 @@ project(Dx11FsrBridge LANGUAGES C CXX RC)
 option(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL "Build the standard FSR2 translation exports" OFF)
 option(DX11FSRBRIDGE_RELEASE_RUNTIME "Build the release runtime" ON)
 option(DX11FSRBRIDGE_BUILD_FAMILY_TEST "Build the Fsr2FamilyTakeover state-machine test" OFF)
-option(DX11FSRBRIDGE_BUILD_GPU_INTEROP_PROBE "Build the D3D12-owned shared-resource interop probe" OFF)
 option(DX11FSRBRIDGE_BUILD_DX11ON12_SWAPCHAIN_TEST "Build the D3D11On12 flip-swapchain end-to-end test" OFF)
 
 # The bridge deliberately uses the deployed ffx-api runtime provider.  The
@@ -94,16 +93,6 @@ if(DX11FSRBRIDGE_BUILD_FAMILY_TEST)
         UNICODE
         _UNICODE
     )
-endif()
-
-if(DX11FSRBRIDGE_BUILD_GPU_INTEROP_PROBE)
-    add_executable(GpuInteropProbe GpuInteropProbe.cpp)
-    target_compile_features(GpuInteropProbe PRIVATE cxx_std_20)
-    if(MSVC)
-        target_compile_options(GpuInteropProbe PRIVATE /utf-8 /W3)
-    endif()
-    target_compile_definitions(GpuInteropProbe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_link_libraries(GpuInteropProbe PRIVATE d3d11 d3d12 dxgi)
 endif()
 
 if(DX11FSRBRIDGE_BUILD_DX11ON12_SWAPCHAIN_TEST)

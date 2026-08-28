@@ -118,3 +118,8 @@ versionprobe2/
 ffx202-dl/
 .team-audit/
 .agent-teams/
+
+# Full 包第三方依赖（本地保留——打包需要，不提交）
+SharedResources/NVIDIA/
+SharedResources/FpsUnlocker/
+SharedResources/OptiScaler/runtime/OptiScaler.dll
