@@ -23,32 +23,28 @@ For the Chinese documentation, see [README.md](README.md).
 
 The frame-generation feature in the `frame-generation` branch is built against `OptiScaler 0.10.0-pre1`. OptiScaler versions earlier than `0.10.0-pre1` do not support this frame-generation feature.
 
-## Lite Release Package
+## Release Packages
 
-Lite packages are assembled directly by the build script: installer scripts live in `tools/FpsUnlockInstaller/`, package feedback and component metadata live in `assets/FpsUnlockPackage/`, and runtime resources and default configuration live in `SharedResources/`. Lite packages no longer bundle any other ReShade shader packages; the installer can download them directly from the official ReShade, Lilium HDR shaders, and SweetFX upstream sources. FPS Unlocker and OptiScaler are likewise downloaded from official sources or selected manually. The existing contents and packaging method of local Full packages remain unchanged.
+Packages are assembled directly by the build script: installer scripts live in `tools/FpsUnlockInstaller/`, package feedback and component metadata live in `assets/FpsUnlockPackage/`, and runtime resources and default configuration live in `SharedResources/`. GitHub release packages do not bundle the NVIDIA DLSS component or ReShade binaries; the installer downloads them from their official upstream sources at install time (DLSS from NVIDIA Streamline, ReShade from reshade.me). Local distributions must complete those components on their own.
 
-The two first-party DLLs are build outputs and are not committed to the repository. To generate the same FPS Unlock Lite ZIP as GitHub Actions, run the following command on Windows:
+The two first-party DLLs are build outputs and are not committed to the repository. To generate the GitHub release package, run the following command on Windows:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release -GithubLiteOnly
+powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release -GithubOnly
 ```
 
-The output is written to `dist\原神解帧FSR插件包Lite_v*.zip`, while the GitHub release directory contains only `dist\github-release\GenshinFSRBridge.Lite_v*.zip`. GitHub Actions builds and publishes only this FPS Unlock Lite package; it does not generate a FuFu package.
+The output is written to `dist\原神解帧FSR插件包_v*.7z`, while the GitHub release directory contains `dist\github-release\GenshinFSRBridge_v*.zip`. GitHub Actions builds and publishes only this GitHub release package; it does not generate a FuFu package.
 
 ## FuFu Launcher Plugin Source and Local Build
 
-`FufuGraphicsPlugin/` contains the FuFu Launcher plugin source, configuration templates, and the marketplace/local-test Lua installer scripts. The repository does not commit a prebuilt FuFu Launcher plugin binary. A locally built FuFu Launcher plugin package requires the user to complete the runtime components manually; it does not include scripts or resources that automatically download components. To build the local FPS Unlock Full package and FuFu Launcher plugin package, run:
+`FufuGraphicsPlugin/` contains the FuFu Launcher plugin source, configuration templates, and the marketplace/local-test Lua installer scripts. The repository does not commit a prebuilt FuFu Launcher plugin binary. Before a local build, run `tools/Update-UpstreamComponents.ps1` to refresh the upstream component baseline (OptiScaler is pinned to v0.9.4; DLSS, ReShade, and FPS Unlocker fetch their latest official releases with SHA-256 verification), then run:
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\Update-UpstreamComponents.ps1 -WorkspaceRoot .
 powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release
 ```
 
-The FuFu Launcher plugin package is written only to local `dist\FSR-Bridge-Plugin.v*.zip`; it is not included in GitHub Actions or GitHub Releases. To build the plugin DLL separately:
-
-```powershell
-cmake -S .\FufuGraphicsPlugin -B .\build-fufu-plugin -G "Visual Studio 17 2022" -A x64
-cmake --build .\build-fufu-plugin --config Release
-```
+`-FetchUpstream` can be passed to the build script to refresh upstream components before packaging. The FuFu Launcher plugin package is written only to local `dist\FSR-Bridge-Plugin.v*.zip`; it is not included in GitHub Actions or GitHub Releases.
 
 ## Features
 
@@ -66,7 +62,7 @@ cmake --build .\build-fufu-plugin --config Release
 
 ## Usage
 
-Download an archive from [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases), extract it, and run `一键配置.bat`, then follow the prompts to install. For the English interface, run `GenshinFSRBridgeTools.bat`. You can also switch between Chinese and English at any time from the installer main menu; the selection is saved automatically. Depending on the environment, the script obtains [Genshin FPS Unlock](https://github.com/34736384/genshin-fps-unlock/releases), the [NVIDIA DLSS upscaling component (`nvngx_dlss.dll`)](https://github.com/NVIDIA-RTX/Streamline/releases), and [OptiScaler](https://github.com/optiscaler/OptiScaler/releases) to complete the runtime environment.
+Download an archive from [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases), extract it, and run `一键配置.bat`, then follow the prompts to install. For the English interface, run `GenshinFSRBridgeTools.bat`. You can also switch between Chinese and English at any time from the installer main menu; the selection is saved automatically. GitHub release packages include FPS Unlocker and OptiScaler; the installer downloads the [NVIDIA DLSS upscaling component (`nvngx_dlss.dll`)](https://github.com/NVIDIA-RTX/Streamline/releases) and ReShade from their official upstream sources at install time. Local distributions must complete the required components on their own.
 In-game `FSR2` anti-aliasing must be enabled, and the render scale must be below `1`.
 
 `Dx11FsrBridge.dll` does not implement FSR, DLSS, XeSS, or any other upscaling algorithm. It only exposes a standard FSR2 interface to external tools and forwards the game's DX11 upscaling calls to that interface.
@@ -86,16 +82,21 @@ OptiScaler and ReShade runtime configurations are located in their respective co
 
 ## Build
 
-Visual Studio 2022 with the Desktop development with C++ workload, the Windows SDK, and CMake 3.20 or newer are required.
+Visual Studio with the Desktop development with C++ workload, the Windows SDK, and CMake 3.20 or newer (Ninja generator) are required. The release configuration requires the repository's `Dx11FsrBridge\third_party` directory, which contains the FFX12 ffx-api headers and the Microsoft Detours build dependency.
+
+First refresh the upstream component baseline (only needed when component versions change; the script pins OptiScaler to v0.9.4 and fetches the latest official DLSS, ReShade, and FPS Unlocker releases):
 
 ```powershell
-cmake -S .\Dx11FsrBridge -B .\build-package-bridge -G "Visual Studio 17 2022" -A x64 `
-  -DDX11FSRBRIDGE_RELEASE_RUNTIME=ON `
-  -DDX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=ON
-cmake --build .\build-package-bridge --config Release
+powershell -ExecutionPolicy Bypass -File .\tools\Update-UpstreamComponents.ps1 -WorkspaceRoot .
 ```
 
-The DLL is written to `build-package-bridge\Release`; configuration files are generated into the release package by `Build-OnlineInstaller.ps1` from the current component resources. The release configuration requires the repository's `Dx11FsrBridge\third_party` directory, which contains FSR2-compatible ABI headers and the Microsoft Detours build dependency.
+Then build all release packages:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release
+```
+
+`-FetchUpstream` combines both steps. The three first-party DLLs (Bridge / AntiPlayerMosaic / FufuGraphicsPlugin) are compiled automatically by the build script with the Ninja generator; no manual cmake invocation is needed.
 
 ## Logs and Issue Feedback
 
@@ -117,8 +118,9 @@ Do not submit game account details, login information, or screenshots containing
 
 - FSR2 ABI headers and Microsoft Detours are build dependencies only; their original licenses and notices are retained.
 - OptiScaler is an independent project: <https://github.com/optiscaler/OptiScaler>.
-- Lite resources bundle only the official ReShade Add-on DLL (BSD-3-Clause) and the RenoDX Add-on explicitly authorized for unmodified redistribution by [Bilibili UID 3461582765951639](https://space.bilibili.com/3461582765951639). Lilium HDR shaders (GPL-3.0), SweetFX (MIT), and the required standard ReShade effects are downloaded directly from their official upstream sources during installation. The RenoDX author's display name in the permission evidence is “卡文迪许爱吃香蕉” and was previously referenced as “剪刀妹丽丽”; the UID is the stable identity reference across name changes. `RenoDX-Genshin/` is the sole archived source for RenoDX and its permission evidence and is automatically synchronized to the ReShade payload during packaging.
-- This project does not include NVIDIA DLSS, the AMD FSR SDK, or OptiScaler runtime binaries.
+- GitHub release packages do not bundle the NVIDIA DLSS component or ReShade binaries; the installer downloads them from their official upstream sources at install time.
+- Local distributions must complete the required components on their own and comply with each component's licensing terms (for example, shipping the GPL full text with source links, respecting ReShade's official "do not share the binaries" policy, and DLSS limited to NVIDIA GPUs).
+- This project does not include NVIDIA DLSS or AMD FSR SDK runtime binaries.
 
 ## License
 

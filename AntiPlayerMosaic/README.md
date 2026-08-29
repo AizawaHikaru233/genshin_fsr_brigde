@@ -19,14 +19,14 @@
 
 ## 构建
 
-需要 Visual Studio 2022（含 C++ 桌面开发组件）、Windows SDK 和 CMake 3.20 或更新版本。
+需要 Visual Studio（含 C++ 桌面开发组件）、Windows SDK 和 CMake 3.20 或更新版本（Ninja 生成器）。
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ```
 
-输出 DLL 位于 `build\Release`。
+输出 DLL 位于 `build`。构建脚本 `Build-OnlineInstaller.ps1` 会自动以相同方式编译并打包本插件。
 
 ## 边界
 

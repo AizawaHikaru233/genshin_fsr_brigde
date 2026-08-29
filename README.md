@@ -23,32 +23,28 @@
 
 `frame-generation` 分支中的帧生成功能基于 `OptiScaler 0.10.0-pre1` 构建。低于 `0.10.0-pre1` 的 OptiScaler 不支持该帧生成功能。
 
-## Lite 发布包
+## 发布包
 
-Lite 包由构建脚本直接组装：安装器脚本位于 `tools/FpsUnlockInstaller/`，反馈与组件清单位于 `assets/FpsUnlockPackage/`，运行资源和默认配置位于 `SharedResources/`。Lite 包不再内置其他 ReShade 效果库；安装时可由脚本直接从 ReShade、Lilium HDR shaders 和 SweetFX 的官方上游下载。FPS Unlocker 与 OptiScaler 同样由安装器从官方来源下载或要求用户手动选择。本地 Full 包的既有内置内容和打包方式不变。
+包由构建脚本直接组装：安装器脚本位于 `tools/FpsUnlockInstaller/`，反馈与组件清单位于 `assets/FpsUnlockPackage/`，运行资源和默认配置位于 `SharedResources/`。GitHub 发布包不会内置 NVIDIA DLSS 组件与 ReShade 二进制，安装时由脚本从各自官方上游获取（DLSS 来自 NVIDIA Streamline、ReShade 来自 reshade.me）；本地分发包需要自行补齐相应组件。
 
-两个自有 DLL 是编译产物，不提交到仓库。要生成与 GitHub Actions 相同的 FPS Unlock Lite ZIP，请在 Windows 上运行：
+两个自有 DLL 是编译产物，不提交到仓库。要生成 GitHub 发布包，请在 Windows 上运行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release -GithubLiteOnly
+powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release -GithubOnly
 ```
 
-构建结果位于 `dist\原神解帧FSR插件包Lite_v*.zip`，GitHub 发布目录只生成 `dist\github-release\GenshinFSRBridge.Lite_v*.zip`。GitHub Actions 只构建和发布这个 FPS Unlock Lite 包，不生成芙芙包。
+构建结果位于 `dist\原神解帧FSR插件包_v*.7z`，GitHub 发布目录生成 `dist\github-release\GenshinFSRBridge_v*.zip`。GitHub Actions 只构建和发布这个 GitHub 发布包，不生成芙芙包。
 
 ## 芙芙启动器插件包源码与本地构建
 
-`FufuGraphicsPlugin/` 提供芙芙启动器插件的源码、配置模板以及商城/本地测试 Lua 安装脚本；仓库不提交芙芙启动器插件二进制包。芙芙启动器插件包的本地构建需要用户自行补齐运行组件，不包含自动下载组件的脚本和资源。要在本地编译并同时生成 FPS Unlock Full 与芙芙启动器插件包，请运行：
+`FufuGraphicsPlugin/` 提供芙芙启动器插件的源码、配置模板以及商城/本地测试 Lua 安装脚本；仓库不提交芙芙启动器插件二进制包。本地构建前先运行 `tools/Update-UpstreamComponents.ps1` 获取上游组件基线（OptiScaler 固定 v0.9.4，DLSS、ReShade、FPS Unlocker 获取各自最新正式版并做 SHA-256 校验），再运行：
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\Update-UpstreamComponents.ps1 -WorkspaceRoot .
 powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release
 ```
 
-芙芙启动器插件包仅写入本地 `dist\FSR-Bridge-Plugin.v*.zip`，不会进入 GitHub Actions 或 GitHub Release。也可以单独编译插件 DLL：
-
-```powershell
-cmake -S .\FufuGraphicsPlugin -B .\build-fufu-plugin -G "Visual Studio 17 2022" -A x64
-cmake --build .\build-fufu-plugin --config Release
-```
+也可以让构建脚本先自动更新上游组件再打包（`-FetchUpstream`）。芙芙启动器插件包仅写入本地 `dist\FSR-Bridge-Plugin.v*.zip`，不会进入 GitHub Actions 或 GitHub Release。
 
 ## 功能
 
@@ -66,7 +62,7 @@ cmake --build .\build-fufu-plugin --config Release
 
 ## 使用方法
 
-从 [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases) 下载压缩包，解压后运行 `一键配置.bat` 并根据提示安装。英语界面可运行 `GenshinFSRBridgeTools.bat`；也可在安装器主菜单中随时切换中文或 English，选择会自动保存。脚本会按环境自动获取 [Genshin FPS Unlock](https://github.com/34736384/genshin-fps-unlock/releases)、[NVIDIA DLSS 超分组件（`nvngx_dlss.dll`）](https://github.com/NVIDIA-RTX/Streamline/releases) 和 [OptiScaler](https://github.com/optiscaler/OptiScaler/releases)，补全运行环境。
+从 [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases) 下载压缩包，解压后运行 `一键配置.bat` 并根据提示安装。英语界面可运行 `GenshinFSRBridgeTools.bat`；也可在安装器主菜单中随时切换中文或 English，选择会自动保存。GitHub 发布包内置 FPS Unlocker 与 OptiScaler，安装脚本会在运行时从官方上游获取 [NVIDIA DLSS 超分组件（`nvngx_dlss.dll`）](https://github.com/NVIDIA-RTX/Streamline/releases) 与 ReShade；本地分发包需要自行补齐相应组件。
 游戏内必须启用 `FSR2` 抗锯齿，渲染精度需低于 `1`
 
 `Dx11FsrBridge.dll` 本身不执行 FSR、DLSS、XeSS 或其他超分算法。它只向外部工具暴露标准 FSR2 接口，并将游戏的 DX11 上采样调用转接到该接口。
@@ -86,16 +82,21 @@ OptiScaler 和 ReShade 的运行配置位于各自组件目录。OptiScaler 的 
 
 ## 构建
 
-需要 Visual Studio 2022（含 C++ 桌面开发组件）、Windows SDK 和 CMake 3.20 或更新版本。
+需要 Visual Studio（含 C++ 桌面开发组件）、Windows SDK 和 CMake 3.20 或更新版本（Ninja 生成器）。发布配置需要仓库内的 `Dx11FsrBridge\third_party` 目录，其中包含 FFX12 ffx-api 头文件和 Microsoft Detours 构建依赖。
+
+先更新上游组件基线（仅需在组件版本变化时执行；脚本固定 OptiScaler v0.9.4，DLSS、ReShade、FPS Unlocker 获取各自最新正式版）：
 
 ```powershell
-cmake -S .\Dx11FsrBridge -B .\build-package-bridge -G "Visual Studio 17 2022" -A x64 `
-  -DDX11FSRBRIDGE_RELEASE_RUNTIME=ON `
-  -DDX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=ON
-cmake --build .\build-package-bridge --config Release
+powershell -ExecutionPolicy Bypass -File .\tools\Update-UpstreamComponents.ps1 -WorkspaceRoot .
 ```
 
-生成的 DLL 会位于 `build-package-bridge\Release`；配置由 `Build-OnlineInstaller.ps1` 从当前资源生成到发行包。发布配置需要仓库内的 `Dx11FsrBridge\third_party` 目录，其中包含 FSR2 兼容 ABI 头文件和 Microsoft Detours 构建依赖。
+然后构建全部发行包：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release
+```
+
+需要先更新组件再打包时可合并为 `-FetchUpstream`。三个自有 DLL（Bridge / AntiPlayerMosaic / FufuGraphicsPlugin）由构建脚本以 Ninja 生成器自动编译，无需手动执行 cmake。
 
 ## 日志与问题反馈
 
@@ -117,8 +118,9 @@ Bridge、OptiScaler 和反虚化组件默认会保留错误日志。每次重新
 
 - FSR2 ABI 头文件与 Microsoft Detours 仅作为构建依赖，保留各自原始许可证与声明。
 - OptiScaler 是独立项目：<https://github.com/optiscaler/OptiScaler>。
-- Lite 资源只内置官方 ReShade Add-on DLL（BSD-3-Clause）和 [Bilibili UID 3461582765951639](https://space.bilibili.com/3461582765951639) 明确授权原样再分发的 RenoDX Add-on；Lilium HDR shaders（GPL-3.0）、SweetFX（MIT）和 ReShade 标准效果依赖在安装时直接从各自官方上游下载。该 RenoDX 作者在授权截图中的显示名为“卡文迪许爱吃香蕉”，此前曾以“剪刀妹丽丽”署名；UID 作为不随改名变化的身份标识。RenoDX 的唯一归档源及授权截图位于 `RenoDX-Genshin/`，打包时会自动同步到 ReShade 载荷。
-- 本项目不包含 NVIDIA DLSS、AMD FSR SDK 或 OptiScaler 运行时二进制文件。
+- GitHub 发布包不会内置 NVIDIA DLSS 组件与 ReShade 二进制，安装时由脚本从各自官方上游获取。
+- 本地分发包需要自行补齐相应组件，并遵守各组件授权要求（例如随附 GPL 全文与源码链接、ReShade 官方"不得分享二进制"、DLSS 仅限 NVIDIA GPU 使用等）。
+- 本项目不包含 NVIDIA DLSS 与 AMD FSR SDK 运行时二进制。
 
 ## 许可证
 
