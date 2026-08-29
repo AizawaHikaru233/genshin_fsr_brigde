@@ -38,34 +38,13 @@ local function apply_fsr4_policy(mode)
     fsr4_mode = mode
 end
 
--- 沙箱 GPU 接口防御：芙芙启动器 1.6.0.2 的 get_gpu/gpu_matches_any 在部分多适配器
--- 环境下可能抛错（get_gpu 无内部捕获，gpu_matches_any 的捕获日志可能不落盘），
--- pcall 包裹保证安装流程不中断：失败时保持 auto 策略并记录错误信息。
-local function safe_get_gpu()
-    local ok, gpu = pcall(system.get_gpu)
-    if not ok then
-        install.log("system.get_gpu 异常（FSR4 策略保持 auto）: " .. tostring(gpu))
-        return nil
-    end
-    return gpu
-end
-
-local function safe_gpu_matches_any(rules)
-    local ok, matched = pcall(system.gpu_matches_any, rules)
-    if not ok then
-        install.log("gpu_matches_any 异常（策略保持 auto）: " .. tostring(matched))
-        return false
-    end
-    return matched == true
-end
-
 local function detect_fsr4_policy()
     if system == nil or system.get_gpu == nil then
         install.log("当前启动器未提供 system.get_gpu，FSR4 策略保持 auto")
         return
     end
 
-    local gpu = safe_get_gpu()
+    local gpu = system.get_gpu()
     if gpu == nil then
         install.log("system.get_gpu 未返回数据，FSR4 策略保持 auto")
         return
@@ -77,9 +56,9 @@ local function detect_fsr4_policy()
         install.log("当前启动器未提供 GPU 模糊匹配接口，FSR4 策略保持 auto")
         return
     end
-    if safe_gpu_matches_any(amd_fp8_rules) then
+    if system.gpu_matches_any(amd_fp8_rules) then
         apply_fsr4_policy("fp8")
-    elseif safe_gpu_matches_any(int8_rules) then
+    elseif system.gpu_matches_any(int8_rules) then
         apply_fsr4_policy("int8")
     else
         install.log("未识别的 GPU 型号，FSR4 策略保持 auto: " .. gpu_name .. " (" .. gpu_vendor .. ")")
@@ -88,7 +67,7 @@ end
 
 detect_fsr4_policy()
 
-install_dlss_runtime = safe_gpu_matches_any(dlss_rules)
+install_dlss_runtime = system.gpu_matches_any(dlss_rules)
 
 install.log("显卡: " .. gpu_name .. " (" .. gpu_vendor .. ")，FSR4 模式: " .. fsr4_mode)
 
