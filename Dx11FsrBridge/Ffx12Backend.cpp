@@ -1,5 +1,4 @@
 #include "Ffx12Backend.h"
-#include "Dx11On12Swapchain.h"
 
 #include <Windows.h>
 #include <d3d11.h>
@@ -121,7 +120,6 @@ struct DebugPixel
 };
 DebugPixel g_debug_pixels[4]; // 0=PQ解码(color_linear) 1=ffxDispatch(output_linear) 2=PQ编码(输出共享) 3=motion解码(motion_cvt)
 std::mutex g_debug_px_mutex;
-bool g_debug_readback_enabled = false; // 管线诊断 readback（按需开启；默认关闭避免周期性 GPU stall）
 std::atomic_uint64_t g_dispatch_counter { 0 };
 bool g_debug_layer = false;           // D3D12 debug layer + info queue
 std::uint32_t g_dump_frames = 0;      // 2026-08-25：dump 前 N 帧 FSR4 输出（诊断边缘抖动）
@@ -909,9 +907,6 @@ bool ensure_input_staging()
     const DXGI_FORMAT depth_fmt = g_input_depth_fmt;
     const DXGI_FORMAT motion_fmt = g_input_motion_fmt;
     const DXGI_FORMAT transparency_fmt = g_input_transparency_fmt;
-    const std::uint32_t color_bpp = 4u;
-    const std::uint32_t depth_bpp = 8u; // R32G8X24
-    const std::uint32_t motion_bpp = 4u;
 
     const auto make_own = [&](DXGI_FORMAT fmt, ComPtr<ID3D12Resource> &own) -> bool
     {
@@ -1934,12 +1929,12 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
 
 } // namespace
 
-// OptiScaler 存在检测——加载 OptiScaler 即需要它接管桥的 FFX 输入。
-// 标准加载名（OptiScaler.dll）；改名加载场景可扩展模块扫描。
-static bool is_optiscaler_loaded()
-{
-    return ::GetModuleHandleW(L"OptiScaler.dll") != nullptr;
-}
+
+
+
+
+
+
 
 bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
 {
@@ -2434,8 +2429,7 @@ void recover_device_removed_locked()
 bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::uint64_t instance_key)
 {
     std::lock_guard lock(g_mutex);
-    const std::uint64_t dispatch_no = g_dispatch_counter.fetch_add(1, std::memory_order_relaxed);
-    const bool collect_diagnostics = g_debug_readback_enabled && ((dispatch_no & 511u) == 0u);
+    g_dispatch_counter.fetch_add(1, std::memory_order_relaxed);
     g_last_ffx_dispatch_rc.store(kFfxDispatchNotReached, std::memory_order_relaxed);
 #if defined(FFX12_DEBUG_STEPS)
     std::printf("[sdk234] dispatch enter active=%d\n", g_active.load(std::memory_order_relaxed) ? 1 : 0);

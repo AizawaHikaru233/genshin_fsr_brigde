@@ -5,7 +5,6 @@ project(Dx11FsrBridge LANGUAGES C CXX RC)
 option(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL "Build the standard FSR2 translation exports" OFF)
 option(DX11FSRBRIDGE_RELEASE_RUNTIME "Build the release runtime" ON)
 option(DX11FSRBRIDGE_BUILD_FAMILY_TEST "Build the Fsr2FamilyTakeover state-machine test" OFF)
-option(DX11FSRBRIDGE_BUILD_DX11ON12_SWAPCHAIN_TEST "Build the D3D11On12 flip-swapchain end-to-end test" OFF)
 
 # The bridge deliberately uses the deployed ffx-api runtime provider.  The
 # static open-SDK host was tested in-game and produced a black output, while
@@ -26,12 +25,9 @@ add_library(Dx11FsrBridge SHARED
     Ffx12Backend.cpp
 )
 
-# 第一百零六轮：旧方案彻底隔离——
-#  Fsr2TranslationLayer（旧 OptiScaler+FRS2 翻译层）与 Dx11On12Swapchain（On12 引导）
-#  不再编译进 DLL；OptiScaler 未来将以新 ffx12 链路为基底重新接入。
-#  宏保留（sdk234 接管块在该宏内），但不再编译翻译层模块。
+# 旧方案已彻底移除：Fsr2TranslationLayer（旧翻译层）与 Dx11On12Swapchain（On12 引导）
+# 不再编译进 DLL；OptiScaler 以新 ffx12 链路为基底接入。
 if(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
-    # Fsr2TranslationLayer.cpp / Fsr2TranslationLayer.def 已从构建中移除（旧方案隔离）。
     target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=1)
 endif()
 
@@ -93,17 +89,4 @@ if(DX11FSRBRIDGE_BUILD_FAMILY_TEST)
         UNICODE
         _UNICODE
     )
-endif()
-
-if(DX11FSRBRIDGE_BUILD_DX11ON12_SWAPCHAIN_TEST)
-    add_executable(Dx11On12SwapchainTest
-        Dx11On12SwapchainTest.cpp
-        Dx11On12Swapchain.cpp
-    )
-    target_compile_features(Dx11On12SwapchainTest PRIVATE cxx_std_20)
-    if(MSVC)
-        target_compile_options(Dx11On12SwapchainTest PRIVATE /utf-8 /W3)
-    endif()
-    target_compile_definitions(Dx11On12SwapchainTest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-    target_link_libraries(Dx11On12SwapchainTest PRIVATE d3d11 d3d12 dxgi)
 endif()
