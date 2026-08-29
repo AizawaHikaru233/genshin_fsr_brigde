@@ -4111,8 +4111,9 @@ bool process_matches()
 
 bool read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo &out_info); // 定义见下（cached 版本在其后调用）
 
-// 视图 ResourceInfo 缓存：D3D11 视图描述创建后不可变，按视图指针缓存避免
-// on-demand 识别路径每 draw 重复 ~9 次 COM 内省。上限防视图集合重建后残留。
+// 视图 ResourceInfo 缓存：仅缓存"识别成功"路径的视图（场景 TAAU 视图长期存活、
+// 地址不复用）；识别失败路径（如 UI 覆盖层）不写缓存，避免视图释放后地址复用
+// 命中旧描述导致永久识别失败（桥接掉）。
 std::mutex g_resource_info_cache_mutex;
 std::unordered_map<std::uintptr_t, ResourceInfo> g_resource_info_cache;
 
@@ -4129,14 +4130,17 @@ ResourceInfo read_resource_info_cached(ID3D11View *view, const wchar_t *kind)
             return it->second;
     }
     read_resource_info(view, kind, info);
-    if (info.resource_key != 0)
-    {
-        std::lock_guard lock(g_resource_info_cache_mutex);
-        if (g_resource_info_cache.size() >= 512)
-            g_resource_info_cache.clear();
-        g_resource_info_cache.emplace(key, info);
-    }
     return info;
+}
+
+void commit_resource_info_cached(ID3D11View *view, const ResourceInfo &info)
+{
+    if (view == nullptr || info.resource_key == 0)
+        return;
+    std::lock_guard lock(g_resource_info_cache_mutex);
+    if (g_resource_info_cache.size() >= 512)
+        g_resource_info_cache.clear();
+    g_resource_info_cache.emplace(reinterpret_cast<std::uintptr_t>(view), info);
 }
 
 bool read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo &out_info)
@@ -7519,6 +7523,13 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     {
         return std::nullopt;
     }
+
+    // 识别成功：提交本次视图的 ResourceInfo 到缓存（仅场景 TAAU 视图——
+    // 长期存活、地址不复用；失败路径不写缓存，杜绝地址复用污染）。
+    for (std::size_t index = 0; index < shader_resources.size(); ++index)
+        commit_resource_info_cached(shader_resources[index], inputs[index]);
+    for (std::size_t index = 0; index < render_targets.size(); ++index)
+        commit_resource_info_cached(render_targets[index], outputs[index]);
 
     g_trace_ps_cb0_key.store(constant_buffer_key, std::memory_order_relaxed);
 
