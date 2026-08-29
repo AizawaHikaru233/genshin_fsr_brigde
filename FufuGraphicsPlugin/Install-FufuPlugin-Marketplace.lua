@@ -1,18 +1,9 @@
 install.log("FSR Bridge Lua 商城安装器已开始执行")
 
--- 仅识别 RTX（用于 DLSS 复制）。FSR4 策略不再由 Lua 检测：
--- 全部交给 bootstrap（FufuGraphicsPlugin.dll）运行时按 DXGI Device-ID 精确分类并写入 OptiScaler.ini。
-local dlss_rules = {
-    { vendor = "NVIDIA", family = "RTX", series = "20" },
-    { vendor = "NVIDIA", family = "RTX", series = "30" },
-    { vendor = "NVIDIA", family = "RTX", series = "40" },
-    { vendor = "NVIDIA", family = "RTX", series = "50" },
-}
-local install_dlss_runtime = false
-if system ~= nil and system.gpu_matches_any ~= nil then
-    install_dlss_runtime = system.gpu_matches_any(dlss_rules) == true
-end
-
+-- 纯文件层安装：不调用任何 GPU 检测接口（芙芙沙箱 GPU API 在部分多适配器环境会中断脚本）。
+-- FSR4 策略与 DLSS 依赖均由 bootstrap（FufuGraphicsPlugin.dll）启动时处理：
+--   - 策略：Device-ID 精确分类写入 OptiScaler.ini（本脚本删除旧配置后由 bootstrap 重建）
+--   - DLSS：bootstrap 检测 OptiScaler 目录缺 nvngx_dlss.dll 且为 RTX 时，从 payload\NVIDIA\DLSS 补齐
 local plugin_id = "FSR-Bridge-Plugin"
 local plugins_dir = install.get_plugins_dir()
 local plugin_dir = plugins_dir .. "\\" .. plugin_id
@@ -83,28 +74,13 @@ install.write_config(plugin_dir, {
 })
 
 install.set_progress(90, "正在准备组件初始配置")
--- 删除旧配置，由 bootstrap 首次启动时按 default_config 模板重新初始化：
---   FSR4Policy.ini（策略文件，bootstrap 缺失时按 auto 用 Device-ID 精确分类）
---   OptiScaler.ini（托管设置 + 策略写入）
+-- 删除旧配置，bootstrap 下次启动时按 default_config 重建：
+--   OptiScaler.ini（托管设置 + Device-ID 策略分类）、FSR4Policy.ini 不再需要
 if install.file_exists(plugin_dir .. "\\FSR4Policy.ini") then
     install.delete(plugin_dir .. "\\FSR4Policy.ini")
 end
 if install.file_exists(opti_dir .. "\\OptiScaler.ini") then
     install.delete(opti_dir .. "\\OptiScaler.ini")
-end
-
-local bundled_dlss = payload_dir .. "\\NVIDIA\\DLSS\\nvngx_dlss.dll"
-local bundled_dlss_license = payload_dir .. "\\NVIDIA\\DLSS\\nvngx_dlss.license.txt"
-if install_dlss_runtime and install.file_exists(bundled_dlss) then
-    install.copy_file(bundled_dlss, opti_dir .. "\\nvngx_dlss.dll")
-    if install.file_exists(bundled_dlss_license) then
-        install.copy_file(bundled_dlss_license, opti_dir .. "\\nvngx_dlss.license.txt")
-    end
-    install.log("已将 NVIDIA DLSS 组件复制到 OptiScaler 运行目录")
-elseif not install_dlss_runtime then
-    install.log("当前显卡不是已识别的 RTX，跳过 NVIDIA DLSS 组件复制")
-else
-    install.log("插件包未包含 NVIDIA DLSS 组件，跳过复制")
 end
 
 install.set_progress(100, "安装完成")
