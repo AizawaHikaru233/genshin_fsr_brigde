@@ -28,6 +28,7 @@ $ErrorActionPreference = 'Stop'
 $OutputEncoding = [System.Text.Encoding]::UTF8
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+$script:CachedVideoControllers = $null # Win32_VideoController 查询缓存（严格模式下必须先初始化）
 
 $scriptDirectory = [IO.Path]::GetFullPath((Split-Path -Parent $PSCommandPath))
 $root = if ([IO.Path]::GetFileName($scriptDirectory) -ieq 'scripts') {
@@ -1307,7 +1308,13 @@ Install-Unlocker -Mode $unlockerMode -ManualPath $UnlockerPackagePath
 if (-not $DisableOptiScaler) {
     $optiMode = Select-SourceMode -Label 'OptiScaler' -RequestedMode $OptiScalerSource -ExistingAvailable (Test-Path -LiteralPath $optiDll -PathType Leaf)
     Install-OptiScaler -Mode $optiMode -ManualPath $OptiScalerPackagePath -PreserveExistingConfig:$PreserveExistingConfigs
-    Install-NvidiaDlssIfNeeded
+    try {
+        Install-NvidiaDlssIfNeeded
+    }
+    catch {
+        # DLSS 为可选组件（仅 NVIDIA RTX 需要）：失败不影响主流程，说明原因与临时办法后继续。
+        Write-Warning (Convert-InstallerText -Value "NVIDIA DLSS 组件安装失败（可选，不影响其他组件）：$($_.Exception.Message)。临时办法：A 卡无需安装 DLSS；N 卡可稍后在「安装模块」或「更新模块」中重试，或从 NVIDIA Streamline 官方发布页手动下载 nvngx_dlss.dll 放入 $optiDir")
+    }
     Assert-File -Path $bridgeDll
     $ffxMainCandidates = @(
         (Join-Path $optiDir 'amd_fidelityfx_dx12.dll'),
