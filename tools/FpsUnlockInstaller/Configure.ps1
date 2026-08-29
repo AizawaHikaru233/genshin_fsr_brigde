@@ -1,6 +1,7 @@
 ﻿param(
     [string]$GamePath,
     [int]$FpsTarget = 0,
+    [switch]$DisableBridge,
     [switch]$DisableOptiScaler,
     [switch]$DisableAntiBlur,
     [switch]$DisableHDR,
@@ -1291,6 +1292,16 @@ if ([string]::IsNullOrWhiteSpace($ReShadeSource)) {
 $unlockerMode = Select-SourceMode -Label 'FPS Unlocker' -RequestedMode $UnlockerSource -ExistingAvailable (Test-Path -LiteralPath $unlocker -PathType Leaf)
 Install-Unlocker -Mode $unlockerMode -ManualPath $UnlockerPackagePath
 
+# Bridge 独立（FSR4——A 卡 7000/9000）：OptiScaler 开启时捆绑强制启用 Bridge
+$bridgeEnabled = -not $DisableBridge -or -not $DisableOptiScaler
+if ($bridgeEnabled) {
+    Assert-File -Path $bridgeDll
+    # Bridge 独立依赖：FFX12 SDK（payload\AMD）——A 卡 FSR4 必需
+    $amdUpscalerDll = Join-Path $payload 'AMD\amd_fidelityfx_upscaler_dx12.dll'
+    if (-not (Test-Path -LiteralPath $amdUpscalerDll -PathType Leaf)) {
+        throw (Convert-InstallerText -Value "FSR Bridge 依赖不完整：缺少 $amdUpscalerDll")
+    }
+}
 if (-not $DisableOptiScaler) {
     $optiMode = Select-SourceMode -Label 'OptiScaler' -RequestedMode $OptiScalerSource -ExistingAvailable (Test-Path -LiteralPath $optiDll -PathType Leaf)
     Install-OptiScaler -Mode $optiMode -ManualPath $OptiScalerPackagePath -PreserveExistingConfig:$PreserveExistingConfigs
@@ -1342,8 +1353,10 @@ $dllList = [System.Collections.Generic.List[string]]::new()
 if (-not $DisableHDR) {
     $dllList.Add($reshadeDll)
 }
-if (-not $DisableOptiScaler) {
+if ($bridgeEnabled) {
     $dllList.Add($bridgeDll)
+}
+if (-not $DisableOptiScaler) {
     $dllList.Add($optiDll)
 }
 if (-not $DisableAntiBlur) {
