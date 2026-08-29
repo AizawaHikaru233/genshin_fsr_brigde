@@ -1,6 +1,6 @@
 # Genshin FSR Bridge
 
-面向原神 Windows DX11 客户端的 FSR2 ABI 桥接 DLL。它在游戏进程中提供标准 FSR2 导出，并把游戏的上采样调用转接给外部兼容实现，例如 OptiScaler。
+面向原神 Windows DX11 客户端的图形插件。它独立 hook 游戏原生 FSR2 调用，并转接到 AMD FFX12 官方 SDK 实现超分：在支持的显卡上直接提供 FSR4/FSR3/FSR2，不依赖 OptiScaler 等外部插件；接入 OptiScaler 后可以进一步扩展 DLSS/XeSS/FSR4 INT8 等超分类型。
 
 本仓库同时包含 `AntiPlayerMosaic/` 子项目。它是独立构建的原神马赛克修复与 UID 隐藏插件，具体用法见该目录的 README。
 
@@ -49,8 +49,8 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 ## 功能
 
 - 通过 DX11 设备与上下文拦截获取原神的 FSR2 调用时机。
-- 提供标准 FSR2 导出，使外部超分工具可以识别 FSR2 接口。
-- 为外部处理器准备颜色、深度、运动向量、抖动和历史资源。
+- 为 FFX12 SDK 准备颜色、深度、运动向量、抖动和历史资源，并转接超分 dispatch。
+- 按显卡能力自动匹配 FSR 系列（FSR4/FSR3/FSR2），支持显卡上无需外部插件即可超分。
 - 将游戏渲染精度菜单扩展为 `0.2–0.9 + 原生`；`原生` 档位为游戏原本的 `1.0` 渲染精度。
 - 运行时日志默认写入 DLL 同目录的 `Dx11FsrBridge.log`，用于排查加载与 Hook 状态。
 
@@ -63,22 +63,11 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 ## 使用方法
 
 从 [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases) 下载压缩包，解压后运行 `一键配置.bat` 并根据提示安装。英语界面可运行 `GenshinFSRBridgeTools.bat`；也可在安装器主菜单中随时切换中文或 English，选择会自动保存。GitHub 发布包内置 FPS Unlocker 与 OptiScaler，安装脚本会在运行时从官方上游获取 [NVIDIA DLSS 超分组件（`nvngx_dlss.dll`）](https://github.com/NVIDIA-RTX/Streamline/releases) 与 ReShade；本地分发包需要自行补齐相应组件。
-游戏内必须启用 `FSR2` 抗锯齿，渲染精度需低于 `1`
+游戏内必须启用 `FSR2` 抗锯齿，渲染精度需低于 `1`。
 
-`Dx11FsrBridge.dll` 本身不执行 FSR、DLSS、XeSS 或其他超分算法。它只向外部工具暴露标准 FSR2 接口，并将游戏的 DX11 上采样调用转接到该接口。
+`Dx11FsrBridge.dll` 独立 hook 原神的 FSR2 调用并转接到 AMD FFX12 SDK，在支持的显卡上直接实现 FSR4/FSR3/FSR2 超分，无需 OptiScaler 等外部插件。可选接入 [OptiScaler](https://github.com/optiscaler/OptiScaler) 扩展超分类型（DLSS、XeSS、FSR4 INT8 等）。安装包已按默认顺序配置好组件加载，通常无需手动指定；`AntiPlayerMosaic.dll` 为可选的反虚化/UID 隐藏插件。
 
-也可以使用其他 DLL 注入工具，但必须保证它支持稳定的按序加载。
-
-推荐加载顺序：
-
-1. `ReShade64.dll`（可选，必须最先加载）
-2. `Dx11FsrBridge.dll`
-3. `OptiScaler.dll`
-4. `AntiPlayerMosaic.dll`（可选）
-
-启用 ReShade 时必须首先加载；随后保持 Bridge 在 [OptiScaler](https://github.com/optiscaler/OptiScaler)（或同类工具）之前，使其在启动时扫描标准 FSR2 导出并接管。该顺序避免 NVIDIA 显卡使用 FSR4 时的初始化兼容性问题。Bridge 不直接加载、修改或捆绑 OptiScaler；后端选择、FSR3/FSR4 模型和其他 OptiScaler 配置均由用户自己的工具安装负责。
-
-OptiScaler 和 ReShade 的运行配置位于各自组件目录。OptiScaler 的 DLL 与日志路径、ReShade 的着色器、纹理、Preset 和截图路径均使用相对路径，避免安装目录含中文时被第三方配置保存逻辑错误转码。只有游戏目录中用于定位外置 ReShade 目录的 `[INSTALL] BasePath` 在跨目录或跨盘安装时必须使用动态生成的绝对路径。
+若接入 OptiScaler 和 ReShade，它们的运行配置位于各自组件目录。OptiScaler 的 DLL 与日志路径、ReShade 的着色器、纹理、Preset 和截图路径均使用相对路径，避免安装目录含中文时被第三方配置保存逻辑错误转码。只有游戏目录中用于定位外置 ReShade 目录的 `[INSTALL] BasePath` 在跨目录或跨盘安装时必须使用动态生成的绝对路径。
 
 ## 构建
 
@@ -100,23 +89,22 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 
 ## 日志与问题反馈
 
-Bridge、OptiScaler 和反虚化组件默认会保留错误日志。每次重新运行会覆盖上一轮日志。
+Bridge 和反虚化组件默认会保留错误日志（接入 OptiScaler/ReShade 时它们也会保留各自日志）。每次重新运行会覆盖上一轮日志。
 遇到游戏无法启动、FSR 无法激活、切换超分后闪退或其他异常时，请在复现后不要再次启动游戏，并提供：
 
 1. `payload/Bridge/Dx11FsrBridge.log` (必须)
-2. `payload/OptiScaler/OptiScaler.log` (必须)
-3. `payload/OptiScaler/OptiScaler.ini`
-4. `payload/ReShade/ReShade.log`（涉及 ReShade 时）
-5. `payload/AntiPlayerMosaic/AntiPlayerMosaic.log`（涉及反虚化、UID 或水下马赛克时）
-6. 芙芙插件目录下的 `FSR-Bridge-Plugin.log`（使用芙芙启动器插件时）
-7. 显卡型号、游戏版本、异常发生阶段和所选超分模式
+2. `payload/OptiScaler/OptiScaler.log` 与 `payload/OptiScaler/OptiScaler.ini`（使用 OptiScaler 时）
+3. `payload/ReShade/ReShade.log`（涉及 ReShade 时）
+4. `payload/AntiPlayerMosaic/AntiPlayerMosaic.log`（涉及反虚化、UID 或水下马赛克时）
+5. 芙芙插件目录下的 `FSR-Bridge-Plugin.log`（使用芙芙启动器插件时）
+6. 显卡型号、游戏版本、异常发生阶段和所选超分模式
 
-需要进一步排查时，可临时将 `OptiScaler.ini` 中 `Log` 下的 `LogLevel` 改为 `1（Debug）`或 `0（Trace）`但诊断结束后应恢复正式配置以避免额外开销。
+需要进一步排查时，可临时将 `OptiScaler.ini`（接入 OptiScaler 时）中 `Log` 下的 `LogLevel` 改为 `1（Debug）`或 `0（Trace）`，但诊断结束后应恢复正式配置以避免额外开销。
 不要把游戏账号、登录信息或包含个人信息的截图提交到公开 Issue。
 
 ## 第三方组件
 
-- FSR2 ABI 头文件与 Microsoft Detours 仅作为构建依赖，保留各自原始许可证与声明。
+- FFX12 ffx-api 头文件与 Microsoft Detours 仅作为构建依赖，保留各自原始许可证与声明。
 - OptiScaler 是独立项目：<https://github.com/optiscaler/OptiScaler>。
 - GitHub 发布包不会内置 NVIDIA DLSS 组件与 ReShade 二进制，安装时由脚本从各自官方上游获取。
 - 本地分发包需要自行补齐相应组件，并遵守各组件授权要求（例如随附 GPL 全文与源码链接、ReShade 官方"不得分享二进制"、DLSS 仅限 NVIDIA GPU 使用等）。

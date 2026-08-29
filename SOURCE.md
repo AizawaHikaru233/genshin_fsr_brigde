@@ -2,7 +2,7 @@
 
 ## 运行模块
 
-- `Dx11FsrBridge/`：原神 DX11 渲染链路的 FSR2 桥接层。
+- `Dx11FsrBridge/`：原神 DX11 渲染链路插件（独立 hook 游戏原生 FSR2 并转接 AMD FFX12 SDK 超分）。
   - `Dx11FsrBridge.cpp`：D3D11 拦截、渲染状态跟踪、动态输入采集、FFX12 接管调度与运行日志。
   - `Ffx12Backend.*`：FFX12 SDK 后端（自建 D3D12 设备 + 共享纹理 GPU 互操作、版本前缀匹配与 dispatch）。
   - `RenderScaleMenu.*`：渲染精度候选值、菜单标签和低于原生比例的应用逻辑；Release 只保留 3 个必要 Hook 与菜单事件触发的受限扫描（RVA 与特征签名硬编码于源码，不读 INI）。

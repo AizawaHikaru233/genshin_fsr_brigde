@@ -1,6 +1,6 @@
 # Genshin FSR Bridge
 
-An FSR2 ABI bridge DLL for the Genshin Impact Windows DX11 client. It exposes standard FSR2 exports inside the game process and forwards the game's upscaling calls to a compatible external implementation, such as OptiScaler.
+A graphics plugin for the Genshin Impact Windows DX11 client. It independently hooks the game's native FSR2 calls and forwards them to the AMD FFX12 official SDK for upscaling: FSR4/FSR3/FSR2 are provided directly on supported GPUs without any external plugin such as OptiScaler. OptiScaler can additionally be connected to extend the upscaler types (DLSS, XeSS, FSR4 INT8, etc.).
 
 This repository also includes the `AntiPlayerMosaic/` subproject. It is an independently built plugin for fixing Genshin Impact's mosaic effects and hiding the UID. See the README in that directory for details.
 
@@ -49,8 +49,8 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 ## Features
 
 - Intercepts DX11 device and context activity to obtain the timing of Genshin Impact's FSR2 calls.
-- Exposes standard FSR2 exports so external upscaling tools can detect the FSR2 interface.
-- Prepares color, depth, motion-vector, jitter, and history resources for the external processor.
+- Prepares color, depth, motion-vector, jitter, and history resources for the FFX12 SDK and forwards the upscaling dispatch.
+- Auto-matches the FSR series by GPU capability (FSR4/FSR3/FSR2); upscaling works on supported GPUs without external plugins.
 - Extends the in-game render-scale menu to `0.2–0.9 + 0.999`; `0.999` replaces the original highest menu slot.
 - Writes runtime logs to `Dx11FsrBridge.log` beside the DLL by default for load and hook diagnostics.
 
@@ -65,20 +65,9 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 Download an archive from [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases), extract it, and run `一键配置.bat`, then follow the prompts to install. For the English interface, run `GenshinFSRBridgeTools.bat`. You can also switch between Chinese and English at any time from the installer main menu; the selection is saved automatically. GitHub release packages include FPS Unlocker and OptiScaler; the installer downloads the [NVIDIA DLSS upscaling component (`nvngx_dlss.dll`)](https://github.com/NVIDIA-RTX/Streamline/releases) and ReShade from their official upstream sources at install time. Local distributions must complete the required components on their own.
 In-game `FSR2` anti-aliasing must be enabled, and the render scale must be below `1`.
 
-`Dx11FsrBridge.dll` does not implement FSR, DLSS, XeSS, or any other upscaling algorithm. It only exposes a standard FSR2 interface to external tools and forwards the game's DX11 upscaling calls to that interface.
+`Dx11FsrBridge.dll` independently hooks Genshin Impact's FSR2 calls and forwards them to the AMD FFX12 SDK, providing FSR4/FSR3/FSR2 upscaling directly on supported GPUs without any external plugin. [OptiScaler](https://github.com/optiscaler/OptiScaler) can optionally be connected to extend the upscaler types (DLSS, XeSS, FSR4 INT8, etc.). The package configures component loading in the default order, so manual ordering is normally not required; `AntiPlayerMosaic.dll` is an optional anti-mosaic/UID-hiding plugin.
 
-Other DLL injection tools may also be used, but they must support stable ordered loading.
-
-Recommended loading order:
-
-1. `ReShade64.dll` (optional; must load first)
-2. `Dx11FsrBridge.dll`
-3. `OptiScaler.dll`
-4. `AntiPlayerMosaic.dll` (optional)
-
-When ReShade is enabled, it must load first. Then keep Bridge before [OptiScaler](https://github.com/optiscaler/OptiScaler), or a comparable tool, so it can scan and take over the standard FSR2 exports at startup. This order avoids an initialization compatibility issue with FSR4 on NVIDIA GPUs. Bridge does not directly load, modify, or bundle OptiScaler. Backend selection, FSR3/FSR4 models, and other OptiScaler settings are managed by the user's own tool installation.
-
-OptiScaler and ReShade runtime configurations are located in their respective component directories. OptiScaler DLL and log paths, as well as ReShade shader, texture, preset, and screenshot paths, use relative paths. This prevents third-party configuration-saving logic from incorrectly transcoding installation paths that contain Chinese characters. Only the game-directory `[INSTALL] BasePath`, which locates the external ReShade directory, must use a dynamically generated absolute path when installed across directories or drives.
+When OptiScaler and ReShade are used, their runtime configurations are located in their respective component directories. OptiScaler DLL and log paths, as well as ReShade shader, texture, preset, and screenshot paths, use relative paths. This prevents third-party configuration-saving logic from incorrectly transcoding installation paths that contain Chinese characters. Only the game-directory `[INSTALL] BasePath`, which locates the external ReShade directory, must use a dynamically generated absolute path when installed across directories or drives.
 
 ## Build
 
@@ -100,23 +89,22 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 
 ## Logs and Issue Feedback
 
-Bridge, OptiScaler, and the anti-mosaic component retain error logs by default. Each new run overwrites the previous run's logs.
+Bridge and the anti-mosaic component retain error logs by default (when OptiScaler/ReShade are connected, they also retain their own logs). Each new run overwrites the previous run's logs.
 If the game fails to start, FSR cannot be activated, switching upscalers causes a crash, or another issue occurs, do not launch the game again after reproducing it. Provide the following files and information:
 
 1. `payload/Bridge/Dx11FsrBridge.log` (required)
-2. `payload/OptiScaler/OptiScaler.log` (required)
-3. `payload/OptiScaler/OptiScaler.ini`
-4. `payload/ReShade/ReShade.log` (for ReShade-related issues)
-5. `payload/AntiPlayerMosaic/AntiPlayerMosaic.log` (for anti-mosaic, UID, or underwater mosaic issues)
-6. `FSR-Bridge-Plugin.log` from the FuFu plugin directory (when using the FuFu Launcher plugin)
-7. GPU model, game version, the stage at which the issue occurs, and the selected upscaling mode
+2. `payload/OptiScaler/OptiScaler.log` and `payload/OptiScaler/OptiScaler.ini` (when using OptiScaler)
+3. `payload/ReShade/ReShade.log` (for ReShade-related issues)
+4. `payload/AntiPlayerMosaic/AntiPlayerMosaic.log` (for anti-mosaic, UID, or underwater mosaic issues)
+5. `FSR-Bridge-Plugin.log` from the FuFu plugin directory (when using the FuFu Launcher plugin)
+6. GPU model, game version, the stage at which the issue occurs, and the selected upscaling mode
 
-When further diagnostics are needed, temporarily change `LogLevel` under `Log` in `OptiScaler.ini` to `1 (Debug)` or `0 (Trace)`. Restore the release setting after diagnostics to avoid additional overhead.
+When further diagnostics are needed, temporarily change `LogLevel` under `Log` in `OptiScaler.ini` (when OptiScaler is used) to `1 (Debug)` or `0 (Trace)`. Restore the release setting after diagnostics to avoid additional overhead.
 Do not submit game account details, login information, or screenshots containing personal information to a public Issue.
 
 ## Third-Party Components
 
-- FSR2 ABI headers and Microsoft Detours are build dependencies only; their original licenses and notices are retained.
+- FFX12 ffx-api headers and Microsoft Detours are build dependencies only; their original licenses and notices are retained.
 - OptiScaler is an independent project: <https://github.com/optiscaler/OptiScaler>.
 - GitHub release packages do not bundle the NVIDIA DLSS component or ReShade binaries; the installer downloads them from their official upstream sources at install time.
 - Local distributions must complete the required components on their own and comply with each component's licensing terms (for example, shipping the GPL full text with source links, respecting ReShade's official "do not share the binaries" policy, and DLSS limited to NVIDIA GPUs).
