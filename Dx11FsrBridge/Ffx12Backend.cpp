@@ -406,7 +406,6 @@ ComPtr<ID3D12PipelineState> g_mv_pso;
 ComPtr<ID3D12PipelineState> g_mv_pso_test; // 金丝雀：常数输出 0.5（诊断 pass 是否执行）
 bool g_motion_decode_test = false;
 D3D12_RESOURCE_STATES g_motion_src_state = D3D12_RESOURCE_STATE_COMMON;  // 共享源（D3D11 互操作）
-D3D12_RESOURCE_STATES g_cvt_state = D3D12_RESOURCE_STATE_COMMON;        // ffxApi 视角为 COMPUTE_READ
 
 // ---- PQ 颜色空间（游戏 color 为 HDR10 PQ 编码，FSR2 需线性 HDR）----
 // 输入：PqToLinear 解码 → FSR2（HDR flag）；输出：LinearToPq 编码 → r1。
@@ -827,7 +826,6 @@ void release_motion_decode()
     g_rb_motion_cvt_pitch = 0;
     g_mv_heap.Reset();
     g_motion_src_state = D3D12_RESOURCE_STATE_COMMON;
-    g_cvt_state = D3D12_RESOURCE_STATE_COMMON;
 }
 
 void release_input_staging(); // 定义在尾部（ensure_input_staging 旁）
@@ -1361,7 +1359,6 @@ bool ensure_motion_decode_resources()
         if (FAILED(g_up_motion_cvt->Map(0, &ur, &g_up_motion_cvt_ptr)) || !g_up_motion_cvt_ptr)
             return false;
     }
-    g_cvt_state = D3D12_RESOURCE_STATE_COMMON;
     // 链中点采样 readback（金丝雀：motion 输入非 0 → cvt 非 0 即证明 cmdlist 执行 + 自有 UAV 写正常）
     if (!create_readback_for_texture(g_tex_motion_cvt.Get(), g_rb_motion_cvt, g_rb_motion_cvt_pitch))
         return false;
@@ -1893,9 +1890,6 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     for (ID3D12Resource *resource : inputs)
         barrier(resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_COMMON);
-    barrier(g_tex_motion_cvt.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            D3D12_RESOURCE_STATE_COMMON);
-    g_cvt_state = D3D12_RESOURCE_STATE_COMMON;
     if (FAILED(cmd->Close()))
         return false;
     ID3D12CommandList *lists[] = {cmd};

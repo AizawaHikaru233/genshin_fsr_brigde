@@ -215,6 +215,7 @@ struct Config
     bool ffx12_fail_closed = false; // ：禁止回退原生（测试/故障显式暴露）
     bool ffx12_full_logging = false; // ：Release 下日志全开（排查用；log_line 不过滤）
     bool ffx12_probe = false; // 一次性槽位/cb0 探测（诊断用，默认关）
+    bool optiscaler_bridge_probe = false; // 遗留 OptiScaler 候选桥路径（frames.jsonl 记录，默认关）
     std::uint32_t ffx12_jitter_mode = 4; // 0=+norm*width-0.5, 1=+norm*width(符号反→整体抖), 2=raw, 3=-norm*width+0.5, 4=-norm*width(FSR4实测:符号正确), 5=零
     bool ffx12_depth_inverted = true; // 游戏深度逆方向（0=far）；FSR2 默认 0=near
     bool ffx12_decode_motion = true;  // 游戏 motion 为 R10G10B10A2 平方编码 → 解码 R16G16_FLOAT
@@ -2141,6 +2142,8 @@ void record_color_source_call(
 
 void record_color_source_copy(const ResourceInfo &destination, const ResourceInfo &source, const char *stage)
 {
+    if (!g_config.fsr2_trace_color_producers)
+        return;
     std::uint32_t output_width = 0;
     std::uint32_t output_height = 0;
     {
@@ -2148,8 +2151,7 @@ void record_color_source_copy(const ResourceInfo &destination, const ResourceInf
         output_width = g_state.backbuffer_width;
         output_height = g_state.backbuffer_height;
     }
-    if (!g_config.fsr2_trace_color_producers ||
-        !is_color_source_trace_surface(destination, output_width, output_height))
+    if (!is_color_source_trace_surface(destination, output_width, output_height))
     {
         return;
     }
@@ -3819,6 +3821,8 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12", 0, config_path.c_str()) != 0;
     g_config.ffx12_probe =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12Probe", 0, config_path.c_str()) != 0;
+    g_config.optiscaler_bridge_probe =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"OptiScalerBridgeProbe", 0, config_path.c_str()) != 0;
     g_config.ffx12_jitter_mode = static_cast<std::uint32_t>(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12JitterMode", 4, config_path.c_str()));
     g_config.ffx12_depth_inverted =
@@ -4630,6 +4634,8 @@ void write_candidate_packet(const OptiScalerBridgePacket &packet, UINT group_x, 
 
 std::optional<OptiScalerBridgePacket> build_dispatch_candidate(UINT group_x, UINT group_y, UINT group_z)
 {
+    if (!g_config.optiscaler_bridge_probe)
+        return std::nullopt;
     std::lock_guard lock(g_state_mutex);
 
     if (g_state.candidate_count >= g_config.candidate_limit_per_frame)
@@ -6570,8 +6576,9 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
     poll_final_scene_snapshot(swapchain);
 #endif
 
-    log_line("present frame=" + std::to_string(frame_index) +
-        " size=" + std::to_string(backbuffer_width) + "x" + std::to_string(backbuffer_height));
+    if (g_logging_enabled.load(std::memory_order_relaxed))
+        log_line("present frame=" + std::to_string(frame_index) +
+            " size=" + std::to_string(backbuffer_width) + "x" + std::to_string(backbuffer_height));
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME) && defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     static std::atomic_uint64_t last_runtime_status_tick { 0 };
     const ULONGLONG now = GetTickCount64();
@@ -7036,8 +7043,6 @@ void ensure_context_device_texture_hook(ID3D11DeviceContext *context)
 void STDMETHODCALLTYPE hooked_om_set_render_targets(ID3D11DeviceContext *context, UINT count, ID3D11RenderTargetView *const *rtvs, ID3D11DepthStencilView *dsv)
 {
     ensure_context_device_texture_hook(context);
-    if (g_config.dx11_on12_swapchain)
-    {
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
     {
@@ -7051,7 +7056,6 @@ void STDMETHODCALLTYPE hooked_om_set_render_targets(ID3D11DeviceContext *context
         return;
     }
 #endif
-    }
     ResourceInfo first_target {};
     {
         std::lock_guard lock(g_state_mutex);
@@ -9595,7 +9599,6 @@ bool try_fsr2_translation_draw(
                 // 绑定深度（slot2 SRV）实测内容全 0（bits3x3 全 00000000）——
                 // 非游戏真实深度缓冲。改用当前 draw 的 DSV 资源（场景深度缓冲本体）：
                 // 只要 accumulate 时 DSV 仍绑定则优先替代，否则回退原绑定纹理。
-                if (g_config.ffx12_probe || true)
                 {
                     ID3D11DepthStencilView *cur_dsv = nullptr;
                     ID3D11RenderTargetView *cur_rtvs[4] = {};
@@ -11537,6 +11540,14 @@ void STDMETHODCALLTYPE hooked_copy_resource(ID3D11DeviceContext *context, ID3D11
 
 void STDMETHODCALLTYPE hooked_copy_subresource_region(ID3D11DeviceContext *context, ID3D11Resource *dst, UINT dst_subresource, UINT dst_x, UINT dst_y, UINT dst_z, ID3D11Resource *src, UINT src_subresource, const D3D11_BOX *src_box)
 {
+#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    // Release：全部内省消费点默认关闭时直接透传（同 copy_resource 快路径模式）。
+    if (!g_config.log_resource_ops && !g_config.hdr_composite_probe && !g_config.fsr2_trace_color_producers)
+    {
+        g_original_copy_subresource_region(context, dst, dst_subresource, dst_x, dst_y, dst_z, src, src_subresource, src_box);
+        return;
+    }
+#endif
     ResourceInfo dst_info {};
     ResourceInfo src_info {};
     read_resource_info_from_resource(dst, L"copy_dst", dst_info);
@@ -11596,12 +11607,15 @@ void STDMETHODCALLTYPE hooked_clear_rtv(ID3D11DeviceContext *context, ID3D11Rend
 
 void STDMETHODCALLTYPE hooked_clear_dsv(ID3D11DeviceContext *context, ID3D11DepthStencilView *dsv, UINT flags, FLOAT depth, UINT8 stencil)
 {
-    ResourceInfo info {};
-    read_resource_info(dsv, L"dsv", info);
-    if (g_config.log_resource_ops)
-        log_line("clear_dsv res=" + hex64(info.resource_key) + " size=" + std::to_string(info.width) + "x" + std::to_string(info.height) +
-            " fmt=" + format_string(info.format) + " flags=" + std::to_string(flags) +
-            " depth=" + std::to_string(depth) + " stencil=" + std::to_string(stencil));
+    if (g_config.dx11_on12_swapchain)
+    {
+        ResourceInfo info {};
+        read_resource_info(dsv, L"dsv", info);
+        if (g_config.log_resource_ops)
+            log_line("clear_dsv res=" + hex64(info.resource_key) + " size=" + std::to_string(info.width) + "x" + std::to_string(info.height) +
+                " fmt=" + format_string(info.format) + " flags=" + std::to_string(flags) +
+                " depth=" + std::to_string(depth) + " stencil=" + std::to_string(stencil));
+    }
     g_original_clear_dsv(context, dsv, flags, depth, stencil);
 }
 

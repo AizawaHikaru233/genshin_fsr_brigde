@@ -94,6 +94,8 @@ std::array<std::uint8_t, 0x400> g_recent_object_snapshot {};
 std::uintptr_t g_recent_object_snapshot_instance = 0;
 std::uint64_t g_recent_object_snapshot_tick = 0;
 std::mutex g_recent_object_snapshot_mutex;
+std::mutex g_writable_cache_mutex;
+std::unordered_map<std::uintptr_t, bool> g_writable_cache; // 实例字段可写性缓存（跨帧稳定；上限防实例重建残留）
 
 bool is_executable_address(const void *address);
 bool read_float_value(const void *address, float &value);
@@ -433,14 +435,27 @@ bool seed_selection_from_native_scale(void *instance)
 
 bool is_writable_address(const void *address, std::size_t length)
 {
+    const auto key = reinterpret_cast<std::uintptr_t>(address);
+    {
+        std::lock_guard lock(g_writable_cache_mutex);
+        const auto it = g_writable_cache.find(key);
+        if (it != g_writable_cache.end())
+            return it->second;
+    }
     MEMORY_BASIC_INFORMATION memory {};
-    if (VirtualQuery(address, &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_COMMIT ||
-        memory.Protect == PAGE_NOACCESS || (memory.Protect & PAGE_GUARD) != 0 ||
-        (memory.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0)
-        return false;
-    const auto begin = reinterpret_cast<std::uintptr_t>(address);
-    const auto end = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
-    return begin <= end && length <= end - begin;
+    const bool result = VirtualQuery(address, &memory, sizeof(memory)) == sizeof(memory) &&
+        memory.State == MEM_COMMIT &&
+        memory.Protect != PAGE_NOACCESS && (memory.Protect & PAGE_GUARD) == 0 &&
+        (memory.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0 &&
+        reinterpret_cast<std::uintptr_t>(address) <=
+            reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize &&
+        length <= (reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize) -
+            reinterpret_cast<std::uintptr_t>(address);
+    std::lock_guard lock(g_writable_cache_mutex);
+    if (g_writable_cache.size() >= 128)
+        g_writable_cache.clear(); // 实例重建后重新评估
+    g_writable_cache.emplace(key, result);
+    return result;
 }
 
 bool read_float_value(const void *address, float &value)

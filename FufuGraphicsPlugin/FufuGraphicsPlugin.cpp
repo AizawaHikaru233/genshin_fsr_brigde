@@ -115,19 +115,22 @@ void write_log(const std::string &message)
         GetCurrentThreadId());
 
     const std::string line = std::string(prefix) + message + "\r\n";
-    HANDLE file = CreateFileW(
-        g_log_path.c_str(),
-        FILE_APPEND_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        OPEN_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr);
-    if (file == INVALID_HANDLE_VALUE)
-        return;
+    static HANDLE cached_handle = INVALID_HANDLE_VALUE;
+    if (cached_handle == INVALID_HANDLE_VALUE)
+    {
+        cached_handle = CreateFileW(
+            g_log_path.c_str(),
+            FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (cached_handle == INVALID_HANDLE_VALUE)
+            return;
+    }
     DWORD written = 0;
-    WriteFile(file, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
-    CloseHandle(file);
+    WriteFile(cached_handle, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
 }
 
 void reset_log()
@@ -146,11 +149,11 @@ void reset_log()
 
 std::filesystem::path module_path(const HMODULE module)
 {
-    std::vector<wchar_t> buffer(32768);
-    const DWORD length = GetModuleFileNameW(module, buffer.data(), static_cast<DWORD>(buffer.size()));
-    if (length == 0 || length >= buffer.size())
+    wchar_t buffer[32768];
+    const DWORD length = GetModuleFileNameW(module, buffer, static_cast<DWORD>(std::size(buffer)));
+    if (length == 0 || length >= std::size(buffer))
         return {};
-    return std::filesystem::path(std::wstring(buffer.data(), length));
+    return std::filesystem::path(std::wstring(buffer, length));
 }
 
 bool file_exists(const std::filesystem::path &path)
@@ -162,11 +165,11 @@ bool file_exists(const std::filesystem::path &path)
 std::filesystem::path absolute_from(const std::filesystem::path &base, const std::filesystem::path &path)
 {
     const std::filesystem::path candidate = path.is_absolute() ? path : base / path;
-    std::vector<wchar_t> buffer(32768);
-    const DWORD length = GetFullPathNameW(candidate.c_str(), static_cast<DWORD>(buffer.size()), buffer.data(), nullptr);
-    if (length == 0 || length >= buffer.size())
+    wchar_t buffer[32768];
+    const DWORD length = GetFullPathNameW(candidate.c_str(), static_cast<DWORD>(std::size(buffer)), buffer, nullptr);
+    if (length == 0 || length >= std::size(buffer))
         return candidate;
-    return std::filesystem::path(std::wstring(buffer.data(), length));
+    return std::filesystem::path(std::wstring(buffer, length));
 }
 
 std::string trim_ascii(std::string value)
@@ -330,7 +333,13 @@ bool set_ini_value_utf8(
         }
         const std::string replacement = key + "=" + value;
         if (key_index != lines.size())
+        {
+            const std::string current = trim_ascii(lines[key_index]);
+            const std::size_t eq = current.find('=');
+            if (eq != std::string::npos && trim_ascii(current.substr(eq + 1)) == value)
+                return true; // 值未变化：不重写文件
             lines[key_index] = replacement;
+        }
         else
             lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(section_end), replacement);
     }
@@ -770,8 +779,10 @@ bool ensure_missing_component_configurations(const BootstrapConfig &config)
         const std::filesystem::path nvidia_directory =
             g_module_directory / L"payload" / L"NVIDIA" / L"DLSS";
         const std::filesystem::path dlss_destination = optiscaler_directory / L"nvngx_dlss.dll";
-        if (has_nvidia_rtx_adapter() && !file_exists(dlss_destination) &&
-            file_exists(nvidia_directory / L"nvngx_dlss.dll"))
+        // 先做文件级短路，命中缺失且包内含组件时才枚举 GPU（避免每次启动 DXGI 枚举）。
+        if (!file_exists(dlss_destination) &&
+            file_exists(nvidia_directory / L"nvngx_dlss.dll") &&
+            has_nvidia_rtx_adapter())
         {
             copy_file_replace(nvidia_directory / L"nvngx_dlss.dll", dlss_destination);
             if (file_exists(nvidia_directory / L"nvngx_dlss.license.txt"))
