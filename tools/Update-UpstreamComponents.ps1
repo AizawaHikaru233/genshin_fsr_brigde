@@ -138,7 +138,11 @@ function Update-OptiScaler {
         foreach ($item in Get-ChildItem -LiteralPath $source -Force) {
             if ($item.Name -in $exclude) { continue }
             if ($item.PSIsContainer) {
-                Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $optiRuntime $item.Name) -Recurse -Force
+                $dest = Join-Path $optiRuntime $item.Name
+                # 先删目标同名目录再复制：多次更新时避免 Copy-Item 递归到已存在
+                # 目标目录产生嵌套（如 Licenses\Licenses\）。
+                if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
+                Copy-Item -LiteralPath $item.FullName -Destination $dest -Recurse -Force
             }
             elseif ($item.Name -notin $preserve) {
                 Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $optiRuntime $item.Name) -Force

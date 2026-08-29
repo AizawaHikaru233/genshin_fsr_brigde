@@ -261,6 +261,22 @@ function Prepare-FpsStage {
     Copy-Item -LiteralPath (Join-Path $optiRuntime 'OptiScaler.ini'), (Join-Path $optiRuntime 'OptiScaler-UpscalingFiles.json') -Destination $stageDefaults -Force
     Copy-Item -LiteralPath (Join-Path $reshadeRuntime 'ReShade.ini'), (Join-Path $reshadeRuntime 'ReShadePreset.ini') -Destination $stageDefaults -Force
 
+    # 外部组件 license 集中到独立 license 文件夹（只集中插件本身的 license；
+    # OptiScaler 内部集成 SDK（FidelityFX/DirectX/XeSS）保持原样 OptiScaler\Licenses；
+    # 自有组件 Bridge/AntiPlayerMosaic 不在此列）。
+    $stageLicense = Join-Path $stage 'license'
+    New-Item -ItemType Directory -Path $stageLicense -Force | Out-Null
+    $licenseSources = @(
+        @{ Source = (Join-Path $root 'SharedResources\OptiScaler-LICENSE.txt'); Target = 'OptiScaler-LICENSE.txt' },
+        @{ Source = (Join-Path $root 'SharedResources\FpsUnlocker-LICENSE.txt'); Target = 'FPSUnlocker-LICENSE.txt' },
+        @{ Source = (Join-Path $reshadeRuntime 'LICENSE-ReShade-BSD-3-Clause.txt'); Target = 'ReShade-LICENSE.txt' }
+    )
+    foreach ($entry in $licenseSources) {
+        if (Test-Path -LiteralPath $entry.Source -PathType Leaf) {
+            Copy-Item -LiteralPath $entry.Source -Destination (Join-Path $stageLicense $entry.Target) -Force
+        }
+    }
+
     # NVIDIA DLSS Runtime：仅本地/国内完整包内置；GitHub 合规包不内置（Configure.ps1 首次配置时从
     # NVIDIA 官方 Streamline 发行版下载，分发主体为 NVIDIA 自身，避免第三方分发灰色）。
     if ($LocalFull) {
@@ -286,6 +302,7 @@ function Build-FpsPackage {
             'scripts\Apply-PackageUpdate.ps1', 'scripts\Localization.ps1',
             'Feedback.txt', 'Package-Version.txt', 'NonFrameGeneration.edition', 'upstream-versions.json',
             'unlockfps_nc.exe',
+            'license\OptiScaler-LICENSE.txt', 'license\FPSUnlocker-LICENSE.txt', 'license\ReShade-LICENSE.txt',
             'payload\Bridge\Dx11FsrBridge.dll', 'payload\Bridge\Dx11FsrBridge.ini',
             'payload\AntiPlayerMosaic\AntiPlayerMosaic.dll',
             'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64',
@@ -373,8 +390,23 @@ try {
     Copy-Item -LiteralPath (Join-Path $reshadeRuntime 'ReShade.ini'), (Join-Path $reshadeRuntime 'ReShadePreset.ini') -Destination $defaults -Force
     Remove-Item -LiteralPath (Join-Path $reshade 'ReShade.ini'), (Join-Path $reshade 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
 
+    # 外部组件 license 集中（同 FPS 包：只集中插件本身的 license）
+    $stageLicense = Join-Path $stage 'license'
+    New-Item -ItemType Directory -Path $stageLicense -Force | Out-Null
+    $licenseSources = @(
+        @{ Source = (Join-Path $root 'SharedResources\OptiScaler-LICENSE.txt'); Target = 'OptiScaler-LICENSE.txt' },
+        @{ Source = (Join-Path $root 'SharedResources\FpsUnlocker-LICENSE.txt'); Target = 'FPSUnlocker-LICENSE.txt' },
+        @{ Source = (Join-Path $reshadeRuntime 'LICENSE-ReShade-BSD-3-Clause.txt'); Target = 'ReShade-LICENSE.txt' }
+    )
+    foreach ($entry in $licenseSources) {
+        if (Test-Path -LiteralPath $entry.Source -PathType Leaf) {
+            Copy-Item -LiteralPath $entry.Source -Destination (Join-Path $stageLicense $entry.Target) -Force
+        }
+    }
+
     Assert-RequiredFiles -Path $stage -RelativePaths @(
         'FSR-Bridge-Plugin.dll', 'config.ini', 'Feedback.txt', 'Package-Version.txt',
+        'license\OptiScaler-LICENSE.txt', 'license\FPSUnlocker-LICENSE.txt', 'license\ReShade-LICENSE.txt',
         'payload\Bridge\Dx11FsrBridge.dll', 'payload\Bridge\Dx11FsrBridge.ini',
         'payload\OptiScaler\OptiScaler.dll', 'payload\OptiScaler\amd_fidelityfx_dx12.dll',
         'payload\OptiScaler\amd_fidelityfx_upscaler_dx12.dll', 'payload\OptiScaler\libxell.dll',

@@ -53,10 +53,10 @@ install.set_progress(82, "正在写入插件配置")
 install.write_config(plugin_dir, {
     General = {
         Name = "原神FSR2桥接插件",
-        Description = "支持把原神的FSR2转换为FSR4、DLSS、XESS",
+        Description = "支持把原神的FSR2转换为FSR4（A卡7000/9000）、DLSS/XeSS/FSR4 INT8（其余显卡）",
         Developer = "シリアCelia",
         File = "FSR-Bridge-Plugin.dll",
-        Version = "1.2.3"
+        Version = "2.0.0"
     },
     EnableBridge = {
         Name = "启用 FSR Bridge",
