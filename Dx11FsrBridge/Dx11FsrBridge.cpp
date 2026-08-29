@@ -10717,7 +10717,7 @@ bool try_fsr2_translation_draw(
     static std::atomic_uint64_t motion_mask_skip_logged_key { 0 };
     static std::atomic_uint32_t motion_mask_skip_active { 0 };
     constexpr std::uint32_t k_motion_lock_frames = 30;
-    constexpr ULONGLONG k_motion_relock_ms = 60000;
+    constexpr ULONGLONG k_motion_relock_ms = 5000; // UI/事件切换后视图恢复的 relock 安全网（原 60s 过长——UI 关闭后场景 motion 重建为新资源时持续 fallback 60s）
     ResourceInfo motion_guard_info {};
     ResourceInfo color_guard_info {};
     const bool motion_guard_valid =
