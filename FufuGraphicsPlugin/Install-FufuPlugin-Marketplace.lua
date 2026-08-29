@@ -1,28 +1,7 @@
 install.log("FSR Bridge Lua 商城安装器已开始执行")
 
-local fsr4_update = "auto"
-local fsr4_upscaler_index = "auto"
-local fsr4_force_int8 = "auto"
-local fsr4_mode = "auto"
-local gpu_name = "Unknown"
-local gpu_vendor = "Unknown"
-
-local amd_fp8_rules = {
-    { vendor = "AMD", family = "RX", series = "9000" },
-}
-
-local int8_rules = {
-    { vendor = "NVIDIA", family = "GTX", series = "16" },
-    { vendor = "NVIDIA", family = "RTX", series = "20" },
-    { vendor = "NVIDIA", family = "RTX", series = "30" },
-    { vendor = "NVIDIA", family = "RTX", series = "40" },
-    { vendor = "NVIDIA", family = "RTX", series = "50" },
-    { vendor = "AMD", family = "RX", series = "7000" },
-    { vendor = "Intel", family = "Arc" },
-}
-
--- DLSS is only useful on RTX hardware. GTX 16 is allowed to use FSR4 INT8,
--- but must not receive NVIDIA DLSS runtime files during installation.
+-- 仅识别 RTX（用于 DLSS 复制）。FSR4 策略不再由 Lua 检测：
+-- 全部交给 bootstrap（FufuGraphicsPlugin.dll）运行时按 DXGI Device-ID 精确分类并写入 OptiScaler.ini。
 local dlss_rules = {
     { vendor = "NVIDIA", family = "RTX", series = "20" },
     { vendor = "NVIDIA", family = "RTX", series = "30" },
@@ -30,46 +9,9 @@ local dlss_rules = {
     { vendor = "NVIDIA", family = "RTX", series = "50" },
 }
 local install_dlss_runtime = false
-
-local function apply_fsr4_policy(mode)
-    fsr4_update = "true"
-    fsr4_upscaler_index = "0"
-    fsr4_force_int8 = mode == "int8" and "true" or "false"
-    fsr4_mode = mode
+if system ~= nil and system.gpu_matches_any ~= nil then
+    install_dlss_runtime = system.gpu_matches_any(dlss_rules) == true
 end
-
-local function detect_fsr4_policy()
-    if system == nil or system.get_gpu == nil then
-        install.log("当前启动器未提供 system.get_gpu，FSR4 策略保持 auto")
-        return
-    end
-
-    local gpu = system.get_gpu()
-    if gpu == nil then
-        install.log("system.get_gpu 未返回数据，FSR4 策略保持 auto")
-        return
-    end
-    if gpu.name ~= nil then gpu_name = gpu.name end
-    if gpu.vendor ~= nil then gpu_vendor = gpu.vendor end
-
-    if system.gpu_matches_any == nil then
-        install.log("当前启动器未提供 GPU 模糊匹配接口，FSR4 策略保持 auto")
-        return
-    end
-    if system.gpu_matches_any(amd_fp8_rules) then
-        apply_fsr4_policy("fp8")
-    elseif system.gpu_matches_any(int8_rules) then
-        apply_fsr4_policy("int8")
-    else
-        install.log("未识别的 GPU 型号，FSR4 策略保持 auto: " .. gpu_name .. " (" .. gpu_vendor .. ")")
-    end
-end
-
-detect_fsr4_policy()
-
-install_dlss_runtime = system.gpu_matches_any(dlss_rules)
-
-install.log("显卡: " .. gpu_name .. " (" .. gpu_vendor .. ")，FSR4 模式: " .. fsr4_mode)
 
 local plugin_id = "FSR-Bridge-Plugin"
 local plugins_dir = install.get_plugins_dir()
@@ -77,7 +19,6 @@ local plugin_dir = plugins_dir .. "\\" .. plugin_id
 local payload_dir = plugin_dir .. "\\payload"
 local opti_root_dir = payload_dir .. "\\OptiScaler"
 local opti_dir = opti_root_dir
-local config_stage_dir = plugin_dir .. "\\._lua_config_stage"
 install.log("插件目录: " .. plugin_dir)
 
 install.set_progress(0, "正在准备原神 FSR2 桥接插件")
@@ -141,18 +82,16 @@ install.write_config(plugin_dir, {
     }
 })
 
-install.set_progress(90, "正在准备官方默认配置")
-install.delete(opti_dir .. "\\OptiScaler.ini")
-install.create_dir(config_stage_dir)
-install.write_config(config_stage_dir, {
-    FSR4Policy = {
-        UpscalerIndex = fsr4_upscaler_index,
-        Fsr4Update = fsr4_update,
-        Fsr4ForceEnableInt8 = fsr4_force_int8
-    }
-})
-install.move_file(config_stage_dir .. "\\config.ini", plugin_dir .. "\\FSR4Policy.ini")
-install.delete(config_stage_dir)
+install.set_progress(90, "正在准备组件初始配置")
+-- 删除旧配置，由 bootstrap 首次启动时按 default_config 模板重新初始化：
+--   FSR4Policy.ini（策略文件，bootstrap 缺失时按 auto 用 Device-ID 精确分类）
+--   OptiScaler.ini（托管设置 + 策略写入）
+if install.file_exists(plugin_dir .. "\\FSR4Policy.ini") then
+    install.delete(plugin_dir .. "\\FSR4Policy.ini")
+end
+if install.file_exists(opti_dir .. "\\OptiScaler.ini") then
+    install.delete(opti_dir .. "\\OptiScaler.ini")
+end
 
 local bundled_dlss = payload_dir .. "\\NVIDIA\\DLSS\\nvngx_dlss.dll"
 local bundled_dlss_license = payload_dir .. "\\NVIDIA\\DLSS\\nvngx_dlss.license.txt"
