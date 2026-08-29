@@ -1,5 +1,16 @@
 install.log("FSR Bridge Lua 安装器已开始执行")
 
+local dlss_rules = {
+    { vendor = "NVIDIA", family = "RTX", series = "20" },
+    { vendor = "NVIDIA", family = "RTX", series = "30" },
+    { vendor = "NVIDIA", family = "RTX", series = "40" },
+    { vendor = "NVIDIA", family = "RTX", series = "50" },
+}
+local install_dlss_runtime = false
+if system ~= nil and system.gpu_matches_any ~= nil then
+    install_dlss_runtime = system.gpu_matches_any(dlss_rules) == true
+end
+
 local plugin_id = "FSR-Bridge-Plugin"
 local plugins_dir = install.get_plugins_dir()
 local plugin_dir = plugins_dir .. "\\" .. plugin_id
@@ -85,6 +96,20 @@ if install.file_exists(plugin_dir .. "\\FSR4Policy.ini") then
 end
 if install.file_exists(opti_dir .. "\\OptiScaler.ini") then
     install.delete(opti_dir .. "\\OptiScaler.ini")
+end
+
+local bundled_dlss = payload_dir .. "\\NVIDIA\\DLSS\\nvngx_dlss.dll"
+local bundled_dlss_license = payload_dir .. "\\NVIDIA\\DLSS\\nvngx_dlss.license.txt"
+if install_dlss_runtime and install.file_exists(bundled_dlss) then
+    install.copy_file(bundled_dlss, opti_dir .. "\\nvngx_dlss.dll")
+    if install.file_exists(bundled_dlss_license) then
+        install.copy_file(bundled_dlss_license, opti_dir .. "\\nvngx_dlss.license.txt")
+    end
+    install.log("已将 NVIDIA DLSS 组件复制到 OptiScaler 运行目录")
+elseif not install_dlss_runtime then
+    install.log("当前显卡不是已识别的 RTX，跳过 NVIDIA DLSS 组件复制")
+else
+    install.log("插件包未包含 NVIDIA DLSS 组件，跳过复制")
 end
 
 install.set_progress(100, "安装完成")
