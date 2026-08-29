@@ -80,8 +80,6 @@ install.write_config(plugin_dir, {
 })
 
 install.set_progress(90, "正在准备组件初始配置")
--- 删除旧配置，bootstrap 下次启动时按 default_config 重建：
---   OptiScaler.ini（托管设置 + Device-ID 策略分类）、FSR4Policy.ini 不再需要
 if install.file_exists(plugin_dir .. "\\FSR4Policy.ini") then
     install.delete(plugin_dir .. "\\FSR4Policy.ini")
 end
