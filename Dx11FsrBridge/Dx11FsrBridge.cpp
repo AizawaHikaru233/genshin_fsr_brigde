@@ -7206,6 +7206,141 @@ struct TargetUpscalerDrawInfo
     std::uint32_t output_rtv_slot = 1;
 };
 
+// 接管路径指纹缓存（正缓存）：缓存"识别成功"的资源特征指纹 → 布局。
+// 键 = 特征值（尺寸/格式/槽位组合，非指针）——UI 切换/视图地址复用无关。
+// 命中：按缓存布局读少量视图验证指纹 → 直接构造 info（省 9 视图完整读取）。
+struct UpscalerPathCacheEntry
+{
+    std::uint32_t color_slot = 0;
+    std::uint32_t depth_slot = 2;
+    std::uint32_t motion_slot = 3;
+    std::uint32_t transparency_slot = UINT_MAX;
+    std::uint32_t output_rtv_slot = 1;
+    std::uint32_t output_w = 0;
+    std::uint32_t output_h = 0;
+    std::uint32_t output_fmt = 0;
+    std::uint64_t last_hit_tick = 0;
+};
+std::mutex g_upscaler_path_cache_mutex;
+std::unordered_map<std::uint64_t, UpscalerPathCacheEntry> g_upscaler_path_cache;
+
+std::uint64_t upscaler_path_fingerprint(
+    const std::array<ResourceInfo, 7> &inputs,
+    const std::array<ResourceInfo, 2> &outputs,
+    const TargetUpscalerDrawInfo &info)
+{
+    std::uint64_t h = 14695981039346656037ull;
+    const auto mix = [&h](std::uint64_t v) { h ^= v; h *= 1099511628211ull; };
+    const auto mix_info = [&mix](const ResourceInfo &r)
+    {
+        mix(static_cast<std::uint64_t>(r.width));
+        mix(static_cast<std::uint64_t>(r.height));
+        mix(static_cast<std::uint64_t>(r.format));
+    };
+    mix(static_cast<std::uint64_t>(info.color_srv_slot));
+    mix(static_cast<std::uint64_t>(info.motion_srv_slot));
+    mix(static_cast<std::uint64_t>(info.depth_srv_slot));
+    mix(static_cast<std::uint64_t>(info.output_rtv_slot));
+    mix_info(inputs[info.color_srv_slot]);
+    mix_info(inputs[info.motion_srv_slot]);
+    mix_info(inputs[info.depth_srv_slot]);
+    mix_info(outputs[0]);
+    mix_info(outputs[1]);
+    return h;
+}
+
+// 快速路径：正缓存命中（output 特征匹配 + 按缓存布局读 3 SRV 指纹验证）→ 直接构造 info。
+std::optional<TargetUpscalerDrawInfo> try_upscaler_path_cache_fast(
+    ID3D11RenderTargetView *const *render_targets,
+    ID3D11ShaderResourceView *const *shader_resources)
+{
+    ResourceInfo out0 {};
+    read_resource_info(render_targets[0], L"fsr2_path_out", out0);
+    if (out0.resource_key == 0)
+        return std::nullopt;
+
+    std::lock_guard lock(g_upscaler_path_cache_mutex);
+    for (auto &[fingerprint, entry] : g_upscaler_path_cache)
+    {
+        (void)fingerprint;
+        if (entry.output_w != out0.width || entry.output_h != out0.height ||
+            entry.output_fmt != static_cast<std::uint32_t>(out0.format))
+            continue; // output 段不匹配：跳过（避免按旧布局读 SRV）
+
+        ResourceInfo color {}, motion {}, depth {};
+        read_resource_info(shader_resources[entry.color_slot], L"fsr2_path_color", color);
+        read_resource_info(shader_resources[entry.motion_slot], L"fsr2_path_motion", motion);
+        read_resource_info(shader_resources[entry.depth_slot], L"fsr2_path_depth", depth);
+        if (color.resource_key == 0 || motion.resource_key == 0 || depth.resource_key == 0)
+            continue;
+
+        ResourceInfo out1 {};
+        if (entry.output_rtv_slot < 2)
+            read_resource_info(render_targets[entry.output_rtv_slot], L"fsr2_path_out1", out1);
+
+        std::uint64_t h = 14695981039346656037ull;
+        const auto mix = [&h](std::uint64_t v) { h ^= v; h *= 1099511628211ull; };
+        const auto mix_info = [&mix](const ResourceInfo &r)
+        {
+            mix(static_cast<std::uint64_t>(r.width));
+            mix(static_cast<std::uint64_t>(r.height));
+            mix(static_cast<std::uint64_t>(r.format));
+        };
+        mix(static_cast<std::uint64_t>(entry.color_slot));
+        mix(static_cast<std::uint64_t>(entry.motion_slot));
+        mix(static_cast<std::uint64_t>(entry.depth_slot));
+        mix(static_cast<std::uint64_t>(entry.output_rtv_slot));
+        mix_info(color);
+        mix_info(motion);
+        mix_info(depth);
+        mix_info(out0);
+        mix_info(out1);
+        if (h != fingerprint)
+            continue;
+
+        TargetUpscalerDrawInfo info;
+        info.render_width = color.width;
+        info.render_height = color.height;
+        info.output_width = out0.width;
+        info.output_height = out0.height;
+        info.color_srv_slot = entry.color_slot;
+        info.depth_srv_slot = entry.depth_slot;
+        info.motion_srv_slot = entry.motion_slot;
+        info.transparency_srv_slot = entry.transparency_slot;
+        info.output_rtv_slot = entry.output_rtv_slot;
+        info.color_resource_key = color.resource_key;
+        info.motion_resource_key = motion.resource_key;
+        entry.last_hit_tick = GetTickCount64();
+        return info;
+    }
+    return std::nullopt;
+}
+
+// cb0 注册（jitter map/unmap 快照链自愈）——完整识别与快速路径共用
+void register_cb0_for_jitter(ID3D11Buffer *constant_buffer)
+{
+    if (constant_buffer == nullptr)
+        return;
+    D3D11_BUFFER_DESC desc {};
+    constant_buffer->GetDesc(&desc);
+    const std::uint64_t key = reinterpret_cast<std::uint64_t>(constant_buffer);
+    g_trace_ps_cb0_key.store(key, std::memory_order_relaxed);
+    if (key != 0 && desc.ByteWidth != 0)
+    {
+        std::lock_guard lock(g_buffer_info_mutex);
+        BufferInfo &registered = g_buffer_info[key];
+        if (registered.resource_key == 0)
+        {
+            registered.resource_key = key;
+            registered.byte_width = desc.ByteWidth;
+            registered.bind_flags = desc.BindFlags;
+            registered.usage = desc.Usage;
+            log_line("mode2_on_demand_cb0_registered key=" + hex64(key) +
+                " bytes=" + std::to_string(desc.ByteWidth));
+        }
+    }
+}
+
 DXGI_FORMAT resource_view_or_format(const ResourceInfo &info)
 {
     return info.view_format != DXGI_FORMAT_UNKNOWN ? info.view_format : info.format;
@@ -7469,6 +7604,25 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     context->PSGetShaderResources(0, static_cast<UINT>(shader_resources.size()), shader_resources.data());
     context->PSGetConstantBuffers(0, 1, &constant_buffer);
 
+    // 快速路径：正缓存命中直接构造接管（省 9 视图完整读取——只读 RTV[0] + 布局 3 SRV 验证指纹）
+    if (const auto fast_info = try_upscaler_path_cache_fast(render_targets.data(), shader_resources.data()))
+    {
+        register_cb0_for_jitter(constant_buffer);
+        for (ID3D11ShaderResourceView *view : shader_resources)
+        {
+            if (view != nullptr)
+                view->Release();
+        }
+        for (ID3D11RenderTargetView *render_target : render_targets)
+        {
+            if (render_target != nullptr)
+                render_target->Release();
+        }
+        if (constant_buffer != nullptr)
+            constant_buffer->Release();
+        return fast_info;
+    }
+
     D3D11_VIEWPORT viewport {};
     UINT viewport_count = 1;
     context->RSGetViewports(&viewport_count, &viewport);
@@ -7517,22 +7671,31 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     }
 
     g_trace_ps_cb0_key.store(constant_buffer_key, std::memory_order_relaxed);
+    register_cb0_for_jitter(constant_buffer);
 
-    // cb0 若在钩子安装前创建则不在 g_buffer_info 中，map/unmap 快照链会静默失败，
-    // 导致 jitter 恒为零；用现场 GetDesc 结果补注册使快照链自愈。
-    if (constant_buffer_key != 0 && constant_buffer_description.ByteWidth != 0)
+    // 正缓存写入（仅识别成功路径——值语义指纹，UI 切换/地址复用无关）
     {
-        std::lock_guard lock(g_buffer_info_mutex);
-        BufferInfo &registered = g_buffer_info[constant_buffer_key];
-        if (registered.resource_key == 0)
+        std::lock_guard lock(g_upscaler_path_cache_mutex);
+        UpscalerPathCacheEntry entry;
+        entry.color_slot = identified->color_srv_slot;
+        entry.depth_slot = identified->depth_srv_slot;
+        entry.motion_slot = identified->motion_srv_slot;
+        entry.transparency_slot = identified->transparency_srv_slot;
+        entry.output_rtv_slot = identified->output_rtv_slot;
+        entry.output_w = outputs[0].width;
+        entry.output_h = outputs[0].height;
+        entry.output_fmt = static_cast<std::uint32_t>(outputs[0].format);
+        entry.last_hit_tick = GetTickCount64();
+        const std::uint64_t fingerprint = upscaler_path_fingerprint(inputs, outputs, *identified);
+        if (g_upscaler_path_cache.size() >= 8)
         {
-            registered.resource_key = constant_buffer_key;
-            registered.byte_width = constant_buffer_description.ByteWidth;
-            registered.bind_flags = constant_buffer_description.BindFlags;
-            registered.usage = constant_buffer_description.Usage;
-            log_line("mode2_on_demand_cb0_registered key=" + hex64(constant_buffer_key) +
-                " bytes=" + std::to_string(constant_buffer_description.ByteWidth));
+            auto oldest = g_upscaler_path_cache.begin();
+            for (auto it = g_upscaler_path_cache.begin(); it != g_upscaler_path_cache.end(); ++it)
+                if (it->second.last_hit_tick < oldest->second.last_hit_tick)
+                    oldest = it;
+            g_upscaler_path_cache.erase(oldest);
         }
+        g_upscaler_path_cache[fingerprint] = entry;
     }
 
     static std::atomic_bool identified_logged { false };
