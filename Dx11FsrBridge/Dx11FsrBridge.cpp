@@ -3172,13 +3172,14 @@ void log_line(const std::string &line)
         "failed", "failure", "error", "invalid", "mismatch", "exception",
         "unavailable", "unresolved", "unsupported", "missing", "refusing"
     };
-    static constexpr std::array<std::string_view, 9> basic_terms {
+    static constexpr std::array<std::string_view, 10> basic_terms {
         // 正式版日志精简——只保留：接管结果(ffx12_result/failed)、
         // 显卡型号(ffx12_gpu)、SDK 路径(ffx12_sdk)、FSR 实际版本(ffx12_version)、渲染精度菜单状态。
         // hook 数据状态（draw_hook_active/iat_scan/fsr2_translation_candidate/ffx12_path 等）一律不写。
         "ffx12_gpu", "ffx12_sdk", "ffx12_version", "ffx12_result", "ffx12_failed",
         "jit_norm", "jitter_px",
-        "render_scale_menu hook_ready", "render_scale_menu render_scale_written"
+        "render_scale_menu hook_ready", "render_scale_menu render_scale_written",
+        "fsr2_on_demand_identify_fail"
     };
     const bool startup_marker = line.starts_with("Dx11FsrBridge active");
     const bool error_message = std::any_of(error_terms.begin(), error_terms.end(),
@@ -4110,38 +4111,6 @@ bool process_matches()
 }
 
 bool read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo &out_info); // 定义见下（cached 版本在其后调用）
-
-// 视图 ResourceInfo 缓存：仅缓存"识别成功"路径的视图（场景 TAAU 视图长期存活、
-// 地址不复用）；识别失败路径（如 UI 覆盖层）不写缓存，避免视图释放后地址复用
-// 命中旧描述导致永久识别失败（桥接掉）。
-std::mutex g_resource_info_cache_mutex;
-std::unordered_map<std::uintptr_t, ResourceInfo> g_resource_info_cache;
-
-ResourceInfo read_resource_info_cached(ID3D11View *view, const wchar_t *kind)
-{
-    ResourceInfo info {};
-    if (view == nullptr)
-        return info;
-    const auto key = reinterpret_cast<std::uintptr_t>(view);
-    {
-        std::lock_guard lock(g_resource_info_cache_mutex);
-        const auto it = g_resource_info_cache.find(key);
-        if (it != g_resource_info_cache.end())
-            return it->second;
-    }
-    read_resource_info(view, kind, info);
-    return info;
-}
-
-void commit_resource_info_cached(ID3D11View *view, const ResourceInfo &info)
-{
-    if (view == nullptr || info.resource_key == 0)
-        return;
-    std::lock_guard lock(g_resource_info_cache_mutex);
-    if (g_resource_info_cache.size() >= 512)
-        g_resource_info_cache.clear();
-    g_resource_info_cache.emplace(reinterpret_cast<std::uintptr_t>(view), info);
-}
 
 bool read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo &out_info)
 {
@@ -7470,10 +7439,23 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     if (context == nullptr || element_count != 3)
         return std::nullopt;
 
+    // 诊断：候选 draw（3 顶点）识别失败限量记录（5s 一次），定位 UI 切换后桥接掉线环节
+    static std::atomic_uint64_t on_demand_fail_tick { 0 };
+    const auto log_fail = [](std::string &&detail) {
+        const ULONGLONG now = GetTickCount64();
+        ULONGLONG last = on_demand_fail_tick.load(std::memory_order_relaxed);
+        if (now - last < 5000 ||
+            !on_demand_fail_tick.compare_exchange_strong(last, now, std::memory_order_relaxed))
+            return;
+        log_line("fsr2_on_demand_identify_fail " + detail);
+    };
+
     std::array<ID3D11RenderTargetView *, 2> render_targets {};
     context->OMGetRenderTargets(static_cast<UINT>(render_targets.size()), render_targets.data(), nullptr);
     if (render_targets[0] == nullptr || render_targets[1] == nullptr)
     {
+        log_fail(std::string("stage=prescreen rtv0=") + (render_targets[0] != nullptr ? "1" : "0") +
+            " rtv1=" + (render_targets[1] != nullptr ? "1" : "0"));
         for (ID3D11RenderTargetView *render_target : render_targets)
         {
             if (render_target != nullptr)
@@ -7494,9 +7476,9 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     std::array<ResourceInfo, 7> inputs {};
     std::array<ResourceInfo, 2> outputs {};
     for (std::size_t index = 0; index < shader_resources.size(); ++index)
-        inputs[index] = read_resource_info_cached(shader_resources[index], L"fsr2_on_demand_srv");
+        read_resource_info(shader_resources[index], L"fsr2_on_demand_srv", inputs[index]);
     for (std::size_t index = 0; index < render_targets.size(); ++index)
-        outputs[index] = read_resource_info_cached(render_targets[index], L"fsr2_on_demand_rtv");
+        read_resource_info(render_targets[index], L"fsr2_on_demand_rtv", outputs[index]);
 
     D3D11_BUFFER_DESC constant_buffer_description {};
     if (constant_buffer != nullptr)
@@ -7521,15 +7503,18 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         constant_buffer_description.ByteWidth, constant_buffer_key);
     if (!identified)
     {
+        std::ostringstream detail;
+        detail << "stage=identify"
+               << " out0=" << outputs[0].width << "x" << outputs[0].height
+               << " fmt=" << static_cast<std::uint32_t>(outputs[0].format)
+               << " out1=" << outputs[1].width << "x" << outputs[1].height
+               << " srv0=" << inputs[0].width << "x" << inputs[0].height
+               << " srv1=" << inputs[1].width << "x" << inputs[1].height
+               << " vp=" << static_cast<std::uint32_t>(viewport.Width) << "x"
+               << static_cast<std::uint32_t>(viewport.Height);
+        log_fail(detail.str());
         return std::nullopt;
     }
-
-    // 识别成功：提交本次视图的 ResourceInfo 到缓存（仅场景 TAAU 视图——
-    // 长期存活、地址不复用；失败路径不写缓存，杜绝地址复用污染）。
-    for (std::size_t index = 0; index < shader_resources.size(); ++index)
-        commit_resource_info_cached(shader_resources[index], inputs[index]);
-    for (std::size_t index = 0; index < render_targets.size(); ++index)
-        commit_resource_info_cached(render_targets[index], outputs[index]);
 
     g_trace_ps_cb0_key.store(constant_buffer_key, std::memory_order_relaxed);
 
@@ -10704,13 +10689,6 @@ bool try_fsr2_translation_draw(
             : last_depth_state.load(std::memory_order_relaxed);
     const bool depth_path_changed =
         depth_format_compatible && previous_depth_state != 0 && previous_depth_state != depth_state;
-    if (depth_path_changed)
-    {
-        // UI/场景切换：视图集合变化，清空视图 ResourceInfo 缓存，
-        // 防止释放后的地址复用命中旧描述导致识别错误（画面锯齿/错误接管）。
-        std::lock_guard lock(g_resource_info_cache_mutex);
-        g_resource_info_cache.clear();
-    }
 
     // Motion-mask lock.  During normal rendering views[3] is the real motion
     // buffer (whose .z channel is used as the FSR2 reactive mask).  The
