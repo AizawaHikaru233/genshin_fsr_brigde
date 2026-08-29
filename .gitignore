@@ -100,6 +100,7 @@ fsr2_sdk_params_enumeration.md
 reconcile-threeway-gap.md
 
 # 交接/计划/报告类文档（不进入仓库——本地保留）
+docs/
 交接文档*.md
 AI智能体任务计划*.md
 **/NEXT-TEST-CHECKLIST*.md
