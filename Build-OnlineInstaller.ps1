@@ -256,6 +256,8 @@ function Prepare-FpsStage {
     Copy-DirectoryContents -Source $optiRuntime -Destination $stageOpti
     # 桥默认 FSR SDK 路径（Ffx12DllPath 留空时使用 payload\AMD\）。
     Copy-Item -LiteralPath (Join-Path $optiRuntime 'amd_fidelityfx_upscaler_dx12.dll') -Destination (Join-Path $stageAmd 'amd_fidelityfx_upscaler_dx12.dll') -Force
+    # AMD FFX12 SDK license（FSR4 = FFX API 2.x，从 OptiScaler\Licenses 复制）。
+    Copy-Item -LiteralPath (Join-Path $optiRuntime 'Licenses\FidelityFX_v2_LICENSE.md') -Destination (Join-Path $stageAmd 'FidelityFX_v2_LICENSE.md') -Force
     # The package defaults are generated from the exact component resources used in this build.
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $stageDefaults 'Dx11FsrBridge.ini') -Force
     Copy-Item -LiteralPath (Join-Path $optiRuntime 'OptiScaler.ini'), (Join-Path $optiRuntime 'OptiScaler-UpscalingFiles.json') -Destination $stageDefaults -Force
@@ -315,7 +317,7 @@ function Build-FpsPackage {
             'payload\OptiScaler\amd_fidelityfx_dx12.dll', 'payload\OptiScaler\amd_fidelityfx_upscaler_dx12.dll',
             'payload\OptiScaler\libxell.dll', 'payload\OptiScaler\libxess.dll',
             'payload\OptiScaler\libxess_dx11.dll', 'payload\OptiScaler\D3D12_Optiscaler\D3D12Core.dll',
-            'payload\AMD\amd_fidelityfx_upscaler_dx12.dll'
+            'payload\AMD\amd_fidelityfx_upscaler_dx12.dll', 'payload\AMD\FidelityFX_v2_LICENSE.md'
         )
         if ($LocalFull) {
             $required += @(
@@ -381,6 +383,8 @@ try {
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $bridge 'Dx11FsrBridge.ini') -Force
     Copy-DirectoryContents -Source $optiRuntime -Destination $opti
     Copy-Item -LiteralPath (Join-Path $optiRuntime 'amd_fidelityfx_upscaler_dx12.dll') -Destination (Join-Path $amd 'amd_fidelityfx_upscaler_dx12.dll') -Force
+    # AMD FFX12 SDK license（FSR4 = FFX API 2.x，从 OptiScaler\Licenses 复制）。
+    Copy-Item -LiteralPath (Join-Path $optiRuntime 'Licenses\FidelityFX_v2_LICENSE.md') -Destination (Join-Path $amd 'FidelityFX_v2_LICENSE.md') -Force
     Copy-Item -LiteralPath (Join-Path $dlssRuntime 'nvngx_dlss.dll') -Destination $nvidia -Force
     Copy-Item -LiteralPath (Join-Path $dlssRuntime 'nvngx_dlss.license.txt') -Destination $nvidia -Force
     Copy-DirectoryContents -Source $reshadeRuntime -Destination $reshade
@@ -412,7 +416,7 @@ try {
         'payload\OptiScaler\amd_fidelityfx_upscaler_dx12.dll', 'payload\OptiScaler\libxell.dll',
         'payload\OptiScaler\libxess.dll', 'payload\OptiScaler\libxess_dx11.dll',
         'payload\OptiScaler\D3D12_Optiscaler\D3D12Core.dll',
-        'payload\AMD\amd_fidelityfx_upscaler_dx12.dll',
+        'payload\AMD\amd_fidelityfx_upscaler_dx12.dll', 'payload\AMD\FidelityFX_v2_LICENSE.md',
         'payload\NVIDIA\DLSS\nvngx_dlss.dll', 'payload\NVIDIA\DLSS\nvngx_dlss.license.txt',
         'payload\ReShade\ReShade64.dll', 'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64',
         'payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin.txt',
