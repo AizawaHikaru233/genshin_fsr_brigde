@@ -75,34 +75,6 @@ function Build-PackageComponents {
     }
 }
 
-function New-PackageComponentManifest {
-    param(
-        [Parameter(Mandatory)][string]$PackageRoot,
-        [switch]$LocalFull
-    )
-
-    $componentPaths = [ordered]@{
-        'Dx11FsrBridge.dll' = 'payload\Bridge\Dx11FsrBridge.dll'
-        'AntiPlayerMosaic.dll' = 'payload\AntiPlayerMosaic\AntiPlayerMosaic.dll'
-        'OptiScaler.dll' = 'payload\OptiScaler\OptiScaler.dll'
-    }
-    if ($LocalFull) { $componentPaths['ReShade64.dll'] = 'payload\ReShade\ReShade64.dll' }
-
-    $manifest = foreach ($name in $componentPaths.Keys) {
-        $relativePath = $componentPaths[$name]
-        $item = Get-Item -LiteralPath (Join-Path $PackageRoot $relativePath)
-        $fileVersion = [string]$item.VersionInfo.FileVersion
-        if ([string]::IsNullOrWhiteSpace($fileVersion)) { $fileVersion = 'unknown' }
-        [pscustomobject]@{
-            Name = $name
-            Version = $fileVersion
-            SHA256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash
-            Bytes = $item.Length
-        }
-    }
-    $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $PackageRoot 'component-manifest.json') -Encoding UTF8
-}
-
 function Reset-Stage {
     param([string]$Path)
     $distRoot = [IO.Path]::GetFullPath($dist).TrimEnd('\') + '\'
@@ -297,7 +269,6 @@ function Prepare-FpsStage {
         Copy-Item -LiteralPath (Join-Path $dlssRuntime 'nvngx_dlss.dll') -Destination $stageNvidia -Force
         Copy-Item -LiteralPath (Join-Path $dlssRuntime 'nvngx_dlss.license.txt') -Destination $stageNvidia -Force
     }
-    New-PackageComponentManifest -PackageRoot $Stage -LocalFull:$LocalFull
 }
 
 function Build-FpsPackage {
@@ -312,7 +283,7 @@ function Build-FpsPackage {
     try {
         $required = @(
             '一键配置.bat', 'GenshinFSRBridgeTools.bat', 'scripts\Configure.ps1', 'scripts\ReShadeResources.ps1',
-            'scripts\Apply-PackageUpdate.ps1', 'scripts\Localization.ps1', 'component-manifest.json',
+            'scripts\Apply-PackageUpdate.ps1', 'scripts\Localization.ps1',
             'Feedback.txt', 'Package-Version.txt', 'NonFrameGeneration.edition', 'upstream-versions.json',
             'unlockfps_nc.exe',
             'payload\Bridge\Dx11FsrBridge.dll', 'payload\Bridge\Dx11FsrBridge.ini',

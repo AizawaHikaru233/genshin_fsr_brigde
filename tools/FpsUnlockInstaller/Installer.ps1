@@ -17,7 +17,7 @@ $OutputEncoding = [Text.Encoding]::UTF8
 $root = [IO.Path]::GetFullPath((Split-Path -Parent $PSCommandPath))
 $scriptsDirectory = Join-Path $root 'scripts'
 $configureScript = Join-Path $scriptsDirectory 'Configure.ps1'
-$statePath = Join-Path $root '.installer-state.json'
+$statePath = Join-Path $root 'fps_config.json' # GamePath/FPSTarget 存 fps unlock 配置；语言自动识别
 $fpsConfigPath = Join-Path $root 'fps_config.json'
 $errorLogPath = Join-Path $root '.last-install-error.log'
 $unlockerPath = Join-Path $root 'unlockfps_nc.exe'
@@ -28,7 +28,6 @@ $optiPath = Join-Path $optiDirectory 'OptiScaler.dll'
 $bridgePath = Join-Path $payloadDirectory 'Bridge\Dx11FsrBridge.dll'
 $antiBlurPath = Join-Path $payloadDirectory 'AntiPlayerMosaic\AntiPlayerMosaic.dll'
 $reShadePath = Join-Path $payloadDirectory 'ReShade\ReShade64.dll'
-$componentManifestPath = Join-Path $root 'component-manifest.json'
 $selfUpdateRepository = 'AizawaHikaru233/genshin_fsr_brigde'
 $selfUpdateHelperPath = Join-Path $scriptsDirectory 'Apply-PackageUpdate.ps1'
 $script:SelfUpdateStarted = $false
@@ -37,7 +36,7 @@ $shortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) '原神.lnk'
 $legacyShortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) '原神整合版.lnk'
 
 . (Join-Path $scriptsDirectory 'Localization.ps1')
-$script:Language = Get-InstallerLanguage -RequestedLanguage $Language -StatePath $statePath
+$script:Language = Get-InstallerLanguage -RequestedLanguage $Language
 Initialize-InstallerLocalization -Language $script:Language
 
 function Write-Header {
@@ -80,32 +79,33 @@ function Select-GameFolder {
 }
 
 function Read-State {
-    if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
-        return [pscustomobject]@{ GamePath = $null; FpsTarget = 60; Language = $script:Language }
+    # GamePath/FpsTarget 从 fps unlock 配置（fps_config.json）读取；语言自动识别
+    $gamePath = $null
+    $fpsTarget = 60
+    if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+        try {
+            $config = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $gamePathProperty = $config.PSObject.Properties['GamePath']
+            if ($null -ne $gamePathProperty) { $gamePath = [string]$gamePathProperty.Value }
+            $fpsProperty = $config.PSObject.Properties['FPSTarget']
+            if ($null -ne $fpsProperty -and $null -ne $fpsProperty.Value -and [int]$fpsProperty.Value -gt 0) { $fpsTarget = [int]$fpsProperty.Value }
+        }
+        catch { }
     }
-    try {
-        $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
-        $fpsTarget = 60
-        $fpsProperty = $state.PSObject.Properties['FpsTarget']
-        if ($null -ne $fpsProperty -and $null -ne $fpsProperty.Value -and [int]$fpsProperty.Value -gt 0) { $fpsTarget = [int]$fpsProperty.Value }
-        $languageProperty = $state.PSObject.Properties['Language']
-        $savedLanguage = if ($null -ne $languageProperty -and [string]$languageProperty.Value -in @('zh-CN', 'en-US')) { [string]$languageProperty.Value } else { $script:Language }
-        $gamePathProperty = $state.PSObject.Properties['GamePath']
-        $gamePath = if ($null -ne $gamePathProperty) { [string]$gamePathProperty.Value } else { $null }
-        return [pscustomobject]@{ GamePath = $gamePath; FpsTarget = $fpsTarget; Language = $savedLanguage }
-    }
-    catch {
-        return [pscustomobject]@{ GamePath = $null; FpsTarget = 60; Language = $script:Language }
-    }
+    return [pscustomobject]@{ GamePath = $gamePath; FpsTarget = $fpsTarget; Language = $script:Language }
 }
 
 function Save-State {
-    param([string]$SelectedGamePath, [int]$FpsTarget, [ValidateSet('zh-CN', 'en-US')][string]$SelectedLanguage = $script:Language)
-    [ordered]@{
-        GamePath = $SelectedGamePath
-        FpsTarget = $FpsTarget
-        Language = $SelectedLanguage
-    } | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding UTF8
+    # 仅更新 fps unlock 配置的 GamePath/FPSTarget（不维护独立 state 文件；语言由系统/参数自动决定）
+    param([string]$SelectedGamePath, [int]$FpsTarget)
+    if ([string]::IsNullOrWhiteSpace($SelectedGamePath)) { return }
+    $config = [ordered]@{}
+    if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+        try { $config = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $config = [ordered]@{} }
+    }
+    $config.GamePath = $SelectedGamePath
+    if ($FpsTarget -gt 0) { $config.FPSTarget = $FpsTarget }
+    $config | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding UTF8
 }
 
 function Select-GamePath {
@@ -527,30 +527,16 @@ function Get-FileVersionLabel {
     return "v$version"
 }
 
-function Get-ComponentVersionLabel {
-    param([string]$Name, [string]$Fallback = '未知')
-    if (-not (Test-Path -LiteralPath $componentManifestPath -PathType Leaf)) { return $Fallback }
-    try {
-        $manifest = Get-Content -LiteralPath $componentManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        $component = @($manifest | Where-Object { $_.Name -eq $Name } | Select-Object -First 1)
-        if ($component.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$component[0].Version)) { return $Fallback }
-        return "v$([string]$component[0].Version)"
-    }
-    catch {
-        return $Fallback
-    }
-}
-
 function Write-InstallCatalog {
     param([string]$SelectedGamePath)
     $renoDxPath = Join-Path $root 'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64'
     $unlockerVersion = Get-FileVersionLabel -Path $unlockerPath
     $optiVersion = Get-FileVersionLabel -Path $optiPath
-    $bridgeVersion = Get-ComponentVersionLabel -Name 'Dx11FsrBridge.dll' -Fallback (Get-FileVersionLabel -Path $bridgePath)
-    $antiVersion = Get-ComponentVersionLabel -Name 'AntiPlayerMosaic.dll' -Fallback (Get-FileVersionLabel -Path $antiBlurPath)
+    $bridgeVersion = Get-FileVersionLabel -Path $bridgePath
+    $antiVersion = Get-FileVersionLabel -Path $antiBlurPath
     $reShadeVersion = Get-FileVersionLabel -Path $reShadePath
     $renoDxVersion = Get-FileVersionLabel -Path $renoDxPath
-    $managerVersion = Get-ComponentVersionLabel -Name 'Dx11FsrBridge.dll' -Fallback '未知'
+    $managerVersion = Get-FileVersionLabel -Path $bridgePath -Fallback '未知'
     $state = Get-ModuleState -SelectedGamePath $SelectedGamePath
     $unlockerStatus = if ($state.Unlocker) { '已安装' } else { '未安装' }
     $optiStatus = if ($state.OptiScaler) { '已安装' } else { '未安装' }
@@ -700,13 +686,14 @@ function Get-LatestRelease {
 }
 
 function Get-CurrentPackageVersion {
-    if (-not (Test-Path -LiteralPath $componentManifestPath -PathType Leaf)) { return '0.0.0' }
-    try {
-        $manifest = Get-Content -LiteralPath $componentManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        $bridge = @($manifest | Where-Object { $_.Name -eq 'Dx11FsrBridge.dll' } | Select-Object -First 1)
-        if ($bridge.Count -eq 1 -and [string]$bridge[0].Version -match '^\d+(\.\d+)+$') { return [string]$bridge[0].Version }
+    # 当前包版本 = 本机 Dx11FsrBridge.dll 的文件版本
+    if (Test-Path -LiteralPath $bridgePath -PathType Leaf) {
+        try {
+            $version = [string](Get-Item -LiteralPath $bridgePath).VersionInfo.FileVersion
+            if ($version -match '^\d+(\.\d+)+$') { return $version }
+        }
+        catch { }
     }
-    catch { }
     return '0.0.0'
 }
 

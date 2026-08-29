@@ -18,7 +18,6 @@ $relaunch = [IO.Path]::GetFullPath($RelaunchScript)
 $logPath = Join-Path $target '.last-self-update.log'
 $preservedRelativePaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($relativePath in @(
-    '.installer-state.json',
     'fps_config.json',
     'payload\Bridge\Dx11FsrBridge.ini',
     'payload\OptiScaler\OptiScaler.ini',

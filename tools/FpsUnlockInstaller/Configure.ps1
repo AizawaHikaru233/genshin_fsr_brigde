@@ -722,7 +722,8 @@ function Install-OptiScaler {
         $mainDll = Get-ChildItem -LiteralPath $expanded -Recurse -File -Filter 'OptiScaler.dll' | Select-Object -First 1
         if ($null -eq $mainDll) { throw (Convert-InstallerText -Value '所选 OptiScaler 包中没有找到 OptiScaler.dll。') }
         if ($Mode -eq 'Auto' -and $mainDll.VersionInfo.FileVersion -ne $optiFileVersion) {
-            throw (Convert-InstallerText -Value "OptiScaler 版本不是 $optiFileVersion：$($mainDll.VersionInfo.FileVersion)")
+            # 仅要求必要组件存在：版本与预置不一致时提示但不中断（用户可自行使用其他 OptiScaler 版本）
+            Write-Warning (Convert-InstallerText -Value "OptiScaler 版本 $($mainDll.VersionInfo.FileVersion) 与预置 $optiFileVersion 不同，继续安装（必要组件存在即可）")
         }
         $sourceDirectory = $mainDll.Directory.FullName
         if (-not (Test-Path -LiteralPath (Join-Path $sourceDirectory 'amd_fidelityfx_upscaler_dx12.dll') -PathType Leaf)) {
@@ -1242,21 +1243,6 @@ function Reset-PluginConfigurations {
         LastVersionNotify = 0
         DllList = @($loadedDlls)
     } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $fpsConfig -Encoding UTF8
-    $installerStatePath = Join-Path $root '.installer-state.json'
-    $savedLanguage = $null
-    if (Test-Path -LiteralPath $installerStatePath -PathType Leaf) {
-        try {
-            $existingState = Get-Content -LiteralPath $installerStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
-            $languageProperty = $existingState.PSObject.Properties['Language']
-            if ($null -ne $languageProperty -and [string]$languageProperty.Value -in @('zh-CN', 'en-US')) {
-                $savedLanguage = [string]$languageProperty.Value
-            }
-        }
-        catch {}
-    }
-    $newState = [ordered]@{ GamePath = $resolvedGameExe; FpsTarget = 60 }
-    if ($null -ne $savedLanguage) { $newState.Language = $savedLanguage }
-    $newState | ConvertTo-Json | Set-Content -LiteralPath $installerStatePath -Encoding UTF8
 }
 
 if ($ResetPluginConfigsOnly) {

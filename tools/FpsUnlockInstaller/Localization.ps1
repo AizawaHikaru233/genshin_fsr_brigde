@@ -14,18 +14,10 @@ function Get-InstallerDefaultLanguage {
 function Get-InstallerLanguage {
     param(
         [ValidateSet('Auto', 'zh-CN', 'en-US')]
-        [string]$RequestedLanguage = 'Auto',
-        [string]$StatePath
+        [string]$RequestedLanguage = 'Auto'
     )
 
     if ($RequestedLanguage -ne 'Auto') { return $RequestedLanguage }
-    if (-not [string]::IsNullOrWhiteSpace($StatePath) -and (Test-Path -LiteralPath $StatePath -PathType Leaf)) {
-        try {
-            $state = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
-            if ([string]$state.Language -in @('zh-CN', 'en-US')) { return [string]$state.Language }
-        }
-        catch { }
-    }
     return Get-InstallerDefaultLanguage
 }
 
