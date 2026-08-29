@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$GamePath,
     [int]$FpsTarget = 0,
     [switch]$DisableOptiScaler,
@@ -251,14 +251,21 @@ function Invoke-OfficialDownload {
     throw (Convert-InstallerText -Value "下载失败：直连与全部备用下载路线均不可用。$([Environment]::NewLine)$($failures -join [Environment]::NewLine)")
 }
 
+function Get-VideoControllersOnce {
+    # 每安装会话只查询一次 Win32_VideoController（CIM/WMI 查询 ~100-500ms）
+    if ($null -eq $script:CachedVideoControllers) {
+        try {
+            $script:CachedVideoControllers = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
+        }
+        catch {
+            try { $script:CachedVideoControllers = @(Get-WmiObject -Class Win32_VideoController -ErrorAction Stop) } catch { $script:CachedVideoControllers = @() }
+        }
+    }
+    return @($script:CachedVideoControllers)
+}
+
 function Get-NvidiaVideoControllers {
-    $controllers = @()
-    try {
-        $controllers = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
-    }
-    catch {
-        try { $controllers = @(Get-WmiObject -Class Win32_VideoController -ErrorAction Stop) } catch { return @() }
-    }
+    $controllers = @(Get-VideoControllersOnce)
     return @($controllers | Where-Object {
         ([string]$_.PNPDeviceID -match '(?i)VEN_10DE') -or
         ([string]$_.AdapterCompatibility -match '(?i)NVIDIA') -or
@@ -299,13 +306,7 @@ function Get-Fsr4GpuPolicy {
         $controllers = @($InputControllers)
     }
     else {
-        $controllers = @()
-        try {
-            $controllers = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
-        }
-        catch {
-            try { $controllers = @(Get-WmiObject -Class Win32_VideoController -ErrorAction Stop) } catch { $controllers = @() }
-        }
+        $controllers = @(Get-VideoControllersOnce)
     }
 
     # 遍历全部显卡取"最优"策略（fp8 优先于 int8），不依赖 AdapterRAM 排序：

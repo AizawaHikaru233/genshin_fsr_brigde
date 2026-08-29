@@ -1812,8 +1812,9 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
         return false;
     if (slot.fence_value != 0 && g_fence->GetCompletedValue() < slot.fence_value)
     {
+        // 超时保护：GPU 卡死时不再无限挂起（1s 后失败返回，上层 fail-open）。
         if (FAILED(g_fence->SetEventOnCompletion(slot.fence_value, g_fence_event)) ||
-            WaitForSingleObject(g_fence_event, INFINITE) != WAIT_OBJECT_0)
+            WaitForSingleObject(g_fence_event, 1000) != WAIT_OBJECT_0)
             return false;
     }
     if (FAILED(slot.allocator->Reset()) || FAILED(slot.list->Reset(slot.allocator.Get(), nullptr)))
@@ -1835,13 +1836,12 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
 
     // 共享输入统一先到 NON_PIXEL_SHADER_RESOURCE（FFX 将从这里再转自身需要的状态）
     // motion 输入 = 共享解码 R16G16（D3D11 CS 已解码）；raw motion 不再进 D3D12
-    std::vector<ID3D12Resource *> inputs;
-    inputs.push_back(g_tex_color.d12.Get());
-    inputs.push_back(g_tex_depth_share.d12.Get());
-    inputs.push_back(g_tex_motion_cvt_share.d12.Get());
+    ID3D12Resource *inputs[4] = {};
+    inputs[0] = g_tex_color.d12.Get();
+    inputs[1] = g_tex_depth_share.d12.Get();
+    inputs[2] = g_tex_motion_cvt_share.d12.Get();
     if (input.use_reactive_mask && g_tex_reactive_share.d12)
-        inputs.push_back(g_tex_reactive_share.d12.Get());
-    inputs.erase(std::remove(inputs.begin(), inputs.end(), nullptr), inputs.end());
+        inputs[3] = g_tex_reactive_share.d12.Get();
     for (ID3D12Resource *resource : inputs)
         barrier(resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 

@@ -3191,7 +3191,7 @@ void log_line(const std::string &line)
     }
 #endif
     std::lock_guard lock(g_log_mutex);
-    std::ofstream out(g_log_path, std::ios::app);
+    static std::ofstream out(g_log_path, std::ios::app); // 常驻流：避免每次写盘开/关
     SYSTEMTIME st {};
     GetLocalTime(&st);
     char prefix[64] {};
@@ -3214,7 +3214,7 @@ void log_focus_line(const std::string &line)
     if (!g_logging_enabled.load(std::memory_order_relaxed))
         return;
     std::lock_guard lock(g_log_mutex);
-    std::ofstream out(g_log_path, std::ios::app);
+    static std::ofstream out(g_log_path, std::ios::app); // 常驻流：避免每次写盘开/关
     SYSTEMTIME st {};
     GetLocalTime(&st);
     char prefix[64] {};
@@ -4107,6 +4107,36 @@ bool process_matches()
             return false;
     }
     return true;
+}
+
+bool read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo &out_info); // 定义见下（cached 版本在其后调用）
+
+// 视图 ResourceInfo 缓存：D3D11 视图描述创建后不可变，按视图指针缓存避免
+// on-demand 识别路径每 draw 重复 ~9 次 COM 内省。上限防视图集合重建后残留。
+std::mutex g_resource_info_cache_mutex;
+std::unordered_map<std::uintptr_t, ResourceInfo> g_resource_info_cache;
+
+ResourceInfo read_resource_info_cached(ID3D11View *view, const wchar_t *kind)
+{
+    ResourceInfo info {};
+    if (view == nullptr)
+        return info;
+    const auto key = reinterpret_cast<std::uintptr_t>(view);
+    {
+        std::lock_guard lock(g_resource_info_cache_mutex);
+        const auto it = g_resource_info_cache.find(key);
+        if (it != g_resource_info_cache.end())
+            return it->second;
+    }
+    read_resource_info(view, kind, info);
+    if (info.resource_key != 0)
+    {
+        std::lock_guard lock(g_resource_info_cache_mutex);
+        if (g_resource_info_cache.size() >= 512)
+            g_resource_info_cache.clear();
+        g_resource_info_cache.emplace(key, info);
+    }
+    return info;
 }
 
 bool read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo &out_info)
@@ -6897,6 +6927,13 @@ void STDMETHODCALLTYPE hooked_ps_set_shader_resources(ID3D11DeviceContext *conte
 
 void STDMETHODCALLTYPE hooked_vs_set_shader(ID3D11DeviceContext *context, ID3D11VertexShader *shader, ID3D11ClassInstance *const *class_instances, UINT class_instances_count)
 {
+#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
+    {
+        g_original_vs_set_shader(context, shader, class_instances, class_instances_count);
+        return;
+    }
+#endif
     const ShaderInfo shader_info = lookup_vertex_shader_info(shader);
     {
         std::lock_guard lock(g_state_mutex);
@@ -6909,6 +6946,13 @@ void STDMETHODCALLTYPE hooked_vs_set_shader(ID3D11DeviceContext *context, ID3D11
 
 void STDMETHODCALLTYPE hooked_vs_set_constant_buffers(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11Buffer *const *buffers)
 {
+#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
+    {
+        g_original_vs_set_constant_buffers(context, start_slot, count, buffers);
+        return;
+    }
+#endif
     {
         std::lock_guard lock(g_state_mutex);
         update_constant_buffer_array(g_state.vs_cbs, start_slot, count, buffers);
@@ -6975,6 +7019,13 @@ void STDMETHODCALLTYPE hooked_ps_set_constant_buffers(ID3D11DeviceContext *conte
 
 void STDMETHODCALLTYPE hooked_cs_set_shader_resources(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11ShaderResourceView *const *views)
 {
+#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
+    {
+        g_original_cs_set_shader_resources(context, start_slot, count, views);
+        return;
+    }
+#endif
     {
         std::lock_guard lock(g_state_mutex);
         update_view_array(g_state.cs_srvs, start_slot, count, views, L"cs_srv");
@@ -6984,6 +7035,13 @@ void STDMETHODCALLTYPE hooked_cs_set_shader_resources(ID3D11DeviceContext *conte
 
 void STDMETHODCALLTYPE hooked_cs_set_uavs(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11UnorderedAccessView *const *views, const UINT *initial_counts)
 {
+#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
+    {
+        g_original_cs_set_uavs(context, start_slot, count, views, initial_counts);
+        return;
+    }
+#endif
     {
         std::lock_guard lock(g_state_mutex);
         update_uav_array(g_state.cs_uavs, start_slot, count, views);
@@ -6993,6 +7051,13 @@ void STDMETHODCALLTYPE hooked_cs_set_uavs(ID3D11DeviceContext *context, UINT sta
 
 void STDMETHODCALLTYPE hooked_cs_set_shader(ID3D11DeviceContext *context, ID3D11ComputeShader *shader, ID3D11ClassInstance *const *class_instances, UINT class_instances_count)
 {
+#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
+    {
+        g_original_cs_set_shader(context, shader, class_instances, class_instances_count);
+        return;
+    }
+#endif
     const ShaderInfo shader_info = lookup_compute_shader_info(shader);
     {
         std::lock_guard lock(g_state_mutex);
@@ -7005,6 +7070,13 @@ void STDMETHODCALLTYPE hooked_cs_set_shader(ID3D11DeviceContext *context, ID3D11
 
 void STDMETHODCALLTYPE hooked_cs_set_constant_buffers(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11Buffer *const *buffers)
 {
+#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
+    {
+        g_original_cs_set_constant_buffers(context, start_slot, count, buffers);
+        return;
+    }
+#endif
     {
         std::lock_guard lock(g_state_mutex);
         update_constant_buffer_array(g_state.cs_cbs, start_slot, count, buffers);
@@ -7418,9 +7490,9 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     std::array<ResourceInfo, 7> inputs {};
     std::array<ResourceInfo, 2> outputs {};
     for (std::size_t index = 0; index < shader_resources.size(); ++index)
-        read_resource_info(shader_resources[index], L"fsr2_on_demand_srv", inputs[index]);
+        inputs[index] = read_resource_info_cached(shader_resources[index], L"fsr2_on_demand_srv");
     for (std::size_t index = 0; index < render_targets.size(); ++index)
-        read_resource_info(render_targets[index], L"fsr2_on_demand_rtv", outputs[index]);
+        outputs[index] = read_resource_info_cached(render_targets[index], L"fsr2_on_demand_rtv");
 
     D3D11_BUFFER_DESC constant_buffer_description {};
     if (constant_buffer != nullptr)

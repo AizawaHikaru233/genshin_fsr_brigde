@@ -38,6 +38,8 @@ std::atomic_bool g_hide_uid_logged_cache_reset { false };
 std::atomic<ULONGLONG> g_hide_uid_next_tick { 0 };
 constexpr ULONGLONG k_hide_uid_retry_interval_ms = 1200;
 constexpr ULONGLONG k_hide_uid_steady_interval_ms = 8000;
+constexpr ULONGLONG k_hide_uid_retry_cap_ms = 64000; // 连续失败退避上限（约 1 分钟）
+std::atomic<UINT32> g_hide_uid_retry_count { 0 };
 std::array<void *, k_hide_uid_paths.size()> g_hide_uid_string_cache {};
 std::array<void *, k_hide_uid_paths.size()> g_hide_uid_object_cache {};
 std::atomic_int g_hide_uid_exception_streak { 0 };
@@ -320,8 +322,20 @@ void hide_uid_from_main_thread()
             return;
 
         const bool hidden = hide_uid_once();
-        const ULONGLONG interval = hidden ? k_hide_uid_steady_interval_ms : k_hide_uid_retry_interval_ms;
-        g_hide_uid_next_tick.store(now + interval, std::memory_order_relaxed);
+        if (hidden)
+        {
+            g_hide_uid_retry_count.store(0, std::memory_order_relaxed);
+            g_hide_uid_next_tick.store(now + k_hide_uid_steady_interval_ms, std::memory_order_relaxed);
+        }
+        else
+        {
+            // 连续失败指数退避（封顶），成功后复位
+            const UINT32 retries = g_hide_uid_retry_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            const ULONGLONG backoff = std::min<ULONGLONG>(
+                k_hide_uid_retry_interval_ms * (1ull << std::min<UINT32>(retries, 6u)),
+                k_hide_uid_retry_cap_ms);
+            g_hide_uid_next_tick.store(now + backoff, std::memory_order_relaxed);
+        }
     }
 }
 
