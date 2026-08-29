@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release', 'RelWithDebInfo', 'MinSizeRel')]
     [string]$Configuration = 'Release',
@@ -72,25 +72,6 @@ function Build-PackageComponents {
         Select-Object -First 1 -ExpandProperty FullName
     if ([string]::IsNullOrWhiteSpace($script:bridgeDll) -or [string]::IsNullOrWhiteSpace($script:antiDll)) {
         throw 'CMake 未生成必要的 FPS Unlock 包 DLL。'
-    }
-}
-
-function Assert-OptiConfigMatchesRuntime {
-    $configPath = Join-Path $optiRuntime 'OptiScaler.ini'
-    $runtimePath = Join-Path $optiRuntime 'OptiScaler.dll'
-    if (-not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
-        Write-Host 'OptiScaler.dll 未随仓库提供，跳过 OptiScaler 运行时版本校验。'
-        return
-    }
-    $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
-    $marker = [regex]::Match($config, '(?m)^;\s*FSR Bridge OptiScalerRuntimeVersion\s*=\s*([^\r\n;]+)\s*$')
-    if (-not $marker.Success) {
-        throw 'OptiScaler.ini 缺少 FSR Bridge OptiScalerRuntimeVersion 标记。更新 OptiScaler 时必须同步配置模板。'
-    }
-    $expectedVersion = $marker.Groups[1].Value.Trim()
-    $actualVersion = [string](Get-Item -LiteralPath $runtimePath).VersionInfo.FileVersion
-    if (-not [string]::Equals($expectedVersion, $actualVersion, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "OptiScaler.ini 适配版本为 $expectedVersion，但当前 OptiScaler.dll 为 $actualVersion。请同步更新配置模板。"
     }
 }
 
@@ -460,7 +441,7 @@ if ($FetchUpstream) {
 }
 
 Build-PackageComponents
-Assert-OptiConfigMatchesRuntime
+# 上游版本一致性由 tools\Update-UpstreamComponents.ps1 保证（官方包 SHA-256 校验 + versions.json 记录 FileVersion）。
 $version = Get-BridgeVersion
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
 foreach ($pattern in @(

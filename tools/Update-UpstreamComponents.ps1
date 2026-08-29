@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [string]$WorkspaceRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $PSCommandPath) '..')),
     [ValidateSet('All', 'OptiScaler', 'Dlss', 'ReShade', 'FpsUnlocker')]
@@ -124,9 +124,11 @@ function Update-OptiScaler {
         $source = $mainDll.Directory.FullName
 
         New-Item -ItemType Directory -Force -Path $optiRuntime | Out-Null
-        # 覆盖二进制/许可；保留我们的定制 OptiScaler.ini 与 OptiScaler-UpscalingFiles.json（配置资产不随上游覆盖）。
+        # 覆盖二进制/许可与官方第一手 OptiScaler.ini（default_config 模板来源，随上游版本同步；
+        # 关键键由 Configure.ps1 / bootstrap 的托管设置覆写）。仅保留定制的 OptiScaler-UpscalingFiles.json
+        # （curated 组件清单，Configure.ps1 读取，不随上游覆盖）。
         # 排除官方包中的帧生成/代理/其他后端组件与安装脚本——这些不进入发布包（与打包禁止名单一致）。
-        $preserve = @('OptiScaler.ini', 'OptiScaler-UpscalingFiles.json')
+        $preserve = @('OptiScaler-UpscalingFiles.json')
         $exclude = @(
             'amd_fidelityfx_framegeneration_dx12.dll', 'amd_fidelityfx_vk.dll',
             'dlssg_to_fsr3_amd_is_better.dll', 'fakenvapi.dll', 'fakenvapi.ini',
