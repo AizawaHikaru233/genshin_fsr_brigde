@@ -81,9 +81,3 @@ end
 
 install.set_progress(100, "安装完成")
 install.show_notification("安装成功", "原神FSR2桥接插件已就绪", "success", 5000)
-
--- 注：芙芙沙箱对脚本开头的注释行解析异常（会导致脚本在首行后中断），注释一律放在文件末尾。
--- 本脚本为纯文件层安装，不调用任何 GPU 检测接口。FSR4 策略与 DLSS 依赖均由
--- bootstrap（FufuGraphicsPlugin.dll）启动时处理：策略按 DXGI Device-ID 精确分类写入
--- OptiScaler.ini（本脚本删除旧配置后由 bootstrap 重建）；DLSS 在 OptiScaler 目录缺
--- nvngx_dlss.dll 且为 RTX 时从 payload\NVIDIA\DLSS 补齐。
