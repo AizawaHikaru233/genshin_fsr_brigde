@@ -14,7 +14,7 @@
 #include "Fsr2FamilyTakeover.h"
 #include "Il2CppCallSiteHook.h"
 #include "Ffx12Backend.h"
-// 第一百零六轮：旧方案隔离——Dx11On12Swapchain.h / Fsr2TranslationLayer.h 不再编译引用。
+// 旧方案隔离——Dx11On12Swapchain.h / Fsr2TranslationLayer.h 不再编译引用。
 
 #include <algorithm>
 #include <array>
@@ -212,8 +212,8 @@ struct Config
     // 桥直接驱动 AMD SDK（不经 OptiScaler）；Phase 2 的调用点接管会调用它的 dispatch。
     bool ffx12 = false;
     std::wstring ffx12_dll_path;
-    bool ffx12_fail_closed = false; // 第一百二十四轮：禁止回退原生（测试/故障显式暴露）
-    bool ffx12_full_logging = false; // 第一百三十四轮：Release 下日志全开（排查用；log_line 不过滤）
+    bool ffx12_fail_closed = false; // ：禁止回退原生（测试/故障显式暴露）
+    bool ffx12_full_logging = false; // ：Release 下日志全开（排查用；log_line 不过滤）
     bool ffx12_probe = false; // 一次性槽位/cb0 探测（诊断用，默认关）
     std::uint32_t ffx12_jitter_mode = 4; // 0=+norm*width-0.5, 1=+norm*width(符号反→整体抖), 2=raw, 3=-norm*width+0.5, 4=-norm*width(FSR4实测:符号正确), 5=零
     bool ffx12_depth_inverted = true; // 游戏深度逆方向（0=far）；FSR2 默认 0=near
@@ -233,7 +233,7 @@ struct Config
     float ffx12_fov_scale = 1.0f;       // FOV 缩放（AA 重投影验证：1.0=45°）
     bool ffx12_jitter_delay = true;   // 2026-08-25 FSR4 实测：游戏双缓冲预录滞后一帧 → 用上一帧 jitter（jdelay=1）
     bool ffx12_force_reset = false;   // 诊断：每帧强制 FSR2 reset（与正常对比：相同=历史零贡献/单帧重建）
-    // 第八十七轮：原生 D3D11 纯 GPU 传输（自建 D3D12 + NT 共享句柄 + D3D11.4 fence）。
+    // 原生 D3D11 纯 GPU 传输（自建 D3D12 + NT 共享句柄 + D3D11.4 fence）。
     // 默认开：GpuInteropProbe 已在本机字节级验证；不劫持游戏设备为 On12（进场前冻结根因）。
     bool ffx12_gpu_interop = true;
 #endif
@@ -452,14 +452,14 @@ std::mutex g_final_scene_snapshot_mutex;
 FinalSceneSnapshotState g_final_scene_snapshot;
 #endif
 std::atomic_bool g_logging_enabled = false;
-// 第一百一十轮：显卡路由摘要（initialize 早期产生、被 reset_log 清空）——存全局，active 后补打保证可见
+// 显卡路由摘要（initialize 早期产生、被 reset_log 清空）——存全局，active 后补打保证可见
 static bool g_route_applied = false; // 路由已应用（防止设备补检重复应用）
-// 第一百二十一轮：路由信息（apply 时保存，焦点框首次成功/失败时输出，保证三行相邻）
+// 路由信息（apply 时保存，焦点框首次成功/失败时输出，保证三行相邻）
 static std::string g_route_gpu_name;
 static std::string g_route_vendor_label;
 static std::string g_route_sdk_path;
 
-// 第一百三十三轮：OptiScaler 输出定向修复——XeSS/DLSS 的 jitter 需 ≤±0.5（像素/归一化），
+// OptiScaler 输出定向修复——XeSS/DLSS 的 jitter 需 ≤±0.5（像素/归一化），
 // FSR 输出保持原样（互不干扰）。运行时按 OptiScaler.ini 的 Dx11Upscaler/Dx12Upscaler 判定
 // （用户菜单切换会写回 INI；限频刷新）。
 enum class OptiOutput
@@ -509,7 +509,7 @@ static OptiOutput opti_output_current()
     }
     return g_opti_output.load(std::memory_order_relaxed);
 }
-// 第一百一十轮：显卡路由（定义于 initialize 之前；设备创建 hook 先于定义处使用，需前置声明）
+// 显卡路由（定义于 initialize 之前；设备创建 hook 先于定义处使用，需前置声明）
 static void apply_adapter_route(std::uint32_t vendor, std::uint32_t device, const std::wstring &desc,
                                 const char *source);
 static void route_from_d3d11_device(ID3D11Device *d3d11_device);
@@ -991,7 +991,7 @@ static void append_tex_samples(std::string &out, const char *tag,
     // On12 shared-queue renderer（游戏 D3D11 设备是 D3D11On12）：下面的 staging
     // 读回（CreateTexture2D → CopySubresourceRegion → Flush → Map(READ)）是在游戏
     // draw 内发起的 CPU 同步等待，落在共享队列上可能永远不返回 → 游戏在进入渲染
-    // 场景前整体无响应（第八十六轮：日志精确断在 ffx12_pipeline 之后、
+    // 场景前整体无响应（日志精确断在 ffx12_pipeline 之后、
     // ffx12_backend_samples 之前）。采样仅为诊断，On12 路径一律跳过；
     // native-D3D11 CPU-bridge 路径（dx11on12=0）保持原行为。
     {
@@ -3163,7 +3163,7 @@ void log_line(const std::string &line)
     if (!g_logging_enabled.load(std::memory_order_relaxed))
         return;
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    // 第一百三十四轮：Ffx12FullLogging=1 时跳过白名单过滤（全量日志——排查切换渲染精度卡死等）
+    // Ffx12FullLogging=1 时跳过白名单过滤（全量日志——排查切换渲染精度卡死等）
     if (!g_config.ffx12_full_logging)
     {
     static constexpr std::array<std::string_view, 11> error_terms {
@@ -3171,7 +3171,7 @@ void log_line(const std::string &line)
         "unavailable", "unresolved", "unsupported", "missing", "refusing"
     };
     static constexpr std::array<std::string_view, 9> basic_terms {
-        // 第一百二十轮：正式版日志精简——只保留：接管结果(ffx12_result/failed)、
+        // 正式版日志精简——只保留：接管结果(ffx12_result/failed)、
         // 显卡型号(ffx12_gpu)、SDK 路径(ffx12_sdk)、FSR 实际版本(ffx12_version)、渲染精度菜单状态。
         // hook 数据状态（draw_hook_active/iat_scan/fsr2_translation_candidate/ffx12_path 等）一律不写。
         "ffx12_gpu", "ffx12_sdk", "ffx12_version", "ffx12_result", "ffx12_failed",
@@ -3206,7 +3206,7 @@ void reset_log()
     std::ofstream(g_log_path, std::ios::trunc).close();
 }
 
-// 第一百二十一轮：焦点区域行——无条件写入（绕过 RELEASE 过滤白名单，用于分隔线/空行/关键信息框）
+// 焦点区域行——无条件写入（绕过 RELEASE 过滤白名单，用于分隔线/空行/关键信息框）
 void log_focus_line(const std::string &line)
 {
     if (!g_logging_enabled.load(std::memory_order_relaxed))
@@ -3221,7 +3221,7 @@ void log_focus_line(const std::string &line)
     out << prefix << line << "\n";
 }
 
-// 第一百二十一轮：接管信息焦点框——显卡型号 / SDK 路径 / FSR 实际版本 相邻输出，
+// 接管信息焦点框——显卡型号 / SDK 路径 / FSR 实际版本 相邻输出，
 // 空行 + 分隔线制造明显焦点区域（排版参考：[ffx] Upscaler Version 风格）。
 static void log_focus_block(const char *state)
 {
@@ -3462,7 +3462,7 @@ void set_osd_text(const std::wstring &text)
 }
 
 // OSD：显示桥内 FSR 路径的生效状态（用户据此确认当前运行模式与传输，
-// 悬浮文本窗口方式呈现，不干涉游戏画面——第九十轮替代画面内版本标记）。
+// 悬浮文本窗口方式呈现，不干涉游戏画面——替代画面内版本标记）。
 static void update_osd_sdk234(std::uint64_t count, std::uint32_t rw, std::uint32_t rh,
                               std::uint32_t dw, std::uint32_t dh)
 {
@@ -3893,7 +3893,7 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DumpFrames", 0, config_path.c_str())));
     {
         wchar_t ver_buf[32] {};
-        // 第一百四十轮：默认请求最高版本前缀（4.x）——provider 的 GET_VERSIONS 按 GPU
+        // 默认请求最高版本前缀（4.x）——provider 的 GET_VERSIONS 按 GPU
         // 能力过滤，降级链 4→3→2 自动兜底；无需按显卡分类强制降级。
         GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Version", L"ffx12-fsr4.x", ver_buf,
                                  static_cast<DWORD>(std::size(ver_buf)), config_path.c_str());
@@ -3907,9 +3907,9 @@ void load_config()
                                  static_cast<DWORD>(std::size(buf)), config_path.c_str());
         g_config.ffx12_dll_path = buf;
         if (g_config.ffx12_dll_path.empty())
-            // 第一百零伍轮：默认指向 Bridge 目录自身副本（不再依赖 OptiScaler 目录布局——
+            // 默认指向 Bridge 目录自身副本（不再依赖 OptiScaler 目录布局——
             // OptiScaler 更新后其 SDK DLL 移入子目录，外路径失配导致 LoadLibrary 失败 → 黑屏）。
-            // 第一百零捌轮：正式版 SDK 统一放上一级 payload\AMD（Bridge 目录只留桥本体）。
+            // 正式版 SDK 统一放上一级 payload\AMD（Bridge 目录只留桥本体）。
             g_config.ffx12_dll_path = g_module_dir.parent_path() / L"AMD" / L"amd_fidelityfx_upscaler_dx12.dll";
         ffx12::set_sdk_dll_path(g_config.ffx12_dll_path.c_str());
     }
@@ -6582,7 +6582,7 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
         log_line("fsr2_runtime_status frame=" + std::to_string(frame_index) +
             " candidates=" + std::to_string(g_fsr2_translation_candidate_count.load(std::memory_order_relaxed)) +
             " dispatches=" + std::to_string(g_fsr2_translation_dispatch_count.load(std::memory_order_relaxed)) +
-            " failures=" + std::to_string(g_fsr2_translation_failure_count.load(std::memory_order_relaxed))); // 第一百零六轮：旧 shim 已移除
+            " failures=" + std::to_string(g_fsr2_translation_failure_count.load(std::memory_order_relaxed))); // ：旧 shim 已移除
     }
 #endif
     tone_map_hdr_backbuffer_to_sdr(swapchain, frame_index);
@@ -8594,7 +8594,7 @@ void maybe_track_fsr2_color_candidate(ID3D11DeviceContext *context, UINT element
     }
 }
 
-// 第一百零六轮：旧翻译层早期输出探针整体停用（旧方案隔离，保留文本供参考）
+// 旧翻译层早期输出探针整体停用（旧方案隔离，保留文本供参考）
 #if 0
 void maybe_dispatch_early_output_probe(ID3D11DeviceContext *context, UINT element_count)
 {
@@ -9240,7 +9240,7 @@ bool try_fsr2_translation_draw(
     if (translation_mode == 0 || context == nullptr)
         return false;
 
-    // 第一百零六轮：旧翻译层上下文重置（upscaler_stall 恢复）已移除——新架构仅 ffx12 链路。
+    // 旧翻译层上下文重置（upscaler_stall 恢复）已移除——新架构仅 ffx12 链路。
 
     if (unsafe_dx11_on12_backend_selected())
     {
@@ -9294,7 +9294,7 @@ bool try_fsr2_translation_draw(
             std::uint64_t duplicate_frame_count = 0;
             std::uint64_t last_dispatch_tick = 0; // 接管空窗检测
             std::uint64_t last_frame_tick = 0;    // 帧间隔测量
-            // 帧时间步（第九十四轮）：高精度 + 游戏帧号门控——
+            // 帧时间步（）：高精度 + 游戏帧号门控——
             // 同帧多次 dispatch（alternate 双缓冲/多视图）共享同一时间步；
             // 不同帧间 dt = QPC 实测真实帧间隔。
             std::uint64_t last_frame_index = 0;
@@ -9726,7 +9726,7 @@ bool try_fsr2_translation_draw(
                         return true;
                     }
                 }
-                // 2026-08-24（用户要求）：切断原生 FSR2，全部实例接管，只允许 FSR2.3.4 SDK。
+                // 2026-08-24（）：切断原生 FSR2，全部实例接管，只允许 FSR2.3.4 SDK。
                 // 每实例独立 FSR2 context（后端按 instance_key 隔离历史）；实例重建 = 新 key = 隐式 reset。
                 // 实例切换日志（低频）：记录实例集合变化供诊断。
                 {
@@ -9743,7 +9743,7 @@ bool try_fsr2_translation_draw(
                     }
                 }
                 {
-                // 第一百零一轮：绑定深度（slot2 SRV）实测内容全 0（bits3x3 全 00000000）——
+                // 绑定深度（slot2 SRV）实测内容全 0（bits3x3 全 00000000）——
                 // 非游戏真实深度缓冲。改用当前 draw 的 DSV 资源（场景深度缓冲本体）：
                 // 只要 accumulate 时 DSV 仍绑定则优先替代，否则回退原绑定纹理。
                 if (g_config.ffx12_probe || true)
@@ -9991,12 +9991,12 @@ bool try_fsr2_translation_draw(
                 }
                 st->prev_jx = jit_src_x;
                 st->prev_jy = jit_src_y;
-                // 第一百三十三轮：OptiScaler 输出定向修复——XeSS/DLSS 的 jitter 需 ≤±0.5
+                // OptiScaler 输出定向修复——XeSS/DLSS 的 jitter 需 ≤±0.5
                 // （xessD3D12Execute 报 Invalid Argument：jitterOffset 超界）。仅 XeSS/DLSS
                 // 激活时把像素 jitter 夹紧到 ±0.5（子像素），FSR 输出保持原样（互不干扰）。
                 const OptiOutput opti_out = opti_output_current();
                 const bool xess_or_dlss = opti_out == OptiOutput::XeSS || opti_out == OptiOutput::Dlss;
-                // 第一百三十三轮：XeSS/DLSS 定向——jitter 夹紧 ±0.5（xessD3D12Execute 校验，
+                // XeSS/DLSS 定向——jitter 夹紧 ±0.5（xessD3D12Execute 校验，
                 // 静态 AA 生效）；motion 方向/缩放/depth 归一化均实测无效果（OptiScaler 的
                 // XeSS 输出链路内部限制）→ 全部回退默认。FSR 输出完全不读取此分支（参数隔离）。
                 ffx12::set_motion_flip(1.0f);
@@ -10318,7 +10318,7 @@ bool try_fsr2_translation_draw(
                             hex64(reinterpret_cast<std::uint64_t>(motion_tex)) +
                             " out=" + hex64(draw_out_ptr));
                     }
-                    // 第一百二十轮：首次成功时上报实际 FSR 版本（含降级结果）
+                    // 首次成功时上报实际 FSR 版本（含降级结果）
                     {
                         static std::atomic_bool focus_logged { false };
                         if (!focus_logged.exchange(true, std::memory_order_relaxed))
@@ -10564,9 +10564,9 @@ bool try_fsr2_translation_draw(
                             " sdk_msgs=" + (msgs.empty() ? std::string("none") : narrow(msgs)));
                     }
                     invalidate_direct_attempt("DISPATCH_FAILED");
-                    // 第一百零六轮：旧翻译层已停用——sdk234 未接管时直接放行
+                    // 旧翻译层已停用——sdk234 未接管时直接放行
                     // （新架构仅 ffx12 一条链路；OptiScaler 后续以 ffx12 为基底重新接入）。
-                    // 第一百二十四轮：Ffx12FailClosed=1 时禁止回退原生（跳过原始 draw，
+                    // Ffx12FailClosed=1 时禁止回退原生（跳过原始 draw，
                     // 画面显式异常暴露故障，用于 SDK 缺失/路由错误等测试）。
                     if (g_config.ffx12_fail_closed)
                         return true;
@@ -10967,7 +10967,7 @@ bool try_fsr2_translation_draw(
         }
     }
 
-    // 第一百零六轮：旧翻译层执行段停用（旧 OptiScaler+Bridge 方案隔离，文本保留供参考）。
+    // 旧翻译层执行段停用（旧 OptiScaler+Bridge 方案隔离，文本保留供参考）。
     // sdk234 失败已在上方 return false，不再走旧翻译层。
 #if 0
     ID3D11ShaderResourceView *translation_color = views[0];
@@ -11662,7 +11662,7 @@ bool try_fsr2_translation_draw(
 #endif
     return skip_original_draw;
 #endif
-    return false; // 第一百零六轮：旧翻译层停用后直接放行（新架构仅 ffx12 链路）
+    return false; // ：旧翻译层停用后直接放行（新架构仅 ffx12 链路）
 }
 #endif
 
@@ -11999,8 +11999,8 @@ bool try_spatial_copy_draw(ID3D11DeviceContext *context, UINT element_count, Dra
 
 void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT index_count, UINT start_index_location, INT base_vertex_location)
 {
-    // 第一百一十三轮：passthrough 机制已整体移除（实测让 OptiScaler 丢失 FFX 输入识别）。
-    // 所有显卡统一桥直连；OptiScaler 共存时并行（各自独立链路，第一百一十轮实测无冲突；
+    // passthrough 机制已整体移除（实测让 OptiScaler 丢失 FFX 输入识别）。
+    // 所有显卡统一桥直连；OptiScaler 共存时并行（各自独立链路，实测无冲突；
     // N/Intel 上 OptiScaler 用于提供 DLSS/XeSS，不依赖桥让路）。
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     capture_runtime_snapshot_if_requested();
@@ -12049,7 +12049,7 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
         begin_fsr2_transient_capture(context, *target_draw_info);
     maybe_dump_color_candidate_inputs(context, index_count);
     maybe_dump_same_frame_fsr2_inputs(context, index_count);
-    // 第一百零六轮：旧翻译层 probe 停用（旧方案隔离）
+    // 旧翻译层 probe 停用（旧方案隔离）
 #endif
 #endif
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
@@ -12199,7 +12199,7 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
         begin_fsr2_transient_capture(context, *target_draw_info);
     maybe_dump_color_candidate_inputs(context, vertex_count);
     maybe_dump_same_frame_fsr2_inputs(context, vertex_count);
-    // 第一百零六轮：旧翻译层 probe 停用（旧方案隔离）
+    // 旧翻译层 probe 停用（旧方案隔离）
 #endif
 #endif
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
@@ -13027,7 +13027,7 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
     D3D_FEATURE_LEVEL *feature_level,
     ID3D11DeviceContext **context)
 {
-    // 第一百零六轮：旧 On12 引导移除（旧方案隔离）。
+    // 旧 On12 引导移除（旧方案隔离）。
     DXGI_SWAP_CHAIN_DESC effective_swapchain_desc {};
     const DXGI_SWAP_CHAIN_DESC *effective_desc = swapchain_desc;
     if (g_config.native_ldr_swapchain_unorm && swapchain_desc != nullptr &&
@@ -13058,7 +13058,7 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
         install_device_hooks(device != nullptr ? *device : nullptr);
         install_factory_hooks_from_device(device != nullptr ? *device : nullptr);
         install_context_hooks(context != nullptr ? *context : nullptr);
-        route_from_d3d11_device(device != nullptr ? *device : nullptr); // 第一百一十轮：设备级路由补检
+        route_from_d3d11_device(device != nullptr ? *device : nullptr); // ：设备级路由补检
         if (swapchain != nullptr && *swapchain != nullptr)
         {
             DXGI_SWAP_CHAIN_DESC created_desc {};
@@ -13086,7 +13086,7 @@ HRESULT WINAPI hooked_create_device(
     D3D_FEATURE_LEVEL *feature_level,
     ID3D11DeviceContext **context)
 {
-    // 第一百零六轮：旧 On12 引导移除（旧方案隔离）。
+    // 旧 On12 引导移除（旧方案隔离）。
     const HRESULT hr = g_original_create_device(
         adapter,
         driver_type,
@@ -13104,7 +13104,7 @@ HRESULT WINAPI hooked_create_device(
         install_device_hooks(device != nullptr ? *device : nullptr);
         install_factory_hooks_from_device(device != nullptr ? *device : nullptr);
         install_context_hooks(context != nullptr ? *context : nullptr);
-        route_from_d3d11_device(device != nullptr ? *device : nullptr); // 第一百一十轮：设备级路由补检
+        route_from_d3d11_device(device != nullptr ? *device : nullptr); // ：设备级路由补检
         log_line("hooked D3D11CreateDevice");
     }
     return hr;
@@ -13212,7 +13212,7 @@ void on_module_activity(const char *source, HMODULE module)
     install_loader_hooks_for_loaded_modules();
     install_hdr_environment_probe_for_loaded_modules();
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
-    // 第一百零六轮：旧 FSR2 shim 查询日志已移除（旧 OptiScaler 接入）。
+    // 旧 FSR2 shim 查询日志已移除（旧 OptiScaler 接入）。
 #endif
 }
 
@@ -13375,11 +13375,11 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR proc_name)
     return address;
 }
 
-// 第一百一十轮：显卡路由统一应用点（DllMain attach 早期 + D3D11 设备创建后补检）。
+// 显卡路由统一应用点（DllMain attach 早期 + D3D11 设备创建后补检）。
 // 早期 CreateDXGIFactory1/EnumAdapters1 在 loader lock 内可能失败（vendor=0），此时不标记
 // applied，留给设备创建 hook 用 IDXGIDevice::GetAdapter 补检——保证 RDNA2 4.0.2c 路由可靠生效。
-// 第一百一十三轮：passthrough 机制已整体移除（实测让 OptiScaler 丢失 FFX 输入识别）——
-// 第一百四十轮：不再做 GPU 架构分类与 402c 双路径——所有显卡统一默认 provider
+// passthrough 机制已整体移除（实测让 OptiScaler 丢失 FFX 输入识别）——
+// 不再做 GPU 架构分类与 402c 双路径——所有显卡统一默认 provider
 // （Ffx12DllPath，payload\AMD\amd_fidelityfx_upscaler_dx12.dll），provider 的
 // ffxQueryDescGetVersions 按 GPU 能力返回最高支持版本，降级链 4→3→2 兜底；
 // RDNA2 等需要 4.0.2c 的用户自行替换 SDK 文件（见 ini 备注）。
@@ -13408,7 +13408,7 @@ static bool contains_ci(const std::wstring &hay, const wchar_t *needle)
 static void apply_adapter_route(std::uint32_t vendor, std::uint32_t device, const std::wstring &desc,
                                 const char *source)
 {
-    // 第一百四十轮：不再做显卡型号识别与 402c 双路径——所有显卡统一走默认 provider
+    // 不再做显卡型号识别与 402c 双路径——所有显卡统一走默认 provider
     // （Ffx12DllPath，默认 payload\AMD\amd_fidelityfx_upscaler_dx12.dll）。
     // provider 的 ffxQueryDescGetVersions 按 GPU 能力返回最高支持版本，降级链 4→3→2 兜底；
     // RDNA2 等需要 4.0.2c 的用户自行替换 SDK 文件（见 ini 备注）。
@@ -13469,7 +13469,7 @@ void initialize()
 #endif
     load_config();
 
-    // 第一百四十轮：不再做显卡型号识别/402c 双路径——所有显卡统一 preload 默认 provider
+    // 不再做显卡型号识别/402c 双路径——所有显卡统一 preload 默认 provider
     // （Ffx12DllPath，默认 payload\AMD\amd_fidelityfx_upscaler_dx12.dll），
     // provider 的 ffxQueryDescGetVersions 按 GPU 能力返回最高支持版本，降级链 4→3→2 兜底。
     // preload 保证进程内"标准名"模块唯一 = 实际使用的 provider → OptiScaler 的 FFX 输入
@@ -13525,7 +13525,7 @@ void initialize()
         " target_process_filter=disabled");
 #endif
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
-    // 第一百零六轮：FSR2 GetProcAddress shim（旧 OptiScaler 接入）已移除。
+    // FSR2 GetProcAddress shim（旧 OptiScaler 接入）已移除。
     if (g_config.fsr2_il2cpp_hook)
     {
         il2cpp_callsite::Config hook_cfg;
@@ -13580,7 +13580,7 @@ void initialize()
 #endif
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     // Release 构建同样需要 OSD（show_osd 配置控制）：此前被 Release 条件编译切掉，
-    // 导致 OSD 悬浮窗从未启动（第九十轮"无可见 OSD"根因）。以下两行移到 #endif 之后。
+    // 导致 OSD 悬浮窗从未启动（"无可见 OSD"根因）。以下两行移到 #endif 之后。
 #endif
     start_osd();
     set_osd_text(L"Dx11FsrBridge OSD\n等待 DX11 dispatch 数据");

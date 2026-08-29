@@ -456,7 +456,7 @@ bool name_contains_series(
     return false;
 }
 
-// 第一百三十九轮：增加按 Device ID 精确分类（核显名字通常只是
+// 增加按 Device ID 精确分类（核显名字通常只是
 // "AMD Radeon(TM) Graphics"，不含型号，名字匹配识别不到——Device ID 才是权威）。
 enum class Fsr4GpuClass { Unsupported, Fp8, Int8 };
 

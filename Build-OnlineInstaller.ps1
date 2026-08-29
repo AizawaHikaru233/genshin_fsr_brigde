@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release', 'RelWithDebInfo', 'MinSizeRel')]
     [string]$Configuration = 'Release',
@@ -54,7 +54,7 @@ function Invoke-Cmake {
 }
 
 function Build-PackageComponents {
-    # 第一百三十九轮：VS 18 的 MSBuild 编译器检测与 CMake 4.3 不兼容（最小项目也复现
+    # VS 18 的 MSBuild 编译器检测与 CMake 4.3 不兼容（最小项目也复现
     # "compiler identification unknown"），改用 Ninja 生成器（cl 直连，不依赖 MSBuild）。
     Invoke-Cmake @(
         '-S', (Join-Path $root 'Dx11FsrBridge'), '-B', $bridgeBuild, '-G', 'Ninja',

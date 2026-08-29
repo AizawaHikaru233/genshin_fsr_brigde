@@ -266,7 +266,7 @@ function Get-NvidiaVideoControllers {
     })
 }
 
-# 第一百三十九轮：Device ID 精确分类（核显名字通常只是 "AMD Radeon(TM) Graphics"，
+# Device ID 精确分类（核显名字通常只是 "AMD Radeon(TM) Graphics"，
 # 不含型号，名字匹配识别不到）。Device ID 来源于 GPU 硬件 ID 汇总表。
 $script:AmdFp8DevIds = @('7550', '7551', '7590')
 $script:AmdInt8DevIds = @(

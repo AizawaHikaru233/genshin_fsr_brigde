@@ -53,8 +53,8 @@ void set_sdk_dll_path(const wchar_t *path);
 //    后端用 compute pass 解码为 R16G16_FLOAT 再交给 FSR2（否则 FSR2 按 UNORM 读出 0.5px 假位移）。
 void set_depth_inverted(bool inverted);
 void set_decode_motion(bool decode);
-void set_motion_flip(float flip); // 第一百三十三轮：XeSS/DLSS 定向——motion 方向翻转（±1）
-void set_depth_scale(float scale); // 第一百三十三轮：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
+void set_motion_flip(float flip); // ：XeSS/DLSS 定向——motion 方向翻转（±1）
+void set_depth_scale(float scale); // ：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
 // 运动矢量是否已经包含投影 jitter。仅在已包含时启用 SDK 的 jitter cancellation。
 void set_motion_vectors_jittered(bool jittered);
 // 输入颜色为 HDR（10-bit 线性 HDR 管线）时置 true（FSR2 需按 HDR 处理颜色/曝光）。
@@ -74,7 +74,7 @@ void adapter_luids(std::uint64_t &d11_luid, std::uint64_t &d12_luid);
 // OptiScaler-style DX11-on-12 capability probe result (does not imply that
 // native game D3D11 resources can be wrapped in-place).
 void interop_capabilities(bool &dx11on12, bool &gpu_only_transport);
-// 第八十七轮：原生 D3D11 纯 GPU 传输（自建 D3D12 设备 + NT 共享句柄纹理 +
+// 原生 D3D11 纯 GPU 传输（自建 D3D12 设备 + NT 共享句柄纹理 +
 // D3D11.4 共享 fence，不劫持游戏设备为 On12）。遵守该开关时后端在 dispatch 中
 // 走 dispatch_gpu_shared（GPU 拷贝进共享纹理 → FFX12 → GPU 拷贝出），无 CPU staging。
 void set_gpu_interop(bool enable);
@@ -86,17 +86,17 @@ void get_sdk_messages(std::wstring &out);
 void set_output_mark(bool mark);
 // 解码常数注入测试（诊断）：=true 时 PQ 解码 pass 输出固定 0.5（判断 pass 执行 vs SRV 读取断裂）。
 void set_decode_test(bool test);
-// 第九十六轮：motion 解码金丝雀——=true 时 motion 解码 pass 输出固定 (0.5,0.5)（无视输入）。
+// motion 解码金丝雀——=true 时 motion 解码 pass 输出固定 (0.5,0.5)（无视输入）。
 // 判读：cvt 变 0.5 → pass 执行、描述符链路 OK（问题在 SRV 源/输入交接）；
 //       cvt 仍 0 → pass 未执行或 UAV/描述符断。
 void set_motion_decode_test(bool test);
-// 第一百零贰轮：静止死区——=true 时 motion 解码把 |mv|<0.0005UV（≈1px@1920）的像素归零，
+// 静止死区——=true 时 motion 解码把 |mv|<0.0005UV（≈1px@1920）的像素归零，
 // 触发 FSR 静止锁定（消除静止残余 motion 驱动的时间累积网格/竖纹）。动态不受影响。
 void set_motion_deadzone(bool enable);
-// 第一百零伍轮：与 OptiScaler 共存兼容——
+// 与 OptiScaler 共存兼容——
 // preload：注入早期（OptiScaler loader hook 前）装载 FFX 模块并缓存句柄。
-// 第一百一十三轮：passthrough 机制已整体移除（实测会让 OptiScaler 丢失 FFX 输入识别）——
-// 所有显卡统一桥直连；OptiScaler 共存时并行（各自独立链路，第一百一十轮实测无冲突）。
+// passthrough 机制已整体移除（实测会让 OptiScaler 丢失 FFX 输入识别）——
+// 所有显卡统一桥直连；OptiScaler 共存时并行（各自独立链路，实测无冲突）。
 void preload(const wchar_t *path);
 // 诊断：后端输出共享纹理的 D3D11 侧（桥读回对比 CopyResource 是否生效）。
 ID3D11Texture2D *debug_output_texture();
@@ -145,6 +145,6 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
 
 // 查询当前选择的后端版本名（"2.3.4"/"4.1.1"/...）——诊断用。
 const char *selected_version_name();
-// 第一百二十轮：实际匹配到的 provider 版本名（"4.1.1"/"4.0.2c"/"3.1.5" 等，含降级结果）。
+// 实际匹配到的 provider 版本名（"4.1.1"/"4.0.2c"/"3.1.5" 等，含降级结果）。
 const char *matched_version_name();
 } // namespace ffx12

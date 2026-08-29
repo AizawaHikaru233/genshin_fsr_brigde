@@ -37,10 +37,10 @@ namespace
 std::atomic_bool g_active { false };
 std::mutex g_mutex;
 std::wstring g_sdk_path;
-// 第一百一十六轮：实际装载的 SDK 路径（与 g_sdk_path 区分——g_sdk_path 会被路由覆盖，
+// 实际装载的 SDK 路径（与 g_sdk_path 区分——g_sdk_path 会被路由覆盖，
 // 而句柄可能来自 preload 的旧路径；装载路径不一致时必须释放重载，否则版本列表错配）。
 std::wstring g_sdk_loaded_path;
-// 第一百二十三轮：preload 候选缓存（提前装载防 OptiScaler LoadLibrary hook 劫持——
+// preload 候选缓存（提前装载防 OptiScaler LoadLibrary hook 劫持——
 // 实测 402c 文件名同样被劫持 err=18）。init_locked 按最终路径从缓存取句柄，不再走 LoadLibrary。
 struct PreloadEntry
 {
@@ -102,9 +102,9 @@ struct SdkContext
 };
 std::vector<SdkContext> g_sdk_ctxs;
 std::string g_version_name = "ffx12";
-// 第一百二十轮：实际匹配到的 provider 版本名（如 "4.1.1"/"4.0.2c"/"3.1.5"）——日志如实上报。
+// 实际匹配到的 provider 版本名（如 "4.1.1"/"4.0.2c"/"3.1.5"）——日志如实上报。
 std::string g_sdk_matched_name = "?";
-// 第一百零捌轮：版本判定简化为大版本前缀（"2."/"3."/"4."），SDK 更新（4.1.1→4.2.x 等）免适配。
+// 版本判定简化为大版本前缀（"2."/"3."/"4."），SDK 更新（4.1.1→4.2.x 等）免适配。
 std::string g_sdk_version_prefix = "2.";
 std::uint64_t g_d11_luid = 0;  // D3D11 适配器 LUID（诊断）
 std::uint64_t g_d12_luid = 0;  // D3D12 适配器 LUID（诊断）
@@ -168,7 +168,7 @@ DXGI_FORMAT g_input_motion_fmt = DXGI_FORMAT_R16G16_FLOAT;
 DXGI_FORMAT g_input_transparency_fmt = DXGI_FORMAT_R8_UNORM;
 DXGI_FORMAT g_input_output_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
 
-// ---- 第八十七轮：原生 D3D11 纯 GPU 传输（NT 共享句柄 + D3D11.4 共享 fence）----
+// ---- ：原生 D3D11 纯 GPU 传输（NT 共享句柄 + D3D11.4 共享 fence）----
 // 设计依据（推翻 2026-08-24"legacy 共享纹理在 D3D12 读为 0"结论）：
 //   D3D11_RESOURCE_MISC_SHARED（legacy 共享面）句柄 D3D12 无法正确打开 → 读零；
 //   正确机制 = D3D11_RESOURCE_MISC_SHARED_NTHANDLE + IDXGIResource1::CreateSharedHandle
@@ -191,23 +191,23 @@ SharedTex g_tex_depth_share {};           // R32_FLOAT 共享深度（CS 输出/
 ComPtr<ID3D11UnorderedAccessView> g_depth_share_uav;
 ComPtr<ID3D11ShaderResourceView> g_depth_src_srv; // 游戏深度的 R32_FLOAT SRV（按纹理缓存）
 ID3D11Texture2D *g_depth_src_last = nullptr;
-// 第九十六轮：D3D11 侧 motion 解码（金丝雀证实原 D3D12 decode pass 从不写 cvt）
+// D3D11 侧 motion 解码（金丝雀证实原 D3D12 decode pass 从不写 cvt）
 ComPtr<ID3D11ComputeShader> g_motion_decode_cs;   // D3D11 decode compute
-ComPtr<ID3D11ComputeShader> g_motion_decode_dz_cs; // 第一百零贰轮：静止死区变体
+ComPtr<ID3D11ComputeShader> g_motion_decode_dz_cs; // ：静止死区变体
 bool g_motion_deadzone = false;                  // =true 用死区变体（微小 motion 归零）
 SharedTex g_tex_motion_cvt_share {};              // R16G16_FLOAT 共享解码输出（D3D12 直读给 FFX）
 ComPtr<ID3D11UnorderedAccessView> g_motion_cvt_share_uav;
 ComPtr<ID3D11ShaderResourceView> g_motion_src_srv; // 游戏 motion R10G10B10A2 SRV（按纹理缓存）
 ID3D11Texture2D *g_motion_src_last = nullptr;
-// 第九十七轮：reactive（motion B 通道）GPU 化——D3D11 CS 同 pass 输出共享 R8_UNORM
+// reactive（motion B 通道）GPU 化——D3D11 CS 同 pass 输出共享 R8_UNORM
 SharedTex g_tex_reactive_share {};                // R8_UNORM 共享 reactive（D3D12 直读给 FFX）
 ComPtr<ID3D11UnorderedAccessView> g_reactive_share_uav;
 
 // 运行期配置（桥 load_config 时设置；启动后固定）
 bool g_depth_inverted = true;   // 游戏深度逆方向（0=far）—— 2026-08-23 采样验证
 bool g_decode_motion = true;    // 游戏 motion 为 R10G10B10A2 平方编码
-float g_motion_flip = 1.0f;     // 第一百三十三轮：XeSS/DLSS 定向——motion 方向翻转（默认 +1 = FSR 方向）
-float g_depth_scale = 1.0f;     // 第一百三十三轮：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
+float g_motion_flip = 1.0f;     // ：XeSS/DLSS 定向——motion 方向翻转（默认 +1 = FSR 方向）
+float g_depth_scale = 1.0f;     // ：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
 ComPtr<ID3D11Buffer> g_motion_cb;   // MotionParams 常数缓冲（b0: g_flip）
 bool g_motion_vectors_jittered = false; // 游戏配置：motion 是否已包含投影 jitter
 bool g_hdr_input = true;        // 游戏 10-bit HDR 管线（useRealType）
@@ -345,11 +345,11 @@ void main(uint3 id : SV_DispatchThreadID)
 }
 )";
 
-// ---- 第八十七轮：深度提取 compute（游戏 R32G8X24_TYPELESS → 共享 R32_FLOAT）----
+// ---- ：深度提取 compute（游戏 R32G8X24_TYPELESS → 共享 R32_FLOAT）----
 // R32G8X24 不能建 D3D11 SHARED/NTHANDLE 共享纹理（CreateTexture2D E_INVALIDARG，probe 实证），
 // 因此必须先在 D3D11 侧把深度提取为可共享的 R32_FLOAT（恰好是 FFX12 期望的深度 SRV 格式）。
 // 提取在游戏的 immediate context 上执行（注入 compute pass，样式同旧 Mode-2 翻译层）。
-// 第一百三十三轮：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]；游戏逆深度实际 [0,~0.03]，
+// XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]；游戏逆深度实际 [0,~0.03]，
 // 不归一化则 XeSS 深度感知/低分辨率 MV 上采样失真 → 视角移动残影。b0: g_depth_scale，XeSS 时 >1）。
 static const char *g_depth_extract_hlsl = R"(
 cbuffer DepthParams : register(b0)
@@ -366,7 +366,7 @@ void main(uint3 id : SV_DispatchThreadID)
 }
 )";
 
-// ---- 第九十六轮：D3D11 侧 motion 解码（对称于深度提取）----
+// ---- ：D3D11 侧 motion 解码（对称于深度提取）----
 // 金丝雀（MotionDecodeTest）证明原 D3D12 解码 pass 从未写 cvt（On12/GPU-interop 均如此），
 // 静态 AA 靠 jitter 相位累积、动态全废的历史原因找到。此处改在游戏原生 D3D11 设备上
 // 用 compute 直接解码：t0=游戏 motion（R10G10B10A2 平方编码）→ u0=共享 R16G16_FLOAT
@@ -374,7 +374,7 @@ void main(uint3 id : SV_DispatchThreadID)
 static const char *g_motion_decode_d11_hlsl = R"(
 cbuffer MotionParams : register(b0)
 {
-    float g_flip; // 第一百三十三轮：XeSS/DLSS 定向——motion 方向翻转（XeSS-SR 约定 prev→curr，与 FSR 相反）
+    float g_flip; // ：XeSS/DLSS 定向——motion 方向翻转（XeSS-SR 约定 prev→curr，与 FSR 相反）
     float3 g_pad;
 };
 Texture2D<float4> in_mv : register(t0);
@@ -387,7 +387,7 @@ void main(uint3 id : SV_DispatchThreadID)
     float2 d = c.rg - 0.498039;
     float2 mv = -sign(d) * (4.0 * d * d) * g_flip;
     #if defined(FFX12_MOTION_DEADZONE)
-    // 第一百零贰轮：静止死区——|mv| 低于阈值归零，让 FSR 进入静止锁定（lock），
+    // 静止死区——|mv| 低于阈值归零，让 FSR 进入静止锁定（lock），
     // 消除静止时残余 motion 驱动的时间累积网格（竖纹/云刺）。阈值 0.0005 UV ≈ 1px@1920。
     static const float2 k_dz = float2(0.0005, 0.0005);
     if (abs(mv.x) < k_dz.x && abs(mv.y) < k_dz.y)
@@ -448,7 +448,7 @@ struct OutputSamples
 OutputSamples g_out_samples;
 std::mutex g_out_samples_mutex;
 
-// ---- 链中点二分采样（2026-08-24 第三轮：enc 全 0 + sdk_msgs=none → 定位 D3D12 链断点）----
+// ---- 链中点二分采样（2026-08-24 enc 全 0 + sdk_msgs=none → 定位 D3D12 链断点）----
 // 4 个 D3D12 自有纹理各采样中央像素：
 //   motion_cvt（金丝雀：motion 输入非 0 → 若 cvt≠0 则 cmdlist 执行 + 自有纹理 UAV 写正常）
 //   color_linear（PQ 解码输出：若=0 → 解码 pass 或共享输入 SRV 读断裂）
@@ -520,11 +520,11 @@ ID3D12PipelineState *marker_pso_for_version()
         return g_marker_411_pso.Get();
     return g_marker_234_pso.Get();
 }
-// 版本标记堆创建（第八十八轮起 CPU/On12/GPU-interop 共用；定义在
+// 版本标记堆创建（起 CPU/On12/GPU-interop 共用；定义在
 // ensure_output_landing_resources 之后）。enc 为标记目标纹理的 D3D12 侧。
 bool ensure_marker_heap_for(ID3D12Resource *enc);
 
-// ---- 金丝雀（2026-08-24 第四轮）：常数 compute 写 64×64 自有纹理 ----
+// ---- 金丝雀（2026-08-24 ）：常数 compute 写 64×64 自有纹理 ----
 // 不依赖任何输入；读回 0xFFC08040（R=64,G=128,B=192,A=255 小端）= cmdlist 执行 + 自有 UAV + readback 全通。
 static const char *g_canary_hlsl = R"(
 RWTexture2D<float4> out_c : register(u0);
@@ -547,11 +547,11 @@ D3D12_GPU_DESCRIPTOR_HANDLE g_pq_out_uav_gpu {};
 D3D12_CPU_DESCRIPTOR_HANDLE g_pq_out_uav_cpu {};
 ComPtr<ID3D12DescriptorHeap> g_pq_out_cpu_heap; // 非 shader-visible（CPU 可读）：clear 的 CPU 句柄必须来自此类堆
 
-// ---- 输入 CPU 中转（2026-08-24 第六轮：legacy 共享 SRV 读返回 0 实证）----
+// ---- 输入 CPU 中转（2026-08-24 legacy 共享 SRV 读返回 0 实证）----
 // 金丝雀证明自有纹理 UAV/SRV/readback 全通；解码输出全 0 的唯一解释 = 共享纹理在 D3D12 读为 0。
 // 修复：输入不再经 D3D12 读共享纹理——D3D11 staging 读游戏输入（samples 已证明可行）
 // → CPU → D3D12 upload buffer → CopyTextureRegion 到自有输入纹理 → 链全部消费自有纹理。
-// 深度特别处理（2026-08-24 第十一轮）：R32G8X24_TYPELESS 的 D3D12 拷贝 footprint 为 4BPP
+// 深度特别处理（2026-08-24 ）：R32G8X24_TYPELESS 的 D3D12 拷贝 footprint 为 4BPP
 // （深度平面；G8X24 是独立 stencil 平面）——若按 8BPP 行距 memcpy 会越界写（已实证 AV）。
 // 深度走提取路径：staging 保持 R32G8X24（匹配游戏），memcpy 每像素取前 4B 深度 → R32_FLOAT
 // 自有纹理/上传（4BPP，与 D3D12 footprint 一致）。
@@ -761,7 +761,7 @@ bool open_on_d3d12(SharedTex &st)
     return true;
 }
 
-// 第八十七轮：NT 共享纹理（SHARED|SHARED_NTHANDLE）——D3D12 可正确打开的跨 API
+// NT 共享纹理（SHARED|SHARED_NTHANDLE）——D3D12 可正确打开的跨 API
 // 共享机制（legacy GetSharedHandle 在 D3D12 读零，见 GpuInteropProbe 实证）。
 ComPtr<ID3D11Texture2D> make_shared_texture_nt(UINT w, UINT h, DXGI_FORMAT fmt, UINT bind_flags)
 {
@@ -1165,10 +1165,10 @@ bool ensure_output_landing_resources()
     return true;
 }
 
-// 版本标记堆创建（第八十八轮起供 CPU / On12 / GPU-interop 三路径共用）。
+// 版本标记堆创建（起供 CPU / On12 / GPU-interop 三路径共用）。
 // heap 内按 g_mv_rs root signature 布局：[SRV(enc)@0, UAV(enc)@1]（t0=desc0/u0=desc1）。
 // 旧实现把 UAV 放 0、SRV 放 1 与 g_mv_rs 相反，u0 会绑定到 SRV 描述符 → 驱动层崩溃
-// （第八十八轮进场闪退根因；该标记路径此前从未被真实启用过）。
+// （进场闪退根因；该标记路径此前从未被真实启用过）。
 // 调用方在画标记时把 UAV 覆盖为当前输出纹理。
 bool ensure_marker_heap_for(ID3D12Resource *enc)
 {
@@ -1443,7 +1443,7 @@ bool ensure_pool(const FrameInput &input)
     if (input.output_target && (input.output_target->GetDesc(&td), td.Format != DXGI_FORMAT_UNKNOWN))
         output_fmt = td.Format;
 
-    // 第八十七轮：原生 D3D11 纯 GPU 传输池（NT 共享句柄纹理；无 CPU staging）。
+    // 原生 D3D11 纯 GPU 传输池（NT 共享句柄纹理；无 CPU staging）。
     // 游戏保持原生 D3D11 设备；自建 D3D12 设备经共享句柄读取同一 GPU 内存。
     if (g_gpu_interop_ready)
     {
@@ -1465,11 +1465,11 @@ bool ensure_pool(const FrameInput &input)
         g_tex_depth_share.d11 = make_shared_texture_nt(input.render_w, input.render_h,
                                                        DXGI_FORMAT_R32_FLOAT,
                                                        D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);
-        // 第九十六轮：共享解码 motion（R16G16_FLOAT；D3D11 CS 解码写 → D3D12 直读给 FFX）
+        // 共享解码 motion（R16G16_FLOAT；D3D11 CS 解码写 → D3D12 直读给 FFX）
         g_tex_motion_cvt_share.d11 = make_shared_texture_nt(input.render_w, input.render_h,
                                                             DXGI_FORMAT_R16G16_FLOAT,
                                                             D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);
-        // 第九十七轮：共享 reactive（R8_UNORM；motion B 通道提取，同 CS 输出）
+        // 共享 reactive（R8_UNORM；motion B 通道提取，同 CS 输出）
         g_tex_reactive_share.d11 = make_shared_texture_nt(input.render_w, input.render_h,
                                                           DXGI_FORMAT_R8_UNORM,
                                                           D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);
@@ -1539,7 +1539,7 @@ bool ensure_pool(const FrameInput &input)
         return true;
     }
 
-    // 第一百零肆轮清理：CPU staging 回退路径已移除——GPU 互操作未就绪时直接失败，
+    // 清理：CPU staging 回退路径已移除——GPU 互操作未就绪时直接失败，
     // 由 dispatch 返回 false 让游戏走原有原生 FSR 路径（fail-open 不损画质）。
     sdk_note(L"gpu interop not ready stage=pool");
     return false;
@@ -1675,7 +1675,7 @@ bool create_context(SdkContext &sc)
 
 
 
-// 第八十七轮：原生 D3D11 纯 GPU 传输（游戏设备保持原生 D3D11，不劫持为 On12）。
+// 原生 D3D11 纯 GPU 传输（游戏设备保持原生 D3D11，不劫持为 On12）。
 // 与 dispatch_on12_direct 等价的全 GPU 链路，但资源经 NT 共享句柄（D3D11 建 /
 // D3D12 打开）跨设备流转，同步用 D3D11.4 共享 fence：
 //   ① D3D11（游戏 stream）：深度 CS 提取 + CopyResource 输入 → Signal(f11, v1)
@@ -1707,7 +1707,7 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
         if (!g_depth_src_srv || g_depth_src_last != input.depth)
         {
             g_depth_src_srv.Reset();
-            // 第一百零一轮：按深度纹理实际格式选视图（绑定深度曾全 0；
+            // 按深度纹理实际格式选视图（绑定深度曾全 0；
             // DSV 深度可能为 D24 族或 D32 族——Load().x 统一得到 0..1）
             DXGI_FORMAT srv_fmt = DXGI_FORMAT_R32_FLOAT;
             ID3D11Texture2D *dtex = nullptr;
@@ -1760,7 +1760,7 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
             game_context->CSSetShader(nullptr, nullptr, 0);
         }
     }
-    // 第九十六轮：D3D11 侧 motion 解码——游戏 motion（R10G10B10A2 平方编码）→
+    // D3D11 侧 motion 解码——游戏 motion（R10G10B10A2 平方编码）→
     // 共享 R16G16_FLOAT。绕过原 D3D12 decode pass（金丝雀证实从不写 cvt）。
     if (input.motion && g_motion_decode_cs && g_motion_cvt_share_uav)
     {
@@ -1803,7 +1803,7 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     }
     if (input.color)
         game_context->CopyResource(g_tex_color.d11.Get(), input.color);
-    // 第九十六轮：motion 不再拷贝进共享 raw 纹理——解码 CS 已直接读游戏纹理，
+    // motion 不再拷贝进共享 raw 纹理——解码 CS 已直接读游戏纹理，
     // 解码结果（共享 R16G16）才是 FFX 的 motion 输入。
     game_context->Flush();
     const std::uint64_t v1 = g_shared_fence_value + 1;
@@ -1842,7 +1842,7 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     };
 
     // 共享输入统一先到 NON_PIXEL_SHADER_RESOURCE（FFX 将从这里再转自身需要的状态）
-    // 第九十六轮：motion 输入 = 共享解码 R16G16（D3D11 CS 已解码）；raw motion 不再进 D3D12
+    // motion 输入 = 共享解码 R16G16（D3D11 CS 已解码）；raw motion 不再进 D3D12
     std::vector<ID3D12Resource *> inputs;
     inputs.push_back(g_tex_color.d12.Get());
     inputs.push_back(g_tex_depth_share.d12.Get());
@@ -1865,7 +1865,7 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     dispatch.motionVectors =
         ffxApiGetResourceDX12(g_tex_motion_cvt_share.d12.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
     dispatch.motionVectors.description.format = FFX_API_SURFACE_FORMAT_R16G16_FLOAT;
-    // 第九十七轮：reactive（motion B 通道提取，共享 R8）——历史"无改善"结论在 motion=0 坏基线上，重估
+    // reactive（motion B 通道提取，共享 R8）——历史"无改善"结论在 motion=0 坏基线上，重估
     if (input.use_reactive_mask && g_tex_reactive_share.d12)
     {
         dispatch.reactive =
@@ -1934,7 +1934,7 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
 
 } // namespace
 
-// 第一百三十七轮：OptiScaler 存在检测——加载 OptiScaler 即需要它接管桥的 FFX 输入。
+// OptiScaler 存在检测——加载 OptiScaler 即需要它接管桥的 FFX 输入。
 // 标准加载名（OptiScaler.dll）；改名加载场景可扩展模块扫描。
 static bool is_optiscaler_loaded()
 {
@@ -1948,7 +1948,7 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
     if (game_device == nullptr)
         return false;
     g_d11dev = game_device;
-    // 第一百零肆轮清理：On12 引导已移除（不发生产品路线）。自建 D3D12 设备 + 共享句柄互操作。
+    // 清理：On12 引导已移除（不发生产品路线）。自建 D3D12 设备 + 共享句柄互操作。
     g_gpu_only_transport_available = false; // enabled only after direct gpu-interop dispatch lands.
     SetUnhandledExceptionFilter(sdk234_exception_filter); // 崩溃定位：异常写 sdk234_steps.log
     sdk234_step("init begin");
@@ -2025,7 +2025,7 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
     if (g_fence_event == nullptr)
         return false;
 
-    // ---- 第八十七轮：原生 D3D11 纯 GPU 传输初始化 ----
+    // ---- ：原生 D3D11 纯 GPU 传输初始化 ----
     // 共享 fence（D3D12 创建 → D3D11 OpenSharedFence）+ 深度提取/motion 解码 CS 编译。
     g_gpu_interop_ready = false;
     if (g_gpu_interop)
@@ -2063,7 +2063,7 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
                              &g_depth_extract_cs)))
                 setup_ok = false;
         }
-        // 第九十六轮：D3D11 侧 motion 解码 CS（绕过从不写 cvt 的 D3D12 decode pass）
+        // D3D11 侧 motion 解码 CS（绕过从不写 cvt 的 D3D12 decode pass）
         if (setup_ok)
         {
             ComPtr<ID3DBlob> blob, err;
@@ -2077,7 +2077,7 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
                              &g_motion_decode_cs)))
                 setup_ok = false;
         }
-        // 第一百零贰轮：静止死区变体（微小 motion 归零；触发 FSR 静止锁定）
+        // 静止死区变体（微小 motion 归零；触发 FSR 静止锁定）
         if (setup_ok)
         {
             ComPtr<ID3DBlob> blob, err;
@@ -2094,7 +2094,7 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
         }
         if (setup_ok)
         {
-            // 第一百三十三轮：motion 解码 CS 常数缓冲（b0: g_flip——XeSS/DLSS 方向翻转）
+            // motion 解码 CS 常数缓冲（b0: g_flip——XeSS/DLSS 方向翻转）
             D3D11_BUFFER_DESC mcb {};
             mcb.ByteWidth = 16;
             mcb.Usage = D3D11_USAGE_DEFAULT;
@@ -2144,8 +2144,8 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
         sdk_note(L"ffx-api path missing stage=runtime");
         return false;
     }
-    // 第一百一十六轮：路由可能把 SDK 路径从默认 4.1.1 切到 402c（RDNA2/N 卡 16-50/Intel Arc）。
-    // 第一百二十三轮：切换时从 preload 候选缓存取句柄（候选已在 OptiScaler hook 装好前装载，
+    // 路由可能把 SDK 路径从默认 4.1.1 切到 402c（RDNA2/N 卡 16-50/Intel Arc）。
+    // 切换时从 preload 候选缓存取句柄（候选已在 OptiScaler hook 装好前装载，
     // 避免 LoadLibrary 被劫持 err=18 → 4070 Super 实测）；缓存未命中才兜底 LoadLibrary。
     if (g_sdk_module != nullptr && g_sdk_loaded_path == sdk_dll_path)
     {
@@ -2154,9 +2154,9 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
     else
     {
         HMODULE target = nullptr;
-        // 第一百二十三轮起：候选缓存优先（preload 的干净句柄，防 OptiScaler hook 劫持 err=18），
+        // 起：候选缓存优先（preload 的干净句柄，防 OptiScaler hook 劫持 err=18），
         // 缓存未命中才 LoadLibrary 兜底（Auto402c=0 手动路径场景：与 OptiScaler 模块对齐）。
-        // 第一百三十七轮曾尝试统一 LoadLibrary——破坏手动接管，回滚恢复本逻辑。
+        // 曾尝试统一 LoadLibrary——破坏手动接管，回滚恢复本逻辑。
         for (const PreloadEntry &e : g_preloaded)
         {
             if (e.path == sdk_dll_path)
@@ -2221,7 +2221,7 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
         return false;
     }
     g_sdk_version_id = 0;
-    // 第一百一十四轮（N 卡降级）：大版本前缀匹配，无匹配时自动降级 4→3→2。
+    // （N 卡降级）：大版本前缀匹配，无匹配时自动降级 4→3→2。
     // 例：N 卡上 4.1.1 provider 的 GET_VERSIONS 列表不含 "4.x"（provider 按 GPU 能力过滤：
     // FSR4 仅 RDNA4/RDNA3 dGPU 官方支持），请求 4.x 应自动回落 3.1.5（理论预期），
     // 而非硬失败导致每帧 DISPATCH_FAILED。降级结果同步 OSD 显示名，避免误导。
@@ -2361,7 +2361,7 @@ bool active()
     return g_active.load(std::memory_order_relaxed);
 }
 
-// 设备移除恢复（第九十八轮）：放弃当前 D3D12/互操作后端并复位活动标志，
+// 设备移除恢复（）：放弃当前 D3D12/互操作后端并复位活动标志，
 // 下一次 dispatch 惰性重建（新设备/队列/共享纹理/FFX context）。
 // 坏设备上不调用 runtime.destroy（可能 AV）；旧 context 随进程回收（一次事故级泄漏可接受）。
 // 调用方必须已持有 g_mutex（dispatch 路径）。
@@ -2471,7 +2471,7 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
         {
             sdk_note(L"dispatch device-removed d3d12 reason=0x%08X stage=entry",
                      static_cast<unsigned>(drr));
-            recover_device_removed_locked(); // 第九十八轮：放弃后端，下次 dispatch 惰性重建
+            recover_device_removed_locked(); // ：放弃后端，下次 dispatch 惰性重建
             return false;
         }
     }
@@ -2562,12 +2562,12 @@ void set_decode_motion(bool decode)
     g_decode_motion = decode;
 }
 
-void set_motion_flip(float flip) // 第一百三十三轮：XeSS/DLSS 定向——motion 方向翻转（±1）
+void set_motion_flip(float flip) // ：XeSS/DLSS 定向——motion 方向翻转（±1）
 {
     g_motion_flip = flip;
 }
 
-void set_depth_scale(float scale) // 第一百三十三轮：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
+void set_depth_scale(float scale) // ：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
 {
     g_depth_scale = scale;
 }
@@ -2607,9 +2607,9 @@ void set_dump_frames(std::uint32_t n)
     g_dump_frames = n;
 }
 
-// 第一百零六轮：版本命名规范——对外统一 ffx12 品牌（ffx12-fsr4.1.1 / ffx12-fsr3.1.5 /
+// 版本命名规范——对外统一 ffx12 品牌（ffx12-fsr4.1.1 / ffx12-fsr3.1.5 /
 // ffx12-fsr2.3.4），内部映射回 ffx-api 枚举名（4.1.1/3.1.5/2.3.4）做版本匹配。
-// 第一百零捌轮：版本判定简化为大版本（ffx12-fsr4.x / ffx12-fsr3.x / ffx12-fsr2.x）——
+// 版本判定简化为大版本（ffx12-fsr4.x / ffx12-fsr3.x / ffx12-fsr2.x）——
 // 按前缀匹配 provider 支持的版本列表（4.x 命中 4.0.2c/4.1.1/未来 4.2.x），SDK 更新免适配。
 void set_sdk_version(const char *name)
 {
@@ -2627,7 +2627,7 @@ void set_sdk_version(const char *name)
         g_sdk_version_prefix = std::string(1, input[0]) + ".";
     else
         g_sdk_version_prefix.clear();
-    // 显示名统一为 ffx12 品牌（4.0.2c 为 RDNA2 专用 FSR4 模型，第一百零柒轮）
+    // 显示名统一为 ffx12 品牌（4.0.2c 为 RDNA2 专用 FSR4 模型，）
     if (g_sdk_version_prefix == "4.")
         g_version_name = "ffx12/FSR4";
     else if (g_sdk_version_prefix == "3.")
@@ -2677,8 +2677,8 @@ void set_motion_deadzone(bool enable)
     g_motion_deadzone = enable;
 }
 
-// 第一百零伍轮：与 OptiScaler 共存兼容。
-// 第一百二十三轮：preload 提前装载**全部候选** provider（默认 4.1.1 + 402c）并缓存句柄——
+// 与 OptiScaler 共存兼容。
+// preload 提前装载**全部候选** provider（默认 4.1.1 + 402c）并缓存句柄——
 // OptiScaler 的 LoadLibrary hook 会劫持任意 ffx-api 文件名（含 402c，4070 Super 实测 err=18），
 // 必须在 hook 装好前（DllMain attach 早期）加载；init_locked 按最终路径从缓存取句柄。
 void preload(const wchar_t *path)
