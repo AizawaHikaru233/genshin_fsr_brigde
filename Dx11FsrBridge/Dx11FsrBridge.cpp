@@ -10693,6 +10693,13 @@ bool try_fsr2_translation_draw(
             : last_depth_state.load(std::memory_order_relaxed);
     const bool depth_path_changed =
         depth_format_compatible && previous_depth_state != 0 && previous_depth_state != depth_state;
+    if (depth_path_changed)
+    {
+        // UI/场景切换：视图集合变化，清空视图 ResourceInfo 缓存，
+        // 防止释放后的地址复用命中旧描述导致识别错误（画面锯齿/错误接管）。
+        std::lock_guard lock(g_resource_info_cache_mutex);
+        g_resource_info_cache.clear();
+    }
 
     // Motion-mask lock.  During normal rendering views[3] is the real motion
     // buffer (whose .z channel is used as the FSR2 reactive mask).  The
