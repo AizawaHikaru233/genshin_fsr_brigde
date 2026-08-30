@@ -9,7 +9,7 @@
     [string]$UnlockerSource,
     [ValidateSet('Auto', 'Manual', 'Existing')]
     [string]$OptiScalerSource,
-    [ValidateSet('Auto', 'Bundled', 'Existing')]
+    [ValidateSet('Auto', 'AutoReShadeOnly', 'Bundled', 'Existing')]
     [string]$ReShadeSource,
     [string]$UnlockerPackagePath,
     [string]$OptiScalerPackagePath,
@@ -532,7 +532,7 @@ function Copy-DirectoryContents {
 }
 
 function Install-ReShadeResources {
-    param([ValidateSet('Auto', 'Bundled', 'Existing')][string]$Mode)
+    param([ValidateSet('Auto', 'AutoReShadeOnly', 'Bundled', 'Existing')][string]$Mode)
     if ($Mode -in @('Bundled', 'Existing')) {
         Assert-File -Path $reshadeDll
         Assert-Directory -Path $shaderDir
@@ -547,11 +547,10 @@ function Install-ReShadeResources {
             -DestinationDirectory $stageDirectory `
             -BundledSourceDirectory $reshadeDir `
             -TemporaryDirectory $temporaryDirectory `
-            -UserAgent 'GenshinOneClick-ReShadeInstaller' | Out-Null
+            -UserAgent 'GenshinOneClick-ReShadeInstaller' `
+            -IncludeEffects:($Mode -eq 'Auto') | Out-Null
 
-        foreach ($replaceDirectory in @('Shaders', 'Textures')) {
-            Remove-Item -LiteralPath (Join-Path $shaderDir $replaceDirectory) -Recurse -Force -ErrorAction SilentlyContinue
-        }
+        # 效果库增量安装：不清空已有文件——只增量和同名替换（-Force 覆盖同名字，保留用户新增/旧文件）
         New-Item -ItemType Directory -Force -Path $reshadeDir | Out-Null
         Copy-DirectoryContents -Source $stageDirectory -Destination $reshadeDir
         Assert-File -Path $reshadeDll
@@ -560,7 +559,12 @@ function Install-ReShadeResources {
             -ExpectedSha256 (Get-ReShadeResourceSpec).ReShadeDllSha256 `
             -Label 'ReShade64.dll'
         Assert-Directory -Path $shaderDir
-        Write-Host '已从官方来源安装 ReShade 与效果库。' -ForegroundColor Green
+        if ($Mode -eq 'AutoReShadeOnly') {
+            Write-Host '已从官方来源安装 ReShade 本体（仅 ReShade + RenoDX，未下载效果库）。' -ForegroundColor Green
+        }
+        else {
+            Write-Host '已从官方来源安装 ReShade 与效果库。' -ForegroundColor Green
+        }
     }
     finally {
         if (Test-Path -LiteralPath $temporaryDirectory) {

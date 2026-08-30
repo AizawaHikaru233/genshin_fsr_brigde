@@ -853,23 +853,26 @@ function Select-ComponentSource {
 }
 
 function Select-ReShadeSource {
-    $bundledEffectsAvailable =
-        (Test-Path -LiteralPath (Join-Path $payloadDirectory 'ReShade\reshade-shaders\Shaders\FakeHDR.fx') -PathType Leaf) -or
-        (Test-Path -LiteralPath (Join-Path $payloadDirectory 'ReShade\reshade-shaders\Shaders\lilium__tone_mapping.fx') -PathType Leaf)
+    $localReShadePresent = Test-Path -LiteralPath $reShadePath -PathType Leaf
     Write-Host ''
     Write-Host 'ReShade 与效果库安装来源：' -ForegroundColor Yellow
-    Write-Host '  1. 从 ReShade 及效果作者的官方来源下载（推荐）'
-    if ($bundledEffectsAvailable) {
-        Write-Host '  2. 使用安装包内置 ReShade 与效果库（支持离线安装）'
-    }
-    else {
-        Write-Host '  2. 仅使用安装包内置 ReShade + RenoDX（不含效果库）'
-    }
+    Write-Host '  1. 从 ReShade 及效果作者的官方来源下载（ReShade + 效果库）'
+    Write-Host '  2. 仅使用 ReShade + RenoDX（不额外下载效果库）'
     Write-Host '  0. 返回上一层'
+    if ($localReShadePresent) {
+        Write-Host '（检测到游戏目录已有 ReShade——选项 1/2 将下载更新至最新版，效果库只做增量合并）' -ForegroundColor DarkGray
+    }
     while ($true) {
         $choice = (Read-Host '请输入选项，直接回车使用官方下载').Trim()
         if ([string]::IsNullOrWhiteSpace($choice) -or $choice -eq '1') { return 'Auto' }
-        if ($choice -eq '2') { return 'Bundled' }
+        if ($choice -eq '2') {
+            # 选项 2 先检测本地 ReShade：存在则不下载（等效原"内置"效果；GitHub 包无本地→走下载）
+            if (Test-Path -LiteralPath $reShadePath -PathType Leaf) {
+                Write-Host '（检测到本地已有 ReShade——跳过下载，直接使用现有 ReShade）' -ForegroundColor DarkGray
+                return 'Existing'
+            }
+            return 'AutoReShadeOnly'
+        }
         if ($choice -eq '0') { return $null }
         Write-Host '无效选项。' -ForegroundColor Red
     }

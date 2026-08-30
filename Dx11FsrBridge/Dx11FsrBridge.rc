@@ -1,10 +1,10 @@
-#pragma code_page(65001)
+﻿#pragma code_page(65001)
 
 #include <windows.h>
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 2,0,0,0
- PRODUCTVERSION 2,0,0,0
+ FILEVERSION 2,1,0,0
+ PRODUCTVERSION 2,1,0,0
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
  FILEFLAGS 0
  FILEOS VOS_NT_WINDOWS32
@@ -17,12 +17,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Celia"
             VALUE "FileDescription", "Genshin Impact DX11 FSR Bridge"
-            VALUE "FileVersion", "2.0.0.0"
+            VALUE "FileVersion", "2.1.0.0"
             VALUE "InternalName", "Dx11FsrBridge"
             VALUE "LegalCopyright", "Copyright (C) 2026 Celia"
             VALUE "OriginalFilename", "Dx11FsrBridge.dll"
             VALUE "ProductName", "Genshin FSR Bridge"
-            VALUE "ProductVersion", "1.2.3.0"
+            VALUE "ProductVersion", "2.1.0.0"
             VALUE "Comments", "FSR2 ABI bridge with OptiScaler translation and render-scale menu integration."
         END
     END

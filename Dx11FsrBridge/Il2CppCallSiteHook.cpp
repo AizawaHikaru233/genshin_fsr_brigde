@@ -3,9 +3,11 @@
 #include <Windows.h>
 
 #include <atomic>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <vector>
 
 namespace il2cpp_callsite
 {
@@ -188,6 +190,46 @@ bool build_stub(bool skip_render, std::uint8_t *render, std::uint8_t *stub)
 }
 
 } // namespace
+
+// RVA 自动识别：扫描 exe 代码段（BaseOfCode..SizeOfCode）找 render 序言
+// （k_render_head）且在 render_rva - ucb_rva 偏移处为 ucb 序言（k_ucb_head）的候选。
+// 返回候选 RVA（供配置对齐——国际服/版本更新偏移不同）。
+std::vector<std::uint32_t> scan_render_candidates(std::uint64_t exe_base,
+                                                  std::uint32_t render_rva, std::uint32_t ucb_rva)
+{
+    std::vector<std::uint32_t> candidates;
+    if (exe_base == 0 || render_rva <= ucb_rva)
+        return candidates;
+    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(exe_base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return candidates;
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(exe_base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return candidates;
+    const std::size_t text_size = nt->OptionalHeader.SizeOfCode;
+    if (text_size == 0 || text_size > (1u << 30))
+        return candidates;
+    const std::uint8_t *text = reinterpret_cast<const std::uint8_t *>(exe_base + nt->OptionalHeader.BaseOfCode);
+    const std::ptrdiff_t ucb_delta = static_cast<std::ptrdiff_t>(render_rva) - static_cast<std::ptrdiff_t>(ucb_rva);
+    for (std::size_t i = 0; i + sizeof(k_render_head) <= text_size; ++i)
+    {
+        if (std::memcmp(text + i, k_render_head, sizeof(k_render_head)) != 0)
+            continue;
+        // ucb 在 render 上方 ucb_delta 处（text 偏移 = i - ucb_delta）
+        if (i < static_cast<std::size_t>(ucb_delta))
+            continue;
+        const std::size_t ucb_off = i - static_cast<std::size_t>(ucb_delta);
+        if (ucb_off + sizeof(k_ucb_head) > text_size)
+            continue;
+        if (std::memcmp(text + ucb_off, k_ucb_head, sizeof(k_ucb_head)) != 0)
+            continue;
+        // 配对命中：render 在 ucb 上方 ucb_delta 处（与国服相对布局一致）
+        candidates.push_back(static_cast<std::uint32_t>(nt->OptionalHeader.BaseOfCode + i));
+        if (candidates.size() >= 8)
+            break;
+    }
+    return candidates;
+}
 
 bool install(std::uint64_t exe_base, const Config &cfg)
 {
@@ -653,6 +695,112 @@ std::size_t projection_matrix(float *out, std::size_t capacity, std::uint64_t *c
     if (camera_ptr != nullptr)
         *camera_ptr = g_projection_camera;
     return 16;
+}
+
+// 特征识别（优先于硬编码 RVA）：g_MethodPointers 全量指针 + FFX_FSR2 30 方法尺寸
+// 序列 gap 匹配（唯一命中——国服/国际服/版本更新通用）。内存版（游戏 exe 已加载——
+// 扫描 .rdata/.data 中指向 il2cpp 段的 u64 指针）。
+bool detect_ffx12_method_rvas(std::uint64_t exe_base,
+                              std::uint32_t &render_rva,
+                              std::uint32_t &ucb_rva,
+                              std::uint32_t &camera_rva)
+{
+    render_rva = ucb_rva = camera_rva = 0;
+    if (exe_base == 0)
+        return false;
+    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(exe_base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(exe_base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return false;
+
+    const std::uint8_t *base = reinterpret_cast<const std::uint8_t *>(exe_base);
+    // 1) 段表：找 il2cpp 段（方法代码）与数据段（.rdata/.data——g_MethodPointers 所在）
+    const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    std::uint64_t il2_va = 0, il2_end = 0;
+    struct DataSec { std::uint64_t va, size; };
+    std::vector<DataSec> data_secs;
+    for (std::uint16_t i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+    {
+        const IMAGE_SECTION_HEADER &s = sec[i];
+        char name[9] {};
+        std::memcpy(name, s.Name, 8);
+        const std::uint64_t va = s.VirtualAddress;
+        if (std::strcmp(name, "il2cpp") == 0)
+        {
+            il2_va = va;
+            il2_end = va + s.Misc.VirtualSize;
+        }
+        else if (s.Characteristics & IMAGE_SCN_MEM_READ &&
+                 !(s.Characteristics & IMAGE_SCN_MEM_EXECUTE) &&
+                 (std::strcmp(name, ".rdata") == 0 || std::strcmp(name, ".data") == 0))
+        {
+            data_secs.push_back({va, s.Misc.VirtualSize});
+        }
+    }
+    if (il2_va == 0 || data_secs.empty())
+        return false;
+    const std::uint64_t il2_lo = il2_va, il2_hi = il2_end;
+
+    // 2) 收集数据段中指向 il2cpp 段的 u64（g_MethodPointers 候选）
+    std::vector<std::uint32_t> rvas;
+    for (const DataSec &ds : data_secs)
+    {
+        const std::size_t cnt = static_cast<std::size_t>(ds.size / 8);
+        for (std::size_t i = 0; i < cnt; ++i)
+        {
+            const std::uint64_t v = *reinterpret_cast<const std::uint64_t *>(base + ds.va + i * 8);
+            if (v >= exe_base + il2_lo && v < exe_base + il2_hi)
+                rvas.push_back(static_cast<std::uint32_t>(v - exe_base));
+        }
+    }
+    if (rvas.size() < 64)
+        return false;
+    std::sort(rvas.begin(), rvas.end());
+    rvas.erase(std::unique(rvas.begin(), rvas.end()), rvas.end());
+
+    // 3) 30 方法尺寸序列 gap 匹配（方法顺序/尺寸 = FFX_FSR2 结构特征——非 RVA 硬编码）
+    static constexpr std::uint32_t k_seq[30] = {
+        0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0xD0,0x10,0x170,0x30,0x20,0x10,0x130,0x20,0xB0,
+        0x70,0x3E0,0x1D0,0x1CE0,0x18C0,0x120,0x70,0xFA0,0x280,0x260,0x110,0xA0};
+    const auto tol_for = [](std::uint32_t s) -> std::int32_t {
+        if (s == 0xFA0) return 0x400;
+        if (s <= 0x20) return 0x10;
+        if (s <= 0x100) return 0x40;
+        return 0x100;
+    };
+    int best_idx = -1, best_exact = -1;
+    std::int64_t best_drift = 0;
+    for (std::size_t i = 0; i + 30 < rvas.size(); ++i)
+    {
+        int exact = 0;
+        std::int64_t drift = 0;
+        bool ok = true;
+        for (int k = 0; k < 29; ++k)
+        {
+            const std::int64_t gap = static_cast<std::int64_t>(rvas[i + k + 1]) - rvas[i + k];
+            const std::int64_t dev = gap - k_seq[k];
+            if (dev > tol_for(k_seq[k]) || dev < -tol_for(k_seq[k])) { ok = false; break; }
+            if (dev == 0) ++exact;
+            drift += dev;
+        }
+        if (ok && drift >= -0x1000 && drift <= 0x1000 && exact > best_exact)
+        {
+            best_idx = static_cast<int>(i);
+            best_exact = exact;
+            best_drift = drift;
+        }
+    }
+    if (best_idx < 0 || best_exact < 20)
+        return false;
+
+    // 4) 输出：get_downscaleRatio=idx0；ConfigureJitteredProjectionMatrix=idx19；
+    //    UpdateCommandBuffer=idx24；Render=idx25
+    render_rva = rvas[best_idx + 25];
+    ucb_rva = rvas[best_idx + 24];
+    camera_rva = rvas[best_idx + 19];
+    return true;
 }
 
 } // namespace il2cpp_callsite

@@ -215,6 +215,7 @@ struct Config
     bool ffx12_fail_closed = false; // ：禁止回退原生（测试/故障显式暴露）
     bool ffx12_full_logging = false; // ：Release 下日志全开（排查用；log_line 不过滤）
     bool ffx12_probe = false; // 一次性槽位/cb0 探测（诊断用，默认关）
+    bool ffx12_feature_fallback = true; // 特征识别兜底：1=运行时特征优先+已有样本(硬编码)兜底；0=纯特征识别（验证用——关闭所有版本特定样本）
     bool optiscaler_bridge_probe = false; // 遗留 OptiScaler 候选桥路径（frames.jsonl 记录，默认关）
     std::uint32_t ffx12_jitter_mode = 4; // 0=+norm*width-0.5, 1=+norm*width(符号反→整体抖), 2=raw, 3=-norm*width+0.5, 4=-norm*width(FSR4实测:符号正确), 5=零
     bool ffx12_depth_inverted = true; // 游戏深度逆方向（0=far）；FSR2 默认 0=near
@@ -3172,14 +3173,14 @@ void log_line(const std::string &line)
         "failed", "failure", "error", "invalid", "mismatch", "exception",
         "unavailable", "unresolved", "unsupported", "missing", "refusing"
     };
-    static constexpr std::array<std::string_view, 10> basic_terms {
+    static constexpr std::array<std::string_view, 11> basic_terms {
         // 正式版日志精简——只保留：接管结果(ffx12_result/failed)、
         // 显卡型号(ffx12_gpu)、SDK 路径(ffx12_sdk)、FSR 实际版本(ffx12_version)、渲染精度菜单状态。
         // hook 数据状态（draw_hook_active/iat_scan/fsr2_translation_candidate/ffx12_path 等）一律不写。
         "ffx12_gpu", "ffx12_sdk", "ffx12_version", "ffx12_result", "ffx12_failed",
         "jit_norm", "jitter_px",
         "render_scale_menu hook_ready", "render_scale_menu render_scale_written",
-        "fsr2_on_demand_identify_fail"
+        "fsr2_on_demand_identify_fail", "fsr2_il2cpp_rva_feature_match"
     };
     const bool startup_marker = line.starts_with("Dx11FsrBridge active");
     const bool error_message = std::any_of(error_terms.begin(), error_terms.end(),
@@ -3818,6 +3819,24 @@ void load_config()
     g_config.ffx12_camera_rva = read_hex_rva(L"Ffx12CameraRva", 0x06B558D0);
     g_config.ffx12_projection_setter_rva =
         read_hex_rva(L"Ffx12ProjectionSetterRva", 0x013DC510);
+    // 国际服（GenshinImpact.exe——打包偏移不同）RVA 覆盖：g_MethodPointers
+    // 30 方法 gap 匹配唯一命中（Render 0x06B580D0 / UCB 0x06B58060 / Camera 0x06B54420）
+    {
+        wchar_t exe_path[MAX_PATH] {};
+        if (GetModuleFileNameW(nullptr, exe_path, MAX_PATH) > 0)
+        {
+            std::wstring exe_name = std::filesystem::path(exe_path).filename().wstring();
+            for (wchar_t &ch : exe_name)
+                ch = static_cast<wchar_t>(towlower(ch));
+            if (exe_name.find(L"genshinimpact") != std::wstring::npos ||
+                exe_name.find(L"global") != std::wstring::npos)
+            {
+                g_config.fsr2_il2cpp_render_rva = read_hex_rva(L"Fsr2Il2CppRenderRvaGlobal", 0x06B580D0);
+                g_config.fsr2_il2cpp_ucb_rva = read_hex_rva(L"Fsr2Il2CppUcbRvaGlobal", 0x06B58060);
+                g_config.ffx12_camera_rva = read_hex_rva(L"Ffx12CameraRvaGlobal", 0x06B54420);
+            }
+        }
+    }
     g_config.ffx12 =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12", 0, config_path.c_str()) != 0;
     g_config.ffx12_probe =
@@ -4082,6 +4101,8 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"BlockDx11On12Upscalers", 1, config_path.c_str()) != 0;
 #endif
     g_config.show_osd = GetPrivateProfileIntW(L"Dx11FsrBridge", L"ShowOSD", 0, config_path.c_str()) != 0;
+    g_config.ffx12_feature_fallback =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FeatureFallback", 1, config_path.c_str()) != 0;
     g_config.assume_phase_order = GetPrivateProfileIntW(L"Dx11FsrBridge", L"AssumePhaseOrder", 0, config_path.c_str()) != 0;
     g_config.enable_similarity_probe = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableSimilarityProbe", 0, config_path.c_str()) != 0;
     g_config.reset_similarity_on_recording = GetPrivateProfileIntW(L"Dx11FsrBridge", L"ResetSimilarityOnRecording", 1, config_path.c_str()) != 0;
@@ -4191,6 +4212,23 @@ bool read_resource_info_from_resource(ID3D11Resource *resource, const wchar_t *k
     out_info.format = desc.Format;
     texture->Release();
     return true;
+}
+
+// SEH 保护读取：渲染线程 draw 时视图可能被游戏释放（竞态）——无效视图
+// GetDesc/QueryInterface 崩溃 → 捕获返回 false（info 空——识别跳过，不崩溃）
+bool safe_read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo &out_info)
+{
+    if (view == nullptr)
+        return false;
+    __try
+    {
+        return read_resource_info(view, kind, out_info);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        out_info = {};
+        return false;
+    }
 }
 
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
@@ -5322,9 +5360,13 @@ bool matches_final_scene_boundary(
         is_backbuffer = g_final_scene_probe_backbuffers.contains(target.resource_key);
     }
 
-    const bool matches = target.resource_key != 0 && pixel_shader_hash == k_final_scene_ps &&
-        vertex_shader_hash == k_final_scene_vs && target.width != 0 && target.height != 0 &&
-        target.width == viewport_width && target.height == viewport_height && is_backbuffer &&
+    // 特征识别（版本无关）：final scene = 已知 backbuffer 资源 + 输出尺寸==viewport。
+    // 样本兜底（fallback=1 时）：已知 ps/vs shader hash 匹配也接受（版本特定——仅诊断确认）。
+    const bool feature_matches = target.resource_key != 0 && target.width != 0 && target.height != 0 &&
+        target.width == viewport_width && target.height == viewport_height && is_backbuffer;
+    const bool sample_matches = g_config.ffx12_feature_fallback &&
+        pixel_shader_hash == k_final_scene_ps && vertex_shader_hash == k_final_scene_vs;
+    const bool matches = (feature_matches || sample_matches) &&
         (!apply_snapshot_interval ||
             (g_config.final_scene_snapshot &&
                 frame_index % g_config.final_scene_snapshot_interval_frames == 0));
@@ -7255,7 +7297,7 @@ std::optional<TargetUpscalerDrawInfo> try_upscaler_path_cache_fast(
     ID3D11ShaderResourceView *const *shader_resources)
 {
     ResourceInfo out0 {};
-    read_resource_info(render_targets[0], L"fsr2_path_out", out0);
+    safe_read_resource_info(render_targets[0], L"fsr2_path_out", out0);
     if (out0.resource_key == 0)
         return std::nullopt;
 
@@ -7268,15 +7310,15 @@ std::optional<TargetUpscalerDrawInfo> try_upscaler_path_cache_fast(
             continue; // output 段不匹配：跳过（避免按旧布局读 SRV）
 
         ResourceInfo color {}, motion {}, depth {};
-        read_resource_info(shader_resources[entry.color_slot], L"fsr2_path_color", color);
-        read_resource_info(shader_resources[entry.motion_slot], L"fsr2_path_motion", motion);
-        read_resource_info(shader_resources[entry.depth_slot], L"fsr2_path_depth", depth);
+        safe_read_resource_info(shader_resources[entry.color_slot], L"fsr2_path_color", color);
+        safe_read_resource_info(shader_resources[entry.motion_slot], L"fsr2_path_motion", motion);
+        safe_read_resource_info(shader_resources[entry.depth_slot], L"fsr2_path_depth", depth);
         if (color.resource_key == 0 || motion.resource_key == 0 || depth.resource_key == 0)
             continue;
 
         ResourceInfo out1 {};
         if (entry.output_rtv_slot < 2)
-            read_resource_info(render_targets[entry.output_rtv_slot], L"fsr2_path_out1", out1);
+            safe_read_resource_info(render_targets[entry.output_rtv_slot], L"fsr2_path_out1", out1);
 
         std::uint64_t h = 14695981039346656037ull;
         const auto mix = [&h](std::uint64_t v) { h ^= v; h *= 1099511628211ull; };
@@ -7564,14 +7606,16 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(UINT element_
 
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
 // mode 2 的按需识别路径：不依赖 Set 钩子维护的 g_state 镜像，在候选 draw 现场直接查询
-// 状态并做完整签名校验。两段式：先用"双 RTV"预筛掉绝大多数全屏三角形（TAAU 签名要求
+// 状态并做完整签名校验。两段式：先用"双 RTV"预筛掉绝大多数 draw（TAAU 签名要求
 // 同时绑定 output_metadata 与 output_color 两个 RTV），再对剩余候选做全量内省。
+// element_count 不硬性要求 3（国际服等 TAAU 可能用 DrawIndexed 非 3 顶点）——
+// 双 RTV 预筛前置（任意 draw 低成本 2 COM），单 RTV 直接拒绝（安全）。
 // 不做任何 shader hash 过滤，因此技能等使用不同 shader 的 TAAU 路径同样能被识别。
 std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     ID3D11DeviceContext *context,
     UINT element_count)
 {
-    if (context == nullptr || element_count != 3)
+    if (context == nullptr)
         return std::nullopt;
 
     // 诊断：候选 draw（3 顶点）识别失败限量记录（5s 一次），定位 UI 切换后桥接掉线环节
@@ -7587,6 +7631,40 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
 
     std::array<ID3D11RenderTargetView *, 2> render_targets {};
     context->OMGetRenderTargets(static_cast<UINT>(render_targets.size()), render_targets.data(), nullptr);
+    // 低分辨率候选 draw 诊断（TAAU 渲染精度 <1 时应出现低分辨率 rtv0）——
+    // 记录其 RTV/SRV 特征判断国际服 TAAU 布局（前 12 次，独立于单 RTV diag）。
+    {
+        ResourceInfo rtv0_info {};
+        safe_read_resource_info(render_targets[0], L"fsr2_diag_rtv0", rtv0_info);
+        if (rtv0_info.resource_key != 0 && rtv0_info.width < 3840)
+        {
+            static std::atomic_uint32_t lowres_diag_count { 0 };
+            if (lowres_diag_count.fetch_add(1, std::memory_order_relaxed) < 12)
+            {
+                std::array<ID3D11ShaderResourceView *, 7> diag_srvs {};
+                context->PSGetShaderResources(0, static_cast<UINT>(diag_srvs.size()), diag_srvs.data());
+                std::ostringstream diag;
+                diag << "fsr2_on_demand_lowres rtv0=" << rtv0_info.width << "x" << rtv0_info.height
+                     << "f" << static_cast<std::uint32_t>(rtv0_info.format)
+                     << " rtv1=" << (render_targets[1] != nullptr ? "1" : "0")
+                     << " srvs=";
+                for (std::size_t i = 0; i < diag_srvs.size(); ++i)
+                {
+                    ResourceInfo info {};
+                    read_resource_info(diag_srvs[i], L"fsr2_diag_srv", info);
+                    diag << i << ":" << (info.resource_key
+                        ? (std::to_string(info.width) + "x" + std::to_string(info.height) + "f" + std::to_string(static_cast<std::uint32_t>(info.format)))
+                        : "0") << " ";
+                    if (diag_srvs[i] != nullptr)
+                        diag_srvs[i]->Release();
+                }
+                log_line(diag.str());
+            }
+        }
+    }
+    // 双 RTV 硬预筛（稳定安全——1.1.5/1.2.3 同）：国际服 TAAU 为双 RTV
+    // （1.1.5 实测 render=2304x1296 output=3840x2160——output_metadata+output_color）。
+    // 单 RTV 放行曾导致启动崩溃（普通 draw 误入 identify）——不再放行。
     if (render_targets[0] == nullptr || render_targets[1] == nullptr)
     {
         log_fail(std::string("stage=prescreen rtv0=") + (render_targets[0] != nullptr ? "1" : "0") +
@@ -7598,6 +7676,18 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         }
         return std::nullopt;
     }
+    const bool single_rtv = render_targets[1] == nullptr;
+    if (single_rtv)
+        log_fail("stage=prescreen_single_rtv rtv0=1 rtv1=0 proceeding_to_identify");
+
+    // 阶段日志（崩溃定位）：单 RTV 放行路径每步记录（限量前 16 次——崩溃点=最后一行）
+    static std::atomic_uint32_t on_demand_stage_count { 0 };
+    const auto stage_log = [](std::string &&msg) {
+        if (on_demand_stage_count.fetch_add(1, std::memory_order_relaxed) >= 16)
+            return;
+        log_line("fsr2_stage " + msg);
+    };
+    stage_log(std::string("identify_begin single_rtv=") + (single_rtv ? "1" : "0"));
 
     std::array<ID3D11ShaderResourceView *, 7> shader_resources {};
     ID3D11Buffer *constant_buffer = nullptr;
@@ -7630,9 +7720,9 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     std::array<ResourceInfo, 7> inputs {};
     std::array<ResourceInfo, 2> outputs {};
     for (std::size_t index = 0; index < shader_resources.size(); ++index)
-        read_resource_info(shader_resources[index], L"fsr2_on_demand_srv", inputs[index]);
+        safe_read_resource_info(shader_resources[index], L"fsr2_on_demand_srv", inputs[index]);
     for (std::size_t index = 0; index < render_targets.size(); ++index)
-        read_resource_info(render_targets[index], L"fsr2_on_demand_rtv", outputs[index]);
+        safe_read_resource_info(render_targets[index], L"fsr2_on_demand_rtv", outputs[index]);
 
     D3D11_BUFFER_DESC constant_buffer_description {};
     if (constant_buffer != nullptr)
@@ -7650,11 +7740,86 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     if (constant_buffer != nullptr)
         constant_buffer->Release();
 
-    const auto identified = identify_target_upscaler_resources(
-        inputs, outputs,
-        viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Width) : 0,
-        viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Height) : 0,
-        constant_buffer_description.ByteWidth, constant_buffer_key);
+    // 第一签名：固定槽位（1.1.5/1.2.3 兼容——国际服实测匹配 render=2304x1296
+    // output=3840x2160）。inputs[0..6]/outputs[0..1] 固定布局，无格式过滤。
+    const auto fixed_slot_identify = [&]() -> std::optional<TargetUpscalerDrawInfo> {
+        const ResourceInfo &color = inputs[0];
+        const ResourceInfo &weights = inputs[1];
+        const ResourceInfo &depth = inputs[2];
+        const ResourceInfo &motion = inputs[3];
+        const ResourceInfo &flags = inputs[4];
+        const ResourceInfo &history_metadata = inputs[5];
+        const ResourceInfo &history_color = inputs[6];
+        const ResourceInfo &output_metadata = outputs[0];
+        const ResourceInfo &output_color = outputs[1];
+        const bool resources_present = color.resource_key != 0 && weights.resource_key != 0 &&
+            depth.resource_key != 0 && motion.resource_key != 0 && flags.resource_key != 0 &&
+            history_metadata.resource_key != 0 && history_color.resource_key != 0 &&
+            output_metadata.resource_key != 0 && output_color.resource_key != 0;
+        const bool input_dimensions_match = depth.width == color.width && depth.height == color.height &&
+            motion.width == color.width && motion.height == color.height &&
+            flags.width == color.width && flags.height == color.height;
+        const bool output_dimensions_match =
+            output_metadata.width == output_color.width && output_metadata.height == output_color.height &&
+            history_metadata.width == output_color.width && history_metadata.height == output_color.height &&
+            history_color.width == output_color.width && history_color.height == output_color.height &&
+            viewport_count != 0 && static_cast<std::uint32_t>(viewport.Width) == output_color.width &&
+            static_cast<std::uint32_t>(viewport.Height) == output_color.height;
+        if (!resources_present || !input_dimensions_match || !output_dimensions_match ||
+            weights.width != 16 || weights.height != 16 ||
+            color.width > output_color.width || color.height > output_color.height ||
+            constant_buffer_description.ByteWidth < 464)
+        {
+            // 只记录 4K TAAU 输出（output=3840x2160——1.1.5 识别的国际服 TAAU 特征）
+            if (output_color.width == 3840 || output_color.height == 2160)
+            {
+                static std::atomic_uint32_t fixed_slot_diag_count { 0 };
+                if (fixed_slot_diag_count.fetch_add(1, std::memory_order_relaxed) < 12)
+                {
+                    std::ostringstream diag;
+                    diag << "fsr2_fixed_slot_fail"
+                         << " res=" << (resources_present ? 1 : 0)
+                         << " in_dim=" << (input_dimensions_match ? 1 : 0)
+                         << " out_dim=" << (output_dimensions_match ? 1 : 0)
+                         << " w=" << weights.width << "x" << weights.height
+                         << " color=" << color.width << "x" << color.height
+                         << " out=" << output_color.width << "x" << output_color.height
+                         << " outm=" << output_metadata.width << "x" << output_metadata.height
+                         << " hm=" << history_metadata.width << "x" << history_metadata.height
+                         << " hc=" << history_color.width << "x" << history_color.height
+                         << " vp=" << (viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Width) : 0)
+                         << "x" << (viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Height) : 0)
+                         << " cb0=" << constant_buffer_description.ByteWidth;
+                    log_line(diag.str());
+                }
+            }
+            return std::nullopt;
+        }
+        TargetUpscalerDrawInfo info;
+        info.render_width = color.width;
+        info.render_height = color.height;
+        info.output_width = output_color.width;
+        info.output_height = output_color.height;
+        info.constant_buffer_key = constant_buffer_key;
+        info.color_resource_key = color.resource_key;
+        info.motion_resource_key = motion.resource_key;
+        info.color_srv_slot = 0;
+        info.depth_srv_slot = 2;
+        info.motion_srv_slot = 3;
+        info.output_rtv_slot = 1;
+        return info;
+    };
+
+    std::optional<TargetUpscalerDrawInfo> identified = fixed_slot_identify();
+    if (!identified)
+    {
+        // 第二签名：动态槽位评分（国服技能等不同 shader 的 TAAU 路径）
+        identified = identify_target_upscaler_resources(
+            inputs, outputs,
+            viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Width) : 0,
+            viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Height) : 0,
+            constant_buffer_description.ByteWidth, constant_buffer_key);
+    }
     if (!identified)
     {
         std::ostringstream detail;
@@ -7667,8 +7832,10 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
                << " vp=" << static_cast<std::uint32_t>(viewport.Width) << "x"
                << static_cast<std::uint32_t>(viewport.Height);
         log_fail(detail.str());
+        stage_log("identify_end fail");
         return std::nullopt;
     }
+    stage_log("identify_end ok");
 
     g_trace_ps_cb0_key.store(constant_buffer_key, std::memory_order_relaxed);
     register_cb0_for_jitter(constant_buffer);
@@ -9358,6 +9525,7 @@ bool try_fsr2_translation_draw(
     }
 
     // ---- Phase 2: 调用点驱动的 FSR2 2.3.4 后端（不经 OptiScaler、不经 cb0 jitter） ----
+    // il2cpp 必须激活（RVA 特征识别对齐后——国际服通过 Ffx12Il2CppRvaAutoScan 自动定位）
     if (g_config.ffx12 && il2cpp_callsite::active())
     {
         // 2026-08-25（多实例修复）：状态按实例隔离。旧实现 = 全局代次门控 + 全局参数：
@@ -9966,9 +10134,26 @@ bool try_fsr2_translation_draw(
                                     {
                                         const float *f = static_cast<const float *>(m.pData);
                                         // 候选槽（归一化 jitter ∈ (0,1)；0 视为未写入，≥1 视为脏数据）
+                                        // 兜底模式（fallback=1）：样本槽优先（cb0[28].xy / [27].zw / [26].zw）
+                                        // 纯特征模式（fallback=0）：扫描全 cb0（0..127 float 对）取前 3 个合理对
                                         float cb[3][2] {};
                                         bool ok[3] = {false, false, false};
-                                        const int idx[3][2] = {{112, 113}, {110, 111}, {106, 107}};
+                                        int idx[3][2] = {{112, 113}, {110, 111}, {106, 107}};
+                                        if (!g_config.ffx12_feature_fallback)
+                                        {
+                                            int found = 0;
+                                            for (int i = 0; i < 128 && found < 3; ++i)
+                                            {
+                                                const float a = f[i * 2], b = f[i * 2 + 1];
+                                                if ((a != 0.0f || b != 0.0f) && a < 1.0f && b < 1.0f)
+                                                {
+                                                    idx[found][0] = i * 2;
+                                                    idx[found][1] = i * 2 + 1;
+                                                    ++found;
+                                                }
+                                            }
+                                            // 无合理对：保留样本槽兜底（全冻结视图——锁定后无抖动累积，同原生）
+                                        }
                                         for (int s = 0; s < 3; ++s)
                                         {
                                             const float a = f[idx[s][0]], b = f[idx[s][1]];
@@ -10975,6 +11160,20 @@ bool try_fsr2_translation_draw(
     if (views[0] == nullptr || !depth_format_compatible || motion_mask_skip || views[3] == nullptr ||
         (g_config.fsr2_use_reactive_mask && views[4] == nullptr) || render_targets[1] == nullptr)
     {
+        static std::atomic_uint64_t dispatch_reject_log_tick { 0 };
+        const ULONGLONG now_tick = GetTickCount64();
+        ULONGLONG last_tick = dispatch_reject_log_tick.load(std::memory_order_relaxed);
+        if (now_tick - last_tick > 5000 &&
+            dispatch_reject_log_tick.compare_exchange_strong(last_tick, now_tick, std::memory_order_relaxed))
+        {
+            log_line(std::string("fsr2_dispatch_reject") +
+                " v0=" + (views[0] != nullptr ? "1" : "0") +
+                " depth_ok=" + (depth_format_compatible ? "1" : "0") +
+                " mask_skip=" + (motion_mask_skip ? "1" : "0") +
+                " v3=" + (views[3] != nullptr ? "1" : "0") +
+                " rtv0=" + (render_targets[0] != nullptr ? "1" : "0") +
+                " rtv1=" + (render_targets[1] != nullptr ? "1" : "0"));
+        }
         if (!depth_format_compatible)
             last_depth_state.store(UINT64_MAX, std::memory_order_relaxed);
         if (views[2] != nullptr && !depth_format_compatible)
@@ -12938,6 +13137,18 @@ void initialize()
         hook_cfg.capture_projection = g_config.ffx12_projection_hook;
         hook_cfg.projection_setter_rva = g_config.ffx12_projection_setter_rva;
         const std::uint64_t exe_base = reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
+        // 特征识别优先（不依赖硬编码 RVA——国服/国际服/版本更新通用）：
+        // g_MethodPointers + FFX_FSR2 30 方法尺寸序列 gap 匹配；失败用配置（硬编码兜底）。
+        std::uint32_t detected_render = 0, detected_ucb = 0, detected_camera = 0;
+        if (il2cpp_callsite::detect_ffx12_method_rvas(exe_base, detected_render, detected_ucb, detected_camera))
+        {
+            hook_cfg.render_rva = detected_render;
+            hook_cfg.update_cmd_buffer_rva = detected_ucb;
+            hook_cfg.camera_rva = detected_camera;
+            log_line("fsr2_il2cpp_rva_feature_match render=0x" + hex64(detected_render) +
+                " ucb=0x" + hex64(detected_ucb) +
+                " camera=0x" + hex64(detected_camera));
+        }
         log_line("ffx12_camera_config probe=" +
             std::to_string(g_config.ffx12_probe_camera ? 1 : 0) +
             " hook=" + std::to_string(g_config.ffx12_camera_hook ? 1 : 0) +
@@ -12956,9 +13167,22 @@ void initialize()
                 (g_config.fsr2_il2cpp_skip_render ? std::string("skip") : std::string("observe")) +
                 " render_va=" + hex64(exe_base + hook_cfg.render_rva));
         else
+        {
             log_line("fsr2_il2cpp_hook_failed render_rva=0x" + hex64(hook_cfg.render_rva) +
                 " skip=" + std::to_string(g_config.fsr2_il2cpp_skip_render ? 1 : 0) +
                 " fallback=draw_family_skip");
+            // RVA 自动识别诊断：扫描 render/ucb 序言配对候选（国际服/版本更新偏移对齐）
+            const auto candidates = il2cpp_callsite::scan_render_candidates(
+                exe_base, hook_cfg.render_rva, hook_cfg.update_cmd_buffer_rva);
+            if (!candidates.empty())
+            {
+                std::ostringstream cand_log;
+                cand_log << "fsr2_il2cpp_rva_candidates count=" << candidates.size() << " rvas=";
+                for (const std::uint32_t rva : candidates)
+                    cand_log << "0x" << hex64(rva) << " ";
+                log_line(cand_log.str());
+            }
+        }
         if (g_config.ffx12_camera_hook)
         {
             if (il2cpp_callsite::install_camera(exe_base, hook_cfg))

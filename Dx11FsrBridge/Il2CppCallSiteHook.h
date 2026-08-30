@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace il2cpp_callsite
 {
@@ -84,4 +85,17 @@ bool install_projection_setter(std::uint64_t exe_base, const Config &cfg);
 bool projection_ready();
 std::uint64_t projection_generation();
 std::size_t projection_matrix(float *out, std::size_t capacity, std::uint64_t *camera_ptr);
+
+// RVA 自动识别：扫描 exe 代码段找 render 序言 + ucb 序言（固定偏移配对）的候选。
+// 国际服/版本更新时 RVA 偏移不同——用序言特征对齐（输出候选 RVA 供配置/验证）。
+std::vector<std::uint32_t> scan_render_candidates(std::uint64_t exe_base,
+                                                  std::uint32_t render_rva, std::uint32_t ucb_rva);
+
+// 特征识别（优先于硬编码 RVA）：g_MethodPointers 全量指针 + FFX_FSR2 30 方法
+// 尺寸序列 gap 匹配（唯一命中——国服/国际服/版本更新通用）。成功输出
+// render/ucb/camera RVA（VA-exe_base）；失败返回 false（调用方用配置兜底）。
+bool detect_ffx12_method_rvas(std::uint64_t exe_base,
+                              std::uint32_t &render_rva,
+                              std::uint32_t &ucb_rva,
+                              std::uint32_t &camera_rva);
 } // namespace il2cpp_callsite

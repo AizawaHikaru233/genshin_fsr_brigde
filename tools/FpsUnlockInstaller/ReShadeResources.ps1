@@ -2,24 +2,29 @@
 
 function Get-ReShadeResourceSpec {
     # 版本基线优先取自包内 upstream-versions.json（由 tools\Update-UpstreamComponents.ps1 生成并同步）；
-    # 旧包无此文件时回退内置默认值。
+    # 旧包无此文件时回退内置默认值。效果库（standard/lilium/sweetfx）清单缺失时同样回退默认
+    # （upstream-versions.json 只含 ReShade 本体信息——效果库按内置 commit 基线）。
     if ($null -ne $script:UpstreamVersions -and $null -ne $script:UpstreamVersions.reshade -and
         -not [string]::IsNullOrWhiteSpace([string]$script:UpstreamVersions.reshade.version)) {
         $r = $script:UpstreamVersions.reshade
+        # StrictMode 安全：先查属性存在性再取值（不存在 → $null → 用内置默认基线）
+        $std = if ($r.PSObject.Properties['standard']) { $r.standard } else { $null }
+        $lil = if ($r.PSObject.Properties['lilium']) { $r.lilium } else { $null }
+        $sfx = if ($r.PSObject.Properties['sweetfx']) { $r.sweetfx } else { $null }
         return [pscustomobject]@{
             ReShadeVersion   = [string]$r.version
             ReShadeSetupUrl  = [string]$r.setupUrl
             ReShadeSetupSha256 = [string]$r.setupSha256
             ReShadeDllSha256 = [string]$r.dllSha256
-            StandardCommit   = [string]$r.standard.commit
-            StandardUrl      = [string]$r.standard.url
-            StandardSha256   = [string]$r.standard.sha256
-            LiliumCommit     = [string]$r.lilium.commit
-            LiliumUrl        = [string]$r.lilium.url
-            LiliumSha256     = [string]$r.lilium.sha256
-            SweetFxCommit    = [string]$r.sweetfx.commit
-            SweetFxUrl       = [string]$r.sweetfx.url
-            SweetFxSha256    = [string]$r.sweetfx.sha256
+            StandardCommit   = if ($null -ne $std) { [string]$std.commit } else { '6db142b4b1a05c764222e5b0bd9a644b7ccfe1dc' }
+            StandardUrl      = if ($null -ne $std) { [string]$std.url } else { 'https://github.com/crosire/reshade-shaders/archive/6db142b4b1a05c764222e5b0bd9a644b7ccfe1dc.zip' }
+            StandardSha256   = if ($null -ne $std) { [string]$std.sha256 } else { '12D082C8AB1DBCB5E221E1B6116A0343F3182EE517F09BB966B117ACC7635312' }
+            LiliumCommit     = if ($null -ne $lil) { [string]$lil.commit } else { '5093d4f7441d8ca793d4a04496d1b78f640418e6' }
+            LiliumUrl        = if ($null -ne $lil) { [string]$lil.url } else { 'https://github.com/EndlesslyFlowering/ReShade_HDR_shaders/archive/5093d4f7441d8ca793d4a04496d1b78f640418e6.zip' }
+            LiliumSha256     = if ($null -ne $lil) { [string]$lil.sha256 } else { 'F8972F060A35BA4EFC4F48F8CE7283F8F3B92DD8BFE421C154161539109FE016' }
+            SweetFxCommit    = if ($null -ne $sfx) { [string]$sfx.commit } else { '16d1a42247cb5baaf660120ee35c9a33bb94649c' }
+            SweetFxUrl       = if ($null -ne $sfx) { [string]$sfx.url } else { 'https://github.com/CeeJayDK/SweetFX/archive/16d1a42247cb5baaf660120ee35c9a33bb94649c.zip' }
+            SweetFxSha256    = if ($null -ne $sfx) { [string]$sfx.sha256 } else { '7901037254B06B85E564F5B8774F2F59BF2503143CE1562F9AC704A3F3D74EC6' }
         }
     }
     return [pscustomobject]@{
@@ -127,7 +132,8 @@ function New-OfficialReShadePayload {
         [string]$DestinationDirectory,
         [string]$BundledSourceDirectory,
         [string]$TemporaryDirectory,
-        [string]$UserAgent = 'GenshinFsrBridge-ReShadeInstaller'
+        [string]$UserAgent = 'GenshinFsrBridge-ReShadeInstaller',
+        [switch]$IncludeEffects
     )
     $spec = Get-ReShadeResourceSpec
     if (Test-Path -LiteralPath $DestinationDirectory) {
@@ -141,11 +147,15 @@ function New-OfficialReShadePayload {
     New-Item -ItemType Directory -Force -Path $shaderDestination, $textureDestination, $addonDestination | Out-Null
 
     $downloads = @(
-        [pscustomobject]@{ Name = "ReShade_Setup_$($spec.ReShadeVersion)_Addon.exe"; Url = $spec.ReShadeSetupUrl; Hash = $spec.ReShadeSetupSha256; Label = "ReShade $($spec.ReShadeVersion) Add-on setup" },
-        [pscustomobject]@{ Name = 'reshade-shaders.zip'; Url = $spec.StandardUrl; Hash = $spec.StandardSha256; Label = 'ReShade standard effects' },
-        [pscustomobject]@{ Name = 'lilium-hdr.zip'; Url = $spec.LiliumUrl; Hash = $spec.LiliumSha256; Label = 'Lilium HDR shaders' },
-        [pscustomobject]@{ Name = 'sweetfx.zip'; Url = $spec.SweetFxUrl; Hash = $spec.SweetFxSha256; Label = 'SweetFX shaders' }
+        [pscustomobject]@{ Name = "ReShade_Setup_$($spec.ReShadeVersion)_Addon.exe"; Url = $spec.ReShadeSetupUrl; Hash = $spec.ReShadeSetupSha256; Label = "ReShade $($spec.ReShadeVersion) Add-on setup" }
     )
+    if ($IncludeEffects) {
+        $downloads += @(
+            [pscustomobject]@{ Name = 'reshade-shaders.zip'; Url = $spec.StandardUrl; Hash = $spec.StandardSha256; Label = 'ReShade standard effects' },
+            [pscustomobject]@{ Name = 'lilium-hdr.zip'; Url = $spec.LiliumUrl; Hash = $spec.LiliumSha256; Label = 'Lilium HDR shaders' },
+            [pscustomobject]@{ Name = 'sweetfx.zip'; Url = $spec.SweetFxUrl; Hash = $spec.SweetFxSha256; Label = 'SweetFX shaders' }
+        )
+    }
     foreach ($download in $downloads) {
         $path = Join-Path $TemporaryDirectory $download.Name
         Write-Host "Downloading $($download.Label)..." -ForegroundColor Cyan
@@ -160,28 +170,35 @@ function New-OfficialReShadePayload {
     $standardExpanded = Join-Path $TemporaryDirectory 'standard-expanded'
     $liliumExpanded = Join-Path $TemporaryDirectory 'lilium-expanded'
     $sweetFxExpanded = Join-Path $TemporaryDirectory 'sweetfx-expanded'
-    Expand-Archive -LiteralPath (Join-Path $TemporaryDirectory 'reshade-shaders.zip') -DestinationPath $standardExpanded -Force
-    Expand-Archive -LiteralPath (Join-Path $TemporaryDirectory 'lilium-hdr.zip') -DestinationPath $liliumExpanded -Force
-    Expand-Archive -LiteralPath (Join-Path $TemporaryDirectory 'sweetfx.zip') -DestinationPath $sweetFxExpanded -Force
-    $standardRoot = Get-ReShadeArchiveRoot -ExpandedDirectory $standardExpanded -Label 'ReShade standard effects'
-    $liliumRoot = Get-ReShadeArchiveRoot -ExpandedDirectory $liliumExpanded -Label 'Lilium HDR shaders'
-    $sweetFxRoot = Get-ReShadeArchiveRoot -ExpandedDirectory $sweetFxExpanded -Label 'SweetFX shaders'
-
-    foreach ($name in @('ReShade.fxh', 'ReShadeUI.fxh')) {
-        Copy-Item -LiteralPath (Join-Path $standardRoot "Shaders\$name") -Destination (Join-Path $shaderDestination $name) -Force
-    }
-    foreach ($name in @('FontAtlas.png', 'lut.png')) {
-        Copy-Item -LiteralPath (Join-Path $standardRoot "Textures\$name") -Destination (Join-Path $textureDestination $name) -Force
-    }
-    Copy-ReShadeDirectoryContents -Source (Join-Path $liliumRoot 'Shaders') -Destination $shaderDestination
-    Copy-ReShadeDirectoryContents -Source (Join-Path $liliumRoot 'Textures') -Destination $textureDestination
-    Copy-Item -LiteralPath (Join-Path $sweetFxRoot 'Shaders\SweetFX\FakeHDR.fx') -Destination (Join-Path $shaderDestination 'FakeHDR.fx') -Force
-    foreach ($name in @('AreaTex.png', 'Layer.png', 'SearchTex.png')) {
-        Copy-Item -LiteralPath (Join-Path $sweetFxRoot "Textures\SweetFX\$name") -Destination (Join-Path $textureDestination $name) -Force
+    $standardRoot = $null
+    $liliumRoot = $null
+    $sweetFxRoot = $null
+    if ($IncludeEffects) {
+        Expand-Archive -LiteralPath (Join-Path $TemporaryDirectory 'reshade-shaders.zip') -DestinationPath $standardExpanded -Force
+        Expand-Archive -LiteralPath (Join-Path $TemporaryDirectory 'lilium-hdr.zip') -DestinationPath $liliumExpanded -Force
+        Expand-Archive -LiteralPath (Join-Path $TemporaryDirectory 'sweetfx.zip') -DestinationPath $sweetFxExpanded -Force
+        $standardRoot = Get-ReShadeArchiveRoot -ExpandedDirectory $standardExpanded -Label 'ReShade standard effects'
+        $liliumRoot = Get-ReShadeArchiveRoot -ExpandedDirectory $liliumExpanded -Label 'Lilium HDR shaders'
+        $sweetFxRoot = Get-ReShadeArchiveRoot -ExpandedDirectory $sweetFxExpanded -Label 'SweetFX shaders'
     }
 
-    Copy-Item -LiteralPath (Join-Path $liliumRoot 'LICENSE') -Destination (Join-Path $shaderRoot 'LICENSE-ReShade_HDR_shaders-GPL-3.0.txt') -Force
-    Copy-Item -LiteralPath (Join-Path $sweetFxRoot 'LICENSE') -Destination (Join-Path $shaderRoot 'LICENSE-SweetFX-MIT.txt') -Force
+    if ($IncludeEffects) {
+        foreach ($name in @('ReShade.fxh', 'ReShadeUI.fxh')) {
+            Copy-Item -LiteralPath (Join-Path $standardRoot "Shaders\$name") -Destination (Join-Path $shaderDestination $name) -Force
+        }
+        foreach ($name in @('FontAtlas.png', 'lut.png')) {
+            Copy-Item -LiteralPath (Join-Path $standardRoot "Textures\$name") -Destination (Join-Path $textureDestination $name) -Force
+        }
+        Copy-ReShadeDirectoryContents -Source (Join-Path $liliumRoot 'Shaders') -Destination $shaderDestination
+        Copy-ReShadeDirectoryContents -Source (Join-Path $liliumRoot 'Textures') -Destination $textureDestination
+        Copy-Item -LiteralPath (Join-Path $sweetFxRoot 'Shaders\SweetFX\FakeHDR.fx') -Destination (Join-Path $shaderDestination 'FakeHDR.fx') -Force
+        foreach ($name in @('AreaTex.png', 'Layer.png', 'SearchTex.png')) {
+            Copy-Item -LiteralPath (Join-Path $sweetFxRoot "Textures\SweetFX\$name") -Destination (Join-Path $textureDestination $name) -Force
+        }
+
+        Copy-Item -LiteralPath (Join-Path $liliumRoot 'LICENSE') -Destination (Join-Path $shaderRoot 'LICENSE-ReShade_HDR_shaders-GPL-3.0.txt') -Force
+        Copy-Item -LiteralPath (Join-Path $sweetFxRoot 'LICENSE') -Destination (Join-Path $shaderRoot 'LICENSE-SweetFX-MIT.txt') -Force
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($BundledSourceDirectory) -and
         (Test-Path -LiteralPath $BundledSourceDirectory -PathType Container)) {
@@ -204,24 +221,31 @@ function New-OfficialReShadePayload {
 
     $provenance = @(
         'Downloaded directly from the following upstream sources by the installer:',
-        "ReShade $($spec.ReShadeVersion): $($spec.ReShadeSetupUrl)",
-        "crosire/reshade-shaders commit $($spec.StandardCommit): $($spec.StandardUrl)",
-        "EndlesslyFlowering/ReShade_HDR_shaders commit $($spec.LiliumCommit): $($spec.LiliumUrl)",
-        "CeeJayDK/SweetFX commit $($spec.SweetFxCommit): $($spec.SweetFxUrl)"
+        "ReShade $($spec.ReShadeVersion): $($spec.ReShadeSetupUrl)"
     )
+    if ($IncludeEffects) {
+        $provenance += @(
+            "crosire/reshade-shaders commit $($spec.StandardCommit): $($spec.StandardUrl)",
+            "EndlesslyFlowering/ReShade_HDR_shaders commit $($spec.LiliumCommit): $($spec.LiliumUrl)",
+            "CeeJayDK/SweetFX commit $($spec.SweetFxCommit): $($spec.SweetFxUrl)"
+        )
+    }
     [IO.File]::WriteAllLines(
         (Join-Path $shaderRoot 'NOTICE-Downloaded-Upstream-Sources.txt'),
         $provenance,
         [Text.UTF8Encoding]::new($false))
 
-    foreach ($required in @(
-        $reshadeDll,
-        (Join-Path $shaderDestination 'ReShade.fxh'),
-        (Join-Path $shaderDestination 'ReShadeUI.fxh'),
-        (Join-Path $shaderDestination 'FakeHDR.fx'),
-        (Join-Path $shaderDestination 'lilium__tone_mapping.fx'),
-        (Join-Path $textureDestination 'lilium__font_atlas.png')
-    )) {
+    $requiredList = @($reshadeDll)
+    if ($IncludeEffects) {
+        $requiredList += @(
+            (Join-Path $shaderDestination 'ReShade.fxh'),
+            (Join-Path $shaderDestination 'ReShadeUI.fxh'),
+            (Join-Path $shaderDestination 'FakeHDR.fx'),
+            (Join-Path $shaderDestination 'lilium__tone_mapping.fx'),
+            (Join-Path $textureDestination 'lilium__font_atlas.png')
+        )
+    }
+    foreach ($required in $requiredList) {
         if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "The official ReShade resources are incomplete: $required" }
     }
     return $DestinationDirectory

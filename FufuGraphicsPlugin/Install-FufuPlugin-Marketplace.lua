@@ -1,4 +1,4 @@
-install.log("FSR Bridge Lua 商城安装器已开始执行")
+﻿install.log("FSR Bridge Lua 商城安装器已开始执行")
 
 local dlss_rules = {
     { vendor = "NVIDIA", family = "RTX", series = "20" },
@@ -6,9 +6,14 @@ local dlss_rules = {
     { vendor = "NVIDIA", family = "RTX", series = "40" },
     { vendor = "NVIDIA", family = "RTX", series = "50" },
 }
+local nvidia_rules = {
+    { vendor = "NVIDIA" },
+}
 local install_dlss_runtime = false
+local is_nvidia = false
 if system ~= nil and system.gpu_matches_any ~= nil then
     install_dlss_runtime = system.gpu_matches_any(dlss_rules) == true
+    is_nvidia = system.gpu_matches_any(nvidia_rules) == true
 end
 
 local plugin_id = "FSR-Bridge-Plugin"
@@ -46,7 +51,7 @@ install.write_config(plugin_dir, {
         Description = "支持把原神的FSR2转换为FSR4（A卡7000/9000）、DLSS/XeSS/FSR4 INT8（其余显卡）",
         Developer = "シリアCelia",
         File = "FSR-Bridge-Plugin.dll",
-        Version = "2.0.0"
+        Version = "2.1.0"
     },
     EnableBridge = {
         Name = "启用 FSR Bridge",
@@ -61,7 +66,7 @@ install.write_config(plugin_dir, {
     EnableReShade = {
         Name = "启用 ReShade",
         Type = "bool",
-        Value = "1"
+        Value = is_nvidia and "0" or "1"
     },
     IssueFeedback = {
         Name = "问题反馈",
