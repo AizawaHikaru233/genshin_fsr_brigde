@@ -21,15 +21,6 @@ std::filesystem::path g_module_directory;
 std::filesystem::path g_log_path;
 std::mutex g_log_mutex;
 
-constexpr std::array<const char *, 6> k_fsr2_exports {
-    "ffxFsr2ContextCreate",
-    "ffxFsr2ContextDispatch",
-    "ffxFsr2ContextDestroy",
-    "ffxFsr2GetUpscaleRatioFromQualityMode",
-    "ffxFsr2GetRenderResolutionFromQualityMode",
-    "ffxFsr2GetJitterPhaseCount",
-};
-
 struct BootstrapConfig
 {
     bool enable_bridge = true;
@@ -1188,62 +1179,6 @@ HMODULE load_module(const char *label, const std::filesystem::path &path)
     return module;
 }
 
-bool verify_bridge_shim(const HMODULE bridge)
-{
-    using get_proc_address_fn = decltype(&GetProcAddress);
-    HMODULE kernel_base = GetModuleHandleW(L"kernelbase.dll");
-    if (kernel_base == nullptr)
-    {
-        write_log("fsr2_shim_verify_failed reason=kernelbase_missing");
-        return false;
-    }
-    const auto kernel_base_get_proc_address = reinterpret_cast<get_proc_address_fn>(
-        GetProcAddress(kernel_base, "GetProcAddress"));
-    if (kernel_base_get_proc_address == nullptr)
-    {
-        write_log("fsr2_shim_verify_failed reason=kernelbase_get_proc_address_missing");
-        return false;
-    }
-
-    HMODULE executable = GetModuleHandleW(nullptr);
-    std::size_t matched = 0;
-    for (const char *name : k_fsr2_exports)
-    {
-        FARPROC bridge_export = kernel_base_get_proc_address(bridge, name);
-        FARPROC executable_export = kernel_base_get_proc_address(executable, name);
-        const bool match = bridge_export != nullptr && executable_export == bridge_export;
-        write_log(std::string("shim_query name=") + name + " match=" + (match ? "1" : "0"));
-        if (match)
-            ++matched;
-    }
-    write_log("fsr2_shim_matches=" + std::to_string(matched) + "/" + std::to_string(k_fsr2_exports.size()));
-    return matched == k_fsr2_exports.size();
-}
-
-bool export_entry_is_detoured(const FARPROC address)
-{
-    if (address == nullptr)
-        return false;
-    MEMORY_BASIC_INFORMATION information {};
-    if (VirtualQuery(reinterpret_cast<const void *>(address), &information, sizeof(information)) == 0)
-        return false;
-    const auto *bytes = reinterpret_cast<const std::uint8_t *>(address);
-    return bytes[0] == 0xE9 || bytes[0] == 0xEB ||
-        (bytes[0] == 0xFF && bytes[1] == 0x25) ||
-        (bytes[0] == 0x48 && bytes[1] == 0xB8);
-}
-
-bool verify_optiscaler_hooks(const HMODULE bridge)
-{
-    const bool create_hooked = export_entry_is_detoured(GetProcAddress(bridge, "ffxFsr2ContextCreate"));
-    const bool dispatch_hooked = export_entry_is_detoured(GetProcAddress(bridge, "ffxFsr2ContextDispatch"));
-    const bool destroy_hooked = export_entry_is_detoured(GetProcAddress(bridge, "ffxFsr2ContextDestroy"));
-    write_log(std::string("optiscaler_fsr_hooks create=") + (create_hooked ? "1" : "0") +
-        " dispatch=" + (dispatch_hooked ? "1" : "0") +
-        " destroy=" + (destroy_hooked ? "1" : "0"));
-    return create_hooked && dispatch_hooked;
-}
-
 DWORD WINAPI bootstrap_thread(void *)
 {
     const auto self_path = module_path(g_module);
@@ -1333,11 +1268,6 @@ DWORD WINAPI bootstrap_thread(void *)
         bridge = load_module("bridge", config.bridge_path);
         if (bridge == nullptr)
             return 9;
-        if (!verify_bridge_shim(bridge))
-        {
-            write_log("plugin_stopped reason=fsr2_shim_not_ready");
-            return 10;
-        }
     }
 
     if (config.enable_optiscaler)
@@ -1350,11 +1280,6 @@ DWORD WINAPI bootstrap_thread(void *)
         HMODULE optiscaler = load_module("optiscaler", config.optiscaler_path);
         if (optiscaler == nullptr)
             return 12;
-        if (!verify_optiscaler_hooks(bridge))
-        {
-            write_log("plugin_stopped reason=optiscaler_fsr_hooks_missing");
-            return 13;
-        }
     }
 
     write_log(std::string("plugin_success bridge=") + (config.enable_bridge ? "1" : "0") +
