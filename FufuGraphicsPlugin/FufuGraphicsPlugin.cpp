@@ -724,7 +724,7 @@ bool apply_optiscaler_managed_settings(
         { "Libraries", "OptiDllPath", wide_to_utf8(optiscaler_directory.wstring()) },
         { "Log", "LogToFile", "true" },
         { "Log", "LogLevel", "2" },
-        { "Log", "LogFileName", "OptiScaler.log" },
+        // LogFileName 保持 OptiScaler 默认（不覆写路径）
         { "FrameGen", "Enabled", "false" },
         { "FrameGen", "FGInput", "nofg" },
         { "FrameGen", "FGOutput", "nofg" },

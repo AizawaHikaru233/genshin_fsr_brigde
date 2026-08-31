@@ -402,7 +402,7 @@ function Set-OptiScalerManagedSettings {
     #   - FSR4 策略（Fsr4Update/UpscalerIndex/Fsr4ForceEnableInt8/FsrNonLinearColorSpace）
     #   - Spoofing.Dxgi=false（原神无 DLSS 场景——A 卡不伪装成 N 卡，防副作用）
     #   - Libraries.OptiDllPath 绝对路径
-    #   - Log：LogToFile=true / LogLevel=2 / LogFileName=OptiScaler.log
+    #   - Log：LogToFile=true / LogLevel=2（LogFileName 保持 OptiScaler 默认，不覆写路径）
     #   - FrameGen 版型（非帧生成版强制关闭）
     # Upscalers/Inputs/Plugins 等其余设置由 default_config 模板自足，脚本不覆写。
     Set-Fsr4GpuPolicy -Path $Path | Out-Null
@@ -410,7 +410,7 @@ function Set-OptiScalerManagedSettings {
     Set-IniValue -Path $Path -Section 'Libraries' -Key 'OptiDllPath' -Value ([IO.Path]::GetFullPath($optiDir).TrimEnd('\'))
     Set-IniValue -Path $Path -Section 'Log' -Key 'LogToFile' -Value 'true'
     Set-IniValue -Path $Path -Section 'Log' -Key 'LogLevel' -Value '2'
-    Set-IniValue -Path $Path -Section 'Log' -Key 'LogFileName' -Value 'OptiScaler.log'
+    # LogFileName 保持 OptiScaler 默认（不覆写路径）
     if ($nonFrameGenerationEdition) {
         Set-IniValue -Path $Path -Section 'FrameGen' -Key 'Enabled' -Value 'false'
         Set-IniValue -Path $Path -Section 'FrameGen' -Key 'FGInput' -Value 'nofg'

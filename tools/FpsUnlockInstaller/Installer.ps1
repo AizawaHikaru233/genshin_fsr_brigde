@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$GamePath,
     [switch]$NoShortcut,
     [switch]$ResumeUpdateAll,
@@ -313,7 +313,7 @@ function Repair-RuntimePaths {
         Set-IniPathValue -Path $optiIni -Section 'Log' -Key 'LogToFile' -Value 'true' | Out-Null
         Set-IniPathValue -Path $optiIni -Section 'Log' -Key 'LogLevel' -Value '2' | Out-Null
         Set-IniPathValue -Path $optiIni -Section 'Log' -Key 'SingleFile' -Value 'true' | Out-Null
-        Set-IniPathValue -Path $optiIni -Section 'Log' -Key 'LogFileName' -Value 'OptiScaler.log' | Out-Null
+        # LogFileName 保持 OptiScaler 默认（不覆写路径）
         Set-IniPathValue -Path $optiIni -Section 'Log' -Key 'LogAsync' -Value 'false' | Out-Null
         Set-IniPathValue -Path $optiIni -Section 'Log' -Key 'LogAsyncThreads' -Value '1' | Out-Null
         if ($nonFrameGenerationEdition) {
