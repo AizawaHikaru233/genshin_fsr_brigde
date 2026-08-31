@@ -1,4 +1,4 @@
-﻿install.log("FSR Bridge Lua 安装器已开始执行")
+install.log("FSR Bridge Lua 安装器已开始执行")
 
 local dlss_rules = {
     { vendor = "NVIDIA", family = "RTX", series = "20" },
@@ -101,6 +101,14 @@ if install.file_exists(plugin_dir .. "\\FSR4Policy.ini") then
 end
 if install.file_exists(opti_dir .. "\\OptiScaler.ini") then
     install.delete(opti_dir .. "\\OptiScaler.ini")
+end
+-- 删除后从 default_config 恢复模板（含 [Spoofing] Dxgi=false——原神无 DLSS 场景禁用显卡伪装）
+local opti_default = payload_dir .. "\\default_config\\OptiScaler.ini"
+if install.file_exists(opti_default) then
+    install.copy_file(opti_default, opti_dir .. "\\OptiScaler.ini")
+    install.log("已恢复 OptiScaler 默认配置（Dxgi=false——禁用显卡伪装）")
+else
+    install.log("default_config 缺少 OptiScaler.ini，OptiScaler 将使用运行时默认")
 end
 
 local bundled_dlss = payload_dir .. "\\NVIDIA\\DLSS\\nvngx_dlss.dll"

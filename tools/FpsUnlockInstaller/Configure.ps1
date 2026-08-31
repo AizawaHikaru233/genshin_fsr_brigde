@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$GamePath,
     [int]$FpsTarget = 0,
     [switch]$DisableBridge,
@@ -400,11 +400,13 @@ function Set-OptiScalerManagedSettings {
     param([string]$Path)
     # OptiScaler.ini 托管设置（与芙芙 bootstrap 保持一致）：
     #   - FSR4 策略（Fsr4Update/UpscalerIndex/Fsr4ForceEnableInt8/FsrNonLinearColorSpace）
+    #   - Spoofing.Dxgi=false（原神无 DLSS 场景——A 卡不伪装成 N 卡，防副作用）
     #   - Libraries.OptiDllPath 绝对路径
     #   - Log：LogToFile=true / LogLevel=2 / LogFileName=OptiScaler.log
     #   - FrameGen 版型（非帧生成版强制关闭）
     # Upscalers/Inputs/Plugins 等其余设置由 default_config 模板自足，脚本不覆写。
     Set-Fsr4GpuPolicy -Path $Path | Out-Null
+    Set-IniValue -Path $Path -Section 'Spoofing' -Key 'Dxgi' -Value 'false'
     Set-IniValue -Path $Path -Section 'Libraries' -Key 'OptiDllPath' -Value ([IO.Path]::GetFullPath($optiDir).TrimEnd('\'))
     Set-IniValue -Path $Path -Section 'Log' -Key 'LogToFile' -Value 'true'
     Set-IniValue -Path $Path -Section 'Log' -Key 'LogLevel' -Value '2'

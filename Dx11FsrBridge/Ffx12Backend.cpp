@@ -1715,6 +1715,13 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
                     case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
                         srv_fmt = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
                         break;
+                    case DXGI_FORMAT_R32G8X24_TYPELESS:
+                    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+                    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+                        // 官方约定：D32S8/R32G8X24 深度需用 R32_FLOAT_X8X24 视图读深度分量
+                        // （普通 R32_FLOAT 视图读不到——实测深度全 0）
+                        srv_fmt = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+                        break;
                     default:
                         srv_fmt = DXGI_FORMAT_R32_FLOAT;
                         break;
