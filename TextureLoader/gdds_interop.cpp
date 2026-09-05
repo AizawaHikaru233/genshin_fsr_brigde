@@ -272,11 +272,21 @@ bool CreateReplacementTexture(const GddsInfo &info, ComPtr<ID3D11Texture2D> &d11
     return SUCCEEDED(hr) && d12 != nullptr;
 }
 
-// DS 队列完成 → Signal 共享 fence（D3D12 COPY 队列，不占渲染路径）
+// DS 队列完成 → Signal 共享 fence（D3D12 COPY 队列，不占渲染路径）。
+// 重要：Signal 只是提交（异步），必须等待 GPU 真正执行完再返回——否则渲染线程
+// 绑定替换纹理时 ctx4->Wait(fence) 会阻塞等待 Signal 执行（N 卡笔记本混合显卡
+// 上曾导致游戏永久卡死）。等待上限 ~500ms，超时仅告警（渲染线程 Wait 前还有
+// GetCompletedValue 快速路径兜底，见 WaitOnRenderThread）。
 void SignalSharedFence()
 {
     const UINT64 value = ++g_fence_value;
     g_signal_queue->Signal(g_shared_fence.Get(), value);
+    for (int i = 0; i < 50; ++i) {
+        if (g_shared_fence->GetCompletedValue() >= value)
+            return;
+        Sleep(10);
+    }
+    debug_log("SignalSharedFence: GPU did not complete signal within 500ms");
 }
 
 } // namespace (anonymous 内部实现)
@@ -563,6 +573,11 @@ void WaitOnRenderThread(ID3D11DeviceContext *immediate_ctx, uint64_t fence_value
 {
     // 渲染线程专用：立即上下文 Wait 与游戏提交串行，无竞态。
     // DS 完成事件已保证 GPU 写入完成——此处通常立即返回（fence 已 Signal）。
+    // 快速路径：fence 已完成则跳过 Wait（D3D12 fence CPU 查询，零成本）——
+    // 即便 SignalSharedFence 超时未确认，渲染线程也绝不阻塞（防 N 卡卡死）。
+    if (g_shared_fence != nullptr &&
+        g_shared_fence->GetCompletedValue() >= fence_value)
+        return;
     ComPtr<ID3D11DeviceContext4> ctx4;
     if (immediate_ctx != nullptr && SUCCEEDED(immediate_ctx->QueryInterface(IID_PPV_ARGS(&ctx4))))
     {
