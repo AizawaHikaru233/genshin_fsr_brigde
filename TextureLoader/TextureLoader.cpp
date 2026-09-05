@@ -225,7 +225,9 @@ static void EnqueueLoad(uint32_t hash, std::wstring path)
         return; // 无匹配且无默认（注册表为空）——不可能，兜底恒存在
     // GDDS 失败终态隔离：DirectStorage 不可用时 GDDS 任务不再入队，
     // 避免队列堆积与 [fail] 刷屏——DDS 路径完全不受影响。
-    if (lt.loader == &g_loaders[0] && ::tloader_gdds::Failed())
+    // gdds_enabled=0：配置禁用 GDDS（N 卡驱动缺陷规避等场景），.gdds 直接跳过。
+    if (lt.loader == &g_loaders[0] &&
+        (!::tloader::g_gdds_enabled || ::tloader_gdds::Failed()))
         return;
     int q = (lt.loader == &g_loaders[0]) ? 0 : 1; // 0=GDDS 1=DDS
     {
@@ -1575,11 +1577,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         // 可调配置（供 gdds_interop/dds_loader/监控线程跨模块共享）
         ::tloader::g_log_level = IniInt(dir, L"log_level", 1);
         ::tloader::g_max_texture_side = IniInt(dir, L"max_texture_side", 0);
+        ::tloader::g_gdds_enabled = IniInt(dir, L"gdds_enabled", 1);
         ParseVramThreshold(dir);
-        TL_LOG(L"[cfg ] log_level=%d vram_threshold_pct=%d vram_threshold_bytes=%llu max_texture_side=%d",
+        TL_LOG(L"[cfg ] log_level=%d vram_threshold_pct=%d vram_threshold_bytes=%llu max_texture_side=%d gdds_enabled=%d",
                ::tloader::g_log_level, ::tloader::g_vram_threshold_pct,
                (unsigned long long)::tloader::g_vram_threshold_bytes,
-               ::tloader::g_max_texture_side);
+               ::tloader::g_max_texture_side, ::tloader::g_gdds_enabled);
 
         // 扫描 Mods 目录：优先用 ini 里的 mods_dir，其次 DLL 同级/上一级 Mods
         std::wstring mods_dir;

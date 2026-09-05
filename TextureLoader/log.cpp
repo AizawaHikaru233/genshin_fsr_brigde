@@ -18,6 +18,7 @@ int g_log_level = 1;
 int g_vram_threshold_pct = 15;   // 默认：可用显存 < 总显存 15% 视为压力
 uint64_t g_vram_threshold_bytes = 0; // 0=百分比模式
 int g_max_texture_side = 0;
+int g_gdds_enabled = 1;          // 默认启用 GDDS（DirectStorage GPU 解压）
 
 void log_init(const std::wstring &dll_dir)
 {
