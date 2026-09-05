@@ -21,7 +21,6 @@
 #include <algorithm>
 #include <condition_variable>
 #include <deque>
-#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -229,6 +228,12 @@ static void EnqueueLoad(uint32_t hash, std::wstring path)
     int q = (lt.loader == &g_loaders[0]) ? 0 : 1; // 0=GDDS 1=DDS
     {
         std::lock_guard<std::mutex> lk(g_loadMutex);
+        // 队列去重：同 hash 已在队列（未消费）时不再重复入队——快速切角色时
+        // 同一纹理被反复创建，避免队列堆积与重复唤醒/加载（消费端仍有兜底检查）。
+        for (const auto &t : g_loadQueue[q]) {
+            if (t.hash == lt.hash)
+                return;
+        }
         g_loadQueue[q].push_back(std::move(lt));
     }
     g_loadCv[q].notify_one();
@@ -811,8 +816,12 @@ static void STDMETHODCALLTYPE HookUpdateSubresource(
         if (ActiveContains(pDstResource)) {
             uint32_t h = 0;
             std::lock_guard<std::mutex> lk(g_lock);
-            if (GetResourceHash(pDstResource, &h))
+            if (GetResourceHash(pDstResource, &h)) {
                 MarkDynamic(pDstResource);
+                // 动态纹理永不替换（慢路径 IsDynamic 跳过）：标记后移出活跃数组，
+                // 后续 UpdateSubresource 不再命中（幂等，销毁时 tracker 再移除无害）
+                ActiveRemove(pDstResource);
+            }
         }
     }
     g_real_update_subresource(This, pDstResource, DstSubresource, pDstBox,
