@@ -3173,12 +3173,13 @@ void log_line(const std::string &line)
         "failed", "failure", "error", "invalid", "mismatch", "exception",
         "unavailable", "unresolved", "unsupported", "missing", "refusing"
     };
-    static constexpr std::array<std::string_view, 11> basic_terms {
+    static constexpr std::array<std::string_view, 13> basic_terms {
         // 正式版日志精简——只保留：接管结果(ffx12_result/failed)、
-        // 显卡型号(ffx12_gpu)、SDK 路径(ffx12_sdk)、FSR 实际版本(ffx12_version)、渲染精度菜单状态。
-        // hook 数据状态（draw_hook_active/iat_scan/fsr2_translation_candidate/ffx12_path 等）一律不写。
+        // 显卡型号(ffx12_gpu)、SDK 路径(ffx12_sdk)、FSR 实际版本(ffx12_version)、渲染精度菜单状态、
+        // 每帧计时(timing/ffx12_path 含 sdk_msgs)。
+        // hook 数据状态（draw_hook_active/iat_scan/fsr2_translation_candidate 等）一律不写。
         "ffx12_gpu", "ffx12_sdk", "ffx12_version", "ffx12_result", "ffx12_failed",
-        "jit_norm", "jitter_px",
+        "jit_norm", "jitter_px", "ffx12_path", "timing",
         "render_scale_menu hook_ready", "render_scale_menu render_scale_written",
         "fsr2_on_demand_identify_fail", "fsr2_il2cpp_rva_feature_match"
     };

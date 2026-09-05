@@ -17,6 +17,7 @@
 #include "dx12/ffx_api_dx12.h"
 
 #include <atomic>
+#include <cstdio>
 #include <array>
 #include <cstdarg>
 #include <cmath>
@@ -2641,6 +2642,19 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
                 (std::uint32_t)(g_timing.total_us.load(std::memory_order_relaxed) / n);
             sdk_note(L"timing async=%d submit=%uus wait=%uus copy=%uus total=%uus frames=%u",
                      g_async_upscale ? 1 : 0, avg_s, avg_w, avg_c, avg_t, n);
+            // 直接落盘（独立文件，不经 sdk_msgs 缓冲/日志白名单——诊断数据不被吞）
+            {
+                FILE *tf = nullptr;
+                if (fopen_s(&tf, "ffx12_timing.log", "a") == 0 && tf)
+                {
+                    SYSTEMTIME st {};
+                    GetLocalTime(&st);
+                    fprintf(tf, "%04d-%02d-%02d %02d:%02d:%02d.%03d timing async=%d submit=%uus wait=%uus copy=%uus total=%uus frames=%u\n",
+                            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                            st.wMilliseconds, g_async_upscale ? 1 : 0, avg_s, avg_w, avg_c, avg_t, n);
+                    fclose(tf);
+                }
+            }
             g_timing.submit_us.store(0, std::memory_order_relaxed);
             g_timing.wait_us.store(0, std::memory_order_relaxed);
             g_timing.copy_us.store(0, std::memory_order_relaxed);
