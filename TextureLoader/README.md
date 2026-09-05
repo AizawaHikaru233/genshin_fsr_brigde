@@ -42,13 +42,13 @@ cmake --build build --config Release
 ## 配置（TextureLoader.ini，放 DLL 同目录）
 
 ```ini
-mods_dir = C:\path\to\your\Mods   ; 递归扫描 mod ini 的根目录（留空自动探测）
-observe_only = 0                  ; 1=只记录哈希匹配不替换；0=真正替换（默认）
-log_level = 1                     ; 0=仅关键 1=常规（默认） 2=详细
-vram_threshold = 15%              ; 显存压力阈值：15% / 1024M / 2G，非法回退 15%
-max_texture_side = 0              ; 替换纹理最大边长；0=不限制（默认）
-gdds_enabled = 1                  ; 1=启用 GDDS（DirectStorage GPU 解压，默认）；0=禁用
-async_load = 0                    ; 0=同步加载（默认，渲染线程建纹理）；1=异步（后台线程）
+mods_dir =                      ; Mods 根目录；留空 = DLL 同目录 Mods（自动创建空的）
+observe_only = 0                ; 1=只记录哈希匹配不替换；0=真正替换（默认）
+log_level = 1                   ; 0=仅关键 1=常规（默认） 2=详细（每次运行覆盖上次日志）
+vram_threshold = 15%            ; 显存压力阈值：15% / 1024M / 2G，非法回退 15%
+max_texture_side = 0            ; 替换纹理最大边长；0=不限制（默认）
+gdds_enabled = 1                ; 1=启用 GDDS（DirectStorage GPU 解压，默认）；0=禁用
+async_load = 0                  ; 0=同步加载（默认，渲染线程建纹理）；1=异步（后台线程）
 ```
 
 > **加载方式说明**：默认**同步加载**（渲染线程创建纹理，3DMigoto 同模型）——

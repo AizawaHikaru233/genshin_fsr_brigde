@@ -1602,7 +1602,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
                ::tloader::g_max_texture_side, ::tloader::g_gdds_enabled,
                ::tloader::g_async_load);
 
-        // 扫描 Mods 目录：优先用 ini 里的 mods_dir，其次 DLL 同级/上一级 Mods
+        // 扫描 Mods 目录：优先用 ini 里的 mods_dir；未配置时默认 DLL 所在目录的
+        // Mods 子目录（不存在则自动创建空的，用户把 mod 放进去即可）。
         std::wstring mods_dir;
         std::wstring ini_mods = GetIniValue(dir, L"mods_dir");
         if (!ini_mods.empty()) {
@@ -1612,24 +1613,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             else
                 TL_LOG(L"[warn] configured mods_dir not found: \"%ls\"", ini_mods.c_str());
         }
-        std::vector<std::wstring> candidates;
-        candidates.push_back(dir + L"Mods");
-        if (slash) {
-            std::wstring up = std::wstring(path, slash + 1) + L"..\\Mods";
-            candidates.push_back(up);
-        }
         if (mods_dir.empty()) {
-            for (const auto &c : candidates) {
-                DWORD attr = GetFileAttributesW(c.c_str());
-                if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
-                    mods_dir = c;
-                    break;
-                }
+            std::wstring def = dir + L"Mods";
+            DWORD attr = GetFileAttributesW(def.c_str());
+            if (attr == INVALID_FILE_ATTRIBUTES) {
+                if (CreateDirectoryW(def.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS)
+                    TL_LOG(L"[ini ] created default Mods directory: \"%ls\"", def.c_str());
             }
+            mods_dir = def;
         }
-        if (mods_dir.empty()) {
-            TL_LOG(L"[warn] Mods directory not found (tried %d paths)", (int)candidates.size() + (ini_mods.empty() ? 0 : 1));
-        } else {
+        {
             size_t n = LoadModInis(mods_dir, g_overrides);
             TL_LOG(L"[ini ] loaded %zu texture overrides from \"%ls\"", n, mods_dir.c_str());
         }

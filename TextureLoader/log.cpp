@@ -26,8 +26,9 @@ void log_init(const std::wstring &dll_dir)
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_file)
         return;
+    // 每次运行覆盖上一次日志（"w" = 截断重写），避免日志无限增长
     std::wstring path = dll_dir + L"\\TextureLoader.log";
-    _wfopen_s(&g_file, path.c_str(), L"a, ccs=UTF-8");
+    _wfopen_s(&g_file, path.c_str(), L"w, ccs=UTF-8");
 }
 
 void log_shutdown()
