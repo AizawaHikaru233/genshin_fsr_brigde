@@ -688,6 +688,9 @@ static void ExecuteLoadTask(const AsyncLoadTask &task)
             // 真实显存占用估算（BC 按块/其余按像素，含 mip 链与数组）——淘汰按大小优先
             it->second.mem_bytes = EstimateTextureMemory(res.format, res.width, res.height,
                                                          res.mip_levels, res.array_size);
+            // 加载即视为活动：last_used 初始化当前时间——刚加载未绑定的缓存
+            // 不会立即被常态回收（防加载-回收抖动）；长期未绑定的自然老化排最前
+            it->second.last_used = GetTickCount64();
             TL_LOG_IF(1, L"[HIT ] tex hash=0x%08X %lsreplaced dds=%ls",
                    task.hash, ::tloader::g_async_load ? L"(async) " : L"",
                    task.path.c_str());
@@ -1117,22 +1120,22 @@ DWORD WINAPI VramMonitorThread(LPVOID)
         }
         bool pressure = avail < target_avail;
 
-        // 预淘汰（proactive）：剩余显存 < 阈值容量 × 2（默认 15%×2=30%）且未到
-        // 紧急阈值时，开始淘汰长时间未使用的缓存。空闲时长阈值随压力线性收紧：
-        //   剩余 = 2×阈值（30%）→ 10 分钟未用即淘汰
-        //   剩余 → 阈值（15%）  → 5 分钟未用即淘汰（强度随进度增加）
-        // 仍只淘汰 refcount==0（未在使用中），绝不碰正在渲染的纹理。
-        if (!pressure && target_avail > 0 && avail < target_avail * 2) {
+        // 常态持续回收：不设触发门槛——每次巡检都按"上次使用时间"排序回收
+        // 闲置缓存（refcount==0，绝不碰正在使用的）。空闲阈值随剩余显存收紧：
+        //   剩余充足（≥2×阈值）→ 60 秒未用即淘汰（宽松、低打扰）
+        //   剩余逼近阈值（15%） → 15 秒未用即淘汰（积极）
+        // 强度同步增加（每轮 4 → 16 条）。15% 为紧急兜底（下方 pressure 分支）。
+        if (!pressure && target_avail > 0) {
             uint64_t pre_start = target_avail * 2;
-            // 压力进度 0..1（0=刚过 2×阈值，1=逼近阈值）
+            // 压力进度 0..1（0=剩余充足，1=逼近阈值）
             uint64_t span = pre_start - target_avail;
             uint64_t below = avail > target_avail ? pre_start - avail : span;
             uint64_t progress = span ? below * 100 / span : 100;
             if (progress > 100)
                 progress = 100;
-            // 空闲阈值：10min → 5min 线性
-            const uint64_t kIdleMaxMs = 10ull * 60 * 1000; // 最宽松：10 分钟
-            const uint64_t kIdleMinMs = 5ull * 60 * 1000;  // 最紧：5 分钟
+            // 空闲阈值：60s → 15s 线性（压力越大回收越积极）
+            const uint64_t kIdleMaxMs = 60ull * 1000; // 剩余充足：60 秒
+            const uint64_t kIdleMinMs = 15ull * 1000; // 逼近阈值：15 秒
             uint64_t idle_ms = kIdleMaxMs -
                 (kIdleMaxMs - kIdleMinMs) * progress / 100;
             // 淘汰强度：进度 0→1 时每轮 4 → 16 条
@@ -1182,14 +1185,13 @@ DWORD WINAPI VramMonitorThread(LPVOID)
                 evicted++;
             }
             if (evicted > 0)
-                TL_LOG(L"[vram] pre-evict: avail=%lluMB (<%lluMB=2x threshold), progress=%llu%%, idle>%llumin, evicted %d (freed ~%lluMB)",
-                       (unsigned long long)(avail >> 20), (unsigned long long)(pre_start >> 20),
-                       (unsigned long long)progress, (unsigned long long)(idle_ms / 60000),
+                TL_LOG(L"[vram] recycle: avail=%lluMB (target=%lluMB), idle>%llus, evicted %d (freed ~%lluMB)",
+                       (unsigned long long)(avail >> 20), (unsigned long long)(target_avail >> 20),
+                       (unsigned long long)(idle_ms / 1000),
                        evicted, (unsigned long long)(freed_bytes >> 20));
             else
-                TL_LOG_IF(2, L"[vram] pre-evict: avail=%lluMB progress=%llu%% idle>%llumin, nothing evictable",
-                       (unsigned long long)(avail >> 20), (unsigned long long)progress,
-                       (unsigned long long)(idle_ms / 60000));
+                TL_LOG_IF(2, L"[vram] recycle: avail=%lluMB idle>%llus, nothing evictable",
+                       (unsigned long long)(avail >> 20), (unsigned long long)(idle_ms / 1000));
         }
 
         if (pressure) {
