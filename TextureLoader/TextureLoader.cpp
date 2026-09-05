@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "log.h"
@@ -202,6 +203,7 @@ struct AsyncLoadTask {
 std::mutex g_loadMutex;
 std::condition_variable g_loadCv[2];
 std::deque<AsyncLoadTask> g_loadQueue[2];
+std::unordered_set<uint32_t> g_inflight; // 已出队正在加载的 hash（防在途重复加载）
 bool g_loadThreadRunning[2] = {false, false};
 
 // 加载器注册表（扩展名 → 实现；nullptr 条目为默认 DDS 兜底）
@@ -228,10 +230,13 @@ static void EnqueueLoad(uint32_t hash, std::wstring path)
     int q = (lt.loader == &g_loaders[0]) ? 0 : 1; // 0=GDDS 1=DDS
     {
         std::lock_guard<std::mutex> lk(g_loadMutex);
-        // 队列去重：同 hash 已在队列（未消费）时不再重复入队——快速切角色时
-        // 同一纹理被反复创建，避免队列堆积与重复唤醒/加载（消费端仍有兜底检查）。
+        // 去重（含在途）：同 hash 已在队列（未消费）或正在加载（已出队）时
+        // 不再入队——快速切角色时同一纹理被反复创建，避免队列堆积、重复
+        // 唤醒与重复加载（消费端/登记端仍有兜底检查）。
+        if (g_inflight.count(hash))
+            return;
         for (const auto &t : g_loadQueue[q]) {
-            if (t.hash == lt.hash)
+            if (t.hash == hash)
                 return;
         }
         g_loadQueue[q].push_back(std::move(lt));
@@ -1007,15 +1012,21 @@ DWORD WINAPI AsyncLoadThread(LPVOID param)
             g_loadCv[idx].wait(lk, [idx] { return !g_loadQueue[idx].empty(); });
             task = std::move(g_loadQueue[idx].front());
             g_loadQueue[idx].pop_front();
+            g_inflight.insert(task.hash); // 在途标记：同 hash 新任务不再入队
         }
         ID3D11Device *dev = g_device;
-        if (!dev || !task.loader)
+        if (!dev || !task.loader) {
+            std::lock_guard<std::mutex> lk(g_loadMutex);
+            g_inflight.erase(task.hash);
             continue;
+        }
         // 检查是否仍需要加载（可能已被其他实例抢先加载）
         {
             std::lock_guard<std::mutex> lk(g_lock);
             auto it = g_replacements.find(task.hash);
             if (it == g_replacements.end() || it->second.texture) {
+                std::lock_guard<std::mutex> lk2(g_loadMutex);
+                g_inflight.erase(task.hash);
                 continue; // 已加载或条目已移除
             }
         }
@@ -1023,6 +1034,10 @@ DWORD WINAPI AsyncLoadThread(LPVOID param)
         t_in_create_texture = true; // 后台线程也防止加载内部重入（建纹理）
         HRESULT lhr = task.loader->load(dev, task.path.c_str(), &res);
         t_in_create_texture = false;
+        {
+            std::lock_guard<std::mutex> lk(g_loadMutex);
+            g_inflight.erase(task.hash); // 加载完成：解除在途标记
+        }
         if (SUCCEEDED(lhr) && res.texture) {
             std::lock_guard<std::mutex> lk(g_lock);
             auto it = g_replacements.find(task.hash);
