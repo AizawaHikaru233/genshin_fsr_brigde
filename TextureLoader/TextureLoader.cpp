@@ -23,9 +23,8 @@
 #include <deque>
 #include <map>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #include "log.h"
@@ -83,10 +82,8 @@ static void FlushPendingRelease()
         obj->Release();
 }
 
-// 快速命中表：所有已加载替换纹理的 hash 集合。绑定热路径改用一个只写不删的
-// 并发集合，把"是否有替换"的查询压到接近无锁开销。
-std::shared_mutex g_hitLock;
-std::unordered_set<uint32_t> g_hasReplacement;
+// 快速命中表已由 g_replacements 本身承担（find 即判定"是否有替换"），
+// 无需独立集合——慢路径一次 g_lock find 同时完成"有无条目/是否需重载/取缓存"。
 
 // 活跃替换资源：紧凑数组（写低频：纹理创建/销毁；读高频：绑定热路径）。
 // 用固定数组替代 unordered_set：读时无锁线性扫 [0, count)，count = 实际存活数
@@ -143,17 +140,99 @@ static bool ActiveContains(ID3D11Resource *res)
     return false;
 }
 
+// 替换 SRV 快速判定数组：绑定热路径先比 SRV 指针——命中说明该视图就是
+// 替换视图（其资源不在 activeArr），无需 GetResource/ActiveContains，直接透传。
+// 与 g_activeArr 同模式：写低频（SRV 创建/释放）互斥串行，读高频无锁扫。
+const int kMaxReplacementSrvs = 4096;
+std::atomic<ID3D11ShaderResourceView *> g_repSrvArr[kMaxReplacementSrvs] = {};
+std::atomic<long> g_repSrvCount{0};
+std::mutex g_repSrvMutex;
+
+static void RepSrvAdd(ID3D11ShaderResourceView *srv)
+{
+    if (!srv)
+        return;
+    std::lock_guard<std::mutex> lk(g_repSrvMutex);
+    long n = g_repSrvCount.load(std::memory_order_relaxed);
+    if (n >= kMaxReplacementSrvs)
+        return;
+    g_repSrvArr[n].store(srv, std::memory_order_release);
+    g_repSrvCount.store(n + 1, std::memory_order_release);
+}
+static void RepSrvRemove(ID3D11ShaderResourceView *srv)
+{
+    if (!srv)
+        return;
+    std::lock_guard<std::mutex> lk(g_repSrvMutex);
+    long n = g_repSrvCount.load(std::memory_order_relaxed);
+    for (long i = 0; i < n; i++) {
+        if (g_repSrvArr[i].load(std::memory_order_relaxed) == srv) {
+            g_repSrvArr[i].store(g_repSrvArr[n - 1].load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+            g_repSrvArr[n - 1].store(nullptr, std::memory_order_relaxed);
+            g_repSrvCount.store(n - 1, std::memory_order_release);
+            return;
+        }
+    }
+}
+static bool RepSrvContains(ID3D11ShaderResourceView *srv)
+{
+    long n = g_repSrvCount.load(std::memory_order_acquire);
+    if (n > kMaxReplacementSrvs)
+        n = kMaxReplacementSrvs;
+    for (long i = 0; i < n; i++) {
+        if (g_repSrvArr[i].load(std::memory_order_acquire) == srv)
+            return true;
+    }
+    return false;
+}
+
 // 异步替换纹理加载：切换角色/加载场景时会瞬间命中大量纹理，若在渲染线程
-// 同步 LoadDdsTexture（磁盘 IO + 建纹理）会造成帧时间尖峰。D3D11 device 方法
-// 线程安全，因此把加载丢给后台线程，渲染线程只做轻量登记。
+// 同步加载（磁盘 IO + 建纹理）会造成帧时间尖峰。D3D11 device 方法线程安全，
+// 因此把加载丢给后台线程，渲染线程只做轻量登记。
+//
+// 双队列 + 双线程（GDDS / DDS 互不干扰）：
+//   - GDDS 加载走 DirectStorage GPU 解压（大纹理 8-128MB，单任务耗时高）
+//   - DDS 走 CPU 磁盘加载（小纹理，低延迟）
+//   两者各自独立消费，大 GDDS 任务不再阻塞 DDS 小纹理；登记/淘汰仍共享 g_lock。
 struct AsyncLoadTask {
     uint32_t hash;
-    std::wstring dds_path;
+    std::wstring path;
+    const TextureLoaderEntry *loader = nullptr; // 入队时选定（替代消费时扩展名判断）
 };
 std::mutex g_loadMutex;
-std::condition_variable g_loadCv;
-std::deque<AsyncLoadTask> g_loadQueue;
-bool g_loadThreadRunning = false;
+std::condition_variable g_loadCv[2];
+std::deque<AsyncLoadTask> g_loadQueue[2];
+bool g_loadThreadRunning[2] = {false, false};
+
+// 加载器注册表（扩展名 → 实现；nullptr 条目为默认 DDS 兜底）
+static const TextureLoaderEntry g_loaders[] = {
+    {L"gdds", ::tloader_gdds::LoadGddsTextureEntry},
+    {L"dds", LoadDdsTexture},
+    {nullptr, LoadDdsTexture}, // 默认兜底：未注册扩展名走 CPU DDS
+};
+
+// 入队：选定加载器并按类型投递到对应队列
+static void EnqueueLoad(uint32_t hash, std::wstring path)
+{
+    AsyncLoadTask lt;
+    lt.hash = hash;
+    lt.path = std::move(path);
+    lt.loader = SelectTextureLoader(lt.path.c_str(), g_loaders,
+                                    _countof(g_loaders));
+    if (!lt.loader)
+        return; // 无匹配且无默认（注册表为空）——不可能，兜底恒存在
+    // GDDS 失败终态隔离：DirectStorage 不可用时 GDDS 任务不再入队，
+    // 避免队列堆积与 [fail] 刷屏——DDS 路径完全不受影响。
+    if (lt.loader == &g_loaders[0] && ::tloader_gdds::Failed())
+        return;
+    int q = (lt.loader == &g_loaders[0]) ? 0 : 1; // 0=GDDS 1=DDS
+    {
+        std::lock_guard<std::mutex> lk(g_loadMutex);
+        g_loadQueue[q].push_back(std::move(lt));
+    }
+    g_loadCv[q].notify_one();
+}
 
 // resource -> 3DMigoto 兼容 hash（CreateTexture2D 时填充）
 // 注意：不用裸指针 map（资源销毁后地址可能被复用导致错误替换），
@@ -167,7 +246,7 @@ struct ReplacementEntry {
     uint32_t refcount = 0;                        // 活跃原纹理数
     uint64_t last_used = 0;                       // 最近绑定命中时间（GetTickCount64）
     uint64_t mem_bytes = 0;                       // 估算显存占用（纹理大小）
-    uint64_t gdds_ready_fence = 0;               // GDDS 完成 fence 值（0=非 GDDS/已等待）
+    uint64_t ready_fence = 0;                      // GDDS 完成 fence 值（0=非 GDDS/已等待）
     DXGI_FORMAT original_format = DXGI_FORMAT_UNKNOWN; // 游戏原纹理格式（CreateTexture2D 时记录）
     UINT original_mips = 0;                       // 游戏原纹理 mip 数（0=未知）
 };
@@ -224,13 +303,9 @@ public:
                         it->second.srv = nullptr;
                         it->second.texture = nullptr;
                         g_replacements.erase(it);
-                        // 条目已删：同步从快速命中表移除，避免只增不删内存膨胀
-                        // （VramMonitor 淘汰路径保留条目+hash 以便重新加载，此处
-                        //  原纹理已全部销毁，hash 不再需要）。
-                        {
-                            std::unique_lock<std::shared_mutex> hl(g_hitLock);
-                            g_hasReplacement.erase(hash);
-                        }
+                        RepSrvRemove(srv); // 替换视图已释放：从快速判定数组移除
+                        // （无独立快速命中表：条目删除后 find 不命中即跳过，
+                        //  无需额外同步。）
                     }
                 }
                 // 活跃资源数组：本原纹理已销毁，清空其槽位供复用
@@ -395,8 +470,8 @@ ID3D11ShaderResourceView *CreateReplacementSRV(uint32_t hash,
         // SetShaderResources hook 调用，即游戏渲染线程）等待一次建立可见性。
         // 严禁在后台加载线程调用立即上下文 Wait——与游戏提交竞态会损坏
         // GPU 命令流导致 TDR/全暗。
-        gdds_fence = it->second.gdds_ready_fence;
-        it->second.gdds_ready_fence = 0; // 只等待一次
+        gdds_fence = it->second.ready_fence;
+        it->second.ready_fence = 0; // 只等待一次
         tex->AddRef(); // 锁外使用安全：防止后台加载线程/销毁同时释放
     }
     if (!g_device)
@@ -489,6 +564,7 @@ ID3D11ShaderResourceView *CreateReplacementSRV(uint32_t hash,
             return srv;
         }
         it->second.srv = srv; // 缓存持有引用
+        RepSrvAdd(srv);       // 登记替换视图：绑定热路径可无 COM 快速判定
         srv->AddRef();
         tex->Release();
         return srv;
@@ -561,14 +637,7 @@ static HRESULT STDMETHODCALLTYPE HookCreateTexture2D(
                     ActiveAdd(*ppTexture2D);
                 }
                 if (need_load) {
-                    AsyncLoadTask lt;
-                    lt.hash = hash;
-                    lt.dds_path = ov->dds_path;
-                    {
-                        std::lock_guard<std::mutex> lk(g_loadMutex);
-                        g_loadQueue.push_back(std::move(lt));
-                    }
-                    g_loadCv.notify_one();
+                    EnqueueLoad(hash, ov->dds_path);
                 }
             }
         }
@@ -610,12 +679,17 @@ static void STDMETHODCALLTYPE HookSetShaderResourcesCommon(
     }
 
     // 有活跃替换资源：遍历判断本次绑定是否含替换资源。
-    // 无锁线性扫 g_activeArr（几十项），无共享锁开销。
+    // 两级无锁判定（均不解引用/无 COM 调用）：
+    //   1) SRV 指针即替换视图（我们创建过）→ 无需处理，直接透传
+    //   2) 否则 GetResource 查原纹理是否在 activeArr（需替换）
+    // 对"反复绑定替换 SRV"的常见场景省掉每次 GetResource/Release COM 调用。
     bool anyHit = false;
     for (UINT i = 0; i < NumViews; i++) {
         ID3D11ShaderResourceView *srv = ppShaderResourceViews[i];
         if (!srv)
             continue;
+        if (RepSrvContains(srv))
+            continue; // 替换视图：无需再替换
         ID3D11Resource *res = nullptr;
         srv->GetResource(&res);
         if (!res)
@@ -652,15 +726,12 @@ static void STDMETHODCALLTYPE HookSetShaderResourcesCommon(
         // 动态纹理（创建后被 UpdateSubresource 更新过）跳过替换，避免闪烁
         if (hash && IsDynamic(res))
             hash = 0;
-        // g_hasReplacement 由 AsyncLoadThread 并发写入，读必须持共享锁
-        // （unordered_set 并发读写是未定义行为，高速切角色时曾崩溃）
         if (hash) {
-            std::shared_lock<std::shared_mutex> hl(g_hitLock);
-            if (!g_hasReplacement.count(hash))
-                hash = 0;
-        }
-        if (hash) {
-            // 检查替换缓存是否还在（可能被显存淘汰 → texture 为空）
+            // 一次锁内判定：条目存在且纹理已加载 → 建 SRV；
+            // 条目存在但纹理为空（显存淘汰）→ 重新异步加载；
+            // 条目不存在（原纹理全销毁）→ 跳过（保留原纹理）。
+            // （移除独立 g_hasReplacement 集：g_replacements.find 即判定，
+            //   省一次 shared_lock + unordered_set 查询。）
             bool need_reload = false;
             {
                 std::lock_guard<std::mutex> lk(g_lock);
@@ -676,16 +747,8 @@ static void STDMETHODCALLTYPE HookSetShaderResourcesCommon(
                     if (oit != g_overrides.end())
                         dds_path = oit->second.dds_path;
                 }
-                if (!dds_path.empty()) {
-                    AsyncLoadTask lt;
-                    lt.hash = hash;
-                    lt.dds_path = std::move(dds_path);
-                    {
-                        std::lock_guard<std::mutex> lk(g_loadMutex);
-                        g_loadQueue.push_back(std::move(lt));
-                    }
-                    g_loadCv.notify_one();
-                }
+                if (!dds_path.empty())
+                    EnqueueLoad(hash, std::move(dds_path));
             } else {
                 // 读取原 SRV 的视图描述，创建格式/mip 一致的替换 SRV
                 D3D11_SHADER_RESOURCE_VIEW_DESC origDesc;
@@ -921,21 +984,23 @@ DWORD WINAPI BootstrapThread(LPVOID)
     return 0;
 }
 
-// 后台替换纹理加载线程：消费 g_loadQueue，LoadDdsTexture（磁盘 IO + 建纹理），
-// 完成后更新替换表。渲染线程只做轻量登记，避免切换角色时的帧时间尖峰。
-// .gdds 扩展名 → GDDS DirectStorage GPU 解压路径（gdds_interop）。
-DWORD WINAPI AsyncLoadThread(LPVOID)
+// 后台替换纹理加载线程（两条：idx 0=GDDS，idx 1=DDS）：
+// 消费对应队列，经统一加载器注册表执行加载，完成后更新替换表。
+// 渲染线程只做轻量登记，避免切换角色时的帧时间尖峰。
+// GDDS/DDS 各自独立消费——大 GDDS 任务不阻塞 DDS 小纹理；登记共享 g_lock。
+DWORD WINAPI AsyncLoadThread(LPVOID param)
 {
+    const int idx = (int)(intptr_t)param;
     while (true) {
         AsyncLoadTask task;
         {
             std::unique_lock<std::mutex> lk(g_loadMutex);
-            g_loadCv.wait(lk, [] { return !g_loadQueue.empty(); });
-            task = std::move(g_loadQueue.front());
-            g_loadQueue.pop_front();
+            g_loadCv[idx].wait(lk, [idx] { return !g_loadQueue[idx].empty(); });
+            task = std::move(g_loadQueue[idx].front());
+            g_loadQueue[idx].pop_front();
         }
         ID3D11Device *dev = g_device;
-        if (!dev)
+        if (!dev || !task.loader)
             continue;
         // 检查是否仍需要加载（可能已被其他实例抢先加载）
         {
@@ -945,54 +1010,21 @@ DWORD WINAPI AsyncLoadThread(LPVOID)
                 continue; // 已加载或条目已移除
             }
         }
-        DdsLoadResult res;
-        t_in_create_texture = true; // 后台线程也防止 LoadDdsTexture 内部重入
-        HRESULT lhr = E_FAIL;
-        // 按扩展名分发：.gdds → DirectStorage GPU 解压；其余 → 现有 CPU DDS 路径
-        const bool is_gdds = _wcsicmp(
-            wcsrchr(task.dds_path.c_str(), L'.') ? wcsrchr(task.dds_path.c_str(), L'.') : L"",
-            L".gdds") == 0;
-        if (is_gdds) {
-            if (tloader_gdds::Initialize(dev)) {
-                uint64_t ready_fence = 0;
-                ID3D11Texture2D *tex = tloader_gdds::LoadGddsTexture(task.dds_path.c_str(),
-                                                                     &ready_fence, &res.skipped);
-                if (tex) {
-                    res.texture = tex; // 已 AddRef（登记持有）
-                    D3D11_TEXTURE2D_DESC td;
-                    tex->GetDesc(&td);
-                    res.format = td.Format;
-                    res.width = td.Width;
-                    res.height = td.Height;
-                    res.array_size = td.ArraySize;
-                    res.mip_levels = td.MipLevels;
-                    res.gdds_ready_fence = ready_fence; // 供渲染线程绑定前等待
-                    lhr = S_OK;
-                }
-            } else {
-                TL_LOG(L"[fail] tex hash=0x%08X gdds init failed (DirectStorage unavailable)",
-                       task.hash);
-            }
-        } else {
-            lhr = LoadDdsTexture(dev, task.dds_path.c_str(), &res);
-        }
+        TextureLoadResult res;
+        t_in_create_texture = true; // 后台线程也防止加载内部重入（建纹理）
+        HRESULT lhr = task.loader->load(dev, task.path.c_str(), &res);
         t_in_create_texture = false;
         if (SUCCEEDED(lhr) && res.texture) {
             std::lock_guard<std::mutex> lk(g_lock);
             auto it = g_replacements.find(task.hash);
             if (it != g_replacements.end() && !it->second.texture) {
                 it->second.texture = res.texture;
-                it->second.gdds_ready_fence = res.gdds_ready_fence; // GDDS 完成 fence（渲染线程等待）
+                it->second.ready_fence = res.ready_fence; // GDDS 完成 fence（渲染线程等待）
                 // 真实显存占用估算（BC 按块/其余按像素，含 mip 链与数组）——淘汰按大小优先
                 it->second.mem_bytes = EstimateTextureMemory(res.format, res.width, res.height,
                                                              res.mip_levels, res.array_size);
-                // 快速命中表：替换已加载，此后该 hash 可命中
-                {
-                    std::unique_lock<std::shared_mutex> hl(g_hitLock);
-                    g_hasReplacement.insert(task.hash);
-                }
                 TL_LOG_IF(1, L"[HIT ] tex hash=0x%08X (async) replaced dds=%ls",
-                       task.hash, task.dds_path.c_str());
+                       task.hash, task.path.c_str());
             } else {
                 // 锁内不直接 Release（D3D 回调可能反向等 g_lock）——延迟到渲染线程
                 QueueRelease(res.texture);
@@ -1001,7 +1033,8 @@ DWORD WINAPI AsyncLoadThread(LPVOID)
             // max_texture_side 配置跳过（非错误）——仅 level>=1 记录
             TL_LOG_IF(1, L"[skip] tex hash=0x%08X dds over max_texture_side", task.hash);
         } else {
-            TL_LOG(L"[fail] tex hash=0x%08X dds load failed hr=0x%08X", task.hash, lhr);
+            TL_LOG(L"[fail] tex hash=0x%08X load failed hr=0x%08X (%ls)",
+                   task.hash, lhr, task.path.c_str());
         }
     }
     return 0;
@@ -1090,8 +1123,8 @@ DWORD WINAPI VramMonitorThread(LPVOID)
                     srv = it->second.srv;
                     it->second.texture = nullptr;
                     it->second.srv = nullptr;
-                    // 保留条目（refcount=0），供重新加载；从 g_hasReplacement 移除前
-                    // 保留 hash 以便命中时重新加载
+                    RepSrvRemove(srv); // 淘汰释放替换视图：从快速判定数组移除
+                    // 保留条目（refcount=0），供命中时重新加载（find 判定）
                     freed_bytes += it->second.mem_bytes;
                     it->second.mem_bytes = 0;
                 }
@@ -1266,10 +1299,12 @@ static void AttachToDevice(ID3D11Device *device, ID3D11DeviceContext *context)
     HookDevice(device);
     HookContext(context);
     InterlockedExchange(&g_hook_ready, 1);
-    // 启动后台替换纹理加载线程（仅一次）
-    if (!g_loadThreadRunning) {
-        g_loadThreadRunning = true;
-        CreateThread(nullptr, 0, AsyncLoadThread, nullptr, 0, nullptr);
+    // 启动后台替换纹理加载线程：0=GDDS（DirectStorage GPU 解压），1=DDS（CPU）
+    for (int i = 0; i < 2; i++) {
+        if (!g_loadThreadRunning[i]) {
+            g_loadThreadRunning[i] = true;
+            CreateThread(nullptr, 0, AsyncLoadThread, (LPVOID)(intptr_t)i, 0, nullptr);
+        }
     }
     // 启动显存监控线程（仅一次）
     if (!g_vramMonitorRunning) {

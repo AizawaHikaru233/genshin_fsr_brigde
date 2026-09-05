@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
-// dds_loader.h - Minimal DDS texture loader for the TextureLoader mod DLL.
+// dds_loader.h — 统一纹理加载结果类型 + CPU DDS 加载器 + 加载器注册表。
 //
 // This is a from-scratch minimal loader that understands the DDS + DX10
 // extended header layouts and the compressed/uncompressed DXGI formats used
@@ -16,20 +16,38 @@
 #include <stdint.h>
 #include <wchar.h>
 
-struct DdsLoadResult {
+// 统一加载结果：DDS（CPU）与 GDDS（DirectStorage GPU 解压）共用。
+// 加载成功后 out->texture 非空且已 AddRef（调用方登记持有）。
+struct TextureLoadResult {
     ID3D11Texture2D *texture = nullptr;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     UINT width = 0;
     UINT height = 0;
     UINT array_size = 1;
     UINT mip_levels = 1;
-    uint64_t gdds_ready_fence = 0; // GDDS 完成 fence（0=非 GDDS）
-    bool skipped = false;          // 因 max_texture_side 等配置跳过（非错误）
+    uint64_t ready_fence = 0; // GDDS 完成 fence（渲染线程绑定前等待；DDS 恒 0）
+    bool skipped = false;     // 因 max_texture_side 等配置主动跳过（非错误）
 };
 
-// Loads a .dds file from disk and creates an immutable (DEFAULT usage)
-// ID3D11Texture2D. Returns S_OK on success.
-HRESULT LoadDdsTexture(ID3D11Device *device, const wchar_t *path, DdsLoadResult *out);
+// 加载器函数签名。
+typedef HRESULT (*TextureLoaderFn)(ID3D11Device *device, const wchar_t *path,
+                                   TextureLoadResult *out);
+
+// 加载器注册表项：extension 为小写扩展名（不含点，如 L"gdds"），
+// nullptr 表示默认加载器（兜底，处理未显式注册的扩展名）。
+struct TextureLoaderEntry {
+    const wchar_t *extension; // 小写无点；nullptr = 默认
+    TextureLoaderFn load;
+};
+
+// 按路径扩展名选择加载器：线性扫注册表（条目数极少，无需哈希）。
+// 未匹配到注册项时返回默认项（extension==nullptr）；无默认项返回 nullptr。
+const TextureLoaderEntry *SelectTextureLoader(const wchar_t *path,
+                                              const TextureLoaderEntry *registry,
+                                              size_t count);
+
+// CPU DDS 加载器（实现见 dds_loader.cpp）。
+HRESULT LoadDdsTexture(ID3D11Device *device, const wchar_t *path, TextureLoadResult *out);
 
 // True if a byte sequence at the start of a file is a DDS magic (0x20534444).
 static inline bool IsDdsMagic(const void *ptr)

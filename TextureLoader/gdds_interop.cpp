@@ -105,6 +105,7 @@ void UnloadDstorageRuntime()
 
 std::mutex g_mutex;
 bool g_initialized = false;
+bool g_init_failed = false; // 终态：初始化失败后不再重试（GDDS 不可用，不影响 DDS）
 
 ID3D11Device *g_game_device = nullptr;
 
@@ -285,6 +286,8 @@ bool Initialize(ID3D11Device *game_device)
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_initialized)
         return true;
+    if (g_init_failed)
+        return false; // 终态：之前失败过，不再重复初始化
     if (!game_device)
         return false;
     g_game_device = game_device;
@@ -297,12 +300,14 @@ bool Initialize(ID3D11Device *game_device)
             FAILED(dxgi_dev->GetAdapter(&adapter)))
         {
             debug_log("get adapter failed");
+            g_init_failed = true;
             return false;
         }
         if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0,
                                      IID_PPV_ARGS(&g_d12dev))))
         {
             debug_log("D3D12CreateDevice failed");
+            g_init_failed = true;
             return false;
         }
     }
@@ -312,11 +317,13 @@ bool Initialize(ID3D11Device *game_device)
         if (!LoadDstorageRuntime() || g_pfn_get_factory == nullptr)
         {
             debug_log("DStorageGetFactory unavailable (dstorage.dll not loaded)");
+            g_init_failed = true;
             return false;
         }
         if (FAILED(g_pfn_get_factory(IID_PPV_ARGS(&g_ds_factory))))
         {
             debug_log("DStorageGetFactory failed (dstorage.dll missing?)");
+            g_init_failed = true;
             return false;
         }
         DSTORAGE_QUEUE_DESC qd = {};
@@ -328,6 +335,7 @@ bool Initialize(ID3D11Device *game_device)
         if (FAILED(g_ds_factory->CreateQueue(&qd, IID_PPV_ARGS(&g_ds_queue))))
         {
             debug_log("CreateQueue failed");
+            g_init_failed = true;
             return false;
         }
     }
@@ -338,6 +346,7 @@ bool Initialize(ID3D11Device *game_device)
                                          IID_PPV_ARGS(&g_shared_fence))))
         {
             debug_log("CreateFence shared failed");
+            g_init_failed = true;
             return false;
         }
         HANDLE fh = nullptr;
@@ -345,6 +354,7 @@ bool Initialize(ID3D11Device *game_device)
                                                 GENERIC_ALL, nullptr, &fh)))
         {
             debug_log("fence CreateSharedHandle failed");
+            g_init_failed = true;
             return false;
         }
         ComPtr<ID3D11Device5> d11v5;
@@ -353,6 +363,7 @@ bool Initialize(ID3D11Device *game_device)
         {
             CloseHandle(fh);
             debug_log("D3D11 OpenSharedFence failed");
+            g_init_failed = true;
             return false;
         }
         CloseHandle(fh);
@@ -365,6 +376,7 @@ bool Initialize(ID3D11Device *game_device)
         if (FAILED(g_d12dev->CreateCommandQueue(&cqd, IID_PPV_ARGS(&g_signal_queue))))
         {
             debug_log("create signal queue failed");
+            g_init_failed = true;
             return false;
         }
     }
@@ -580,6 +592,46 @@ bool Active()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_initialized;
+}
+
+bool Failed()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_init_failed;
+}
+
+// TextureLoaderFn 适配：统一加载器注册表入口。
+// 与 DDS 路径完全隔离——GDDS 不可用（未初始化/初始化失败）时立即返回失败，
+// 不抛异常、不阻塞、不重试；DDS 加载不受任何影响。
+HRESULT LoadGddsTextureEntry(ID3D11Device *device, const wchar_t *path,
+                             TextureLoadResult *out)
+{
+    if (!device || !path || !out)
+        return E_INVALIDARG;
+    out->texture = nullptr;
+    out->skipped = false;
+
+    // 惰性初始化：未初始化且未失败才尝试；失败为终态
+    if (!Active() && !Initialize(device))
+        return E_FAIL;
+
+    uint64_t ready_fence = 0;
+    bool skipped = false;
+    ID3D11Texture2D *tex = LoadGddsTexture(path, &ready_fence, &skipped);
+    out->skipped = skipped;
+    if (!tex)
+        return skipped ? HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED) : E_FAIL;
+
+    D3D11_TEXTURE2D_DESC td;
+    tex->GetDesc(&td);
+    out->texture = tex; // 已 AddRef（登记持有）
+    out->format = td.Format;
+    out->width = td.Width;
+    out->height = td.Height;
+    out->array_size = td.ArraySize;
+    out->mip_levels = td.MipLevels;
+    out->ready_fence = ready_fence;
+    return S_OK;
 }
 
 } // namespace tloader_gdds

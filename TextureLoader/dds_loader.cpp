@@ -235,7 +235,28 @@ static void ComputePitch(DXGI_FORMAT fmt, UINT width, UINT height,
 // Loader
 // ---------------------------------------------------------------------------
 
-HRESULT LoadDdsTexture(ID3D11Device *device, const wchar_t *path, DdsLoadResult *out)
+// 按路径扩展名选择加载器：线性扫注册表；未匹配返回默认项（extension==nullptr）。
+const TextureLoaderEntry *SelectTextureLoader(const wchar_t *path,
+                                              const TextureLoaderEntry *registry,
+                                              size_t count)
+{
+    if (!path || !registry || count == 0)
+        return nullptr;
+    const wchar_t *dot = wcsrchr(path, L'.');
+    const wchar_t *ext = dot ? dot + 1 : L"";
+    const TextureLoaderEntry *fallback = nullptr;
+    for (size_t i = 0; i < count; i++) {
+        if (!registry[i].extension) {
+            fallback = &registry[i];
+            continue;
+        }
+        if (_wcsicmp(ext, registry[i].extension) == 0)
+            return &registry[i];
+    }
+    return fallback; // 无匹配 → 默认加载器（可能为 nullptr）
+}
+
+HRESULT LoadDdsTexture(ID3D11Device *device, const wchar_t *path, TextureLoadResult *out)
 {
     if (!device || !path || !out)
         return E_INVALIDARG;

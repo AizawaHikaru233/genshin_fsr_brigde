@@ -19,11 +19,15 @@
 #include <d3d11.h>
 #include <cstdint>
 
+#include "dds_loader.h" // TextureLoadResult / TextureLoaderFn
+
 namespace tloader_gdds
 {
 
 // 惰性初始化：D3D12 设备（同适配器）+ DirectStorage 工厂/队列 + 共享 fence。
 // 线程安全；重复调用幂等。game_device 为游戏 D3D11 设备（取适配器 LUID）。
+// 失败具有终态性：任一环节失败后本模块标记不可用（Active() 返回 false），
+// 不再重复初始化——调用方据 Active() 跳过 GDDS 请求，不影响 DDS 路径。
 bool Initialize(ID3D11Device *game_device);
 
 // GDDS 文件 → 共享纹理（GPU GDeflate 解压直写，零拷贝）。
@@ -37,6 +41,11 @@ bool Initialize(ID3D11Device *game_device);
 ID3D11Texture2D *LoadGddsTexture(const wchar_t *gdds_path, uint64_t *out_ready_fence,
                                  bool *out_skipped = nullptr);
 
+// TextureLoaderFn 适配入口：Initialize（若未初始化且未失败）→ LoadGddsTexture →
+// 填充统一 TextureLoadResult（format/width/height/array/mips/ready_fence）。
+HRESULT LoadGddsTextureEntry(ID3D11Device *device, const wchar_t *path,
+                             TextureLoadResult *out);
+
 // 渲染线程在绑定替换纹理前调用：等待 GDDS 写入完成（幂等，仅当 fence 值
 // 未达到时阻塞；DS 已完成后通常立即返回）。必须在游戏渲染线程（拥有立即
 // 上下文的线程）调用。
@@ -45,6 +54,12 @@ void WaitOnRenderThread(ID3D11DeviceContext *immediate_ctx, uint64_t fence_value
 // 进程退出清理（D3D12 设备/DS 队列/共享 fence）。
 void Shutdown();
 
+// 是否可用（初始化成功且未失败）。GDDS 不可用时调用方应跳过 GDDS 请求。
 bool Active();
+
+// 是否已进入失败终态（初始化曾失败，不再重试）。
+// 调用方可在入队前短路：GDDS 失败后不再投递 GDDS 任务（避免队列堆积/日志刷屏），
+// DDS 路径完全不受影响。
+bool Failed();
 
 } // namespace tloader_gdds

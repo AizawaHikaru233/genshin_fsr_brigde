@@ -49,6 +49,19 @@ vram_threshold = 15%              ; 显存压力阈值：15% / 1024M / 2G，非�
 max_texture_side = 0              ; 替换纹理最大边长；0=不限制
 ```
 
+## 架构
+
+- **统一加载器注册表**（`dds_loader.h`）：`TextureLoadResult` 统一结果类型 +
+  `TextureLoaderEntry{extension, load}` 注册表；入队时按扩展名选定加载器
+  （`.gdds` → DirectStorage GPU 解压；`.dds`/默认 → CPU 加载），替代运行时 if/else。
+- **双队列双线程**：GDDS 与 DDS 各自独立消费队列——大 GDDS 任务（8-128MB GPU 解压）
+  不阻塞 DDS 小纹理；登记/淘汰共享 `g_lock`。
+- **GDDS 失败终态隔离**：DirectStorage 初始化失败后 `Failed()` 置位，GDDS 任务不再
+  入队（避免队列堆积/日志刷屏）；DDS 路径完全不受影响。
+- **热路径两级无锁判定**：绑定热路径先比替换 SRV 指针（命中=无需处理，省 GetResource
+  COM 调用），未命中才查原纹理活跃数组——替换视图反复绑定场景接近零开销。
+- **渲染线程延迟释放**：非渲染线程不直接 Release D3D11 对象，规避 AMD 驱动 UAF。
+
 ## 目录结构
 
 ```
