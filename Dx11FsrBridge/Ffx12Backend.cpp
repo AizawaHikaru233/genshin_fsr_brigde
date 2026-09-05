@@ -88,6 +88,29 @@ std::array<On12CommandSlot, 3> g_on12_command_slots {};
 std::uint32_t g_on12_command_slot_cursor = 0;
 std::atomic_uint64_t g_on12_direct_dispatch_count { 0 };
 
+// 每帧耗时统计（诊断 GPU 空载：QPC 计时，节流输出）
+//  - submit_us：dispatch 内 D3D11 输入准备 + 提交 FFX 的 CPU 耗时
+//  - wait_us  ：finish_pending 的 ctx4->Wait 阻塞（= FFX 未提前完成的时间）
+//  - copy_us  ：输出拷贝耗时
+//  - total_us ：dispatch 调用总耗时（同步模式=帧内硬停；异步=提交即返）
+struct FrameTimingStats
+{
+    std::atomic_uint64_t submit_us { 0 };
+    std::atomic_uint64_t wait_us { 0 };
+    std::atomic_uint64_t copy_us { 0 };
+    std::atomic_uint64_t total_us { 0 };
+    std::atomic_uint32_t frames { 0 };
+};
+FrameTimingStats g_timing {};
+
+static std::uint64_t qpc_us()
+{
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return f.QuadPart ? (std::uint64_t)((double)c.QuadPart * 1000000.0 / (double)f.QuadPart) : 0;
+}
+
 // ffx-api runtime entry points.  Keeping the module loaded for the lifetime of
 // every context is required because the provider owns the temporal history.
 HMODULE g_sdk_module = nullptr;
@@ -1969,6 +1992,7 @@ static bool finish_gpu_shared()
     }
     // 等待 FFX 输出完成（fence 通常已 Signal——GPU 上 FFX 与游戏后续工作并行，
     // 此处仅当游戏提前到达 Present 才短暂阻塞）
+    const std::uint64_t t_wait_start = qpc_us();
     if (FAILED(g_game_ctx4->Wait(g_shared_fence11.Get(), g_pending_v2)))
     {
         g_pending_ffx = false;
@@ -1976,10 +2000,13 @@ static bool finish_gpu_shared()
         g_pending_context.Reset();
         return false;
     }
+    g_timing.wait_us.fetch_add(qpc_us() - t_wait_start, std::memory_order_relaxed);
     ID3D11Texture2D *output = g_pending_output_target.Get();
+    const std::uint64_t t_copy_start = qpc_us();
     if (output)
         game_context->CopyResource(output, g_tex_output.d11.Get());
     game_context->Flush();
+    g_timing.copy_us.fetch_add(qpc_us() - t_copy_start, std::memory_order_relaxed);
     g_pending_ffx = false;
     g_pending_output_target.Reset();
     g_pending_context.Reset();
@@ -2488,6 +2515,7 @@ void recover_device_removed_locked()
 bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::uint64_t instance_key)
 {
     std::lock_guard lock(g_mutex);
+    const std::uint64_t t_dispatch_start = qpc_us();
     g_dispatch_counter.fetch_add(1, std::memory_order_relaxed);
     g_last_ffx_dispatch_rc.store(kFfxDispatchNotReached, std::memory_order_relaxed);
 #if defined(FFX12_DEBUG_STEPS)
@@ -2592,7 +2620,35 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
         if (!finish_gpu_shared())
             return false;
     }
-    return dispatch_gpu_shared(input, game_context, *sc, reset);
+    const bool ok = dispatch_gpu_shared(input, game_context, *sc, reset);
+    // 计时统计：submit = 本次 dispatch 内 FFX 提交前的工作（输入准备+同步）；
+    // total = dispatch 调用总时长（异步=提交即返，同步=含等待+拷贝）。
+    {
+        const std::uint64_t t_now = qpc_us();
+        g_timing.submit_us.fetch_add(t_now - t_dispatch_start, std::memory_order_relaxed);
+        g_timing.total_us.fetch_add(t_now - t_dispatch_start, std::memory_order_relaxed);
+        const std::uint32_t n =
+            g_timing.frames.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 8 || (n % 512) == 0)
+        {
+            const std::uint32_t avg_s =
+                (std::uint32_t)(g_timing.submit_us.load(std::memory_order_relaxed) / n);
+            const std::uint32_t avg_w =
+                (std::uint32_t)(g_timing.wait_us.load(std::memory_order_relaxed) / n);
+            const std::uint32_t avg_c =
+                (std::uint32_t)(g_timing.copy_us.load(std::memory_order_relaxed) / n);
+            const std::uint32_t avg_t =
+                (std::uint32_t)(g_timing.total_us.load(std::memory_order_relaxed) / n);
+            sdk_note(L"timing async=%d submit=%uus wait=%uus copy=%uus total=%uus frames=%u",
+                     g_async_upscale ? 1 : 0, avg_s, avg_w, avg_c, avg_t, n);
+            g_timing.submit_us.store(0, std::memory_order_relaxed);
+            g_timing.wait_us.store(0, std::memory_order_relaxed);
+            g_timing.copy_us.store(0, std::memory_order_relaxed);
+            g_timing.total_us.store(0, std::memory_order_relaxed);
+            g_timing.frames.store(0, std::memory_order_relaxed);
+        }
+    }
+    return ok;
 }
 
 void set_async_upscale(bool enable)
