@@ -206,6 +206,9 @@ std::deque<AsyncLoadTask> g_loadQueue[2];
 std::unordered_set<uint32_t> g_inflight; // 已出队正在加载的 hash（防在途重复加载）
 bool g_loadThreadRunning[2] = {false, false};
 
+// 前置声明（定义在 HookCreateTexture2D 之后，同步/异步共用）
+static void ExecuteLoadTask(const AsyncLoadTask &task);
+
 // 加载器注册表（扩展名 → 实现；nullptr 条目为默认 DDS 兜底）
 static const TextureLoaderEntry g_loaders[] = {
     {L"gdds", ::tloader_gdds::LoadGddsTextureEntry},
@@ -229,6 +232,12 @@ static void EnqueueLoad(uint32_t hash, std::wstring path)
     if (lt.loader == &g_loaders[0] &&
         (!::tloader::g_gdds_enabled || ::tloader_gdds::Failed()))
         return;
+    // 同步模式（async_load=0）：渲染线程直接执行加载——与 3DMigoto/旧版一致，
+    // D3D11 纹理创建在渲染线程（规避 NVIDIA 驱动对后台线程建纹理的缺陷）。
+    if (!::tloader::g_async_load) {
+        ExecuteLoadTask(lt);
+        return;
+    }
     int q = (lt.loader == &g_loaders[0]) ? 0 : 1; // 0=GDDS 1=DDS
     {
         std::lock_guard<std::mutex> lk(g_loadMutex);
@@ -658,6 +667,54 @@ static HRESULT STDMETHODCALLTYPE HookCreateTexture2D(
 }
 
 // ---------------------------------------------------------------------------
+// 执行单个加载任务（异步线程与同步模式共用）：
+// 经统一加载器注册表执行加载，完成后更新替换表。
+// 同步模式（async_load=0）在渲染线程调用——与 3DMigoto/旧版一致，
+// D3D11 纹理创建回到渲染线程，规避 NVIDIA 驱动对后台线程建纹理的缺陷。
+// 注意：调用方不得持有 g_lock（内部会取锁登记）。
+// ---------------------------------------------------------------------------
+static void ExecuteLoadTask(const AsyncLoadTask &task)
+{
+    ID3D11Device *dev = g_device;
+    if (!dev || !task.loader)
+        return;
+    // 检查是否仍需要加载（可能已被其他实例抢先加载）
+    {
+        std::lock_guard<std::mutex> lk(g_lock);
+        auto it = g_replacements.find(task.hash);
+        if (it == g_replacements.end() || it->second.texture)
+            return; // 已加载或条目已移除
+    }
+    TextureLoadResult res;
+    t_in_create_texture = true; // 防止加载内部重入（建纹理）
+    HRESULT lhr = task.loader->load(dev, task.path.c_str(), &res);
+    t_in_create_texture = false;
+    if (SUCCEEDED(lhr) && res.texture) {
+        std::lock_guard<std::mutex> lk(g_lock);
+        auto it = g_replacements.find(task.hash);
+        if (it != g_replacements.end() && !it->second.texture) {
+            it->second.texture = res.texture;
+            it->second.ready_fence = res.ready_fence; // GDDS 完成 fence（渲染线程等待）
+            // 真实显存占用估算（BC 按块/其余按像素，含 mip 链与数组）——淘汰按大小优先
+            it->second.mem_bytes = EstimateTextureMemory(res.format, res.width, res.height,
+                                                         res.mip_levels, res.array_size);
+            TL_LOG_IF(1, L"[HIT ] tex hash=0x%08X %lsreplaced dds=%ls",
+                   task.hash, ::tloader::g_async_load ? L"(async) " : L"",
+                   task.path.c_str());
+        } else {
+            // 锁内不直接 Release（D3D 回调可能反向等 g_lock）——延迟到渲染线程
+            QueueRelease(res.texture);
+        }
+    } else if (res.skipped) {
+        // max_texture_side 配置跳过（非错误）——仅 level>=1 记录
+        TL_LOG_IF(1, L"[skip] tex hash=0x%08X dds over max_texture_side", task.hash);
+    } else {
+        TL_LOG(L"[fail] tex hash=0x%08X load failed hr=0x%08X (%ls)",
+               task.hash, lhr, task.path.c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 通用 SRV 替换 hook（应用于全部着色器阶段）
 // 飘带/布料模拟可能在 VS/CS 阶段采样纹理，只替换 PS 会导致阶段间数据不一致
 // （VS 读原纹理、PS 读替换纹理 → 摆动异常 + 闪烁）。因此所有阶段统一替换。
@@ -1016,51 +1073,10 @@ DWORD WINAPI AsyncLoadThread(LPVOID param)
             g_loadQueue[idx].pop_front();
             g_inflight.insert(task.hash); // 在途标记：同 hash 新任务不再入队
         }
-        ID3D11Device *dev = g_device;
-        if (!dev || !task.loader) {
-            std::lock_guard<std::mutex> lk(g_loadMutex);
-            g_inflight.erase(task.hash);
-            continue;
-        }
-        // 检查是否仍需要加载（可能已被其他实例抢先加载）
-        {
-            std::lock_guard<std::mutex> lk(g_lock);
-            auto it = g_replacements.find(task.hash);
-            if (it == g_replacements.end() || it->second.texture) {
-                std::lock_guard<std::mutex> lk2(g_loadMutex);
-                g_inflight.erase(task.hash);
-                continue; // 已加载或条目已移除
-            }
-        }
-        TextureLoadResult res;
-        t_in_create_texture = true; // 后台线程也防止加载内部重入（建纹理）
-        HRESULT lhr = task.loader->load(dev, task.path.c_str(), &res);
-        t_in_create_texture = false;
+        ExecuteLoadTask(task);
         {
             std::lock_guard<std::mutex> lk(g_loadMutex);
-            g_inflight.erase(task.hash); // 加载完成：解除在途标记
-        }
-        if (SUCCEEDED(lhr) && res.texture) {
-            std::lock_guard<std::mutex> lk(g_lock);
-            auto it = g_replacements.find(task.hash);
-            if (it != g_replacements.end() && !it->second.texture) {
-                it->second.texture = res.texture;
-                it->second.ready_fence = res.ready_fence; // GDDS 完成 fence（渲染线程等待）
-                // 真实显存占用估算（BC 按块/其余按像素，含 mip 链与数组）——淘汰按大小优先
-                it->second.mem_bytes = EstimateTextureMemory(res.format, res.width, res.height,
-                                                             res.mip_levels, res.array_size);
-                TL_LOG_IF(1, L"[HIT ] tex hash=0x%08X (async) replaced dds=%ls",
-                       task.hash, task.path.c_str());
-            } else {
-                // 锁内不直接 Release（D3D 回调可能反向等 g_lock）——延迟到渲染线程
-                QueueRelease(res.texture);
-            }
-        } else if (res.skipped) {
-            // max_texture_side 配置跳过（非错误）——仅 level>=1 记录
-            TL_LOG_IF(1, L"[skip] tex hash=0x%08X dds over max_texture_side", task.hash);
-        } else {
-            TL_LOG(L"[fail] tex hash=0x%08X load failed hr=0x%08X (%ls)",
-                   task.hash, lhr, task.path.c_str());
+            g_inflight.erase(task.hash); // 完成（成功/失败/跳过统一解除）
         }
     }
     return 0;
@@ -1578,11 +1594,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         ::tloader::g_log_level = IniInt(dir, L"log_level", 1);
         ::tloader::g_max_texture_side = IniInt(dir, L"max_texture_side", 0);
         ::tloader::g_gdds_enabled = IniInt(dir, L"gdds_enabled", 1);
+        ::tloader::g_async_load = IniInt(dir, L"async_load", 1);
         ParseVramThreshold(dir);
-        TL_LOG(L"[cfg ] log_level=%d vram_threshold_pct=%d vram_threshold_bytes=%llu max_texture_side=%d gdds_enabled=%d",
+        TL_LOG(L"[cfg ] log_level=%d vram_threshold_pct=%d vram_threshold_bytes=%llu max_texture_side=%d gdds_enabled=%d async_load=%d",
                ::tloader::g_log_level, ::tloader::g_vram_threshold_pct,
                (unsigned long long)::tloader::g_vram_threshold_bytes,
-               ::tloader::g_max_texture_side, ::tloader::g_gdds_enabled);
+               ::tloader::g_max_texture_side, ::tloader::g_gdds_enabled,
+               ::tloader::g_async_load);
 
         // 扫描 Mods 目录：优先用 ini 里的 mods_dir，其次 DLL 同级/上一级 Mods
         std::wstring mods_dir;
