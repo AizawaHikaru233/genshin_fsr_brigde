@@ -419,7 +419,11 @@ HRESULT LoadDdsTexture(ID3D11Device *device, const wchar_t *path, TextureLoadRes
     td.Format = format;
     td.SampleDesc.Count = 1;
     td.SampleDesc.Quality = 0;
-    td.Usage = D3D11_USAGE_DEFAULT;
+    // IMMUTABLE：静态替换纹理创建后从不 Map/UpdateSubresource，创建时一次性
+    // 上传全部子资源——驱动侧走专用静态路径（无需维护 DEFAULT 的可写状态机），
+    // 并规避 NVIDIA 驱动工作线程在 DEFAULT 纹理跨线程交接上的缺陷（RTX 4060
+    // Laptop + 驱动 566.64 在绑定替换 SRV 后驱动线程 READ 0x28 崩溃）。
+    td.Usage = D3D11_USAGE_IMMUTABLE;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     td.CPUAccessFlags = 0;
     td.MiscFlags = 0;
