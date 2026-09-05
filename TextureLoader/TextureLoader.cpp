@@ -22,6 +22,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -281,6 +282,40 @@ IDXGIAdapter3 *g_dxgi_adapter3 = nullptr;        // 查询显存的适配器
 uint64_t g_total_vram = 0;                       // 物理显存字节（DXGI_ADAPTER_DESC.DedicatedVideoMemory）
 volatile long g_vramMonitorRunning = 0;
 
+// ---------------------------------------------------------------------------
+// 闲置候选索引（显存回收的低开销数据源）
+// 监控线程不再每轮全表扫描——维护"可淘汰候选"增量索引：
+//   g_idleSet:      std::set<{last_used, hash}>，按 last_used 升序（最久未用在前）
+//   g_idleLastUsed: hash → 索引内 last_used（惰性修正定位旧键）
+// 维护点全部低频（登记/tracker 归零/淘汰/豁免到期），在 g_lock 内调用；
+// 绑定热路径更新 last_used 不碰索引（零开销），由监控巡检验证时惰性修正。
+// 以下函数必须在持有 g_lock 时调用。
+// ---------------------------------------------------------------------------
+static std::set<std::pair<uint64_t, uint32_t>> g_idleSet;
+static std::unordered_map<uint32_t, uint64_t> g_idleLastUsed;
+
+static void IdleIndexUpdate(uint32_t hash, uint64_t last_used)
+{
+    auto it = g_idleLastUsed.find(hash);
+    if (it != g_idleLastUsed.end()) {
+        g_idleSet.erase({it->second, hash});
+        g_idleLastUsed.erase(it);
+    }
+    g_idleSet.insert({last_used, hash});
+    g_idleLastUsed[hash] = last_used;
+}
+static void IdleIndexRemove(uint32_t hash)
+{
+    auto it = g_idleLastUsed.find(hash);
+    if (it != g_idleLastUsed.end()) {
+        g_idleSet.erase({it->second, hash});
+        g_idleLastUsed.erase(it);
+    }
+}
+
+// 缓存总占用（原子维护：登记 += mem，淘汰 -= mem；监控线程 O(1) 读）
+static std::atomic<uint64_t> g_cacheBytesTotal{0};
+
 // 资源私有数据 GUID（用于存储纹理 hash 与动态标记、释放跟踪器）
 static const GUID TL_HASH_GUID = {0x8a2f6d4e, 0x7c31, 0x4a9b, {0x9e, 0x1c, 0x2d, 0x5f, 0x8a, 0x0b, 0x3c, 0x71}};
 static const GUID TL_DYNAMIC_GUID = {0x9b3e7f5a, 0x8d42, 0x4bc1, {0xaf, 0x2d, 0x3e, 0x60, 0x9c, 0x1d, 0x4e, 0x82}};
@@ -321,8 +356,13 @@ public:
             {
                 std::lock_guard<std::mutex> lk(g_lock);
                 auto it = g_replacements.find(hash);
-                if (it != g_replacements.end() && it->second.refcount > 0)
-                    it->second.refcount--;
+                if (it != g_replacements.end()) {
+                    if (it->second.refcount > 0)
+                        it->second.refcount--;
+                    // refcount 归零 → 重新可淘汰：加入闲置索引（若已有则更新）
+                    if (it->second.refcount == 0 && it->second.texture)
+                        IdleIndexUpdate(hash, it->second.last_used);
+                }
                 // 活跃资源数组：本原纹理已销毁，清空其槽位供复用
                 ActiveRemove(resource);
             }
@@ -691,6 +731,8 @@ static void ExecuteLoadTask(const AsyncLoadTask &task)
             // 加载即视为活动：last_used 初始化当前时间——刚加载未绑定的缓存
             // 不会立即被常态回收（防加载-回收抖动）；长期未绑定的自然老化排最前
             it->second.last_used = GetTickCount64();
+            g_cacheBytesTotal.fetch_add(it->second.mem_bytes, std::memory_order_relaxed);
+            IdleIndexUpdate(task.hash, it->second.last_used); // 可淘汰候选入索引
             TL_LOG_IF(1, L"[HIT ] tex hash=0x%08X %lsreplaced dds=%ls",
                    task.hash, ::tloader::g_async_load ? L"(async) " : L"",
                    task.path.c_str());
@@ -1076,9 +1118,37 @@ DWORD WINAPI AsyncLoadThread(LPVOID param)
 }
 
 
-// 显存感知缓存监控线程：定期查询可用显存，紧张时按 LRU 淘汰替换缓存。
-// 淘汰优先 refcount==0（原纹理已销毁，最安全）的条目；若仍紧张，再淘汰
-// 很久未用的活跃条目（释放后绑定会退化原纹理并触发重新加载）。
+// ---------------------------------------------------------------------------
+// v2 显存回收：四分区状态机 + 压力系数驱动 + 防抖动
+//
+//   舒适区（Comfort）   avail > 总显存×25%          不主动回收（仅缓存超预算时轻度回收）
+//   温和区（Mild）      C% < avail ≤ 25%            轻度回收（闲置 10min，每轮 2~4 条）
+//   压力区（Pressure）  C%×0.5 < avail ≤ C%         中度回收（闲置 2~5min，每轮 8~16 条）
+//   危急区（Critical）  avail ≤ C%×0.5              强力回收（缺口自适应，闲置 ≥30s，每轮 ≤32）
+//
+//   C = 临界百分比，随显存容量自适应（小卡留更多余量）：
+//       C = clamp(20 − (总GB − 4)×0.35, 8, 20) %
+//       4GB→20%  8GB→18.6%  16GB→15.8%  24GB→13%
+//       用户显式 vram_threshold（百分比或容量）优先覆盖 C。
+//
+//   压力系数 P（0..1）驱动全部回收参数：
+//       P = clamp((25%总显存 − avail) / (25%总显存 − C), 0, 1)
+//       闲置阈值 T = 10min → 30s 线性；每轮 N = 2 → 32 条线性
+//       排序主序：P<0.5 LRU 优先（最久未用）；P≥0.5 大纹理优先（快速释放）
+//
+//   防抖动：
+//       - 热缓存豁免：淘汰后 30s 内被重新加载 → 豁免回收 5 分钟
+//       - 缓存总量预算：替换缓存 > 总显存×20% 时舒适区也回收（闲置最久优先）
+//       - 绝不淘汰使用中（refcount>0）
+// ---------------------------------------------------------------------------
+
+// 淘汰/热豁免记录（g_lock 保护）：hash -> 时间戳
+struct EvictRecord {
+    uint64_t evict_time = 0;  // 最近淘汰时刻（GetTickCount64）
+    uint64_t hot_until = 0;   // 热缓存豁免截止（0=未豁免）
+};
+static std::unordered_map<uint32_t, EvictRecord> g_evictRecords;
+
 DWORD WINAPI VramMonitorThread(LPVOID)
 {
     // 从 device 获取 DXGI adapter3 用于查询显存
@@ -1095,195 +1165,258 @@ DWORD WINAPI VramMonitorThread(LPVOID)
         dxgi_dev->Release();
     }
 
+    // 缓存总量预算（总显存 20%）
+    const uint64_t kCacheBudgetPct = 20;
+
+    enum class Zone { Comfort, Mild, Pressure, Critical };
+    Zone zone = Zone::Comfort;
+    Zone last_zone = Zone::Comfort;
+    uint64_t last_record_cleanup = 0;
+
     while (g_dxgi_adapter3) {
-        Sleep(2000);
+        // 状态化动态探针频率：按当前 zone 定频（压力越小探针越稀疏，低开销）
+        DWORD sleep_ms = 5000;
+        switch (last_zone) {
+            case Zone::Comfort:  sleep_ms = 5000; break;
+            case Zone::Mild:     sleep_ms = 3000; break;
+            case Zone::Pressure: sleep_ms = 1500; break;
+            case Zone::Critical: sleep_ms = 800;  break;
+        }
+        Sleep(sleep_ms);
+
         DXGI_QUERY_VIDEO_MEMORY_INFO info;
         if (FAILED(g_dxgi_adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
             continue;
-        // 压力判定（显存容量驱动）：
-        //   - g_vram_threshold_bytes>0 → 可用显存 < 指定容量（如 1024M/2G）
-        //   - 否则                       → 可用显存 < 物理显存百分比（默认 15%）
-        // 基准用物理显存 g_total_vram（DXGI Budget 是驱动动态配额，压力下会被
-        // 压低导致阈值失真——曾出现显存停在 95% 淘汰追不上的现象）。
-        // 未达阈值不淘汰，尽量保证游戏流畅；仅在压力持续时温和淘汰。
-        uint64_t budget = info.Budget;
+
+        uint64_t total = g_total_vram ? g_total_vram : info.Budget; // 物理显存基准
         uint64_t avail = info.Budget > info.CurrentUsage ? info.Budget - info.CurrentUsage : 0;
-        uint64_t target_avail = 0; // 期望可用显存下限
+
+        // 临界可用显存 C（用户显式设置优先，否则规格自适应）
+        uint64_t critical_avail = 0;
         if (::tloader::g_vram_threshold_bytes > 0) {
-            target_avail = ::tloader::g_vram_threshold_bytes;
+            critical_avail = ::tloader::g_vram_threshold_bytes;
         } else {
             int pct = ::tloader::g_vram_threshold_pct;
-            if (pct <= 0)
-                pct = 15;
-            uint64_t base = g_total_vram ? g_total_vram : budget; // 优先物理显存
-            target_avail = base * (uint64_t)pct / 100;
-        }
-        bool pressure = avail < target_avail;
-
-        // 显存稳定性检测：维护最近 8 次采样（16 秒）的可用显存滑动窗口，
-        // 波动率 = (max - min) / max。波动 <=15% 视为"趋于稳定"——此时
-        // 常态回收降级为不积极清理（保护缓存命中率，避免刚淘汰又重载）；
-        // 波动大（场景切换/加载中）才积极回收。
-        static uint64_t s_availHist[8] = {};
-        static int s_histIdx = 0;
-        static int s_histCount = 0;
-        s_availHist[s_histIdx] = avail;
-        s_histIdx = (s_histIdx + 1) % 8;
-        if (s_histCount < 8)
-            s_histCount++;
-        bool vram_stable = false;
-        if (s_histCount >= 8) {
-            uint64_t mn = s_availHist[0], mx = s_availHist[0];
-            for (int i = 1; i < 8; i++) {
-                if (s_availHist[i] < mn) mn = s_availHist[i];
-                if (s_availHist[i] > mx) mx = s_availHist[i];
+            if (pct <= 0) {
+                // 自适应：C = clamp(20 - (GB-4)*0.35, 8, 20)
+                double gb = (double)total / (1024.0 * 1024.0 * 1024.0);
+                double c = 20.0 - (gb - 4.0) * 0.35;
+                if (c < 8.0) c = 8.0;
+                if (c > 20.0) c = 20.0;
+                pct = (int)(c + 0.5);
             }
-            // 波动 <=15%（mx 为 0 时视为稳定，避免除零）
-            vram_stable = (mx == 0) || ((mx - mn) * 100 / mx <= 15);
+            critical_avail = total * (uint64_t)pct / 100;
+        }
+        uint64_t mild_top = total * 25 / 100;      // 温和区上界（25%）
+        uint64_t pressure_bottom = critical_avail / 2; // 压力区下界（危急区起点）
+
+        // 压力系数 P（0..1）
+        uint64_t span = mild_top > critical_avail ? mild_top - critical_avail : 1;
+        uint64_t below = avail > critical_avail ? mild_top - avail : span;
+        uint64_t progress = span ? below * 100 / span : 100;
+        if (progress > 100)
+            progress = 100;
+        double P = (double)progress / 100.0;
+
+        // 分区；zone 变化立即生效（下轮按新频率探针）
+        if (avail <= pressure_bottom)
+            zone = Zone::Critical;
+        else if (avail <= critical_avail)
+            zone = Zone::Pressure;
+        else if (avail <= mild_top)
+            zone = Zone::Mild;
+        else
+            zone = Zone::Comfort;
+        if (zone != last_zone) {
+            last_zone = zone;
+            continue; // 分区刚变化：立即再探（高频响应压力突变）
         }
 
-        // 常态持续回收：不设触发门槛——每次巡检都按"上次使用时间"排序回收
-        // 闲置缓存（refcount==0，绝不碰正在使用的）。空闲阈值随剩余显存收紧：
-        //   剩余充足（≥2×阈值）→ 60 秒未用即淘汰（宽松、低打扰）
-        //   剩余逼近阈值（15%） → 15 秒未用即淘汰（积极）
-        // 强度同步增加（每轮 4 → 16 条）。显存稳定（波动<=15%）时不积极清理：
-        // 闲置阈值拉高到 5 分钟、每轮上限 2 条。15% 为紧急兜底（pressure 分支）。
-        if (!pressure && target_avail > 0) {
-            uint64_t pre_start = target_avail * 2;
-            // 压力进度 0..1（0=剩余充足，1=逼近阈值）
-            uint64_t span = pre_start - target_avail;
-            uint64_t below = avail > target_avail ? pre_start - avail : span;
-            uint64_t progress = span ? below * 100 / span : 100;
-            if (progress > 100)
-                progress = 100;
-            // 空闲阈值：60s → 15s 线性（压力越大回收越积极）；
-            // 显存稳定时拉高到 5 分钟（不积极清理）
-            const uint64_t kIdleMaxMs = 60ull * 1000; // 剩余充足：60 秒
-            const uint64_t kIdleMinMs = 15ull * 1000; // 逼近阈值：15 秒
-            const uint64_t kIdleStableMs = 5ull * 60 * 1000; // 稳定：5 分钟
-            uint64_t idle_ms = vram_stable
-                ? kIdleStableMs
-                : kIdleMaxMs - (kIdleMaxMs - kIdleMinMs) * progress / 100;
-            // 淘汰强度：进度 0→1 时每轮 4 → 16 条；稳定时降至 2 条
-            int evict_limit = vram_stable
-                ? 2
-                : 4 + (int)(12 * progress / 100);
-            uint64_t now = GetTickCount64();
+        uint64_t now = GetTickCount64();
 
-            struct EvictCand { uint64_t mem; uint64_t last_used; uint32_t hash; };
-            std::vector<EvictCand> candidates;
-            {
-                std::lock_guard<std::mutex> lk(g_lock);
-                for (auto &kv : g_replacements) {
-                    if (kv.second.refcount == 0 && kv.second.texture &&
-                        kv.second.last_used != 0 &&
-                        now > kv.second.last_used + idle_ms)
-                        candidates.push_back({kv.second.mem_bytes, kv.second.last_used, kv.first});
+        // 清理过期淘汰记录（节流：每 10 分钟一次，避免每轮全扫）
+        if (now > last_record_cleanup + 10ull * 60 * 1000) {
+            last_record_cleanup = now;
+            std::lock_guard<std::mutex> lk(g_lock);
+            for (auto it = g_evictRecords.begin(); it != g_evictRecords.end();) {
+                if (now > it->second.evict_time + 10ull * 60 * 1000 &&
+                    (it->second.hot_until == 0 || now > it->second.hot_until)) {
+                    // 豁免到期且条目仍可淘汰：重新加入闲置索引
+                    auto rit = g_replacements.find(it->first);
+                    if (rit != g_replacements.end() && rit->second.refcount == 0 &&
+                        rit->second.texture)
+                        IdleIndexUpdate(it->first, rit->second.last_used);
+                    it = g_evictRecords.erase(it);
+                } else {
+                    ++it;
                 }
-                // 最久未用优先（LRU 主序），同代龄大纹理优先
-                std::sort(candidates.begin(), candidates.end(),
-                          [](const EvictCand &a, const EvictCand &b) {
-                              if (a.last_used != b.last_used)
-                                  return a.last_used < b.last_used;
-                              return a.mem > b.mem;
-                          });
             }
-            int evicted = 0;
-            uint64_t freed_bytes = 0;
-            for (auto &c : candidates) {
-                if (evicted >= evict_limit)
+        }
+
+        // 回收参数（按 P 线性驱动；危急区走缺口自适应单独处理）
+        uint64_t idle_ms = 0;
+        int evict_limit = 0;
+        bool size_primary = false; // true = 大纹理优先排序
+        switch (zone) {
+            case Zone::Comfort:
+                idle_ms = 10ull * 60 * 1000; // 10 分钟（缓存超预算时才用）
+                evict_limit = 2;
+                size_primary = false;
+                break;
+            case Zone::Mild:
+                idle_ms = 10ull * 60 * 1000 - (uint64_t)(P * (10ull * 60 * 1000 - 2ull * 60 * 1000));
+                evict_limit = 2 + (int)(P * 6);
+                size_primary = false;
+                break;
+            case Zone::Pressure:
+                idle_ms = 2ull * 60 * 1000 - (uint64_t)(P * (2ull * 60 * 1000 - 30ull * 1000));
+                evict_limit = 8 + (int)(P * 8);
+                size_primary = (P >= 0.5);
+                break;
+            case Zone::Critical:
+                idle_ms = 30ull * 1000; // 30 秒兜底
+                evict_limit = 32;
+                size_primary = true;
+                break;
+        }
+
+        // 缓存总量（O(1) 原子读）
+        uint64_t cache_bytes = g_cacheBytesTotal.load(std::memory_order_relaxed);
+        uint64_t cache_budget = total * kCacheBudgetPct / 100;
+
+        // 从闲置索引取候选（最多取 64 个验证，淘汰上限由 evict_limit 控制）
+        // 惰性修正：索引键过期（被重新绑定）→ 重插到新位置；不可淘汰 → 移除。
+        struct EvictCand { uint64_t mem; uint64_t last_used; uint32_t hash; };
+        std::vector<EvictCand> candidates;
+        {
+            std::lock_guard<std::mutex> lk(g_lock);
+            int scanned = 0;
+            for (auto it = g_idleSet.begin();
+                 it != g_idleSet.end() && scanned < 64;
+                 ++it, ++scanned) {
+                uint32_t hash = it->second;
+                auto rit = g_replacements.find(hash);
+                if (rit == g_replacements.end() || !rit->second.texture) {
+                    IdleIndexRemove(hash); // 条目已释放
+                    continue;
+                }
+                // 惰性修正：索引键 != 实际 last_used → 被重新绑定过，重插
+                if (it->first != rit->second.last_used) {
+                    IdleIndexUpdate(hash, rit->second.last_used);
+                    continue;
+                }
+                if (rit->second.refcount != 0) {
+                    IdleIndexRemove(hash); // 使用中：移出候选（tracker 归零时加回）
+                    continue;
+                }
+                // 热缓存豁免
+                auto er = g_evictRecords.find(hash);
+                if (er != g_evictRecords.end() && er->second.hot_until != 0 &&
+                    now < er->second.hot_until) {
+                    IdleIndexRemove(hash);
+                    continue;
+                }
+                // 闲置时长未达标：索引按 last_used 升序，后面的更不可能达标 → 停止
+                if (rit->second.last_used != 0 &&
+                    now <= rit->second.last_used + idle_ms)
                     break;
-                ID3D11Texture2D *tex = nullptr;
-                ID3D11ShaderResourceView *srv = nullptr;
-                {
-                    std::lock_guard<std::mutex> lk(g_lock);
-                    auto it = g_replacements.find(c.hash);
-                    if (it == g_replacements.end() || it->second.refcount != 0 || !it->second.texture)
-                        continue;
-                    tex = it->second.texture;
-                    srv = it->second.srv;
-                    it->second.texture = nullptr;
-                    it->second.srv = nullptr;
-                    RepSrvRemove(srv);
-                    freed_bytes += it->second.mem_bytes;
-                    it->second.mem_bytes = 0;
-                }
-                if (tex) QueueRelease(tex);
-                if (srv) QueueRelease(srv);
-                evicted++;
+                candidates.push_back({rit->second.mem_bytes, rit->second.last_used, hash});
             }
-            if (evicted > 0)
-                TL_LOG(L"[vram] recycle: avail=%lluMB (target=%lluMB)%s idle>%llus, evicted %d (freed ~%lluMB)",
-                       (unsigned long long)(avail >> 20), (unsigned long long)(target_avail >> 20),
-                       vram_stable ? L" [stable]" : L"",
-                       (unsigned long long)(idle_ms / 1000),
-                       evicted, (unsigned long long)(freed_bytes >> 20));
-            else
-                TL_LOG_IF(2, L"[vram] recycle: avail=%lluMB%s idle>%llus, nothing evictable",
-                       (unsigned long long)(avail >> 20), vram_stable ? L" [stable]" : L"",
-                       (unsigned long long)(idle_ms / 1000));
-        }
-
-        if (pressure) {
-            // 淘汰替换缓存，释放显存（按大小优先：大纹理先释放，回收更多显存）
-            uint64_t gap = target_avail - avail; // 需回收的缺口（回到阈值）
-            TL_LOG(L"[vram] pressure: budget=%lluMB usage=%lluMB avail=%lluMB (target=%lluMB, gap=%lluMB), evicting...",
-                   (unsigned long long)(budget >> 20), (unsigned long long)(info.CurrentUsage >> 20),
-                   (unsigned long long)(avail >> 20), (unsigned long long)(target_avail >> 20),
-                   (unsigned long long)(gap >> 20));
-            // 收集候选：仅 refcount==0（原纹理已销毁，最安全），
-            // 排序：mem_bytes 降序（大纹理优先）→ last_used 升序（LRU 次之）
-            struct EvictCand { uint64_t mem; uint64_t last_used; uint32_t hash; };
-            std::vector<EvictCand> candidates;
-            uint64_t cache_bytes = 0; // 替换缓存总占用（诊断）
-            {
-                std::lock_guard<std::mutex> lk(g_lock);
-                for (auto &kv : g_replacements) {
-                    cache_bytes += kv.second.mem_bytes;
-                    if (kv.second.refcount == 0 && kv.second.texture)
-                        candidates.push_back({kv.second.mem_bytes, kv.second.last_used, kv.first});
-                }
-                std::sort(candidates.begin(), candidates.end(),
-                          [](const EvictCand &a, const EvictCand &b) {
+            // 排序：P<0.5 LRU 优先；P>=0.5 大纹理优先
+            std::sort(candidates.begin(), candidates.end(),
+                      [size_primary](const EvictCand &a, const EvictCand &b) {
+                          if (size_primary) {
                               if (a.mem != b.mem)
-                                  return a.mem > b.mem; // 大纹理优先
-                              return a.last_used < b.last_used; // LRU
-                          });
+                                  return a.mem > b.mem;
+                              return a.last_used < b.last_used;
+                          }
+                          if (a.last_used != b.last_used)
+                              return a.last_used < b.last_used;
+                          return a.mem > b.mem;
+                      });
+        }
+
+        // 执行回收
+        int evicted = 0;
+        uint64_t freed_bytes = 0;
+        uint64_t gap = 0;
+
+        if (zone == Zone::Comfort) {
+            // 舒适区：仅缓存超预算时轻度回收（闲置最久优先）
+            if (cache_bytes <= cache_budget || candidates.empty()) {
+                TL_LOG_IF(2, L"[vram] zone=comfort cache=%llu/%lluMB evict=0",
+                       (unsigned long long)(cache_bytes >> 20),
+                       (unsigned long long)(cache_budget >> 20));
+                continue;
             }
-            TL_LOG(L"[vram] replacement cache total ~%lluMB, evictable candidates %d",
-                   (unsigned long long)(cache_bytes >> 20), (int)candidates.size());
-            // 逐条淘汰：按缺口自适应（回收 >= gap 即停），单轮上限 16 防卡顿
-            int evicted = 0;
-            uint64_t freed_bytes = 0;
-            for (auto &c : candidates) {
-                if (freed_bytes >= gap || evicted >= 16)
-                    break;
-                ID3D11Texture2D *tex = nullptr;
-                ID3D11ShaderResourceView *srv = nullptr;
-                {
-                    std::lock_guard<std::mutex> lk(g_lock);
-                    auto it = g_replacements.find(c.hash);
-                    if (it == g_replacements.end() || it->second.refcount != 0 || !it->second.texture)
-                        continue;
-                    tex = it->second.texture;
-                    srv = it->second.srv;
-                    it->second.texture = nullptr;
-                    it->second.srv = nullptr;
-                    RepSrvRemove(srv); // 淘汰释放替换视图：从快速判定数组移除
-                    // 保留条目（refcount=0），供命中时重新加载（find 判定）
-                    freed_bytes += it->second.mem_bytes;
-                    it->second.mem_bytes = 0;
-                }
-                if (tex) QueueRelease(tex);
-                if (srv) QueueRelease(srv);
-                evicted++;
+            TL_LOG(L"[vram] zone=comfort cache=%llu/%lluMB over budget, recycling idle",
+                   (unsigned long long)(cache_bytes >> 20),
+                   (unsigned long long)(cache_budget >> 20));
+        } else if (zone == Zone::Critical) {
+            // 危急区：缺口自适应（回收 >= gap 即停）
+            gap = critical_avail > avail ? critical_avail - avail : 0;
+            TL_LOG(L"[vram] zone=critical avail=%lluMB gap=%lluMB P=%u%% cache=%llu/%lluMB",
+                   (unsigned long long)(avail >> 20), (unsigned long long)(gap >> 20),
+                   (unsigned)progress, (unsigned long long)(cache_bytes >> 20),
+                   (unsigned long long)(cache_budget >> 20));
+        } else {
+            // 温和/压力区：按 P 驱动参数回收
+            TL_LOG(L"[vram] zone=%s avail=%lluMB P=%u%% idle>%llus N=%d cache=%llu/%lluMB",
+                   zone == Zone::Mild ? L"mild" : L"pressure",
+                   (unsigned long long)(avail >> 20), (unsigned)progress,
+                   (unsigned long long)(idle_ms / 1000), evict_limit,
+                   (unsigned long long)(cache_bytes >> 20),
+                   (unsigned long long)(cache_budget >> 20));
+        }
+
+        for (auto &c : candidates) {
+            if (evicted >= evict_limit)
+                break;
+            if (zone == Zone::Critical && freed_bytes >= gap)
+                break;
+            ID3D11Texture2D *tex = nullptr;
+            ID3D11ShaderResourceView *srv = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(g_lock);
+                auto it = g_replacements.find(c.hash);
+                if (it == g_replacements.end() || it->second.refcount != 0 || !it->second.texture)
+                    continue;
+                // 双重确认热豁免（锁内再查一次）
+                auto er = g_evictRecords.find(c.hash);
+                if (er != g_evictRecords.end() && er->second.hot_until != 0 &&
+                    now < er->second.hot_until)
+                    continue;
+                // 二次校验：候选收集后刚被重新绑定（last_used 已更新）→ 跳过
+                if (it->second.last_used != c.last_used)
+                    continue;
+                tex = it->second.texture;
+                srv = it->second.srv;
+                it->second.texture = nullptr;
+                it->second.srv = nullptr;
+                RepSrvRemove(srv);
+                const uint64_t this_mem = it->second.mem_bytes; // 本条占用
+                freed_bytes += this_mem;
+                it->second.mem_bytes = 0;
+                IdleIndexRemove(c.hash); // 已淘汰：移出候选索引
+                g_cacheBytesTotal.fetch_sub(this_mem, std::memory_order_relaxed);
+                // 记录淘汰时刻（热豁免判定依据）
+                g_evictRecords[c.hash].evict_time = now;
             }
-            if (evicted > 0)
-                TL_LOG(L"[vram] evicted %d replacement caches (freed ~%lluMB of gap %lluMB)",
+            if (tex) QueueRelease(tex);
+            if (srv) QueueRelease(srv);
+            evicted++;
+        }
+
+        if (evicted > 0) {
+            if (zone == Zone::Critical)
+                TL_LOG(L"[vram] evicted %d (freed ~%lluMB of gap %lluMB)",
                        evicted, (unsigned long long)(freed_bytes >> 20),
                        (unsigned long long)(gap >> 20));
             else
-                TL_LOG(L"[vram] no evictable cache (all in use)");
+                TL_LOG(L"[vram] evicted %d (freed ~%lluMB)",
+                       evicted, (unsigned long long)(freed_bytes >> 20));
+        } else if (zone != Zone::Comfort) {
+            TL_LOG(L"[vram] no evictable cache (all in use)");
         }
     }
     return 0;
@@ -1364,10 +1497,11 @@ static int IniInt(const std::wstring &dir, const std::wstring &key, int def)
 }
 
 // 解析 vram_threshold：支持百分比（"15%"）或具体容量（"1024M"/"2G"，M/G 大小写均可，
-// 无后缀数字按 MB 处理）；空值/非法（<=0、非数字）回退默认 15%。结果写入共享配置。
+// 无后缀数字按 MB 处理）。空值/非法 → 自适应模式（pct=0：按显存容量动态推导临界值）。
+// 显式设置时覆盖自适应值（用户自定义优先级最高）。结果写入共享配置。
 static void ParseVramThreshold(const std::wstring &dir)
 {
-    ::tloader::g_vram_threshold_pct = 15;        // 默认：可用显存 < 总显存 15%
+    ::tloader::g_vram_threshold_pct = 0;         // 0 = 自适应（按显存容量推导）
     ::tloader::g_vram_threshold_bytes = 0;       // 0 = 百分比模式
 
     std::wstring v = GetIniValue(dir, L"vram_threshold");
@@ -1404,7 +1538,7 @@ static void ParseVramThreshold(const std::wstring &dir)
     wchar_t *end = nullptr;
     double val = wcstod(v.c_str(), &end);
     if (end == v.c_str() || val <= 0)
-        return; // 非法 → 默认
+        return; // 非法 → 自适应
 
     if (is_pct) {
         if (val > 100.0)
@@ -1759,6 +1893,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
                     kv.second.texture->Release();
             }
             g_replacements.clear();
+            g_idleSet.clear();
+            g_idleLastUsed.clear();
+            g_evictRecords.clear();
+            g_cacheBytesTotal.store(0, std::memory_order_relaxed);
         }
         ::tloader::log_shutdown();
     }
