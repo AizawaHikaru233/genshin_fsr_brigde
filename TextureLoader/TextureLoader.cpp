@@ -1117,6 +1117,81 @@ DWORD WINAPI VramMonitorThread(LPVOID)
         }
         bool pressure = avail < target_avail;
 
+        // 预淘汰（proactive）：剩余显存 < 阈值容量 × 2（默认 15%×2=30%）且未到
+        // 紧急阈值时，开始淘汰长时间未使用的缓存。空闲时长阈值随压力线性收紧：
+        //   剩余 = 2×阈值（30%）→ 10 分钟未用即淘汰
+        //   剩余 → 阈值（15%）  → 5 分钟未用即淘汰（强度随进度增加）
+        // 仍只淘汰 refcount==0（未在使用中），绝不碰正在渲染的纹理。
+        if (!pressure && target_avail > 0 && avail < target_avail * 2) {
+            uint64_t pre_start = target_avail * 2;
+            // 压力进度 0..1（0=刚过 2×阈值，1=逼近阈值）
+            uint64_t span = pre_start - target_avail;
+            uint64_t below = avail > target_avail ? pre_start - avail : span;
+            uint64_t progress = span ? below * 100 / span : 100;
+            if (progress > 100)
+                progress = 100;
+            // 空闲阈值：10min → 5min 线性
+            const uint64_t kIdleMaxMs = 10ull * 60 * 1000; // 最宽松：10 分钟
+            const uint64_t kIdleMinMs = 5ull * 60 * 1000;  // 最紧：5 分钟
+            uint64_t idle_ms = kIdleMaxMs -
+                (kIdleMaxMs - kIdleMinMs) * progress / 100;
+            // 淘汰强度：进度 0→1 时每轮 4 → 16 条
+            int evict_limit = 4 + (int)(12 * progress / 100);
+            uint64_t now = GetTickCount64();
+
+            struct EvictCand { uint64_t mem; uint64_t last_used; uint32_t hash; };
+            std::vector<EvictCand> candidates;
+            {
+                std::lock_guard<std::mutex> lk(g_lock);
+                for (auto &kv : g_replacements) {
+                    if (kv.second.refcount == 0 && kv.second.texture &&
+                        kv.second.last_used != 0 &&
+                        now > kv.second.last_used + idle_ms)
+                        candidates.push_back({kv.second.mem_bytes, kv.second.last_used, kv.first});
+                }
+                // 最久未用优先（LRU 主序），同代龄大纹理优先
+                std::sort(candidates.begin(), candidates.end(),
+                          [](const EvictCand &a, const EvictCand &b) {
+                              if (a.last_used != b.last_used)
+                                  return a.last_used < b.last_used;
+                              return a.mem > b.mem;
+                          });
+            }
+            int evicted = 0;
+            uint64_t freed_bytes = 0;
+            for (auto &c : candidates) {
+                if (evicted >= evict_limit)
+                    break;
+                ID3D11Texture2D *tex = nullptr;
+                ID3D11ShaderResourceView *srv = nullptr;
+                {
+                    std::lock_guard<std::mutex> lk(g_lock);
+                    auto it = g_replacements.find(c.hash);
+                    if (it == g_replacements.end() || it->second.refcount != 0 || !it->second.texture)
+                        continue;
+                    tex = it->second.texture;
+                    srv = it->second.srv;
+                    it->second.texture = nullptr;
+                    it->second.srv = nullptr;
+                    RepSrvRemove(srv);
+                    freed_bytes += it->second.mem_bytes;
+                    it->second.mem_bytes = 0;
+                }
+                if (tex) QueueRelease(tex);
+                if (srv) QueueRelease(srv);
+                evicted++;
+            }
+            if (evicted > 0)
+                TL_LOG(L"[vram] pre-evict: avail=%lluMB (<%lluMB=2x threshold), progress=%llu%%, idle>%llumin, evicted %d (freed ~%lluMB)",
+                       (unsigned long long)(avail >> 20), (unsigned long long)(pre_start >> 20),
+                       (unsigned long long)progress, (unsigned long long)(idle_ms / 60000),
+                       evicted, (unsigned long long)(freed_bytes >> 20));
+            else
+                TL_LOG_IF(2, L"[vram] pre-evict: avail=%lluMB progress=%llu%% idle>%llumin, nothing evictable",
+                       (unsigned long long)(avail >> 20), (unsigned long long)progress,
+                       (unsigned long long)(idle_ms / 60000));
+        }
+
         if (pressure) {
             // 淘汰替换缓存，释放显存（按大小优先：大纹理先释放，回收更多显存）
             uint64_t gap = target_avail - avail; // 需回收的缺口（回到阈值）
