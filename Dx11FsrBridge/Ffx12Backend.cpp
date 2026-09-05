@@ -61,6 +61,19 @@ bool g_dx11on12_available = false;
 bool g_gpu_only_transport_available = false;
 bool g_uses_on12_queue = false;
 
+// 异步交叠（async upscale）：
+//   true（默认）= dispatch 只提交 FFX（不等待），Present 前 finish_pending
+//                  等待并拷贝输出——FFX 与游戏后续 GPU 工作并行（跨帧交叠）
+//   false        = dispatch 内提交+等待+拷贝（旧同步行为，可回退）
+bool g_async_upscale = true;
+// 挂起的异步 FFX：有未 finish 的提交时记录待等 fence 值、输出目标与游戏 context。
+// 仅 g_async_upscale 时使用；由 dispatch（提交）与 finish_pending（完成）串行访问，
+// 受 g_mutex 保护（见 dispatch 入口）。
+bool g_pending_ffx = false;
+UINT64 g_pending_v2 = 0;
+ComPtr<ID3D11Texture2D> g_pending_output_target;
+ComPtr<ID3D11DeviceContext> g_pending_context; // 提交时的游戏 immediate context（AddRef）
+
 // The CPU bridge owns one command list and therefore must wait before each
 // reuse.  The On12 path returns resources to the translation layer with a
 // fence, so it uses a small ring instead: CPU never waits unless it laps the
@@ -1910,12 +1923,24 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     slot.fence_value = ring_signal;
     g_shared_fence_value = v2;
 
-    // ---- ③ D3D11 侧：等待输出完成 → GPU 拷贝回游戏输出 ----
-    if (FAILED(g_game_ctx4->Wait(g_shared_fence11.Get(), v2)))
-        return false;
-    if (input.output_target)
-        game_context->CopyResource(input.output_target, g_tex_output.d11.Get());
-    game_context->Flush();
+    // ---- ③ 输出交接：同步模式立即等待+拷贝；异步模式记 pending，Present 前 finish ----
+    if (!g_async_upscale)
+    {
+        if (FAILED(g_game_ctx4->Wait(g_shared_fence11.Get(), v2)))
+            return false;
+        if (input.output_target)
+            game_context->CopyResource(input.output_target, g_tex_output.d11.Get());
+        game_context->Flush();
+    }
+    else
+    {
+        // 异步：记录挂起（fence 值 + 输出目标 + context），返回——游戏继续渲染，
+        // FFX 与后续 GPU 工作并行；Present 前 finish_pending 完成交接。
+        g_pending_ffx = true;
+        g_pending_v2 = v2;
+        g_pending_output_target = input.output_target; // AddRef（ComPtr 赋值）
+        g_pending_context = game_context;              // AddRef（Present 前使用）
+    }
 
     if (rc == FFX_API_RETURN_OK)
     {
@@ -1926,6 +1951,39 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
                      static_cast<unsigned long long>(count));
     }
     return rc == FFX_API_RETURN_OK;
+}
+
+// 完成挂起的异步 FFX：等待共享 fence（FFX 输出完成）→ CopyResource 到游戏输出。
+// 由 finish_pending（Present 前）或 dispatch 入口调用；调用方持有 g_mutex。
+static bool finish_gpu_shared()
+{
+    if (!g_pending_ffx)
+        return true;
+    ID3D11DeviceContext *game_context = g_pending_context.Get();
+    if (!g_game_ctx4 || !g_shared_fence11 || !game_context)
+    {
+        g_pending_ffx = false;
+        g_pending_output_target.Reset();
+        g_pending_context.Reset();
+        return false;
+    }
+    // 等待 FFX 输出完成（fence 通常已 Signal——GPU 上 FFX 与游戏后续工作并行，
+    // 此处仅当游戏提前到达 Present 才短暂阻塞）
+    if (FAILED(g_game_ctx4->Wait(g_shared_fence11.Get(), g_pending_v2)))
+    {
+        g_pending_ffx = false;
+        g_pending_output_target.Reset();
+        g_pending_context.Reset();
+        return false;
+    }
+    ID3D11Texture2D *output = g_pending_output_target.Get();
+    if (output)
+        game_context->CopyResource(output, g_tex_output.d11.Get());
+    game_context->Flush();
+    g_pending_ffx = false;
+    g_pending_output_target.Reset();
+    g_pending_context.Reset();
+    return true;
 }
 
 } // namespace
@@ -2527,7 +2585,39 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
         sdk_note(L"gpu interop unavailable stage=dispatch");
         return false;
     }
+    // 异步模式：先完成上一帧挂起（防异常路径堆积——若 Present 未被调用，
+    // 下一帧 dispatch 前强制交接；正常路径无挂起，立即返回）
+    if (g_async_upscale && g_pending_ffx)
+    {
+        if (!finish_gpu_shared())
+            return false;
+    }
     return dispatch_gpu_shared(input, game_context, *sc, reset);
+}
+
+void set_async_upscale(bool enable)
+{
+    std::lock_guard lock(g_mutex);
+    // 切换时若从异步切回同步且存在挂起，立即完成（避免 pending 泄漏）
+    if (!enable && g_pending_ffx)
+    {
+        g_pending_ffx = false;
+        g_pending_output_target.Reset();
+        g_pending_context.Reset();
+    }
+    g_async_upscale = enable;
+}
+
+bool async_upscale_enabled()
+{
+    std::lock_guard lock(g_mutex);
+    return g_async_upscale;
+}
+
+bool finish_pending()
+{
+    std::lock_guard lock(g_mutex);
+    return finish_gpu_shared();
 }
 
 

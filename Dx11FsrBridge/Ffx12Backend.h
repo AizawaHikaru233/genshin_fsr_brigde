@@ -143,6 +143,17 @@ void get_chain_samples(ChainSampleData &out);
 // 线程安全（内部互斥）。返回 false 表示本帧失败（调用方回退）。
 bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::uint64_t instance_key = 0);
 
+// 异步交叠（async upscale）：dispatch 只提交 FFX（不等待），游戏继续渲染；
+// Present 前调用 finish_pending 等待 FFX 完成并拷贝输出——FFX 与游戏后续
+// GPU 工作并行，消除渲染线程每帧硬停（GPU 负载不满来源）。
+//  - set_async_upscale(true)：dispatch 提交后立即返回（默认开启）
+//  - set_async_upscale(false)：dispatch 内提交+等待+拷贝（旧同步行为，可回退）
+void set_async_upscale(bool enable);
+bool async_upscale_enabled();
+// 完成挂起的异步 FFX（等 fence + 拷贝输出到 output_target）。无挂起时立即返回 true。
+// 由桥在 Present 前调用；dispatch 入口也会先 finish 上一帧（防异常路径堆积）。
+bool finish_pending();
+
 // 查询当前选择的后端版本名（"2.3.4"/"4.1.1"/...）——诊断用。
 const char *selected_version_name();
 // 实际匹配到的 provider 版本名（"4.1.1"/"4.0.2c"/"3.1.5" 等，含降级结果）。

@@ -3909,6 +3909,11 @@ void load_config()
     g_config.ffx12_gpu_interop =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12GpuInterop", 1, config_path.c_str()) != 0;
     ffx12::set_gpu_interop(g_config.ffx12_gpu_interop);
+    // 异步交叠（async upscale）：默认开启——dispatch 只提交 FFX，Present 前
+    // 完成交接，FFX 与游戏后续渲染并行（消除每帧硬停 → GPU 满载）。
+    // 设 0 回退旧同步行为（dispatch 内等待+拷贝）。
+    ffx12::set_async_upscale(
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12AsyncUpscale", 1, config_path.c_str()) != 0);
     ffx12::set_hdr_input(g_config.ffx12_hdr_input);
     ffx12::set_auto_exposure(g_config.ffx12_auto_exposure);
     ffx12::set_non_linear(g_config.ffx12_non_linear);
@@ -6638,6 +6643,11 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
     }
 #endif
     tone_map_hdr_backbuffer_to_sdr(swapchain, frame_index);
+    // 异步交叠（async upscale）：Present 前完成挂起的 FFX——等待输出就绪并
+    // 拷贝回游戏目标。FFX 与游戏本帧后续渲染已在 GPU 上并行（消除每帧硬停）。
+    // 无挂起时零开销（单锁内布尔检查）。
+    if (ffx12::async_upscale_enabled())
+        ffx12::finish_pending();
     present_fn original_present = g_original_present;
     {
         std::lock_guard lock(g_swapchain_present_mutex);
