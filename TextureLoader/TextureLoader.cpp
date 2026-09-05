@@ -1120,11 +1120,34 @@ DWORD WINAPI VramMonitorThread(LPVOID)
         }
         bool pressure = avail < target_avail;
 
+        // 显存稳定性检测：维护最近 8 次采样（16 秒）的可用显存滑动窗口，
+        // 波动率 = (max - min) / max。波动 <=15% 视为"趋于稳定"——此时
+        // 常态回收降级为不积极清理（保护缓存命中率，避免刚淘汰又重载）；
+        // 波动大（场景切换/加载中）才积极回收。
+        static uint64_t s_availHist[8] = {};
+        static int s_histIdx = 0;
+        static int s_histCount = 0;
+        s_availHist[s_histIdx] = avail;
+        s_histIdx = (s_histIdx + 1) % 8;
+        if (s_histCount < 8)
+            s_histCount++;
+        bool vram_stable = false;
+        if (s_histCount >= 8) {
+            uint64_t mn = s_availHist[0], mx = s_availHist[0];
+            for (int i = 1; i < 8; i++) {
+                if (s_availHist[i] < mn) mn = s_availHist[i];
+                if (s_availHist[i] > mx) mx = s_availHist[i];
+            }
+            // 波动 <=15%（mx 为 0 时视为稳定，避免除零）
+            vram_stable = (mx == 0) || ((mx - mn) * 100 / mx <= 15);
+        }
+
         // 常态持续回收：不设触发门槛——每次巡检都按"上次使用时间"排序回收
         // 闲置缓存（refcount==0，绝不碰正在使用的）。空闲阈值随剩余显存收紧：
         //   剩余充足（≥2×阈值）→ 60 秒未用即淘汰（宽松、低打扰）
         //   剩余逼近阈值（15%） → 15 秒未用即淘汰（积极）
-        // 强度同步增加（每轮 4 → 16 条）。15% 为紧急兜底（下方 pressure 分支）。
+        // 强度同步增加（每轮 4 → 16 条）。显存稳定（波动<=15%）时不积极清理：
+        // 闲置阈值拉高到 5 分钟、每轮上限 2 条。15% 为紧急兜底（pressure 分支）。
         if (!pressure && target_avail > 0) {
             uint64_t pre_start = target_avail * 2;
             // 压力进度 0..1（0=剩余充足，1=逼近阈值）
@@ -1133,13 +1156,18 @@ DWORD WINAPI VramMonitorThread(LPVOID)
             uint64_t progress = span ? below * 100 / span : 100;
             if (progress > 100)
                 progress = 100;
-            // 空闲阈值：60s → 15s 线性（压力越大回收越积极）
+            // 空闲阈值：60s → 15s 线性（压力越大回收越积极）；
+            // 显存稳定时拉高到 5 分钟（不积极清理）
             const uint64_t kIdleMaxMs = 60ull * 1000; // 剩余充足：60 秒
             const uint64_t kIdleMinMs = 15ull * 1000; // 逼近阈值：15 秒
-            uint64_t idle_ms = kIdleMaxMs -
-                (kIdleMaxMs - kIdleMinMs) * progress / 100;
-            // 淘汰强度：进度 0→1 时每轮 4 → 16 条
-            int evict_limit = 4 + (int)(12 * progress / 100);
+            const uint64_t kIdleStableMs = 5ull * 60 * 1000; // 稳定：5 分钟
+            uint64_t idle_ms = vram_stable
+                ? kIdleStableMs
+                : kIdleMaxMs - (kIdleMaxMs - kIdleMinMs) * progress / 100;
+            // 淘汰强度：进度 0→1 时每轮 4 → 16 条；稳定时降至 2 条
+            int evict_limit = vram_stable
+                ? 2
+                : 4 + (int)(12 * progress / 100);
             uint64_t now = GetTickCount64();
 
             struct EvictCand { uint64_t mem; uint64_t last_used; uint32_t hash; };
@@ -1185,13 +1213,15 @@ DWORD WINAPI VramMonitorThread(LPVOID)
                 evicted++;
             }
             if (evicted > 0)
-                TL_LOG(L"[vram] recycle: avail=%lluMB (target=%lluMB), idle>%llus, evicted %d (freed ~%lluMB)",
+                TL_LOG(L"[vram] recycle: avail=%lluMB (target=%lluMB)%s idle>%llus, evicted %d (freed ~%lluMB)",
                        (unsigned long long)(avail >> 20), (unsigned long long)(target_avail >> 20),
+                       vram_stable ? L" [stable]" : L"",
                        (unsigned long long)(idle_ms / 1000),
                        evicted, (unsigned long long)(freed_bytes >> 20));
             else
-                TL_LOG_IF(2, L"[vram] recycle: avail=%lluMB idle>%llus, nothing evictable",
-                       (unsigned long long)(avail >> 20), (unsigned long long)(idle_ms / 1000));
+                TL_LOG_IF(2, L"[vram] recycle: avail=%lluMB%s idle>%llus, nothing evictable",
+                       (unsigned long long)(avail >> 20), vram_stable ? L" [stable]" : L"",
+                       (unsigned long long)(idle_ms / 1000));
         }
 
         if (pressure) {
