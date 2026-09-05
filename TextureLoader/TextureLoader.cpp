@@ -258,9 +258,10 @@ static void EnqueueLoad(uint32_t hash, std::wstring path)
 // resource -> 3DMigoto 兼容 hash（CreateTexture2D 时填充）
 // 注意：不用裸指针 map（资源销毁后地址可能被复用导致错误替换），
 // 改为通过 ID3D11Resource::SetPrivateData 把 hash 挂在资源本身上，随资源消亡。
-// 替换纹理/SRV 缓存按原纹理生命周期引用计数，原纹理销毁后自动释放，避免显存积累。
-// 另外提供显存感知的 LRU 淘汰：显存紧张时释放最久未用的替换缓存（释放后可从磁盘
-// 重新异步加载），实现缓存随显存动态伸缩。
+// 替换纹理/SRV 缓存**全局持久化**（与 3DMigoto CustomResource 同策略）：
+// 原纹理销毁只减 refcount，不释放替换缓存——同 hash 再创建直接复用，避免
+// 反复重载与释放（NVIDIA 驱动对释放路径敏感）。显存压力时由 VramMonitor
+// 淘汰（释放 texture/srv 保留条目，命中时重新加载），进程退出时统一释放。
 struct ReplacementEntry {
     ID3D11Texture2D *texture = nullptr;          // 替换纹理（缓存持有）
     ID3D11ShaderResourceView *srv = nullptr;     // 替换 SRV（缓存持有）
@@ -307,35 +308,23 @@ public:
     {
         ULONG r = --ref;
         if (r == 0) {
-            // 原纹理销毁：替换缓存引用计数 -1；归零则释放替换纹理/SRV。
+            // 原纹理销毁：替换缓存引用计数 -1。
+            // 缓存全局持久化（与 3DMigoto CustomResource 同策略）：原纹理销毁
+            // 不释放替换纹理/SRV、不删除条目——同 hash 再创建时直接复用缓存
+            // （need_load 判定 texture!=nullptr 即跳过加载）。替换纹理仅在
+            // 显存压力淘汰（VramMonitorThread）或进程退出时释放，避免频繁
+            // 创建/销毁替换资源（NVIDIA 驱动对释放路径也敏感，且切角色时
+            // 反复重载浪费 IO）。
             // 注意：D3D 调用本函数时已持有其内部锁（AB-BA 死锁风险），
-            // 因此锁内只操作 map 并收集指针，锁外再 Release D3D 资源。
-            ID3D11Texture2D *tex = nullptr;
-            ID3D11ShaderResourceView *srv = nullptr;
+            // 因此锁内只操作 map，锁外不触碰 D3D 对象（缓存继续持有）。
             {
                 std::lock_guard<std::mutex> lk(g_lock);
                 auto it = g_replacements.find(hash);
-                if (it != g_replacements.end()) {
-                    if (it->second.refcount > 0)
-                        it->second.refcount--;
-                    if (it->second.refcount == 0) {
-                        srv = it->second.srv;
-                        tex = it->second.texture;
-                        it->second.srv = nullptr;
-                        it->second.texture = nullptr;
-                        g_replacements.erase(it);
-                        RepSrvRemove(srv); // 替换视图已释放：从快速判定数组移除
-                        // （无独立快速命中表：条目删除后 find 不命中即跳过，
-                        //  无需额外同步。）
-                    }
-                }
+                if (it != g_replacements.end() && it->second.refcount > 0)
+                    it->second.refcount--;
                 // 活跃资源数组：本原纹理已销毁，清空其槽位供复用
                 ActiveRemove(resource);
             }
-            if (srv)
-                QueueRelease(srv);
-            if (tex)
-                QueueRelease(tex);
             delete this;
         }
         return r;
@@ -1637,6 +1626,20 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         }
     } else if (reason == DLL_PROCESS_DETACH) {
         ::tloader_gdds::Shutdown(); // 释放 GDDS 互操作（D3D12/DS 队列/共享 fence）
+        // 进程退出：统一释放全局持久化的替换缓存（正常运行时不随原纹理销毁，
+        // 退出时一次清空；进程卸载后驱动侧资源由系统回收，此处显式 Release）
+        {
+            std::lock_guard<std::mutex> lk(g_lock);
+            for (auto &kv : g_replacements) {
+                if (kv.second.srv) {
+                    RepSrvRemove(kv.second.srv);
+                    kv.second.srv->Release();
+                }
+                if (kv.second.texture)
+                    kv.second.texture->Release();
+            }
+            g_replacements.clear();
+        }
         ::tloader::log_shutdown();
     }
     return TRUE;
