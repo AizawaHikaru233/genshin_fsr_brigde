@@ -278,6 +278,7 @@ std::unordered_map<uint32_t, TextureOverrideEntry> g_overrides;
 
 // 显存感知缓存控制
 IDXGIAdapter3 *g_dxgi_adapter3 = nullptr;        // 查询显存的适配器
+uint64_t g_total_vram = 0;                       // 物理显存字节（DXGI_ADAPTER_DESC.DedicatedVideoMemory）
 volatile long g_vramMonitorRunning = 0;
 
 // 资源私有数据 GUID（用于存储纹理 hash 与动态标记、释放跟踪器）
@@ -1097,36 +1098,41 @@ DWORD WINAPI VramMonitorThread(LPVOID)
         if (FAILED(g_dxgi_adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
             continue;
         // 压力判定（显存容量驱动）：
-        //   - g_vram_threshold_bytes>0  → 可用显存 < 指定容量（如 1024M/2G）
-        //   - 否则                       → 可用显存 < 总显存百分比（默认 15%）
+        //   - g_vram_threshold_bytes>0 → 可用显存 < 指定容量（如 1024M/2G）
+        //   - 否则                       → 可用显存 < 物理显存百分比（默认 15%）
+        // 基准用物理显存 g_total_vram（DXGI Budget 是驱动动态配额，压力下会被
+        // 压低导致阈值失真——曾出现显存停在 95% 淘汰追不上的现象）。
         // 未达阈值不淘汰，尽量保证游戏流畅；仅在压力持续时温和淘汰。
         uint64_t budget = info.Budget;
         uint64_t avail = info.Budget > info.CurrentUsage ? info.Budget - info.CurrentUsage : 0;
-        bool pressure = false;
+        uint64_t target_avail = 0; // 期望可用显存下限
         if (::tloader::g_vram_threshold_bytes > 0) {
-            pressure = avail < ::tloader::g_vram_threshold_bytes;
+            target_avail = ::tloader::g_vram_threshold_bytes;
         } else {
             int pct = ::tloader::g_vram_threshold_pct;
             if (pct <= 0)
                 pct = 15;
-            pressure = (budget > 0) && (avail * 100 / budget < (uint64_t)pct);
+            uint64_t base = g_total_vram ? g_total_vram : budget; // 优先物理显存
+            target_avail = base * (uint64_t)pct / 100;
         }
+        bool pressure = avail < target_avail;
 
         if (pressure) {
             // 淘汰替换缓存，释放显存（按大小优先：大纹理先释放，回收更多显存）
-            TL_LOG(L"[vram] pressure: budget=%lluMB usage=%lluMB avail=%lluMB (threshold=%s), evicting...",
+            uint64_t gap = target_avail - avail; // 需回收的缺口（回到阈值）
+            TL_LOG(L"[vram] pressure: budget=%lluMB usage=%lluMB avail=%lluMB (target=%lluMB, gap=%lluMB), evicting...",
                    (unsigned long long)(budget >> 20), (unsigned long long)(info.CurrentUsage >> 20),
-                   (unsigned long long)(avail >> 20),
-                   ::tloader::g_vram_threshold_bytes > 0
-                       ? (std::to_wstring(::tloader::g_vram_threshold_bytes >> 20) + L"MB").c_str()
-                       : (std::to_wstring(::tloader::g_vram_threshold_pct) + L"%").c_str());
+                   (unsigned long long)(avail >> 20), (unsigned long long)(target_avail >> 20),
+                   (unsigned long long)(gap >> 20));
             // 收集候选：仅 refcount==0（原纹理已销毁，最安全），
             // 排序：mem_bytes 降序（大纹理优先）→ last_used 升序（LRU 次之）
             struct EvictCand { uint64_t mem; uint64_t last_used; uint32_t hash; };
             std::vector<EvictCand> candidates;
+            uint64_t cache_bytes = 0; // 替换缓存总占用（诊断）
             {
                 std::lock_guard<std::mutex> lk(g_lock);
                 for (auto &kv : g_replacements) {
+                    cache_bytes += kv.second.mem_bytes;
                     if (kv.second.refcount == 0 && kv.second.texture)
                         candidates.push_back({kv.second.mem_bytes, kv.second.last_used, kv.first});
                 }
@@ -1137,11 +1143,13 @@ DWORD WINAPI VramMonitorThread(LPVOID)
                               return a.last_used < b.last_used; // LRU
                           });
             }
-            // 逐条淘汰（每轮少量，避免一次释放过多导致卡顿）
+            TL_LOG(L"[vram] replacement cache total ~%lluMB, evictable candidates %d",
+                   (unsigned long long)(cache_bytes >> 20), (int)candidates.size());
+            // 逐条淘汰：按缺口自适应（回收 >= gap 即停），单轮上限 16 防卡顿
             int evicted = 0;
             uint64_t freed_bytes = 0;
             for (auto &c : candidates) {
-                if (evicted >= 4)
+                if (freed_bytes >= gap || evicted >= 16)
                     break;
                 ID3D11Texture2D *tex = nullptr;
                 ID3D11ShaderResourceView *srv = nullptr;
@@ -1164,8 +1172,11 @@ DWORD WINAPI VramMonitorThread(LPVOID)
                 evicted++;
             }
             if (evicted > 0)
-                TL_LOG(L"[vram] evicted %d replacement caches (freed ~%lluMB)",
-                       evicted, (unsigned long long)(freed_bytes >> 20));
+                TL_LOG(L"[vram] evicted %d replacement caches (freed ~%lluMB of gap %lluMB)",
+                       evicted, (unsigned long long)(freed_bytes >> 20),
+                       (unsigned long long)(gap >> 20));
+            else
+                TL_LOG(L"[vram] no evictable cache (all in use)");
         }
     }
     return 0;
@@ -1336,9 +1347,11 @@ static void LogGpuInfo(ID3D11Device *device)
             case 0x8086: vendor = L"Intel"; break;
             default: break;
         }
-        TL_LOG(L"[gpu ] %ls (vendor=0x%04X %ls, device=0x%04X, rev=%u)",
+        TL_LOG(L"[gpu ] %ls (vendor=0x%04X %ls, device=0x%04X, rev=%u, vram=%lluMB)",
                desc.Description, (unsigned)desc.VendorId, vendor,
-               (unsigned)desc.DeviceId, (unsigned)desc.Revision);
+               (unsigned)desc.DeviceId, (unsigned)desc.Revision,
+               (unsigned long long)(desc.DedicatedVideoMemory >> 20));
+        g_total_vram = desc.DedicatedVideoMemory; // 物理显存（淘汰阈值基准，非动态 Budget）
     }
     // 驱动版本：注册表显示类（{4d36e968-...} 下的 DriverVersion）
     HKEY hClass = nullptr;
