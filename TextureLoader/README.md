@@ -42,28 +42,28 @@ cmake --build build --config Release
 ## 配置（TextureLoader.ini，放 DLL 同目录）
 
 ```ini
-mods_dir = C:\path\to\your\Mods   ; 递归扫描 mod ini 的根目录
-observe_only = 0                  ; 1=只记录哈希匹配不替换；0=真正替换
-log_level = 1                     ; 0=仅关键日志 1=常规 2=详细
+mods_dir = C:\path\to\your\Mods   ; 递归扫描 mod ini 的根目录（留空自动探测）
+observe_only = 0                  ; 1=只记录哈希匹配不替换；0=真正替换（默认）
+log_level = 1                     ; 0=仅关键 1=常规（默认） 2=详细
 vram_threshold = 15%              ; 显存压力阈值：15% / 1024M / 2G，非法回退 15%
-max_texture_side = 0              ; 替换纹理最大边长；0=不限制
-gdds_enabled = 1                  ; 1=启用 GDDS（DirectStorage GPU 解压）；0=禁用
-async_load = 1                    ; 1=异步加载（后台线程建纹理）；0=同步（渲染线程建纹理）
+max_texture_side = 0              ; 替换纹理最大边长；0=不限制（默认）
+gdds_enabled = 1                  ; 1=启用 GDDS（DirectStorage GPU 解压，默认）；0=禁用
+async_load = 0                    ; 0=同步加载（默认，渲染线程建纹理）；1=异步（后台线程）
 ```
 
-> **NVIDIA 驱动兼容**：部分 NVIDIA 驱动（实测 RTX 4060 Laptop + 566.64）对
-> "后台线程创建 D3D11 纹理"的跨线程模式有缺陷（驱动工作线程崩溃/卡死）。
-> 此时设 `async_load = 0`（渲染线程同步加载，3DMigoto 同模型）即可规避，
-> 代价是加载替换纹理时可能有瞬时卡顿；AMD 卡无此问题，可保持异步。
+> **加载方式说明**：默认**同步加载**（渲染线程创建纹理，3DMigoto 同模型）——
+> 兼容性最好；部分 NVIDIA 驱动（实测 RTX 4060 Laptop + 566.64）对"后台线程
+> 创建 D3D11 纹理"的跨线程模式有缺陷（驱动工作线程崩溃/卡死），异步模式
+> 下会触发。AMD 卡无此问题，可设 `async_load = 1` 换取切角色更流畅。
 
 ## 架构
 
 - **统一加载器注册表**（`dds_loader.h`）：`TextureLoadResult` 统一结果类型 +
   `TextureLoaderEntry{extension, load}` 注册表；入队时按扩展名选定加载器
   （`.gdds` → DirectStorage GPU 解压；`.dds`/默认 → CPU 加载），替代运行时 if/else。
-- **双队列双线程**：GDDS 与 DDS 各自独立消费队列——大 GDDS 任务（8-128MB GPU 解压）
-  不阻塞 DDS 小纹理；登记/淘汰共享 `g_lock`。同步模式（`async_load=0`）绕过队列，
-  渲染线程直接执行加载。
+- **双队列双线程（异步模式）**：GDDS 与 DDS 各自独立消费队列——大 GDDS 任务
+  （8-128MB GPU 解压）不阻塞 DDS 小纹理；登记/淘汰共享 `g_lock`。默认同步模式
+  （`async_load=0`）绕过队列，渲染线程直接执行加载。
 - **GDDS 失败终态隔离**：DirectStorage 初始化失败后 `Failed()` 置位，GDDS 任务不再
   入队（避免队列堆积/日志刷屏）；DDS 路径完全不受影响。
 - **热路径两级无锁判定**：绑定热路径先比替换 SRV 指针（命中=无需处理，省 GetResource

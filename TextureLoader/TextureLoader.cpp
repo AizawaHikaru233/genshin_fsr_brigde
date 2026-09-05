@@ -1594,7 +1594,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         ::tloader::g_log_level = IniInt(dir, L"log_level", 1);
         ::tloader::g_max_texture_side = IniInt(dir, L"max_texture_side", 0);
         ::tloader::g_gdds_enabled = IniInt(dir, L"gdds_enabled", 1);
-        ::tloader::g_async_load = IniInt(dir, L"async_load", 1);
+        ::tloader::g_async_load = IniInt(dir, L"async_load", 0); // 默认同步（渲染线程建纹理）
         ParseVramThreshold(dir);
         TL_LOG(L"[cfg ] log_level=%d vram_threshold_pct=%d vram_threshold_bytes=%llu max_texture_side=%d gdds_enabled=%d async_load=%d",
                ::tloader::g_log_level, ::tloader::g_vram_threshold_pct,
