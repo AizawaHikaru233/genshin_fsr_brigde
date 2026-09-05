@@ -1309,6 +1309,60 @@ typedef HRESULT(WINAPI *D3D11CreateDeviceAndSwapChain_t)(IDXGIAdapter *, D3D_DRI
 static D3D11CreateDevice_t RealD3D11CreateDevice = nullptr;
 static D3D11CreateDeviceAndSwapChain_t RealD3D11CreateDeviceAndSwapChain = nullptr;
 
+// 记录 GPU 型号与驱动版本（崩溃定位关键信息：驱动内部崩溃需对照驱动版本）
+static void LogGpuInfo(ID3D11Device *device)
+{
+    IDXGIDevice *dxgi_dev = nullptr;
+    if (FAILED(device->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgi_dev)))
+        return;
+    IDXGIAdapter *adapter = nullptr;
+    if (FAILED(dxgi_dev->GetAdapter(&adapter))) {
+        dxgi_dev->Release();
+        return;
+    }
+    DXGI_ADAPTER_DESC desc = {};
+    if (SUCCEEDED(adapter->GetDesc(&desc))) {
+        const wchar_t *vendor = L"?";
+        switch (desc.VendorId) {
+            case 0x10DE: vendor = L"NVIDIA"; break;
+            case 0x1002: vendor = L"AMD"; break;
+            case 0x8086: vendor = L"Intel"; break;
+            default: break;
+        }
+        TL_LOG(L"[gpu ] %ls (vendor=0x%04X %ls, device=0x%04X, rev=%u)",
+               desc.Description, (unsigned)desc.VendorId, vendor,
+               (unsigned)desc.DeviceId, (unsigned)desc.Revision);
+    }
+    // 驱动版本：注册表显示类（{4d36e968-...} 下的 DriverVersion）
+    HKEY hClass = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}",
+                      0, KEY_READ, &hClass) == ERROR_SUCCESS) {
+        for (DWORD i = 0; i < 32; i++) {
+            wchar_t sub[16];
+            swprintf_s(sub, L"%04u", i);
+            HKEY hDev = nullptr;
+            if (RegOpenKeyExW(hClass, sub, 0, KEY_READ, &hDev) != ERROR_SUCCESS)
+                continue;
+            wchar_t ver[128] = {}, ddesc[256] = {};
+            DWORD sz = sizeof(ver);
+            bool hasVer = RegQueryValueExW(hDev, L"DriverVersion", nullptr, nullptr,
+                                           (LPBYTE)ver, &sz) == ERROR_SUCCESS;
+            sz = sizeof(ddesc);
+            bool hasDesc = RegQueryValueExW(hDev, L"DriverDesc", nullptr, nullptr,
+                                            (LPBYTE)ddesc, &sz) == ERROR_SUCCESS;
+            RegCloseKey(hDev);
+            if (hasVer && hasDesc && wcsstr(ddesc, desc.Description)) {
+                TL_LOG(L"[gpu ] driver: %ls (ver %ls)", ddesc, ver);
+                break;
+            }
+        }
+        RegCloseKey(hClass);
+    }
+    adapter->Release();
+    dxgi_dev->Release();
+}
+
 static void AttachToDevice(ID3D11Device *device, ID3D11DeviceContext *context)
 {
     if (g_hook_ready)
@@ -1323,6 +1377,7 @@ static void AttachToDevice(ID3D11Device *device, ID3D11DeviceContext *context)
     HookDevice(device);
     HookContext(context);
     InterlockedExchange(&g_hook_ready, 1);
+    LogGpuInfo(device);
     // 启动后台替换纹理加载线程：0=GDDS（DirectStorage GPU 解压），1=DDS（CPU）
     for (int i = 0; i < 2; i++) {
         if (!g_loadThreadRunning[i]) {
