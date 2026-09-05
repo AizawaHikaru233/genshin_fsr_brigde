@@ -17,7 +17,8 @@ extern int g_vram_threshold_pct;   // 显存压力阈值（%）：可用显存 <
 extern uint64_t g_vram_threshold_bytes; // 显存压力阈值（字节）；0=用百分比模式
 extern int g_max_texture_side;     // 替换纹理最大边长（像素）；0=不限制
 extern int g_gdds_enabled;         // 1=启用 GDDS（DirectStorage GPU 解压）；0=禁用（.gdds 跳过）
-extern int g_async_load;           // 1=异步加载（默认，后台线程建纹理）；0=同步（渲染线程建纹理，N 卡驱动规避）
+extern int g_async_load;           // 1=异步加载（后台线程建纹理）；0=同步（渲染线程建纹理，N 卡驱动规避）
+extern int g_async_load_explicit;  // 1=用户 ini 显式设置 async_load（不再按 GPU 厂商自动调整）
 } // namespace tloader
 
 #define TL_LOG(...) ::tloader::log_write(__VA_ARGS__)

@@ -15,11 +15,12 @@ FILE *g_file = nullptr;
 } // namespace
 
 int g_log_level = 1;
-int g_vram_threshold_pct = 15;   // 默认：可用显存 < 总显存 15% 视为压力
-uint64_t g_vram_threshold_bytes = 0; // 0=百分比模式
+int g_vram_threshold_pct = 0;    // 0=自适应（按显存容量推导临界值）；>0=用户显式百分比
+uint64_t g_vram_threshold_bytes = 0; // 0=百分比模式；>0=用户显式容量
 int g_max_texture_side = 0;
 int g_gdds_enabled = 1;          // 默认启用 GDDS（DirectStorage GPU 解压）
-int g_async_load = 0;            // 默认同步加载（渲染线程建纹理，兼容性最好；N 卡驱动规避）
+int g_async_load = 1;            // 默认异步（后台线程）；N 卡在 AttachToDevice 时自动切同步
+int g_async_load_explicit = 0;   // 0=未显式设置（按 GPU 厂商自动调整）
 
 void log_init(const std::wstring &dll_dir)
 {

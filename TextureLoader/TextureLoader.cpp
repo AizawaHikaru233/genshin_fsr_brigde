@@ -280,6 +280,7 @@ std::unordered_map<uint32_t, TextureOverrideEntry> g_overrides;
 // 显存感知缓存控制
 IDXGIAdapter3 *g_dxgi_adapter3 = nullptr;        // 查询显存的适配器
 uint64_t g_total_vram = 0;                       // 物理显存字节（DXGI_ADAPTER_DESC.DedicatedVideoMemory）
+uint32_t g_gpu_vendor = 0;                       // GPU 厂商 ID（0x10DE=NVIDIA 0x1002=AMD 0x8086=Intel）
 volatile long g_vramMonitorRunning = 0;
 
 // ---------------------------------------------------------------------------
@@ -1593,6 +1594,7 @@ static void LogGpuInfo(ID3D11Device *device)
                (unsigned)desc.DeviceId, (unsigned)desc.Revision,
                (unsigned long long)(desc.DedicatedVideoMemory >> 20));
         g_total_vram = desc.DedicatedVideoMemory; // 物理显存（淘汰阈值基准，非动态 Budget）
+        g_gpu_vendor = desc.VendorId;             // 厂商 ID（async_load 自动调整依据）
     }
     // 驱动版本：注册表显示类（{4d36e968-...} 下的 DriverVersion）
     HKEY hClass = nullptr;
@@ -1639,6 +1641,17 @@ static void AttachToDevice(ID3D11Device *device, ID3D11DeviceContext *context)
     HookContext(context);
     InterlockedExchange(&g_hook_ready, 1);
     LogGpuInfo(device);
+    // async_load 未显式设置时按 GPU 厂商自动选择：
+    //   NVIDIA → 同步（驱动对后台线程建纹理有缺陷，实测 566.64 崩溃/卡死）
+    //   其他（AMD/Intel）→ 异步（后台线程加载，避免渲染线程阻塞 GPU 空转）
+    if (!::tloader::g_async_load_explicit) {
+        int want = (g_gpu_vendor == 0x10DE) ? 0 : 1;
+        if (::tloader::g_async_load != want) {
+            ::tloader::g_async_load = want;
+            TL_LOG(L"[cfg ] async_load auto-adjusted to %d (vendor=0x%04X)",
+                   want, (unsigned)g_gpu_vendor);
+        }
+    }
     // 启动后台替换纹理加载线程：0=GDDS（DirectStorage GPU 解压），1=DDS（CPU）
     for (int i = 0; i < 2; i++) {
         if (!g_loadThreadRunning[i]) {
@@ -1837,7 +1850,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         ::tloader::g_log_level = IniInt(dir, L"log_level", 1);
         ::tloader::g_max_texture_side = IniInt(dir, L"max_texture_side", 0);
         ::tloader::g_gdds_enabled = IniInt(dir, L"gdds_enabled", 1);
-        ::tloader::g_async_load = IniInt(dir, L"async_load", 0); // 默认同步（渲染线程建纹理）
+        // async_load：ini 显式设置则按值；未设置默认异步（后台线程建纹理，
+        // 避免渲染线程被磁盘 IO/纹理创建阻塞导致 GPU 空转），N 卡在
+        // AttachToDevice（已知 GPU 厂商）时自动切同步规避驱动缺陷。
+        {
+            std::wstring av = GetIniValue(dir, L"async_load");
+            if (av.empty()) {
+                ::tloader::g_async_load = 1; // 默认异步
+                ::tloader::g_async_load_explicit = 0;
+            } else {
+                ::tloader::g_async_load = (av == L"1") ? 1 : 0;
+                ::tloader::g_async_load_explicit = 1;
+            }
+        }
         ParseVramThreshold(dir);
         TL_LOG(L"[cfg ] log_level=%d vram_threshold_pct=%d vram_threshold_bytes=%llu max_texture_side=%d gdds_enabled=%d async_load=%d",
                ::tloader::g_log_level, ::tloader::g_vram_threshold_pct,
