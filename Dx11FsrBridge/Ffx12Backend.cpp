@@ -92,8 +92,10 @@ std::atomic_uint64_t g_on12_direct_dispatch_count { 0 };
 // 每帧耗时统计（诊断 GPU 空载：QPC 计时，节流输出）
 //  - prep_wait_us：dispatch 内 Wait(v_prev)（等上一轮 D3D12 完成）
 //  - prep_cs_us  ：D3D11 输入准备（深度/运动 CS + CopyResource 输入）
-//  - prep_flush_us：Flush 提交（含上一帧遗留的输出拷贝——批次提交成本）
-//  - submit_us   ：D3D12 侧（Wait + Reset + barrier + FFX dispatch + Execute + 双 Signal）
+//  - prep_flush_us：Flush 提交段（去 Flush 后应≈0）
+//  - signal_us   ：ctx4->Signal(v1)（隐含提交 D3D11 命令批——跨 API 交接成本）
+//  - wait12_us   ：g_queue->Wait(v1)（D3D12 队列插入等待——CPU 侧应≈0）
+//  - submit_us   ：D3D12 侧（Reset + barrier + FFX dispatch + Execute + 双 Signal）
 //  - wait_us     ：finish_pending 的 ctx4->Wait 阻塞（= FFX 未提前完成的时间）
 //  - copy_us     ：输出拷贝调用本身（去 Flush 后应≈0）
 //  - total_us    ：dispatch 调用总耗时
@@ -103,6 +105,8 @@ struct FrameTimingStats
     std::atomic_uint64_t prep_cs_us { 0 };
     std::atomic_uint64_t prep_flush_us { 0 };
     std::atomic_uint64_t prep_us { 0 };
+    std::atomic_uint64_t signal_us { 0 };
+    std::atomic_uint64_t wait12_us { 0 };
     std::atomic_uint64_t submit_us { 0 };
     std::atomic_uint64_t wait_us { 0 };
     std::atomic_uint64_t copy_us { 0 };
@@ -1853,16 +1857,23 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     // 解码结果（共享 R16G16）才是 FFX 的 motion 输入。
     const std::uint64_t t_cs_end = qpc_us();
     g_timing.prep_cs_us.fetch_add(t_cs_end - t_prep_start, std::memory_order_relaxed);
-    game_context->Flush();
+    // 实验：不显式 Flush——测试 ctx4->Signal(v1) 是否隐含提交排队命令
+    // （D3D11 输入 CS + 拷贝）。若驱动在 Signal 时提交，pflush 222us 归零。
+    // 风险：Signal 不隐含提交 → D3D12 Wait(v1) 超时（1s 保护）→ dispatch 失败
+    // fail-open 回退原生 FSR（不崩游戏）。有异常立即恢复 Flush。
     const std::uint64_t t_prep_end = qpc_us();
     g_timing.prep_flush_us.fetch_add(t_prep_end - t_cs_end, std::memory_order_relaxed);
     g_timing.prep_us.fetch_add(t_prep_end - t_prep_start, std::memory_order_relaxed);
     const std::uint64_t v1 = g_shared_fence_value + 1;
+    const std::uint64_t t_sig_start = qpc_us();
     if (FAILED(g_game_ctx4->Signal(g_shared_fence11.Get(), v1)))
         return false;
+    g_timing.signal_us.fetch_add(qpc_us() - t_sig_start, std::memory_order_relaxed);
     g_shared_fence_value = v1;
+    const std::uint64_t t_w12_start = qpc_us();
     if (FAILED(g_queue->Wait(g_shared_fence.Get(), v1)))
         return false;
+    g_timing.wait12_us.fetch_add(qpc_us() - t_w12_start, std::memory_order_relaxed);
 
     // ---- ② D3D12 侧：motion 解码 + FFX（共享纹理直读） ----
     const std::uint64_t t_submit_start = qpc_us();
@@ -2660,6 +2671,10 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
                 (std::uint32_t)(g_timing.prep_flush_us.load(std::memory_order_relaxed) / n);
             const std::uint32_t avg_p =
                 (std::uint32_t)(g_timing.prep_us.load(std::memory_order_relaxed) / n);
+            const std::uint32_t avg_sig =
+                (std::uint32_t)(g_timing.signal_us.load(std::memory_order_relaxed) / n);
+            const std::uint32_t avg_w12 =
+                (std::uint32_t)(g_timing.wait12_us.load(std::memory_order_relaxed) / n);
             const std::uint32_t avg_s =
                 (std::uint32_t)(g_timing.submit_us.load(std::memory_order_relaxed) / n);
             const std::uint32_t avg_w =
@@ -2668,8 +2683,8 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
                 (std::uint32_t)(g_timing.copy_us.load(std::memory_order_relaxed) / n);
             const std::uint32_t avg_t =
                 (std::uint32_t)(g_timing.total_us.load(std::memory_order_relaxed) / n);
-            sdk_note(L"timing async=%d pwait=%uus pcs=%uus pflush=%uus prep=%uus submit=%uus wait=%uus copy=%uus total=%uus frames=%u",
-                     g_async_upscale ? 1 : 0, avg_pw, avg_pc, avg_pf, avg_p, avg_s, avg_w, avg_c, avg_t, n);
+            sdk_note(L"timing async=%d pwait=%uus pcs=%uus pflush=%uus sig=%uus w12=%uus submit=%uus wait=%uus copy=%uus total=%uus frames=%u",
+                     g_async_upscale ? 1 : 0, avg_pw, avg_pc, avg_pf, avg_sig, avg_w12, avg_s, avg_w, avg_c, avg_t, n);
             // 直接落盘（独立文件，不经 sdk_msgs 缓冲/日志白名单——诊断数据不被吞）
             {
                 FILE *tf = nullptr;
@@ -2677,9 +2692,9 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
                 {
                     SYSTEMTIME st {};
                     GetLocalTime(&st);
-                    fprintf(tf, "%04d-%02d-%02d %02d:%02d:%02d.%03d timing async=%d pwait=%uus pcs=%uus pflush=%uus prep=%uus submit=%uus wait=%uus copy=%uus total=%uus frames=%u\n",
+                    fprintf(tf, "%04d-%02d-%02d %02d:%02d:%02d.%03d timing async=%d pwait=%uus pcs=%uus pflush=%uus sig=%uus w12=%uus submit=%uus wait=%uus copy=%uus total=%uus frames=%u\n",
                             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
-                            st.wMilliseconds, g_async_upscale ? 1 : 0, avg_pw, avg_pc, avg_pf, avg_p, avg_s, avg_w, avg_c, avg_t, n);
+                            st.wMilliseconds, g_async_upscale ? 1 : 0, avg_pw, avg_pc, avg_pf, avg_sig, avg_w12, avg_s, avg_w, avg_c, avg_t, n);
                     fclose(tf);
                 }
             }
@@ -2687,6 +2702,8 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
             g_timing.prep_cs_us.store(0, std::memory_order_relaxed);
             g_timing.prep_flush_us.store(0, std::memory_order_relaxed);
             g_timing.prep_us.store(0, std::memory_order_relaxed);
+            g_timing.signal_us.store(0, std::memory_order_relaxed);
+            g_timing.wait12_us.store(0, std::memory_order_relaxed);
             g_timing.submit_us.store(0, std::memory_order_relaxed);
             g_timing.wait_us.store(0, std::memory_order_relaxed);
             g_timing.copy_us.store(0, std::memory_order_relaxed);
