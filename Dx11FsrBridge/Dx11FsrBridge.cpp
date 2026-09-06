@@ -215,9 +215,13 @@ struct Config
     bool ffx12 = false;
     std::wstring ffx12_dll_path;
     bool ffx12_fail_closed = false; // ：禁止回退原生（测试/故障显式暴露）
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     bool ffx12_probe = false; // 一次性槽位/cb0 探测（诊断用，默认关）
+#endif
     bool ffx12_feature_fallback = true; // 特征识别兜底：1=运行时特征优先+已有样本(硬编码)兜底；0=纯特征识别（验证用——关闭所有版本特定样本）
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     bool optiscaler_bridge_probe = false; // 遗留 OptiScaler 候选桥路径（frames.jsonl 记录，默认关）
+#endif
     std::uint32_t ffx12_jitter_mode = 4; // 0=+norm*width-0.5, 1=+norm*width(符号反→整体抖), 2=raw, 3=-norm*width+0.5, 4=-norm*width(FSR4实测:符号正确), 5=零
     bool ffx12_depth_inverted = true; // 游戏深度逆方向（0=far）；FSR2 默认 0=near
     bool ffx12_decode_motion = true;  // 游戏 motion 为 R10G10B10A2 平方编码 → 解码 R16G16_FLOAT
@@ -242,12 +246,16 @@ struct Config
 #endif
     bool show_osd = false;
     bool assume_phase_order = false;
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     bool enable_similarity_probe = false;
     bool reset_similarity_on_recording = true;
+#endif
     std::uint32_t candidate_limit_per_frame = 64;
     std::uint32_t interesting_dispatch_log_limit = 256;
     std::uint32_t interesting_dispatch_phase_gap_ms = 1500;
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     std::uint32_t similarity_report_interval_ms = 2000;
+#endif
     std::wstring run_label;
 };
 
@@ -399,6 +407,7 @@ struct ShaderInfo
     UINT uav_other_count = 0;
 };
 
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 struct SimilarityStats
 {
     ULONGLONG first_event_tick = 0;
@@ -426,6 +435,7 @@ struct SimilarityStats
     std::unordered_map<std::string, std::uint64_t> cs_2d_post_contexts;
     std::unordered_map<std::string, std::uint64_t> ps_post_contexts;
 };
+#endif
 
 struct ModeMatch
 {
@@ -441,10 +451,11 @@ std::filesystem::path g_log_path;
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
 std::atomic_uint64_t g_dxgi_swapchain_request_id = 0;
 #endif
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 std::filesystem::path g_frames_path;
-std::filesystem::path g_similarity_path;
 std::filesystem::path g_ps_trace_path;
 std::filesystem::path g_texture_trace_path;
+#endif
 std::mutex g_log_mutex;
 #if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
 std::mutex g_final_scene_probe_mutex;
@@ -453,6 +464,12 @@ std::unordered_set<std::uint64_t> g_final_scene_probe_signatures;
 FinalSceneProbeFrame g_final_scene_probe_frame;
 std::mutex g_final_scene_snapshot_mutex;
 FinalSceneSnapshotState g_final_scene_snapshot;
+#endif
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+std::filesystem::path g_similarity_path;
+std::mutex g_similarity_mutex;
+SimilarityStats g_similarity;
+std::unordered_map<std::string, SimilarityStats> g_similarity_archives;
 #endif
 std::atomic_bool g_logging_enabled = false;
 // 当前日志等级（0=error 1=info 2=debug 3=trace）；load_config 同步 g_config.log_level。
@@ -519,15 +536,17 @@ static OptiOutput opti_output_current()
 static void apply_adapter_route(std::uint32_t vendor, std::uint32_t device, const std::wstring &desc,
                                 const char *source);
 static void route_from_d3d11_device(ID3D11Device *d3d11_device);
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 std::mutex g_ps_trace_mutex;
 std::ofstream g_ps_trace_stream;
 std::atomic_uint32_t g_ps_trace_count = 0;
 std::atomic_uint64_t g_texture_trace_until_tick = 0;
 std::atomic_uint32_t g_texture_trace_count = 0;
+std::atomic_uint64_t g_trace_ps_cb0_key = 0;
+#endif
 std::atomic_uint64_t g_current_ps_hash = 0;
 std::atomic_uint64_t g_mode2_fast_target_ps_hash = 0;
 std::atomic_uint64_t g_mode2_fast_target_ps_key = 0;
-std::atomic_uint64_t g_trace_ps_cb0_key = 0;
 std::mutex g_replacement_mutex;
 std::vector<std::uint8_t> g_spatial_copy_bytecode;
 bool g_spatial_copy_compile_attempted = false;
@@ -728,9 +747,6 @@ struct MappedBufferInfo
 };
 std::unordered_map<std::uint64_t, MappedBufferInfo> g_mapped_buffers;
 std::unordered_map<std::uint64_t, std::vector<std::uint8_t>> g_buffer_snapshots;
-std::mutex g_similarity_mutex;
-SimilarityStats g_similarity;
-std::unordered_map<std::string, SimilarityStats> g_similarity_archives;
 std::mutex g_osd_mutex;
 std::wstring g_osd_text = L"Dx11FsrBridge\n正在初始化";
 std::atomic_bool g_osd_running { false };
@@ -1247,10 +1263,12 @@ std::string mode_label_ascii(int mode)
     }
 }
 
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 std::filesystem::path similarity_path_for_label(const std::string &label);
 void write_similarity_report_to_path_locked(const std::filesystem::path &path, const SimilarityStats &stats, const std::string &label);
 void write_similarity_diff_locked();
 void reset_similarity_locked();
+#endif
 
 void add_unique_feature(std::vector<std::string> &target, const std::string &feature)
 {
@@ -1370,6 +1388,7 @@ void toggle_recording_mode(int mode)
         status = g_mode_status;
     }
 
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (started && g_config.reset_similarity_on_recording)
     {
         std::lock_guard lock(g_similarity_mutex);
@@ -1395,6 +1414,7 @@ void toggle_recording_mode(int mode)
         log_line("similarity_recording_saved label=" + archive_label + " dispatch=" + std::to_string(g_similarity.dispatch_count) +
             " draw=" + std::to_string(g_similarity.draw_count));
     }
+#endif
 
     log_line(std::string(started ? "mode_recording_started " : "mode_recording_stopped ") +
         "mode=" + narrow(calibrated_mode_name(mode)) + " features=" + std::to_string(sample_size));
@@ -1416,12 +1436,15 @@ void clear_mode_samples()
         g_last_interesting_dispatch_tick = 0;
         g_dispatch_phase = 0;
     }
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     {
         std::lock_guard lock(g_similarity_mutex);
         reset_similarity_locked();
         g_similarity_archives.clear();
     }
+#endif
 
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     std::ofstream(g_frames_path, std::ios::trunc).close();
     {
         std::lock_guard lock(g_ps_trace_mutex);
@@ -1435,6 +1458,7 @@ void clear_mode_samples()
     std::ofstream(similarity_path_for_label("FSR_ON"), std::ios::trunc).close();
     std::ofstream(similarity_path_for_label("FSR_OFF"), std::ios::trunc).close();
     std::ofstream(similarity_path_for_label("SMAA"), std::ios::trunc).close();
+#endif
 
     log_line("mode_calibration_and_similarity_cleared");
     set_osd_text(L"Dx11FsrBridge OSD\n已清空全部记录");
@@ -1442,6 +1466,7 @@ void clear_mode_samples()
 
 void poll_mode_hotkeys()
 {
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_config.trace_texture_creates && (GetAsyncKeyState(g_config.texture_trace_hotkey) & 1))
     {
         const ULONGLONG now = GetTickCount64();
@@ -1450,6 +1475,7 @@ void poll_mode_hotkeys()
         log_line("texture_trace_started duration_ms=" + std::to_string(g_config.texture_trace_duration_ms) +
             " main_base=" + hex64(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))));
     }
+#endif
     if (GetAsyncKeyState(VK_F10) & 1)
     {
         clear_mode_samples();
@@ -1766,6 +1792,8 @@ void append_constant_buffer_list(std::ostringstream &out, const char *label, con
     }
 }
 
+// ---- shader 转储诊断（正式版不编译）----
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 void dump_compute_shader_bytecode(std::uint64_t hash, const void *shader_bytecode, std::size_t bytecode_length)
 {
     if (!g_config.dump_compute_shaders || hash == 0 || shader_bytecode == nullptr || bytecode_length == 0)
@@ -1828,6 +1856,7 @@ void dump_vertex_shader_bytecode(std::uint64_t hash, const void *shader_bytecode
     {
     }
 }
+#endif // shader 转储诊断
 
 bool is_fullres_surface(const ResourceInfo &info, std::uint32_t output_width, std::uint32_t output_height)
 {
@@ -2019,6 +2048,8 @@ std::string top_compute_entries_with_reflection(const std::unordered_map<std::ui
     return out.str();
 }
 
+// ---- similarity 对比诊断系统（正式版不编译：SDK 输出 vs 游戏输出对比报告）----
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 void note_resource_read(SimilarityStats &stats, const ResourceInfo &info, const char *reader)
 {
     if (info.resource_key == 0)
@@ -3030,6 +3061,7 @@ void record_similarity_draw(const char *kind, UINT element_count)
 
     maybe_write_similarity_report_locked();
 }
+#endif // similarity 诊断系统（!DX11FSRBRIDGE_RELEASE_RUNTIME）
 
 bool is_relevant_surface(const ResourceInfo &info, std::uint32_t output_width, std::uint32_t output_height)
 {
@@ -3857,10 +3889,14 @@ void load_config()
     }
     g_config.ffx12 =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12", 0, config_path.c_str()) != 0;
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_config.ffx12_probe =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12Probe", 0, config_path.c_str()) != 0;
+#endif
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_config.optiscaler_bridge_probe =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"OptiScalerBridgeProbe", 0, config_path.c_str()) != 0;
+#endif
     g_config.ffx12_jitter_mode = static_cast<std::uint32_t>(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12JitterMode", 4, config_path.c_str()));
     g_config.ffx12_depth_inverted =
@@ -4141,12 +4177,16 @@ void load_config()
     g_config.ffx12_feature_fallback =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FeatureFallback", 1, config_path.c_str()) != 0;
     g_config.assume_phase_order = GetPrivateProfileIntW(L"Dx11FsrBridge", L"AssumePhaseOrder", 0, config_path.c_str()) != 0;
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_config.enable_similarity_probe = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableSimilarityProbe", 0, config_path.c_str()) != 0;
     g_config.reset_similarity_on_recording = GetPrivateProfileIntW(L"Dx11FsrBridge", L"ResetSimilarityOnRecording", 1, config_path.c_str()) != 0;
+#endif
     g_config.candidate_limit_per_frame = static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"CandidateLimitPerFrame", 64, config_path.c_str()));
     g_config.interesting_dispatch_log_limit = static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"InterestingDispatchLogLimit", 256, config_path.c_str()));
     g_config.interesting_dispatch_phase_gap_ms = static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"InterestingDispatchPhaseGapMs", 1500, config_path.c_str()));
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_config.similarity_report_interval_ms = static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"SimilarityReportIntervalMs", 2000, config_path.c_str()));
+#endif
     wchar_t label_buffer[128] {};
     GetPrivateProfileStringW(L"Dx11FsrBridge", L"RunLabel", L"", label_buffer, static_cast<DWORD>(std::size(label_buffer)), config_path.c_str());
     g_config.run_label = label_buffer;
@@ -4663,7 +4703,9 @@ void maybe_dump_color_candidate_inputs(ID3D11DeviceContext *context, UINT elemen
     g_fsr2_early_output_probe_frames_remaining.store(
         g_config.fsr2_early_output_probe ? g_config.fsr2_early_output_probe_frames : 0,
         std::memory_order_release);
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     maybe_dump_color_source_history(context, candidate_color.resource_key);
+#endif
     log_line("fsr2_color_candidate_dumped shader=" +
         hex64(g_current_ps_hash.load(std::memory_order_relaxed)) +
         " output=" + hex64(target->resource_key));
@@ -4693,6 +4735,8 @@ void update_uav_array(std::array<ResourceInfo, D3D11_1_UAV_SLOT_COUNT> &target, 
     }
 }
 
+// ---- 遗留 OptiScaler 候选桥路径（frames.jsonl 记录，诊断；正式版不编译）----
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 void write_candidate_packet(const OptiScalerBridgePacket &packet, UINT group_x, UINT group_y, UINT group_z)
 {
     std::ofstream out(g_frames_path, std::ios::app);
@@ -4769,6 +4813,7 @@ std::optional<OptiScalerBridgePacket> build_dispatch_candidate(UINT group_x, UIN
     write_candidate_packet(packet, group_x, group_y, group_z);
     return packet;
 }
+#endif // OptiScaler 候选桥探测
 
 bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *function_name, void *replacement, void **original)
 {
@@ -4896,9 +4941,11 @@ void capture_runtime_snapshot_if_requested()
 
     if (g_config.trace_texture_creates)
     {
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         const ULONGLONG now = GetTickCount64();
         g_texture_trace_count.store(0, std::memory_order_relaxed);
         g_texture_trace_until_tick.store(now + g_config.texture_trace_duration_ms, std::memory_order_relaxed);
+#endif
         log_line("texture_trace_started source=F12 duration_ms=" + std::to_string(g_config.texture_trace_duration_ms) +
             " main_base=" + hex64(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))));
     }
@@ -7248,7 +7295,9 @@ void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_
         return;
     }
 
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     record_color_source_call("dispatch", group_x, group_y, group_z);
+#endif
 
     if (g_config.log_all_dispatch)
         log_line("dispatch groups=" + std::to_string(group_x) + "x" + std::to_string(group_y) + "x" + std::to_string(group_z));
@@ -7256,6 +7305,7 @@ void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_
     if (g_config.log_interesting_dispatch_details && should_log_interesting_dispatch(group_x, group_y, group_z))
         log_interesting_dispatch_details(group_x, group_y, group_z);
 
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (const auto candidate = build_dispatch_candidate(group_x, group_y, group_z))
     {
         log_line("fsr_candidate frame=" + std::to_string(candidate->frame_index) +
@@ -7267,6 +7317,7 @@ void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_
             " depth=" + hex64(candidate->depth.resource_key) +
             " out=" + hex64(candidate->output.resource_key));
     }
+#endif
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     record_similarity_dispatch(group_x, group_y, group_z);
@@ -7408,7 +7459,9 @@ void register_cb0_for_jitter(ID3D11Buffer *constant_buffer)
     D3D11_BUFFER_DESC desc {};
     constant_buffer->GetDesc(&desc);
     const std::uint64_t key = reinterpret_cast<std::uint64_t>(constant_buffer);
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_trace_ps_cb0_key.store(key, std::memory_order_relaxed);
+#endif
     if (key != 0 && desc.ByteWidth != 0)
     {
         std::lock_guard lock(g_buffer_info_mutex);
@@ -7633,7 +7686,9 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(UINT element_
         }
     }
 
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_trace_ps_cb0_key.store(g_state.ps_cbs[0].resource_key, std::memory_order_relaxed);
+#endif
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_config.fsr2_fast_state_tracking && g_config.fsr2_translation_mode == 2 && fast_target_hash == 0)
     {
@@ -7879,7 +7934,9 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     }
     stage_log("identify_end ok");
 
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_trace_ps_cb0_key.store(constant_buffer_key, std::memory_order_relaxed);
+#endif
     register_cb0_for_jitter(constant_buffer);
 
     // 正缓存写入（仅识别成功路径——值语义指纹，UI 切换/地址复用无关）
@@ -7984,7 +8041,9 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(
         if (!identified)
             return std::nullopt;
 
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         g_trace_ps_cb0_key.store(constant_buffer_key, std::memory_order_relaxed);
+#endif
         return identified;
     }
 #endif
@@ -7998,8 +8057,10 @@ void maybe_dump_target_color_chain(ID3D11DeviceContext *context, UINT element_co
     const auto draw_info = inspect_target_upscaler_draw(element_count);
     if (draw_info)
     {
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         maybe_dump_color_source_history(context, draw_info->color_resource_key);
         maybe_dump_motion_source_history(context, draw_info->motion_resource_key);
+#endif
     }
 }
 
@@ -10376,7 +10437,8 @@ bool try_fsr2_translation_draw(
                     st->last_frame_tick = GetTickCount64();
                 }
 
-                // ---- 一次性原生参数探测（诊断用，Ffx12Probe=1 时启用） ----
+                // ---- 一次性原生参数探测（诊断用，Ffx12Probe=1 时启用；正式版不编译）----
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
                 if (g_config.ffx12_probe)
                 {
                 static std::atomic_uint32_t sdk234_probe_round { 0 };
@@ -10599,6 +10661,7 @@ bool try_fsr2_translation_draw(
                     }
                 }
                 } // if (g_config.ffx12_probe)
+#endif // !DX11FSRBRIDGE_RELEASE_RUNTIME
 
                 if (ffx12::dispatch(sdk_in, context, call_params.instance))
                 {
@@ -10615,7 +10678,7 @@ bool try_fsr2_translation_draw(
                     }
                     const std::uint64_t dcount =
                         sdk234_dispatch_count.fetch_add(1, std::memory_order_relaxed) + 1;
-                    if (g_config.ffx12_probe || dcount <= 8 || dcount % 1024 == 0)
+                    if (dcount <= 8 || dcount % 1024 == 0)
                     {
                         log_line("ffx12_result rc=DISPATCH_OK" +
                             std::string(" gen=") + std::to_string(call_gen) +
@@ -11787,7 +11850,8 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
             if (log_count == 1 || log_count % 1024 == 0)
                 log_line("fsr2_family_skip_draw hash=" + hex64(family_ps_hash) +
                     " total=" + std::to_string(fsr2_family_takeover::skipped_count()));
-            // 一次性 PRE-pass cb0 探测（诊断用，Ffx12Probe=1 时启用）
+            // 一次性 PRE-pass cb0 探测（诊断用，Ffx12Probe=1 时启用；正式版不编译）
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
             if (g_config.ffx12_probe)
             {
                 static std::atomic_int pre_cb0_probe_round { 0 };
@@ -11822,6 +11886,7 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
                 }
                 }
             }
+#endif
             return;
         }
     }
@@ -11892,6 +11957,7 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
 HRESULT STDMETHODCALLTYPE hooked_map(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource, D3D11_MAP map_type, UINT map_flags, D3D11_MAPPED_SUBRESOURCE *mapped)
 {
     const HRESULT hr = g_original_map(context, resource, subresource, map_type, map_flags, mapped);
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (SUCCEEDED(hr) && resource != nullptr && mapped != nullptr && mapped->pData != nullptr)
     {
         const auto key = reinterpret_cast<std::uint64_t>(resource);
@@ -11903,11 +11969,13 @@ HRESULT STDMETHODCALLTYPE hooked_map(ID3D11DeviceContext *context, ID3D11Resourc
         if (it != g_buffer_info.end() && it->second.byte_width != 0)
             g_mapped_buffers[key] = { mapped->pData, it->second.byte_width };
     }
+#endif
     return hr;
 }
 
 void STDMETHODCALLTYPE hooked_unmap(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource)
 {
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (resource != nullptr)
     {
         const auto key = reinterpret_cast<std::uint64_t>(resource);
@@ -11931,6 +11999,7 @@ void STDMETHODCALLTYPE hooked_unmap(ID3D11DeviceContext *context, ID3D11Resource
             g_mapped_buffers.erase(mapped_it);
         }
     }
+#endif // !DX11FSRBRIDGE_RELEASE_RUNTIME
     g_original_unmap(context, resource, subresource);
 }
 
@@ -12010,7 +12079,9 @@ void STDMETHODCALLTYPE hooked_copy_resource(ID3D11DeviceContext *context, ID3D11
     if (g_config.log_resource_ops)
         log_line("copy_resource dst=" + hex64(dst_info.resource_key) + " src=" + hex64(src_info.resource_key));
     record_hdr_composite_copy(dst_info, src_info, "copy_resource");
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     record_color_source_copy(dst_info, src_info, "copy_resource");
+#endif
     g_original_copy_resource(context, dst, src);
 }
 
@@ -12032,7 +12103,9 @@ void STDMETHODCALLTYPE hooked_copy_subresource_region(ID3D11DeviceContext *conte
         log_line("copy_subresource dst=" + hex64(dst_info.resource_key) + " src=" + hex64(src_info.resource_key) +
             " dst_sub=" + std::to_string(dst_subresource) + " src_sub=" + std::to_string(src_subresource));
     record_hdr_composite_copy(dst_info, src_info, "copy_subresource");
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     record_color_source_copy(dst_info, src_info, "copy_subresource");
+#endif
     g_original_copy_subresource_region(context, dst, dst_subresource, dst_x, dst_y, dst_z, src, src_subresource, src_box);
 }
 
@@ -12043,6 +12116,10 @@ void STDMETHODCALLTYPE hooked_update_subresource(ID3D11DeviceContext *context, I
         const auto key = reinterpret_cast<std::uint64_t>(dst);
         // 仅跟踪 trace 目标 cb0（性能：全量跟踪导致 3 FPS；多视图新鲜度改由 sdk234 直接读回解决）
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+        // 正式版：不跟踪任何 buffer 快照（cb0 跟踪链已移除）
+        g_original_update_subresource(context, dst, dst_subresource, dst_box, src_data, src_row_pitch, src_depth_pitch);
+        return;
+#else
         if (key != g_trace_ps_cb0_key.load(std::memory_order_relaxed))
         {
             g_original_update_subresource(context, dst, dst_subresource, dst_box, src_data, src_row_pitch, src_depth_pitch);
@@ -12076,7 +12153,9 @@ void STDMETHODCALLTYPE hooked_clear_rtv(ID3D11DeviceContext *context, ID3D11Rend
             log_line("clear_rtv res=" + hex64(info.resource_key) + " size=" + std::to_string(info.width) + "x" + std::to_string(info.height) +
                 " fmt=" + format_string(info.format) + " color=(" +
                 std::to_string(color[0]) + "," + std::to_string(color[1]) + "," + std::to_string(color[2]) + "," + std::to_string(color[3]) + ")");
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         record_color_source_copy(info, {}, "clear_rtv");
+#endif
     }
     g_original_clear_rtv(context, rtv, color);
 }
@@ -12265,6 +12344,7 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
         }
     }
 
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     const ULONGLONG trace_until = g_texture_trace_until_tick.load(std::memory_order_relaxed);
     if (desc != nullptr && trace_until >= GetTickCount64() && desc->Width >= 512 && desc->Height >= 288)
     {
@@ -12293,6 +12373,7 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
             log_line(out.str());
         }
     }
+#endif
     const HRESULT result = g_original_create_texture_2d(device, effective_desc, initial_data, texture);
     if (SUCCEEDED(result) && effective_desc != desc && texture != nullptr && *texture != nullptr)
     {
@@ -12324,7 +12405,9 @@ HRESULT STDMETHODCALLTYPE hooked_create_pixel_shader(ID3D11Device *device, const
             std::lock_guard lock(g_shader_info_mutex);
             g_pixel_shader_info[key] = { bytecode_hash, static_cast<std::size_t>(bytecode_length) };
         }
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         dump_pixel_shader_bytecode(bytecode_hash, shader_bytecode, static_cast<std::size_t>(bytecode_length));
+#endif
     }
     return hr;
 }
@@ -12343,7 +12426,9 @@ HRESULT STDMETHODCALLTYPE hooked_create_vertex_shader(ID3D11Device *device, cons
             std::lock_guard lock(g_shader_info_mutex);
             g_vertex_shader_info[key] = { bytecode_hash, static_cast<std::size_t>(bytecode_length) };
         }
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         dump_vertex_shader_bytecode(bytecode_hash, shader_bytecode, static_cast<std::size_t>(bytecode_length));
+#endif
     }
     return hr;
 }
@@ -12365,7 +12450,9 @@ HRESULT STDMETHODCALLTYPE hooked_create_compute_shader(ID3D11Device *device, con
             if (bytecode_hash != 0)
                 g_compute_shader_info_by_hash[bytecode_hash] = info;
         }
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         dump_compute_shader_bytecode(bytecode_hash, shader_bytecode, static_cast<std::size_t>(bytecode_length));
+#endif
     }
     return hr;
 }
@@ -13281,6 +13368,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
     else if (reason == DLL_PROCESS_DETACH)
     {
         il2cpp_callsite::shutdown();
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         {
             std::lock_guard lock(g_ps_trace_mutex);
             if (g_ps_trace_stream.is_open())
@@ -13289,6 +13377,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
                 g_ps_trace_stream.close();
             }
         }
+#endif
         g_osd_running = false;
         if (g_osd_window != nullptr)
             PostMessageW(g_osd_window, WM_CLOSE, 0, 0);
