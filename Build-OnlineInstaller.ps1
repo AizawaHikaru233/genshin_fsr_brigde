@@ -254,8 +254,9 @@ function Prepare-FpsStage {
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.ini') -Force
     Copy-Item -LiteralPath $antiDll -Destination (Join-Path $stagePayloadAnti 'AntiPlayerMosaic.dll') -Force
     # TextureLoader（纹理/Mod 加载器）：DLL + ini + DirectStorage 运行时 + 空 Mods 目录。
-    # 模块文件夹内附带其自身 GPL-3.0 许可/溯源与内部依赖（DirectStorage MIT/MS）的许可文本
-    # ——license 集中目录只放"外部单模块"（OptiScaler/ReShade/FPSUnlocker），
+    # 许可文件收进模块目录内 licenses/ 子文件夹（自身 GPL-3.0 许可/溯源 +
+    # 内部依赖 DirectStorage MIT/MS 许可文本）。
+    # license 集中目录只放"外部单模块"（OptiScaler/ReShade/FPSUnlocker），
     # 自有模块（Bridge/AntiPlayerMosaic/TextureLoader）与项目整体同为 GPL-3.0（根 LICENSE）。
     Copy-Item -LiteralPath $tloaderDll -Destination (Join-Path $stagePayloadTextureLoader 'TextureLoader.dll') -Force
     Copy-Item -LiteralPath (Join-Path $tloaderRuntime 'TextureLoader.ini') -Destination (Join-Path $stagePayloadTextureLoader 'TextureLoader.ini') -Force
@@ -265,16 +266,18 @@ function Prepare-FpsStage {
             Copy-Item -LiteralPath $source -Destination (Join-Path $stagePayloadTextureLoader $name) -Force
         }
     }
+    $stageTloaderLicenses = Join-Path $stagePayloadTextureLoader 'licenses'
+    New-Item -ItemType Directory -Path $stageTloaderLicenses -Force | Out-Null
     foreach ($name in @('LICENSE.GPL.txt', 'NOTICE.md', 'AUTHORS.txt')) {
         $source = Join-Path $tloaderSource $name
         if (Test-Path -LiteralPath $source -PathType Leaf) {
-            Copy-Item -LiteralPath $source -Destination (Join-Path $stagePayloadTextureLoader $name) -Force
+            Copy-Item -LiteralPath $source -Destination (Join-Path $stageTloaderLicenses $name) -Force
         }
     }
     foreach ($name in @('LICENSE.txt', 'LICENSE-CODE.txt', 'NOTICES.txt')) {
         $source = Join-Path $tloaderSource "third_party\dstorage\$name"
         if (Test-Path -LiteralPath $source -PathType Leaf) {
-            Copy-Item -LiteralPath $source -Destination (Join-Path $stagePayloadTextureLoader "DirectStorage-$name") -Force
+            Copy-Item -LiteralPath $source -Destination (Join-Path $stageTloaderLicenses "DirectStorage-$name") -Force
         }
     }
     New-Item -ItemType Directory -Path (Join-Path $stagePayloadTextureLoader 'Mods') -Force | Out-Null
@@ -368,10 +371,10 @@ function Build-FpsPackage {
             'payload\AntiPlayerMosaic\AntiPlayerMosaic.dll',
             'payload\TextureLoader\TextureLoader.dll', 'payload\TextureLoader\TextureLoader.ini',
             'payload\TextureLoader\dstorage.dll', 'payload\TextureLoader\dstoragecore.dll',
-            'payload\TextureLoader\LICENSE.GPL.txt', 'payload\TextureLoader\NOTICE.md',
-            'payload\TextureLoader\DirectStorage-LICENSE.txt',
-            'payload\TextureLoader\DirectStorage-LICENSE-CODE.txt',
-            'payload\TextureLoader\DirectStorage-NOTICES.txt',
+            'payload\TextureLoader\licenses\LICENSE.GPL.txt', 'payload\TextureLoader\licenses\NOTICE.md',
+            'payload\TextureLoader\licenses\DirectStorage-LICENSE.txt',
+            'payload\TextureLoader\licenses\DirectStorage-LICENSE-CODE.txt',
+            'payload\TextureLoader\licenses\DirectStorage-NOTICES.txt',
             'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64',
             'payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin.txt',
             'payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin-permission.png',
@@ -455,7 +458,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $dlssRuntime 'nvngx_dlss.license.txt') -Destination $nvidia -Force
     Copy-DirectoryContents -Source $reshadeRuntime -Destination $reshade
     Remove-NonBundledReShadeEffects -ReShadeDirectory $reshade
-    # TextureLoader（纹理/Mod 加载器）；模块文件夹内附 GPL 溯源 + DirectStorage 依赖许可
+    # TextureLoader（纹理/Mod 加载器）；许可收进模块内 licenses/ 子文件夹
     Copy-Item -LiteralPath $tloaderDll -Destination (Join-Path $textureLoader 'TextureLoader.dll') -Force
     Copy-Item -LiteralPath (Join-Path $tloaderRuntime 'TextureLoader.ini') -Destination (Join-Path $textureLoader 'TextureLoader.ini') -Force
     foreach ($name in @('dstorage.dll', 'dstoragecore.dll')) {
@@ -464,16 +467,18 @@ try {
             Copy-Item -LiteralPath $source -Destination (Join-Path $textureLoader $name) -Force
         }
     }
+    $textureLoaderLicenses = Join-Path $textureLoader 'licenses'
+    New-Item -ItemType Directory -Path $textureLoaderLicenses -Force | Out-Null
     foreach ($name in @('LICENSE.GPL.txt', 'NOTICE.md', 'AUTHORS.txt')) {
         $source = Join-Path $tloaderSource $name
         if (Test-Path -LiteralPath $source -PathType Leaf) {
-            Copy-Item -LiteralPath $source -Destination (Join-Path $textureLoader $name) -Force
+            Copy-Item -LiteralPath $source -Destination (Join-Path $textureLoaderLicenses $name) -Force
         }
     }
     foreach ($name in @('LICENSE.txt', 'LICENSE-CODE.txt', 'NOTICES.txt')) {
         $source = Join-Path $tloaderSource "third_party\dstorage\$name"
         if (Test-Path -LiteralPath $source -PathType Leaf) {
-            Copy-Item -LiteralPath $source -Destination (Join-Path $textureLoader "DirectStorage-$name") -Force
+            Copy-Item -LiteralPath $source -Destination (Join-Path $textureLoaderLicenses "DirectStorage-$name") -Force
         }
     }
     New-Item -ItemType Directory -Path (Join-Path $textureLoader 'Mods') -Force | Out-Null
@@ -509,10 +514,10 @@ try {
         'payload\NVIDIA\DLSS\nvngx_dlss.dll', 'payload\NVIDIA\DLSS\nvngx_dlss.license.txt',
         'payload\TextureLoader\TextureLoader.dll', 'payload\TextureLoader\TextureLoader.ini',
         'payload\TextureLoader\dstorage.dll', 'payload\TextureLoader\dstoragecore.dll',
-        'payload\TextureLoader\LICENSE.GPL.txt', 'payload\TextureLoader\NOTICE.md',
-        'payload\TextureLoader\DirectStorage-LICENSE.txt',
-        'payload\TextureLoader\DirectStorage-LICENSE-CODE.txt',
-        'payload\TextureLoader\DirectStorage-NOTICES.txt',
+        'payload\TextureLoader\licenses\LICENSE.GPL.txt', 'payload\TextureLoader\licenses\NOTICE.md',
+        'payload\TextureLoader\licenses\DirectStorage-LICENSE.txt',
+        'payload\TextureLoader\licenses\DirectStorage-LICENSE-CODE.txt',
+        'payload\TextureLoader\licenses\DirectStorage-NOTICES.txt',
         'payload\ReShade\ReShade64.dll', 'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64',
         'payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin.txt',
         'payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin-permission.png',
