@@ -304,10 +304,38 @@ bool set_ini_value_utf8(
 
     if (section_begin == lines.size())
     {
-        if (!lines.empty() && !lines.back().empty())
-            lines.push_back({});
-        lines.push_back("[" + section + "]");
-        lines.push_back(key + "=" + value);
+        // 目标 section 不存在：先在整个文件（无 section 区）找同名键替换，
+        // 找不到才追加 "key=value"（不带 section）——适配 TextureLoader 的
+        // 自研无 section 行解析格式，避免产生重复键导致旧空值遮蔽新值。
+        std::size_t any_key = lines.size();
+        for (std::size_t index = 0; index < lines.size(); ++index)
+        {
+            const std::string line = trim_ascii(lines[index]);
+            if (line.empty() || line.front() == ';' || line.front() == '#' || line.front() == '[')
+                continue;
+            const std::size_t separator = line.find('=');
+            if (separator != std::string::npos &&
+                lower_ascii(trim_ascii(line.substr(0, separator))) == wanted_key)
+            {
+                any_key = index;
+                break;
+            }
+        }
+        const std::string replacement = key + "=" + value;
+        if (any_key != lines.size())
+        {
+            const std::string current = trim_ascii(lines[any_key]);
+            const std::size_t eq = current.find('=');
+            if (eq != std::string::npos && trim_ascii(current.substr(eq + 1)) == value)
+                return true; // 值未变化：不重写文件
+            lines[any_key] = replacement;
+        }
+        else
+        {
+            if (!lines.empty() && !lines.back().empty())
+                lines.push_back({});
+            lines.push_back(replacement);
+        }
     }
     else
     {

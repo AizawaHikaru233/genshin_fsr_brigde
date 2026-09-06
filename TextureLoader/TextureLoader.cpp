@@ -1452,6 +1452,7 @@ static std::wstring GetIniValue(const std::wstring &dir, const std::wstring &key
     }
 
     size_t pos = 0;
+    std::wstring matched;
     while (pos < wdata.size()) {
         size_t eol = wdata.find(L'\n', pos);
         if (eol == std::wstring::npos)
@@ -1471,10 +1472,12 @@ static std::wstring GetIniValue(const std::wstring &dir, const std::wstring &key
         while (!k.empty() && (k.back() == L' ' || k.back() == L'\t')) k.pop_back();
         while (!v.empty() && (v.front() == L' ' || v.front() == L'\t')) v.erase(0, 1);
         while (!v.empty() && (v.back() == L' ' || v.back() == L'\t')) v.pop_back();
+        // 自研无 section 行解析：同名键允许出现多次（如外部工具追加 [General] 段），
+        // 取最后一个匹配——后出现的键覆盖先前的空值/旧值。
         if (k == key)
-            return v;
+            matched = v;
     }
-    return L"";
+    return matched;
 }
 
 static bool IniBool(const std::wstring &dir, const std::wstring &key, bool def)
