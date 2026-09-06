@@ -2,7 +2,7 @@
 
 面向原神 Windows DX11 客户端的图形插件。它独立 hook 游戏原生 FSR2 调用，并转接到 AMD FFX12 官方 SDK 实现超分：在支持的显卡上直接提供 FSR4/FSR3/FSR2，不依赖 OptiScaler 等外部插件；接入 OptiScaler 后可以进一步扩展 DLSS/XeSS/FSR4 INT8 等超分类型。
 
-本仓库同时包含 `AntiPlayerMosaic/` 子项目。它是独立构建的原神马赛克修复与 UID 隐藏插件，具体用法见该目录的 README。
+本仓库同时包含 `AntiPlayerMosaic/` 与 `TextureLoader/` 两个子项目：前者是独立构建的原神马赛克修复与 UID 隐藏插件；后者是 3DMigoto 兼容的纹理替换 / Mod 加载器（支持 DDS 与 DirectStorage GPU 解压的 GDDS）。用法分别见对应目录的 README 与 NOTICE。
 
 英文说明见 [README_EN.md](README_EN.md)。
 
@@ -34,7 +34,6 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 ```
 
 构建结果位于 `dist\原神解帧FSR插件包_v*.7z`，GitHub 发布目录生成 `dist\github-release\GenshinFSRBridge_v*.zip`。GitHub Actions 只构建和发布这个 GitHub 发布包，不生成芙芙包。
-
 ## 芙芙启动器插件包源码与本地构建
 
 `FufuGraphicsPlugin/` 提供芙芙启动器插件的源码、配置模板以及商城/本地测试 Lua 安装脚本；仓库不提交芙芙启动器插件二进制包。本地构建前先运行 `tools/Update-UpstreamComponents.ps1` 获取上游组件基线（OptiScaler 固定 v0.9.4，DLSS、ReShade、FPS Unlocker 获取各自最新正式版并做 SHA-256 校验），再运行：
@@ -53,11 +52,13 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 - 按显卡能力自动匹配 FSR 系列（FSR4/FSR3/FSR2），支持显卡上无需外部插件即可超分。
 - 将游戏渲染精度菜单扩展为 `0.2–0.9 + 原生`；`原生` 档位为游戏原本的 `1.0` 渲染精度。
 - 运行时日志默认写入 DLL 同目录的 `Dx11FsrBridge.log`，用于排查加载与 Hook 状态。
+- **TextureLoader**（纹理/Mod 加载器）：3DMigoto 兼容的 `[TextureOverride]` Mod 加载（DDS 替换 + GDDS DirectStorage GPU 解压），默认从插件包内 `Mods` 目录加载。
 
 ## 仓库结构
 
 - 仓库根目录：FSR Bridge 源码、配置与构建文件。
 - `AntiPlayerMosaic/`：反虚化、隐藏 UID 与水下马赛克修复插件。
+- `TextureLoader/`：3DMigoto 兼容纹理替换 / Mod 加载器（DDS + GDDS）。
 - `third_party/`：Bridge 的构建依赖及其原始声明。
 
 ## 使用方法
@@ -85,7 +86,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\Update-UpstreamComponents.ps1 -
 powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release
 ```
 
-需要先更新组件再打包时可合并为 `-FetchUpstream`。三个自有 DLL（Bridge / AntiPlayerMosaic / FufuGraphicsPlugin）由构建脚本以 Ninja 生成器自动编译，无需手动执行 cmake。
+需要先更新组件再打包时可合并为 `-FetchUpstream`。四个自有 DLL（Bridge / AntiPlayerMosaic / TextureLoader / FufuGraphicsPlugin）由构建脚本以 Ninja 生成器自动编译，无需手动执行 cmake。
 
 ## 日志与问题反馈
 
@@ -96,8 +97,9 @@ Bridge 和反虚化组件默认会保留错误日志（接入 OptiScaler/ReShade
 2. `payload/OptiScaler/OptiScaler.log` 与 `payload/OptiScaler/OptiScaler.ini`（使用 OptiScaler 时）
 3. `payload/ReShade/ReShade.log`（涉及 ReShade 时）
 4. `payload/AntiPlayerMosaic/AntiPlayerMosaic.log`（涉及反虚化、UID 或水下马赛克时）
-5. 芙芙插件目录下的 `FSR-Bridge-Plugin.log`（使用芙芙启动器插件时）
-6. 显卡型号、游戏版本、异常发生阶段和所选超分模式
+5. `payload/TextureLoader/TextureLoader.log`（涉及纹理替换 / Mod 加载时）
+6. 芙芙插件目录下的 `FSR-Bridge-Plugin.log`（使用芙芙启动器插件时）
+7. 显卡型号、游戏版本、异常发生阶段和所选超分模式
 
 需要进一步排查时，可临时将 `OptiScaler.ini`（接入 OptiScaler 时）中 `Log` 下的 `LogLevel` 改为 `1（Debug）`或 `0（Trace）`，但诊断结束后应恢复正式配置以避免额外开销。
 不要把游戏账号、登录信息或包含个人信息的截图提交到公开 Issue。

@@ -61,7 +61,7 @@ install.write_config(plugin_dir, {
         Description = "支持把原神的FSR2转换为FSR4（A卡7000/9000）、DLSS/XeSS/FSR4 INT8（其余显卡）",
         Developer = "シリアCelia",
         File = "FSR-Bridge-Plugin.dll",
-        Version = "2.1.0"
+        Version = "2.2.0"
     },
     EnableBridge = {
         Name = "启用 FSR Bridge",
@@ -77,6 +77,16 @@ install.write_config(plugin_dir, {
         Name = "启用 ReShade",
         Type = "bool",
         Value = is_nvidia and "0" or "1"
+    },
+    EnableTextureLoader = {
+        Name = "启用纹理/Mod 加载器",
+        Type = "bool",
+        Value = "1"
+    },
+    TextureLoaderModPath = {
+        Name = "Mod 加载路径（留空 = 插件目录内 Mods）",
+        Type = "string",
+        Value = ""
     },
     IssueFeedback = {
         Name = "问题反馈",

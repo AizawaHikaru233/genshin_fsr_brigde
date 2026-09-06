@@ -26,10 +26,13 @@ struct BootstrapConfig
     bool enable_bridge = true;
     bool enable_optiscaler = true;
     bool enable_reshade = true;
+    bool enable_texture_loader = true;
     bool reset_configurations = false;
     std::filesystem::path bridge_path;
     std::filesystem::path optiscaler_path;
     std::filesystem::path reshade_path;
+    std::filesystem::path texture_loader_path;
+    std::wstring texture_loader_mod_path; // 自定义 Mod 加载路径（空 = DLL 同目录 Mods）
     std::wstring trigger_module = L"WINTRUST.dll";
     DWORD timeout_ms = 30000;
     DWORD poll_interval_ms = 2;
@@ -782,6 +785,26 @@ bool ensure_missing_component_configurations(const BootstrapConfig &config)
                     optiscaler_directory / L"nvngx_dlss.license.txt");
         }
     }
+    if (!config.texture_loader_path.empty())
+    {
+        const std::filesystem::path texture_loader_ini =
+            config.texture_loader_path.parent_path() / L"TextureLoader.ini";
+        if (!file_exists(texture_loader_ini) &&
+            !copy_file_replace(default_directory / L"TextureLoader.ini", texture_loader_ini))
+        {
+            write_log("config_initialize_failed component=texture_loader");
+            success = false;
+        }
+        // 用户自定义 Mod 加载路径写入 mods_dir（留空 = DLL 同目录 Mods）
+        if (!config.texture_loader_mod_path.empty() &&
+            !set_ini_value_utf8(
+                texture_loader_ini, "General", "mods_dir",
+                wide_to_utf8(config.texture_loader_mod_path)))
+        {
+            write_log("config_initialize_failed component=texture_loader reason=mods_dir_write");
+            success = false;
+        }
+    }
     return success;
 }
 
@@ -854,6 +877,22 @@ bool reset_all_configurations(const BootstrapConfig &config)
     reset_file(default_directory / L"ReShadePreset.ini", game_directory / L"ReShadePreset.ini", "reshade_preset");
     if (!config.reshade_path.empty() && !prepare_reshade_game_configuration(config))
         success = false;
+
+    if (!config.texture_loader_path.empty())
+    {
+        const std::filesystem::path texture_loader_ini =
+            config.texture_loader_path.parent_path() / L"TextureLoader.ini";
+        reset_file(default_directory / L"TextureLoader.ini", texture_loader_ini, "texture_loader");
+        // 重置后仍应用用户自定义 Mod 路径
+        if (!config.texture_loader_mod_path.empty() &&
+            !set_ini_value_utf8(
+                texture_loader_ini, "General", "mods_dir",
+                wide_to_utf8(config.texture_loader_mod_path)))
+        {
+            write_log("config_reset_failed component=texture_loader reason=mods_dir_write");
+            success = false;
+        }
+    }
 
     if (!set_ini_value_utf8(
             g_module_directory / L"config.ini", "ResetConfigurations", "Value", "0"))
@@ -1041,6 +1080,8 @@ BootstrapConfig load_config()
         config.enable_optiscaler = parse_bool(*value, config.enable_optiscaler);
     if (const auto *value = find_fufu(L"EnableReShade"))
         config.enable_reshade = parse_bool(*value, config.enable_reshade);
+    if (const auto *value = find_fufu(L"EnableTextureLoader"))
+        config.enable_texture_loader = parse_bool(*value, config.enable_texture_loader);
     if (const auto *value = find_fufu(L"ResetConfigurations"))
         config.reset_configurations = parse_bool(*value, config.reset_configurations);
     if (const auto *value = find_fufu(L"BridgePath"); value != nullptr && !trim(*value).empty())
@@ -1049,6 +1090,10 @@ BootstrapConfig load_config()
         config.optiscaler_path = absolute_from(g_module_directory, trim(*value));
     if (const auto *value = find_fufu(L"ReShadePath"); value != nullptr && !trim(*value).empty())
         config.reshade_path = absolute_from(g_module_directory, trim(*value));
+    if (const auto *value = find_fufu(L"TextureLoaderPath"); value != nullptr && !trim(*value).empty())
+        config.texture_loader_path = absolute_from(g_module_directory, trim(*value));
+    if (const auto *value = find_fufu(L"TextureLoaderModPath"); value != nullptr)
+        config.texture_loader_mod_path = trim(*value);
     if (const auto *value = find_fufu(L"TriggerModule"))
         config.trigger_module = trim(*value);
     if (const auto *value = find_fufu(L"TimeoutMs"))
@@ -1091,6 +1136,17 @@ BootstrapConfig load_config()
             L"..\\ReShade\\ReShade64.dll",
             L"payload\\ReShade\\ReShade64.dll",
             L"..\\payload\\ReShade\\ReShade64.dll",
+        });
+    }
+    if (config.texture_loader_path.empty())
+    {
+        config.texture_loader_path = first_existing({
+            L"..\\..\\FSRGraphicsPayload\\TextureLoader\\TextureLoader.dll",
+            L"TextureLoader.dll",
+            L"TextureLoader\\TextureLoader.dll",
+            L"..\\TextureLoader\\TextureLoader.dll",
+            L"payload\\TextureLoader\\TextureLoader.dll",
+            L"..\\payload\\TextureLoader\\TextureLoader.dll",
         });
     }
     return config;
@@ -1200,7 +1256,8 @@ DWORD WINAPI bootstrap_thread(void *)
         ensure_missing_component_configurations(config);
     write_log(std::string("settings bridge=") + (config.enable_bridge ? "1" : "0") +
         " optiscaler=" + (config.enable_optiscaler ? "1" : "0") +
-        " reshade=" + (config.enable_reshade ? "1" : "0"));
+        " reshade=" + (config.enable_reshade ? "1" : "0") +
+        " texture_loader=" + (config.enable_texture_loader ? "1" : "0"));
     if (config.enable_optiscaler && !config.enable_bridge)
     {
         write_log("plugin_stopped reason=optiscaler_requires_bridge");
@@ -1212,6 +1269,9 @@ DWORD WINAPI bootstrap_thread(void *)
         write_log("optiscaler_path=" + wide_to_utf8(config.optiscaler_path.wstring()));
     if (config.enable_reshade)
         write_log("reshade_path=" + wide_to_utf8(config.reshade_path.wstring()));
+    if (config.enable_texture_loader)
+        write_log("texture_loader_path=" + wide_to_utf8(config.texture_loader_path.wstring()) +
+            " mod_path=" + wide_to_utf8(config.texture_loader_mod_path));
     if (config.enable_bridge && (config.bridge_path.empty() || !file_exists(config.bridge_path)))
     {
         write_log("bridge_path_invalid");
@@ -1227,7 +1287,14 @@ DWORD WINAPI bootstrap_thread(void *)
         write_log("reshade_path_invalid");
         return 5;
     }
-    if (!config.enable_bridge && !config.enable_optiscaler && !config.enable_reshade)
+    if (config.enable_texture_loader &&
+        (config.texture_loader_path.empty() || !file_exists(config.texture_loader_path)))
+    {
+        write_log("texture_loader_path_invalid");
+        return 17;
+    }
+    if (!config.enable_bridge && !config.enable_optiscaler && !config.enable_reshade &&
+        !config.enable_texture_loader)
     {
         write_log("plugin_success no_components_enabled");
         return 0;
@@ -1282,10 +1349,25 @@ DWORD WINAPI bootstrap_thread(void *)
             return 12;
     }
 
+    // TextureLoader（纹理/Mod 加载器）：独立 hook CreateTexture2D，无加载顺序依赖，
+    // 置于渲染链之后。Mod 路径已在 ensure/reset 阶段写入其 ini（mods_dir）。
+    if (config.enable_texture_loader)
+    {
+        if (GetModuleHandleW(L"TextureLoader.dll") != nullptr)
+        {
+            write_log("plugin_stopped reason=texture_loader_already_loaded");
+            return 18;
+        }
+        HMODULE texture_loader = load_module("texture_loader", config.texture_loader_path);
+        if (texture_loader == nullptr)
+            return 19;
+    }
+
     write_log(std::string("plugin_success bridge=") + (config.enable_bridge ? "1" : "0") +
         " optiscaler=" + (config.enable_optiscaler ? "1" : "0") +
         " reshade=" + (config.enable_reshade ? "1" : "0") +
-        " order=reshade,bridge,optiscaler");
+        " texture_loader=" + (config.enable_texture_loader ? "1" : "0") +
+        " order=reshade,bridge,optiscaler,texture_loader");
     return 0;
 }
 } // namespace

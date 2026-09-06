@@ -1,0 +1,16 @@
+3Dmigoto is available thanks to the work of:
+
+Chiri
+Bo3b Johnson
+Ian Munsie (AKA DarkStarSword)
+
+
+With additional contributions by:
+
+Ulf Jälmgrant (AKA Flugan)
+Vic Lee
+ColAngel
+
+
+And the DX9 port by:
+David Lockwood (AKA davegl1234)

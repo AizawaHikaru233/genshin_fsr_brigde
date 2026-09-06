@@ -222,7 +222,9 @@ function Assert-LanzouUploadSize {
 function Prepare-FpsStage {
     param([string]$Stage, [switch]$LocalFull, [Parameter(Mandatory)][string]$Version)
     Reset-Stage -Path $Stage
-    Copy-Item -LiteralPath (Join-Path $installerSource 'Installer.ps1'), (Join-Path $installerSource 'README.md') -Destination $Stage -Force
+    Copy-Item -LiteralPath (Join-Path $installerSource 'Installer.ps1') -Destination $Stage -Force
+    # 打包产物根目录 README 与仓库根 README 保持同步（单一事实来源）
+    Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $Stage 'README.md') -Force
     Copy-Item -LiteralPath (Join-Path $installerSource 'Configure-Launcher.bat') -Destination (Join-Path $Stage '一键配置.bat') -Force
     Copy-Item -LiteralPath (Join-Path $installerSource 'Configure-Launcher.en.bat') -Destination (Join-Path $Stage 'GenshinFSRBridgeTools.bat') -Force
     $stageScripts = Join-Path $Stage 'scripts'
