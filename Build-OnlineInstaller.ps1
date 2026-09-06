@@ -253,13 +253,28 @@ function Prepare-FpsStage {
     Copy-Item -LiteralPath $bridgeDll -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.dll') -Force
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.ini') -Force
     Copy-Item -LiteralPath $antiDll -Destination (Join-Path $stagePayloadAnti 'AntiPlayerMosaic.dll') -Force
-    # TextureLoader（纹理/Mod 加载器）：DLL + ini + DirectStorage 运行时 + 空 Mods 目录
+    # TextureLoader（纹理/Mod 加载器）：DLL + ini + DirectStorage 运行时 + 空 Mods 目录。
+    # 模块文件夹内附带其自身 GPL-3.0 许可/溯源与内部依赖（DirectStorage MIT/MS）的许可文本
+    # ——license 集中目录只放"外部单模块"（OptiScaler/ReShade/FPSUnlocker），
+    # 自有模块（Bridge/AntiPlayerMosaic/TextureLoader）与项目整体同为 GPL-3.0（根 LICENSE）。
     Copy-Item -LiteralPath $tloaderDll -Destination (Join-Path $stagePayloadTextureLoader 'TextureLoader.dll') -Force
     Copy-Item -LiteralPath (Join-Path $tloaderRuntime 'TextureLoader.ini') -Destination (Join-Path $stagePayloadTextureLoader 'TextureLoader.ini') -Force
     foreach ($name in @('dstorage.dll', 'dstoragecore.dll')) {
         $source = Join-Path $tloaderBuild $name
         if (Test-Path -LiteralPath $source -PathType Leaf) {
             Copy-Item -LiteralPath $source -Destination (Join-Path $stagePayloadTextureLoader $name) -Force
+        }
+    }
+    foreach ($name in @('LICENSE.GPL.txt', 'NOTICE.md', 'AUTHORS.txt')) {
+        $source = Join-Path $tloaderSource $name
+        if (Test-Path -LiteralPath $source -PathType Leaf) {
+            Copy-Item -LiteralPath $source -Destination (Join-Path $stagePayloadTextureLoader $name) -Force
+        }
+    }
+    foreach ($name in @('LICENSE.txt', 'LICENSE-CODE.txt', 'NOTICES.txt')) {
+        $source = Join-Path $tloaderSource "third_party\dstorage\$name"
+        if (Test-Path -LiteralPath $source -PathType Leaf) {
+            Copy-Item -LiteralPath $source -Destination (Join-Path $stagePayloadTextureLoader "DirectStorage-$name") -Force
         }
     }
     New-Item -ItemType Directory -Path (Join-Path $stagePayloadTextureLoader 'Mods') -Force | Out-Null
@@ -306,20 +321,16 @@ function Prepare-FpsStage {
     Copy-Item -LiteralPath (Join-Path $reshadeRuntime 'ReShade.ini'), (Join-Path $reshadeRuntime 'ReShadePreset.ini') -Destination $stageDefaults -Force
     Copy-Item -LiteralPath (Join-Path $tloaderRuntime 'TextureLoader.ini') -Destination (Join-Path $stageDefaults 'TextureLoader.ini') -Force
 
-    # 外部组件 license 集中到独立 license 文件夹（只集中插件本身的 license；
-    # OptiScaler 内部集成 SDK（FidelityFX/DirectX/XeSS）保持原样 OptiScaler\Licenses；
-    # 自有组件 Bridge/AntiPlayerMosaic/TextureLoader 不在此列——TextureLoader 的 GPL 许可
-    # 与其 DirectStorage（MIT/MS）依赖文本一并集中）。
+    # 外部组件 license 集中到独立 license 文件夹：只放"外部单模块"的 license
+    # （OptiScaler/ReShade/FPSUnlocker）；模块内部依赖的 license 留在模块文件夹内
+    # （OptiScaler\Licenses；TextureLoader\ 内 DirectStorage-*）；自有模块
+    # （Bridge/AntiPlayerMosaic/TextureLoader）与项目整体同为 GPL-3.0（根 LICENSE）。
     $stageLicense = Join-Path $stage 'license'
     New-Item -ItemType Directory -Path $stageLicense -Force | Out-Null
     $licenseSources = @(
         @{ Source = (Join-Path $root 'SharedResources\OptiScaler-LICENSE.txt'); Target = 'OptiScaler-LICENSE.txt' },
         @{ Source = (Join-Path $root 'SharedResources\FpsUnlocker-LICENSE.txt'); Target = 'FPSUnlocker-LICENSE.txt' },
-        @{ Source = (Join-Path $reshadeRuntime 'LICENSE-ReShade-BSD-3-Clause.txt'); Target = 'ReShade-LICENSE.txt' },
-        @{ Source = (Join-Path $tloaderSource 'LICENSE.GPL.txt'); Target = 'TextureLoader-LICENSE.txt' },
-        @{ Source = (Join-Path $tloaderSource 'third_party\dstorage\LICENSE.txt'); Target = 'DirectStorage-LICENSE.txt' },
-        @{ Source = (Join-Path $tloaderSource 'third_party\dstorage\LICENSE-CODE.txt'); Target = 'DirectStorage-LICENSE-CODE.txt' },
-        @{ Source = (Join-Path $tloaderSource 'third_party\dstorage\NOTICES.txt'); Target = 'DirectStorage-NOTICES.txt' }
+        @{ Source = (Join-Path $reshadeRuntime 'LICENSE-ReShade-BSD-3-Clause.txt'); Target = 'ReShade-LICENSE.txt' }
     )
     foreach ($entry in $licenseSources) {
         if (Test-Path -LiteralPath $entry.Source -PathType Leaf) {
@@ -357,14 +368,16 @@ function Build-FpsPackage {
             'payload\AntiPlayerMosaic\AntiPlayerMosaic.dll',
             'payload\TextureLoader\TextureLoader.dll', 'payload\TextureLoader\TextureLoader.ini',
             'payload\TextureLoader\dstorage.dll', 'payload\TextureLoader\dstoragecore.dll',
+            'payload\TextureLoader\LICENSE.GPL.txt', 'payload\TextureLoader\NOTICE.md',
+            'payload\TextureLoader\DirectStorage-LICENSE.txt',
+            'payload\TextureLoader\DirectStorage-LICENSE-CODE.txt',
+            'payload\TextureLoader\DirectStorage-NOTICES.txt',
             'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64',
             'payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin.txt',
             'payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin-permission.png',
             'payload\default_config\Dx11FsrBridge.ini', 'payload\default_config\OptiScaler.ini',
             'payload\default_config\OptiScaler-UpscalingFiles.json', 'payload\default_config\ReShade.ini',
             'payload\default_config\ReShadePreset.ini', 'payload\default_config\TextureLoader.ini',
-            'license\TextureLoader-LICENSE.txt', 'license\DirectStorage-LICENSE.txt',
-            'license\DirectStorage-LICENSE-CODE.txt', 'license\DirectStorage-NOTICES.txt',
             'payload\OptiScaler\OptiScaler.dll',
             'payload\OptiScaler\amd_fidelityfx_dx12.dll', 'payload\OptiScaler\amd_fidelityfx_upscaler_dx12.dll',
             'payload\OptiScaler\libxell.dll', 'payload\OptiScaler\libxess.dll',
@@ -442,13 +455,25 @@ try {
     Copy-Item -LiteralPath (Join-Path $dlssRuntime 'nvngx_dlss.license.txt') -Destination $nvidia -Force
     Copy-DirectoryContents -Source $reshadeRuntime -Destination $reshade
     Remove-NonBundledReShadeEffects -ReShadeDirectory $reshade
-    # TextureLoader（纹理/Mod 加载器）
+    # TextureLoader（纹理/Mod 加载器）；模块文件夹内附 GPL 溯源 + DirectStorage 依赖许可
     Copy-Item -LiteralPath $tloaderDll -Destination (Join-Path $textureLoader 'TextureLoader.dll') -Force
     Copy-Item -LiteralPath (Join-Path $tloaderRuntime 'TextureLoader.ini') -Destination (Join-Path $textureLoader 'TextureLoader.ini') -Force
     foreach ($name in @('dstorage.dll', 'dstoragecore.dll')) {
         $source = Join-Path $tloaderBuild $name
         if (Test-Path -LiteralPath $source -PathType Leaf) {
             Copy-Item -LiteralPath $source -Destination (Join-Path $textureLoader $name) -Force
+        }
+    }
+    foreach ($name in @('LICENSE.GPL.txt', 'NOTICE.md', 'AUTHORS.txt')) {
+        $source = Join-Path $tloaderSource $name
+        if (Test-Path -LiteralPath $source -PathType Leaf) {
+            Copy-Item -LiteralPath $source -Destination (Join-Path $textureLoader $name) -Force
+        }
+    }
+    foreach ($name in @('LICENSE.txt', 'LICENSE-CODE.txt', 'NOTICES.txt')) {
+        $source = Join-Path $tloaderSource "third_party\dstorage\$name"
+        if (Test-Path -LiteralPath $source -PathType Leaf) {
+            Copy-Item -LiteralPath $source -Destination (Join-Path $textureLoader "DirectStorage-$name") -Force
         }
     }
     New-Item -ItemType Directory -Path (Join-Path $textureLoader 'Mods') -Force | Out-Null
@@ -458,17 +483,13 @@ try {
     Copy-Item -LiteralPath (Join-Path $tloaderRuntime 'TextureLoader.ini') -Destination (Join-Path $defaults 'TextureLoader.ini') -Force
     Remove-Item -LiteralPath (Join-Path $reshade 'ReShade.ini'), (Join-Path $reshade 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
 
-    # 外部组件 license 集中（同 FPS 包：只集中插件本身的 license）
+    # 外部组件 license 集中（同 FPS 包：只放外部单模块的 license）
     $stageLicense = Join-Path $stage 'license'
     New-Item -ItemType Directory -Path $stageLicense -Force | Out-Null
     $licenseSources = @(
         @{ Source = (Join-Path $root 'SharedResources\OptiScaler-LICENSE.txt'); Target = 'OptiScaler-LICENSE.txt' },
         @{ Source = (Join-Path $root 'SharedResources\FpsUnlocker-LICENSE.txt'); Target = 'FPSUnlocker-LICENSE.txt' },
-        @{ Source = (Join-Path $reshadeRuntime 'LICENSE-ReShade-BSD-3-Clause.txt'); Target = 'ReShade-LICENSE.txt' },
-        @{ Source = (Join-Path $tloaderSource 'LICENSE.GPL.txt'); Target = 'TextureLoader-LICENSE.txt' },
-        @{ Source = (Join-Path $tloaderSource 'third_party\dstorage\LICENSE.txt'); Target = 'DirectStorage-LICENSE.txt' },
-        @{ Source = (Join-Path $tloaderSource 'third_party\dstorage\LICENSE-CODE.txt'); Target = 'DirectStorage-LICENSE-CODE.txt' },
-        @{ Source = (Join-Path $tloaderSource 'third_party\dstorage\NOTICES.txt'); Target = 'DirectStorage-NOTICES.txt' }
+        @{ Source = (Join-Path $reshadeRuntime 'LICENSE-ReShade-BSD-3-Clause.txt'); Target = 'ReShade-LICENSE.txt' }
     )
     foreach ($entry in $licenseSources) {
         if (Test-Path -LiteralPath $entry.Source -PathType Leaf) {
@@ -488,14 +509,16 @@ try {
         'payload\NVIDIA\DLSS\nvngx_dlss.dll', 'payload\NVIDIA\DLSS\nvngx_dlss.license.txt',
         'payload\TextureLoader\TextureLoader.dll', 'payload\TextureLoader\TextureLoader.ini',
         'payload\TextureLoader\dstorage.dll', 'payload\TextureLoader\dstoragecore.dll',
+        'payload\TextureLoader\LICENSE.GPL.txt', 'payload\TextureLoader\NOTICE.md',
+        'payload\TextureLoader\DirectStorage-LICENSE.txt',
+        'payload\TextureLoader\DirectStorage-LICENSE-CODE.txt',
+        'payload\TextureLoader\DirectStorage-NOTICES.txt',
         'payload\ReShade\ReShade64.dll', 'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64',
         'payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin.txt',
         'payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin-permission.png',
         'payload\default_config\Dx11FsrBridge.ini', 'payload\default_config\OptiScaler.ini',
         'payload\default_config\OptiScaler-UpscalingFiles.json', 'payload\default_config\ReShade.ini',
-        'payload\default_config\ReShadePreset.ini', 'payload\default_config\TextureLoader.ini',
-        'license\TextureLoader-LICENSE.txt', 'license\DirectStorage-LICENSE.txt',
-        'license\DirectStorage-LICENSE-CODE.txt', 'license\DirectStorage-NOTICES.txt'
+        'payload\default_config\ReShadePreset.ini', 'payload\default_config\TextureLoader.ini'
     )
     Assert-CleanPackage -Path $stage
 
