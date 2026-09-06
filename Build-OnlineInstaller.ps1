@@ -44,6 +44,7 @@ function Invoke-Cmake {
     param([string[]]$Arguments)
     $cmake = Get-Command cmake.exe -ErrorAction SilentlyContinue
     $cmakePath = if ($null -ne $cmake) { $cmake.Path } else { $null }
+    $visualStudioPath = $null
     if ($null -eq $cmakePath) {
         $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
         if (Test-Path -LiteralPath $vswhere -PathType Leaf) {
@@ -53,6 +54,28 @@ function Invoke-Cmake {
         }
     }
     if ($null -eq $cmakePath) { throw '没有找到 CMake。' }
+    # Ninja 生成器 + cl 直连依赖 VC 工具链环境（LIB/INCLUDE）——若当前进程未初始化
+    # （如从普通 PowerShell 直接运行），先导入 vcvars64.bat 的变量再调用 cmake/ninja。
+    if ([string]::IsNullOrWhiteSpace($env:LIB)) {
+        if ([string]::IsNullOrWhiteSpace($visualStudioPath)) {
+            $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+            if (Test-Path -LiteralPath $vswhere -PathType Leaf) {
+                $visualStudioPath = & $vswhere -latest -products * -property installationPath
+            }
+        }
+        $vcvars = Join-Path $visualStudioPath 'VC\Auxiliary\Build\vcvars64.bat'
+        if (Test-Path -LiteralPath $vcvars -PathType Leaf) {
+            $envSnapshot = & cmd.exe /c "`"$vcvars`" >nul 2>&1 && set"
+            foreach ($line in $envSnapshot) {
+                if ($line -match '^([^=]+)=(.*)$') {
+                    try { Set-Item -Path "Env:$($matches[1])" -Value $matches[2] } catch { }
+                }
+            }
+        }
+        else {
+            throw "缺少 VC 工具链环境且未找到 vcvars64.bat: $vcvars"
+        }
+    }
     & $cmakePath @Arguments | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "CMake 命令失败: $($Arguments -join ' ')" }
 }

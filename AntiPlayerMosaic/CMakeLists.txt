@@ -10,4 +10,6 @@ endif()
 target_compile_definitions(AntiPlayerMosaic PRIVATE
     $<$<CONFIG:Release>:ANTIPLAYER_RELEASE_RUNTIME=1>
 )
-target_link_libraries(AntiPlayerMosaic PRIVATE Psapi)
+# Psapi 函数（EnumProcessModules 等）自 Windows 7 起位于 kernel32（Psapi.lib 仅为
+# 兼容转发库，VS18/新 SDK 已移除该 .lib）——直接链 kernel32。
+target_link_libraries(AntiPlayerMosaic PRIVATE kernel32)
