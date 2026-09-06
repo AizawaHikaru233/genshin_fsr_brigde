@@ -6,6 +6,7 @@
     [switch]$DisableAntiBlur,
     [switch]$DisableHDR,
     [switch]$DisableTextureLoader,
+    [switch]$EnableTextureLoader,
     [ValidateSet('Auto', 'Manual', 'Existing')]
     [string]$UnlockerSource,
     [ValidateSet('Auto', 'Manual', 'Existing')]
@@ -1273,7 +1274,7 @@ if (-not $NonInteractive) {
     $DisableOptiScaler = -not (Read-YesNo -Prompt '启用 FSR Bridge + OptiScaler' -Default $true)
     $DisableAntiBlur = -not (Read-YesNo -Prompt '启用反虚化/隐藏 UID' -Default $true)
     $DisableHDR = -not (Read-YesNo -Prompt '启用 ReShade + RenoDX HDR' -Default $true)
-    $DisableTextureLoader = -not (Read-YesNo -Prompt '启用纹理/Mod 加载器（TextureLoader）' -Default $true)
+    $DisableTextureLoader = -not (Read-YesNo -Prompt '启用纹理/Mod 加载器（TextureLoader）' -Default $false)
     while ($FpsTarget -le 0) {
         $fpsInput = (Read-Host '请输入帧率上限（直接回车使用 300）').Trim()
         if ([string]::IsNullOrWhiteSpace($fpsInput)) {
@@ -1297,6 +1298,13 @@ if ($NonInteractive -and [string]::IsNullOrWhiteSpace($OptiScalerSource)) {
 }
 if ([string]::IsNullOrWhiteSpace($ReShadeSource)) {
     $ReShadeSource = if (Test-Path -LiteralPath $reshadeDll -PathType Leaf) { 'Existing' } else { 'Auto' }
+}
+# TextureLoader 默认不安装：交互模式由询问结果决定（默认 No）；
+# 非交互模式仅当显式 -EnableTextureLoader（且未 -DisableTextureLoader）时启用。
+$textureLoaderEnabled = if ($NonInteractive) {
+    $EnableTextureLoader -and -not $DisableTextureLoader
+} else {
+    -not $DisableTextureLoader
 }
 $unlockerMode = Select-SourceMode -Label 'FPS Unlocker' -RequestedMode $UnlockerSource -ExistingAvailable (Test-Path -LiteralPath $unlocker -PathType Leaf)
 Install-Unlocker -Mode $unlockerMode -ManualPath $UnlockerPackagePath
@@ -1334,7 +1342,7 @@ if (-not $DisableOptiScaler) {
 if (-not $DisableAntiBlur) {
     Assert-File -Path $antiBlurDll
 }
-if (-not $DisableTextureLoader) {
+if ($textureLoaderEnabled) {
     Assert-File -Path $textureLoaderDll
 }
 if (-not $DisableHDR) {
@@ -1374,7 +1382,7 @@ if (-not $DisableOptiScaler) {
 if (-not $DisableAntiBlur) {
     $dllList.Add($antiBlurDll)
 }
-if (-not $DisableTextureLoader) {
+if ($textureLoaderEnabled) {
     $dllList.Add($textureLoaderDll)
 }
 

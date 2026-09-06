@@ -1013,7 +1013,7 @@ function Invoke-InstallWizard {
     if ($desired.OptiScaler) { $arguments += @('-OptiScalerSource', $optiSource) } else { $arguments += '-DisableOptiScaler' }
     if (-not $desired.AntiBlur) { $arguments += '-DisableAntiBlur' }
     if ($desired.HDR) { $arguments += @('-ReShadeSource', $reShadeSource) } else { $arguments += '-DisableHDR' }
-    if (-not $desired.TextureLoader) { $arguments += '-DisableTextureLoader' }
+    if ($desired.TextureLoader) { $arguments += '-EnableTextureLoader' } else { $arguments += '-DisableTextureLoader' }
     if ($desired.OptiScaler -and $optiSource -eq 'Manual') { $arguments += @('-OptiScalerPackagePath', $optiPackagePath) }
     $arguments += '-PreserveExistingConfigs'
     if ($NoShortcut) { $arguments += '-NoShortcut' }
@@ -1115,7 +1115,7 @@ function Invoke-UpdateWizard {
         if ($desired.OptiScaler) { $arguments += @('-OptiScalerSource', $optiSource) } else { $arguments += '-DisableOptiScaler' }
         if (-not $desired.AntiBlur) { $arguments += '-DisableAntiBlur' }
         if ($desired.HDR) { $arguments += @('-ReShadeSource', $reShadeSource) } else { $arguments += '-DisableHDR' }
-        if (-not $desired.TextureLoader) { $arguments += '-DisableTextureLoader' }
+        if ($desired.TextureLoader) { $arguments += '-EnableTextureLoader' } else { $arguments += '-DisableTextureLoader' }
         if ($shouldPreserveExistingConfigs) { $arguments += '-PreserveExistingConfigs' }
         if ($NoShortcut) { $arguments += '-NoShortcut' }
         Write-Host ''

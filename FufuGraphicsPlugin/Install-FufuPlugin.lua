@@ -81,7 +81,7 @@ install.write_config(plugin_dir, {
     EnableTextureLoader = {
         Name = "启用纹理/Mod 加载器",
         Type = "bool",
-        Value = "1"
+        Value = "0"
     },
     TextureLoaderModPath = {
         Name = "Mod 加载路径（留空 = 插件目录内 Mods）",
