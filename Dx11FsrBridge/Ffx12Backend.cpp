@@ -90,13 +90,18 @@ std::uint32_t g_on12_command_slot_cursor = 0;
 std::atomic_uint64_t g_on12_direct_dispatch_count { 0 };
 
 // 每帧耗时统计（诊断 GPU 空载：QPC 计时，节流输出）
-//  - prep_us   ：dispatch 内 D3D11 输入准备（CS + Copy + Flush + Signal）
-//  - submit_us ：dispatch 内 D3D12 侧（Wait + FFX dispatch 调用 + Execute + Signal）
-//  - wait_us   ：finish_pending 的 ctx4->Wait 阻塞（= FFX 未提前完成的时间）
-//  - copy_us   ：输出拷贝耗时
-//  - total_us  ：dispatch 调用总耗时（同步模式=帧内硬停；异步=提交即返）
+//  - prep_wait_us：dispatch 内 Wait(v_prev)（等上一轮 D3D12 完成）
+//  - prep_cs_us  ：D3D11 输入准备（深度/运动 CS + CopyResource 输入）
+//  - prep_flush_us：Flush 提交（含上一帧遗留的输出拷贝——批次提交成本）
+//  - submit_us   ：D3D12 侧（Wait + Reset + barrier + FFX dispatch + Execute + 双 Signal）
+//  - wait_us     ：finish_pending 的 ctx4->Wait 阻塞（= FFX 未提前完成的时间）
+//  - copy_us     ：输出拷贝调用本身（去 Flush 后应≈0）
+//  - total_us    ：dispatch 调用总耗时
 struct FrameTimingStats
 {
+    std::atomic_uint64_t prep_wait_us { 0 };
+    std::atomic_uint64_t prep_cs_us { 0 };
+    std::atomic_uint64_t prep_flush_us { 0 };
     std::atomic_uint64_t prep_us { 0 };
     std::atomic_uint64_t submit_us { 0 };
     std::atomic_uint64_t wait_us { 0 };
@@ -1728,9 +1733,11 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
         }
     }
     // 上一轮 D3D12 对共享输入/输出的使用必须已完成（否则 D3D11 复用会踩未完结的 GPU 工作）。
+    const std::uint64_t t_prep_wait_start = qpc_us();
     if (g_shared_fence_value != 0 &&
         FAILED(g_game_ctx4->Wait(g_shared_fence11.Get(), g_shared_fence_value)))
         return false;
+    g_timing.prep_wait_us.fetch_add(qpc_us() - t_prep_wait_start, std::memory_order_relaxed);
     const std::uint64_t t_prep_start = qpc_us();
 
     // ---- ① D3D11 侧：深度提取（CS）＋ 输入 GPU 拷贝 ----
@@ -1844,8 +1851,11 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
         game_context->CopyResource(g_tex_color.d11.Get(), input.color);
     // motion 不再拷贝进共享 raw 纹理——解码 CS 已直接读游戏纹理，
     // 解码结果（共享 R16G16）才是 FFX 的 motion 输入。
+    const std::uint64_t t_cs_end = qpc_us();
+    g_timing.prep_cs_us.fetch_add(t_cs_end - t_prep_start, std::memory_order_relaxed);
     game_context->Flush();
     const std::uint64_t t_prep_end = qpc_us();
+    g_timing.prep_flush_us.fetch_add(t_prep_end - t_cs_end, std::memory_order_relaxed);
     g_timing.prep_us.fetch_add(t_prep_end - t_prep_start, std::memory_order_relaxed);
     const std::uint64_t v1 = g_shared_fence_value + 1;
     if (FAILED(g_game_ctx4->Signal(g_shared_fence11.Get(), v1)))
@@ -2014,7 +2024,10 @@ static bool finish_gpu_shared()
     const std::uint64_t t_copy_start = qpc_us();
     if (output)
         game_context->CopyResource(output, g_tex_output.d11.Get());
-    game_context->Flush();
+    // 不显式 Flush：拷贝命令留在 D3D11 队列，由游戏随后的 Present（或下一批
+    // 提交）自然带走——省一次显式提交的驱动往返（copy 196us 大头之一）。
+    // 正确性：DXGI Present 会确保 backbuffer 内容就绪（隐含提交排队命令）；
+    // 若游戏在拷贝后不再提交任何命令，Present 仍会带走它。
     g_timing.copy_us.fetch_add(qpc_us() - t_copy_start, std::memory_order_relaxed);
     g_pending_ffx = false;
     g_pending_output_target.Reset();
@@ -2639,6 +2652,12 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
             g_timing.frames.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n == 8 || (n % 512) == 0)
         {
+            const std::uint32_t avg_pw =
+                (std::uint32_t)(g_timing.prep_wait_us.load(std::memory_order_relaxed) / n);
+            const std::uint32_t avg_pc =
+                (std::uint32_t)(g_timing.prep_cs_us.load(std::memory_order_relaxed) / n);
+            const std::uint32_t avg_pf =
+                (std::uint32_t)(g_timing.prep_flush_us.load(std::memory_order_relaxed) / n);
             const std::uint32_t avg_p =
                 (std::uint32_t)(g_timing.prep_us.load(std::memory_order_relaxed) / n);
             const std::uint32_t avg_s =
@@ -2649,8 +2668,8 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
                 (std::uint32_t)(g_timing.copy_us.load(std::memory_order_relaxed) / n);
             const std::uint32_t avg_t =
                 (std::uint32_t)(g_timing.total_us.load(std::memory_order_relaxed) / n);
-            sdk_note(L"timing async=%d prep=%uus submit=%uus wait=%uus copy=%uus total=%uus frames=%u",
-                     g_async_upscale ? 1 : 0, avg_p, avg_s, avg_w, avg_c, avg_t, n);
+            sdk_note(L"timing async=%d pwait=%uus pcs=%uus pflush=%uus prep=%uus submit=%uus wait=%uus copy=%uus total=%uus frames=%u",
+                     g_async_upscale ? 1 : 0, avg_pw, avg_pc, avg_pf, avg_p, avg_s, avg_w, avg_c, avg_t, n);
             // 直接落盘（独立文件，不经 sdk_msgs 缓冲/日志白名单——诊断数据不被吞）
             {
                 FILE *tf = nullptr;
@@ -2658,12 +2677,15 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
                 {
                     SYSTEMTIME st {};
                     GetLocalTime(&st);
-                    fprintf(tf, "%04d-%02d-%02d %02d:%02d:%02d.%03d timing async=%d prep=%uus submit=%uus wait=%uus copy=%uus total=%uus frames=%u\n",
+                    fprintf(tf, "%04d-%02d-%02d %02d:%02d:%02d.%03d timing async=%d pwait=%uus pcs=%uus pflush=%uus prep=%uus submit=%uus wait=%uus copy=%uus total=%uus frames=%u\n",
                             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
-                            st.wMilliseconds, g_async_upscale ? 1 : 0, avg_p, avg_s, avg_w, avg_c, avg_t, n);
+                            st.wMilliseconds, g_async_upscale ? 1 : 0, avg_pw, avg_pc, avg_pf, avg_p, avg_s, avg_w, avg_c, avg_t, n);
                     fclose(tf);
                 }
             }
+            g_timing.prep_wait_us.store(0, std::memory_order_relaxed);
+            g_timing.prep_cs_us.store(0, std::memory_order_relaxed);
+            g_timing.prep_flush_us.store(0, std::memory_order_relaxed);
             g_timing.prep_us.store(0, std::memory_order_relaxed);
             g_timing.submit_us.store(0, std::memory_order_relaxed);
             g_timing.wait_us.store(0, std::memory_order_relaxed);
