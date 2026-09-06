@@ -162,16 +162,20 @@ std::wstring g_sdk_messages;
 std::mutex g_sdk_msg_mutex;
 
 // ---- 管线诊断：中间纹理中央像素（readback 采集）----
+// 正式版（RELEASE_RUNTIME）不编译诊断链：canary/chain readback/debug pixels/
+// dump frames/output mark/decode test/debug layer 全部移除。
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 struct DebugPixel
 {
     float v[4] = {0, 0, 0, 0};
 };
 DebugPixel g_debug_pixels[4]; // 0=PQ解码(color_linear) 1=ffxDispatch(output_linear) 2=PQ编码(输出共享) 3=motion解码(motion_cvt)
 std::mutex g_debug_px_mutex;
-std::atomic_uint64_t g_dispatch_counter { 0 };
 bool g_debug_layer = false;           // D3D12 debug layer + info queue
 std::uint32_t g_dump_frames = 0;      // 2026-08-25：dump 前 N 帧 FSR4 输出（诊断边缘抖动）
 ComPtr<ID3D12InfoQueue> g_info_queue;
+#endif
+std::atomic_uint64_t g_dispatch_counter { 0 };
 void sdk_message_cb(std::uint32_t type, const wchar_t *message)
 {
     if (message == nullptr)
@@ -319,7 +323,8 @@ static const std::uint16_t *motion_decode_lut()
     return lut.data();
 }
 
-// 读取 D3D12 info queue 消息（诊断；定义在尾部，前向声明供 dispatch 使用）
+// 读取 D3D12 info queue 消息（诊断；正式版不编译）
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 static void drain_info_queue();
 
 // 读取 D3D12 info queue 消息并追加到 SDK 消息缓冲（诊断）
@@ -369,6 +374,7 @@ static void drain_info_queue()
     {
     }
 }
+#endif
 
 // ---- motion 解码 compute pass（R10G10B10A2 平方编码 → R16G16_FLOAT）----
 // 游戏 FSR2 accumulate shader（0x78057A29AF6C2D99）的 motion 解码（反汇编实证）：
@@ -451,8 +457,10 @@ ComPtr<ID3D12DescriptorHeap> g_mv_heap;         // [SRV(motion源), UAV(cvt)]，
 UINT g_mv_heap_inc = 0;
 ComPtr<ID3D12RootSignature> g_mv_rs;
 ComPtr<ID3D12PipelineState> g_mv_pso;
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 ComPtr<ID3D12PipelineState> g_mv_pso_test; // 金丝雀：常数输出 0.5（诊断 pass 是否执行）
 bool g_motion_decode_test = false;
+#endif
 D3D12_RESOURCE_STATES g_motion_src_state = D3D12_RESOURCE_STATE_COMMON;  // 共享源（D3D11 互操作）
 
 // ---- PQ 颜色空间（游戏 color 为 HDR10 PQ 编码，FSR2 需线性 HDR）----
@@ -463,11 +471,13 @@ ComPtr<ID3D12DescriptorHeap> g_pq_in_heap;     // [SRV(color源), UAV(color_line
 ComPtr<ID3D12DescriptorHeap> g_pq_out_heap;    // [SRV(output_linear), UAV(输出共享)]
 ComPtr<ID3D12RootSignature> g_pq_rs;           // 通用 SRV+UAV 根签名
 ComPtr<ID3D12PipelineState> g_pq_decode_pso;   // PqToLinear
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 ComPtr<ID3D12PipelineState> g_pq_decode_test_pso; // PqToLinear 常数注入测试（0.5）
-ComPtr<ID3D12PipelineState> g_pq_encode_pso;   // LinearToPq
 ComPtr<ID3D12PipelineState> g_pq_encode_mark_pso; // LinearToPq + 输出标记（诊断）
 bool g_output_mark = false;                    // 输出标记开关（诊断）
 bool g_decode_test = false;                    // 解码常数注入测试（诊断：判断 pass 执行 vs SRV 读）
+#endif
+ComPtr<ID3D12PipelineState> g_pq_encode_pso;   // LinearToPq
 D3D12_RESOURCE_STATES g_color_linear_state = D3D12_RESOURCE_STATE_COMMON;
 D3D12_RESOURCE_STATES g_output_linear_state = D3D12_RESOURCE_STATE_COMMON;
 UINT g_pq_heap_inc = 0;
@@ -483,7 +493,8 @@ ComPtr<ID3D12Resource> g_output_readback;       // READBACK heap（rowPitch×hei
 UINT g_output_readback_row_pitch = 0;
 D3D12_RESOURCE_STATES g_output_enc_state = D3D12_RESOURCE_STATE_COMMON;
 DXGI_FORMAT g_output_enc_format = DXGI_FORMAT_R8G8B8A8_UNORM;
-// E1 诊断：D3D12 自有输出 5 点采样（区分"链不渲染" vs "写共享失败"）
+// E1 诊断 + 链中点二分采样（正式版不编译：OutputSamples/ChainSamples/readback 全部移除）
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 struct OutputSamples
 {
     std::uint32_t raw[5] = {};
@@ -524,6 +535,7 @@ UINT g_rb_output_linear_pitch = 0;
 UINT g_rb_color_own_pitch = 0;
 UINT g_rb_depth_own_pitch = 0;
 UINT g_rb_motion_own_pitch = 0;
+#endif
 
 // 版本标记 pass（2026-08-24：全程可见的 SDK 版本标记，画在 enc 上，与窗口无关）：
 // 边框 24px + 左上角块 110px，颜色编码版本（2.3.4 红 / 3.1.5 绿 / 4.1.1 蓝）。
@@ -569,7 +581,8 @@ ID3D12PipelineState *marker_pso_for_version()
 // ensure_output_landing_resources 之后）。enc 为标记目标纹理的 D3D12 侧。
 bool ensure_marker_heap_for(ID3D12Resource *enc);
 
-// ---- 金丝雀（2026-08-24 ）：常数 compute 写 64×64 自有纹理 ----
+// ---- 金丝雀（2026-08-24 ）：常数 compute 写 64×64 自有纹理（正式版不编译）----
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 // 不依赖任何输入；读回 0xFFC08040（R=64,G=128,B=192,A=255 小端）= cmdlist 执行 + 自有 UAV + readback 全通。
 static const char *g_canary_hlsl = R"(
 RWTexture2D<float4> out_c : register(u0);
@@ -585,6 +598,7 @@ ComPtr<ID3D12DescriptorHeap> g_canary_heap; // [UAV(canary)]
 ComPtr<ID3D12PipelineState> g_canary_pso;
 D3D12_RESOURCE_STATES g_canary_state = D3D12_RESOURCE_STATE_COMMON;
 UINT g_canary_pitch = 0;
+#endif
 
 // enc 清除金丝雀：编码前 ClearUnorderedAccessViewFloat(enc, 灰) ——读回灰色=clear 执行但编码未写；
 // 红色（mark）=编码写了；0=clear 都没执行（cmdlist 空转/未执行）。
@@ -870,8 +884,10 @@ void release_motion_decode()
     g_up_motion_cvt_ptr = nullptr;
     g_up_motion_cvt.Reset();
     g_tex_motion_cvt.Reset();
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_rb_motion_cvt.Reset();
     g_rb_motion_cvt_pitch = 0;
+#endif
     g_mv_heap.Reset();
     g_motion_src_state = D3D12_RESOURCE_STATE_COMMON;
 }
@@ -885,10 +901,12 @@ void release_pq_resources()
     g_tex_output_enc.Reset();
     g_output_readback.Reset();
     g_output_readback_row_pitch = 0;
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_rb_color_linear.Reset();
     g_rb_output_linear.Reset();
     g_rb_color_linear_pitch = 0;
     g_rb_output_linear_pitch = 0;
+#endif
     g_output_enc_state = D3D12_RESOURCE_STATE_COMMON;
     g_pq_in_heap.Reset();
     g_pq_out_heap.Reset();
@@ -898,7 +916,8 @@ void release_pq_resources()
     g_color_linear_state = D3D12_RESOURCE_STATE_COMMON;
     g_output_linear_state = D3D12_RESOURCE_STATE_COMMON;
     release_input_staging();
-    // 金丝雀
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    // 金丝雀 + 链采样（诊断）
     g_canary_tex.Reset();
     g_canary_rb.Reset();
     g_canary_heap.Reset();
@@ -911,6 +930,7 @@ void release_pq_resources()
         g_out_samples = OutputSamples {};
         g_chain_samples = ChainSamples {};
     }
+#endif
 }
 
 // 为 D3D12 自有纹理建 readback buffer（GetCopyableFootprints 对齐 rowPitch）
@@ -1043,7 +1063,8 @@ bool ensure_input_staging()
         sdk_note(L"create staging failed stage=input");
         return false;
     }
-    // 自有输入 readback（链输入送达验证）
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    // 自有输入 readback（链输入送达验证，诊断）
     if (!create_readback_for_texture(g_tex_color_own.Get(), g_rb_color_own, g_rb_color_own_pitch) ||
         !create_readback_for_texture(g_tex_depth_own.Get(), g_rb_depth_own, g_rb_depth_own_pitch) ||
         !create_readback_for_texture(g_tex_motion_own.Get(), g_rb_motion_own, g_rb_motion_own_pitch))
@@ -1051,6 +1072,7 @@ bool ensure_input_staging()
         sdk_note(L"create own-input readback failed stage=input");
         return false;
     }
+#endif
     g_color_own_state = g_depth_own_state = g_motion_own_state =
         g_reactive_own_state = g_transparency_own_state = D3D12_RESOURCE_STATE_COMMON;
     sdk234_step("input_staging ok");
@@ -1084,10 +1106,12 @@ void release_input_staging()
     g_stage_depth.Reset();
     g_stage_motion.Reset();
     g_stage_transparency.Reset();
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_rb_color_own.Reset();
     g_rb_depth_own.Reset();
     g_rb_motion_own.Reset();
     g_rb_color_own_pitch = g_rb_depth_own_pitch = g_rb_motion_own_pitch = 0;
+#endif
     g_up_color_pitch = g_up_depth_pitch = g_up_motion_pitch = g_up_reactive_pitch =
         g_up_transparency_pitch = 0;
     g_stage_color_pitch = g_stage_depth_pitch = g_stage_motion_pitch = g_stage_transparency_pitch = 0;
@@ -1157,7 +1181,8 @@ bool ensure_output_landing_resources()
             return false;
         g_output_enc_state = D3D12_RESOURCE_STATE_COMMON;
     }
-    // 金丝雀：64×64 R8G8B8A8_UNORM 自有纹理 + readback + UAV 堆（执行链证明）
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    // 金丝雀：64×64 R8G8B8A8_UNORM 自有纹理 + readback + UAV 堆（执行链证明，诊断）
     if (!g_canary_tex)
     {
         D3D12_HEAP_PROPERTIES hp {};
@@ -1200,6 +1225,7 @@ bool ensure_output_landing_resources()
         g_d12dev->CreateShaderResourceView(g_canary_tex.Get(), &srv, cpu1);
         g_canary_state = D3D12_RESOURCE_STATE_COMMON;
     }
+#endif
     // 版本标记堆：[UAV(enc)@0, SRV(enc)@1]（UAV 在前，本驱动映射；SRV 供表布局占位，shader 不用）
     if (!ensure_marker_heap_for(g_tex_output_enc.Get()))
         return false;
@@ -1287,11 +1313,13 @@ bool ensure_pq_resources()
                                                      IID_PPV_ARGS(&g_tex_output_linear))))
             return false;
     }
-    // 链中点采样 readback（color_linear / output_linear）
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    // 链中点采样 readback（color_linear / output_linear，诊断）
     if (!create_readback_for_texture(g_tex_color_linear.Get(), g_rb_color_linear, g_rb_color_linear_pitch))
         return false;
     if (!create_readback_for_texture(g_tex_output_linear.Get(), g_rb_output_linear, g_rb_output_linear_pitch))
         return false;
+#endif
     g_pq_heap_inc = g_d12dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     // PQ 解码堆：[UAV(color_linear)@0, SRV(color_own)@1]
     // 2026-08-24 离线复现定案：本驱动（AMD RDNA4）描述符表把 UAV range 排到 offset 0
@@ -1407,9 +1435,11 @@ bool ensure_motion_decode_resources()
         if (FAILED(g_up_motion_cvt->Map(0, &ur, &g_up_motion_cvt_ptr)) || !g_up_motion_cvt_ptr)
             return false;
     }
-    // 链中点采样 readback（金丝雀：motion 输入非 0 → cvt 非 0 即证明 cmdlist 执行 + 自有 UAV 写正常）
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    // 链中点采样 readback（金丝雀：motion 输入非 0 → cvt 非 0 即证明 cmdlist 执行 + 自有 UAV 写正常，诊断）
     if (!create_readback_for_texture(g_tex_motion_cvt.Get(), g_rb_motion_cvt, g_rb_motion_cvt_pitch))
         return false;
+#endif
     // 描述符堆：[SRV(motion源), UAV(cvt)]，shader-visible
     D3D12_DESCRIPTOR_HEAP_DESC hd {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -2080,7 +2110,8 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
     std::printf("[sdk234] init: adapter obtained\n");
     std::fflush(stdout);
 #endif
-    // D3D12 设备（debug layer 可配：先启用 debug interface）
+    // D3D12 设备（debug layer 可配：先启用 debug interface；正式版不编译）
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_debug_layer)
     {
         ComPtr<ID3D12Debug> debug;
@@ -2094,10 +2125,12 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
             debug->EnableDebugLayer();
         }
     }
+#endif
     {
         const HRESULT hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_d12dev));
         if (FAILED(hr) || !g_d12dev)
             return false;
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         if (g_debug_layer)
         {
             if (FAILED(g_d12dev.As(&g_info_queue)))
@@ -2105,6 +2138,7 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
             else
                 g_info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, FALSE);
         }
+#endif
     }
     // 适配器 LUID（验证 D3D11/D3D12 同适配器）
     {
@@ -2439,9 +2473,11 @@ void shutdown()
     g_gpu_interop_ready = false;
     g_active.store(false, std::memory_order_release);
     g_pq_decode_pso.Reset();
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_pq_decode_test_pso.Reset();
-    g_pq_encode_pso.Reset();
     g_pq_encode_mark_pso.Reset();
+#endif
+    g_pq_encode_pso.Reset();
     if (g_fence_event)
     {
         CloseHandle(g_fence_event);
@@ -2685,19 +2721,9 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
                 (std::uint32_t)(g_timing.total_us.load(std::memory_order_relaxed) / n);
             sdk_note(L"timing async=%d pwait=%uus pcs=%uus pflush=%uus sig=%uus w12=%uus submit=%uus wait=%uus copy=%uus total=%uus frames=%u",
                      g_async_upscale ? 1 : 0, avg_pw, avg_pc, avg_pf, avg_sig, avg_w12, avg_s, avg_w, avg_c, avg_t, n);
-            // 直接落盘（独立文件，不经 sdk_msgs 缓冲/日志白名单——诊断数据不被吞）
-            {
-                FILE *tf = nullptr;
-                if (fopen_s(&tf, "ffx12_timing.log", "a") == 0 && tf)
-                {
-                    SYSTEMTIME st {};
-                    GetLocalTime(&st);
-                    fprintf(tf, "%04d-%02d-%02d %02d:%02d:%02d.%03d timing async=%d pwait=%uus pcs=%uus pflush=%uus sig=%uus w12=%uus submit=%uus wait=%uus copy=%uus total=%uus frames=%u\n",
-                            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
-                            st.wMilliseconds, g_async_upscale ? 1 : 0, avg_pw, avg_pc, avg_pf, avg_sig, avg_w12, avg_s, avg_w, avg_c, avg_t, n);
-                    fclose(tf);
-                }
-            }
+            // 独立落盘已移除（调试痕迹）：timing 经 sdk_note → 桥读取时拼入
+            // ffx12_path 行（等级 2 debug），LogLevel>=2 才写主日志——正式版
+            // 默认 LogLevel=1 不产生 timing 输出。
             g_timing.prep_wait_us.store(0, std::memory_order_relaxed);
             g_timing.prep_cs_us.store(0, std::memory_order_relaxed);
             g_timing.prep_flush_us.store(0, std::memory_order_relaxed);
@@ -2806,11 +2832,6 @@ void set_velocity_factor(float factor)
     g_velocity_factor = factor;
 }
 
-void set_dump_frames(std::uint32_t n)
-{
-    g_dump_frames = n;
-}
-
 // 版本命名规范——对外统一 ffx12 品牌（ffx12-fsr4.1.1 / ffx12-fsr3.1.5 /
 // ffx12-fsr2.3.4），内部映射回 ffx-api 枚举名（4.1.1/3.1.5/2.3.4）做版本匹配。
 // 版本判定简化为大版本（ffx12-fsr4.x / ffx12-fsr3.x / ffx12-fsr2.x）——
@@ -2861,21 +2882,6 @@ void get_sdk_messages(std::wstring &out)
     out = g_sdk_messages;
 }
 
-void set_output_mark(bool mark)
-{
-    g_output_mark = mark;
-}
-
-void set_decode_test(bool test)
-{
-    g_decode_test = test;
-}
-
-void set_motion_decode_test(bool test)
-{
-    g_motion_decode_test = test;
-}
-
 void set_motion_deadzone(bool enable)
 {
     g_motion_deadzone = enable;
@@ -2903,11 +2909,6 @@ void preload(const wchar_t *path)
         g_sdk_path = path;
         g_sdk_loaded_path = path;
     }
-}
-
-void set_debug_layer(bool enable)
-{
-    g_debug_layer = enable;
 }
 
 void set_gpu_interop(bool enable)
@@ -2953,6 +2954,27 @@ int last_ffx_dispatch_return_code()
     return g_last_ffx_dispatch_rc.load(std::memory_order_relaxed);
 }
 
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+void set_dump_frames(std::uint32_t n)
+{
+    g_dump_frames = n;
+}
+void set_output_mark(bool mark)
+{
+    g_output_mark = mark;
+}
+void set_decode_test(bool test)
+{
+    g_decode_test = test;
+}
+void set_motion_decode_test(bool test)
+{
+    g_motion_decode_test = test;
+}
+void set_debug_layer(bool enable)
+{
+    g_debug_layer = enable;
+}
 void debug_pixels(float out_pixels[16])
 {
     std::lock_guard lock(g_debug_px_mutex);
@@ -2987,5 +3009,6 @@ void get_chain_samples(ChainSampleData &out)
     out.motion_own = g_chain_samples.motion_own;
     out.valid = g_chain_samples.valid;
 }
+#endif
 
 } // namespace ffx12

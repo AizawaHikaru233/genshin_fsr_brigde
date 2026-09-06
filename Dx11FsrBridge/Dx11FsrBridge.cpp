@@ -102,6 +102,8 @@ struct Config
 {
     bool enabled = true;
     bool enable_logging = false;
+    // 日志等级（LogLevel）：0=仅错误 1=核心状态（默认） 2=节流细节 3=全量（trace）
+    int log_level = 1;
     DWORD target_process_id = 0;
     std::wstring target_process_name;
     bool log_all_dispatch = false;
@@ -213,7 +215,6 @@ struct Config
     bool ffx12 = false;
     std::wstring ffx12_dll_path;
     bool ffx12_fail_closed = false; // ：禁止回退原生（测试/故障显式暴露）
-    bool ffx12_full_logging = false; // ：Release 下日志全开（排查用；log_line 不过滤）
     bool ffx12_probe = false; // 一次性槽位/cb0 探测（诊断用，默认关）
     bool ffx12_feature_fallback = true; // 特征识别兜底：1=运行时特征优先+已有样本(硬编码)兜底；0=纯特征识别（验证用——关闭所有版本特定样本）
     bool optiscaler_bridge_probe = false; // 遗留 OptiScaler 候选桥路径（frames.jsonl 记录，默认关）
@@ -454,6 +455,9 @@ std::mutex g_final_scene_snapshot_mutex;
 FinalSceneSnapshotState g_final_scene_snapshot;
 #endif
 std::atomic_bool g_logging_enabled = false;
+// 当前日志等级（0=error 1=info 2=debug 3=trace）；load_config 同步 g_config.log_level。
+// Ffx12Backend 等跨模块引用（timing 独立落盘门控）。
+int g_bridge_log_level = 1;
 // 显卡路由摘要（initialize 早期产生、被 reset_log 清空）——存全局，active 后补打保证可见
 static bool g_route_applied = false; // 路由已应用（防止设备补检重复应用）
 // 路由信息（apply 时保存，焦点框首次成功/失败时输出，保证三行相邻）
@@ -3161,38 +3165,48 @@ void log_interesting_dispatch_details(UINT group_x, UINT group_y, UINT group_z)
     }
 }
 
-void log_line(const std::string &line)
+// 日志等级推断（替代白名单过滤）：按内容性质分级，LogLevel 放行
+//   0 = 错误（failed/error/invalid/...）
+//   1 = 核心状态（接管结果/GPU/SDK/版本/渲染精度/警告/焦点框）
+//   2 = 节流细节（dispatch 计数/抖动/timing/路径/识别过程）
+//   3 = 其余全部（trace：每帧 present、hook 数据、快照等）
+static int log_line_level(const std::string &line)
 {
-    if (!g_logging_enabled.load(std::memory_order_relaxed))
-        return;
-#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    // Ffx12FullLogging=1 时跳过白名单过滤（全量日志——排查切换渲染精度卡死等）
-    if (!g_config.ffx12_full_logging)
-    {
     static constexpr std::array<std::string_view, 11> error_terms {
         "failed", "failure", "error", "invalid", "mismatch", "exception",
         "unavailable", "unresolved", "unsupported", "missing", "refusing"
     };
-    static constexpr std::array<std::string_view, 13> basic_terms {
-        // 正式版日志精简——只保留：接管结果(ffx12_result/failed)、
-        // 显卡型号(ffx12_gpu)、SDK 路径(ffx12_sdk)、FSR 实际版本(ffx12_version)、渲染精度菜单状态、
-        // 每帧计时(timing/ffx12_path 含 sdk_msgs)。
-        // hook 数据状态（draw_hook_active/iat_scan/fsr2_translation_candidate 等）一律不写。
+    static constexpr std::array<std::string_view, 8> info_terms {
         "ffx12_gpu", "ffx12_sdk", "ffx12_version", "ffx12_result", "ffx12_failed",
-        "jit_norm", "jitter_px", "ffx12_path", "timing",
-        "render_scale_menu hook_ready", "render_scale_menu render_scale_written",
-        "fsr2_on_demand_identify_fail", "fsr2_il2cpp_rva_feature_match"
+        "render_scale_menu", "fsr2_on_demand_identify_fail", "fsr2_il2cpp_rva_feature_match"
     };
-    const bool startup_marker = line.starts_with("Dx11FsrBridge active");
-    const bool error_message = std::any_of(error_terms.begin(), error_terms.end(),
-        [&](std::string_view term) { return line.find(term) != std::string::npos; });
-    const bool basic_message = line.starts_with("warning ") ||
-        std::any_of(basic_terms.begin(), basic_terms.end(),
-            [&](std::string_view term) { return line.find(term) != std::string::npos; });
-    if (!startup_marker && !error_message && !basic_message)
+    static constexpr std::array<std::string_view, 9> debug_terms {
+        "ffx12_dispatch", "ffx12_path", "ffx12_adapter", "timing",
+        "jit_norm", "jitter_px", "warning ", "ffx12_token", "ffx12_native_dump"
+    };
+    if (line.starts_with("Dx11FsrBridge active"))
+        return 1;
+    for (std::string_view term : error_terms)
+        if (line.find(term) != std::string::npos)
+            return 0;
+    if (line.starts_with("warning ") || line.find("unexpected") != std::string::npos)
+        return 1;
+    for (std::string_view term : info_terms)
+        if (line.find(term) != std::string::npos)
+            return 1;
+    for (std::string_view term : debug_terms)
+        if (line.find(term) != std::string::npos)
+            return 2;
+    return 3;
+}
+
+void log_line(const std::string &line)
+{
+    if (!g_logging_enabled.load(std::memory_order_relaxed))
         return;
-    }
-#endif
+    // 等级放行：LogLevel >= 行等级才写
+    if (g_config.log_level < log_line_level(line))
+        return;
     std::lock_guard lock(g_log_mutex);
     static std::ofstream out(g_log_path, std::ios::app); // 常驻流：避免每次写盘开/关
     SYSTEMTIME st {};
@@ -3211,10 +3225,13 @@ void reset_log()
     std::ofstream(g_log_path, std::ios::trunc).close();
 }
 
-// 焦点区域行——无条件写入（绕过 RELEASE 过滤白名单，用于分隔线/空行/关键信息框）
+// 焦点区域行——等级 1（核心状态），默认 LogLevel=1 时可见；
+// 用于分隔线/空行/关键信息框（启动/接管结果焦点区）。
 void log_focus_line(const std::string &line)
 {
     if (!g_logging_enabled.load(std::memory_order_relaxed))
+        return;
+    if (g_config.log_level < 1)
         return;
     std::lock_guard lock(g_log_mutex);
     static std::ofstream out(g_log_path, std::ios::app); // 常驻流：避免每次写盘开/关
@@ -3878,7 +3895,9 @@ void load_config()
                               config_path.c_str()) != 0;
     g_config.ffx12_output_mark =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12OutputMark", 0, config_path.c_str()) != 0;
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     ffx12::set_output_mark(g_config.ffx12_output_mark);
+#endif
     {
         wchar_t fov_buf[32] {};
         GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12FovScale", L"1.0", fov_buf,
@@ -3894,16 +3913,18 @@ void load_config()
         g_config.ffx12_camera_near = std::clamp<float>(std::wcstof(near_buf, nullptr), 0.001f, 100.0f);
         g_config.ffx12_camera_far = std::clamp<float>(std::wcstof(far_buf, nullptr), 10.0f, 100000.0f);
     }
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     ffx12::set_motion_decode_test(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DecodeTest", 0, config_path.c_str()) != 0);
     ffx12::set_decode_test(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DecodeTest", 0, config_path.c_str()) != 0);
     ffx12::set_motion_decode_test(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12MotionDecodeTest", 0, config_path.c_str()) != 0);
-    ffx12::set_motion_deadzone(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12MotionDeadzone", 0, config_path.c_str()) != 0);
     ffx12::set_debug_layer(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DebugLayer", 0, config_path.c_str()) != 0);
+#endif
+    ffx12::set_motion_deadzone(
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12MotionDeadzone", 0, config_path.c_str()) != 0);
     ffx12::set_depth_inverted(g_config.ffx12_depth_inverted);
     ffx12::set_decode_motion(g_config.ffx12_decode_motion);
     ffx12::set_motion_vectors_jittered(g_config.fsr2_motion_vectors_jittered);
@@ -3919,8 +3940,10 @@ void load_config()
     ffx12::set_auto_exposure(g_config.ffx12_auto_exposure);
     ffx12::set_non_linear(g_config.ffx12_non_linear);
     ffx12::set_velocity_factor(g_config.ffx12_velocity_factor);
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     ffx12::set_dump_frames(static_cast<std::uint32_t>(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DumpFrames", 0, config_path.c_str())));
+#endif
     {
         wchar_t ver_buf[32] {};
         // 默认请求最高版本前缀（4.x）——provider 的 GET_VERSIONS 按 GPU
@@ -3945,8 +3968,16 @@ void load_config()
     }
     g_config.ffx12_fail_closed =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FailClosed", 0, config_path.c_str()) != 0;
-    g_config.ffx12_full_logging =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FullLogging", 0, config_path.c_str()) != 0;
+    // 日志等级模式（替代白名单过滤）：0=仅错误 1=核心状态 2=节流细节 3=全量
+    {
+        const int lv = static_cast<int>(
+            GetPrivateProfileIntW(L"Dx11FsrBridge", L"LogLevel", 1, config_path.c_str()));
+        g_config.log_level = std::clamp(lv, 0, 3);
+    }
+    // 兼容旧配置：Ffx12FullLogging=1 等价 LogLevel=3（全量日志）
+    if (GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FullLogging", 0, config_path.c_str()) != 0)
+        g_config.log_level = 3;
+    g_bridge_log_level = g_config.log_level;
 #endif
 #else
     g_config.enabled = GetPrivateProfileIntW(L"Dx11FsrBridge", L"Enabled", 1, config_path.c_str()) != 0;
@@ -10636,6 +10667,17 @@ bool try_fsr2_translation_draw(
                     }
                     if (dcount == 1 || dcount % 1024 == 0)
                     {
+                        bool on12 = false, gpu_only = false;
+                        ffx12::interop_capabilities(on12, gpu_only);
+                        log_line("ffx12_transport count=" + std::to_string(dcount) +
+                            " on12_device=" + std::to_string(on12 ? 1 : 0) +
+                            " gpu_only=" + std::to_string(gpu_only ? 1 : 0) +
+                            " gpu_interop_ready=" +
+                            std::to_string(ffx12::gpu_interop_ready() ? 1 : 0));
+                    }
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+                    if (dcount == 1 || dcount % 1024 == 0)
+                    {
                         float dp[16] {};
                         ffx12::debug_pixels(dp);
                         log_line("ffx12_pipeline count=" + std::to_string(dcount) +
@@ -10645,16 +10687,7 @@ bool try_fsr2_translation_draw(
                             " mvdec=" + std::to_string(dp[12]) + "," + std::to_string(dp[13]) +
                             " (pqdec=PQ解码输出; ffxout=ffxDispatch输出; pqenc=PQ编码输出; mvdec=motion解码)");
                     }
-                    if (dcount == 1 || dcount % 1024 == 0)
-                    {
-                        bool on12 = false, gpu_only = false;
-                        ffx12::interop_capabilities(on12, gpu_only);
-                        log_line("ffx12_transport count=" + std::to_string(dcount) +
-                            " on12_device=" + std::to_string(on12 ? 1 : 0) +
-                            " gpu_only=" + std::to_string(gpu_only ? 1 : 0) +
-                            " gpu_interop_ready=" +
-                            std::to_string(ffx12::gpu_interop_ready() ? 1 : 0));
-                    }
+#endif
                     if (dcount == 1 || dcount % 1024 == 0)
                     {
                         // 读回 ffx12 后端输出与游戏 rtv1 的 5 点采样：
@@ -10666,6 +10699,7 @@ bool try_fsr2_translation_draw(
                         log_line("ffx12_backend_samples count=" + std::to_string(dcount) + bd);
                         log_line("ffx12_rtv1_samples count=" + std::to_string(dcount) + r1);
                     }
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
                     if (dcount == 1 || dcount % 1024 == 0)
                     {
                         // E1+链中点：D3D12 自有输出 5 点 + 链中点二分（金丝雀/解码/派发）。
@@ -10697,6 +10731,7 @@ bool try_fsr2_translation_draw(
                             std::to_string(cs.output_linear[2]) +
                             " (canary=执行+UAV+readback全通; co/dz/mo=自有输入送达; mv_cvt=运动解码; cl=PQ解码; ol=ffxDispatch; enc=PQ编码)");
                     }
+#endif
                     if (il2cpp_callsite::active() && call_params.context != 0)
                     {
                         // 2026-08-26：游戏 FSR2 上下文结构体转储（零补丁，SEH 保护）。
