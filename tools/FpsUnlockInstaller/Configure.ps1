@@ -5,6 +5,7 @@ param(
     [switch]$DisableOptiScaler,
     [switch]$DisableAntiBlur,
     [switch]$DisableHDR,
+    [switch]$DisableTextureLoader,
     [ValidateSet('Auto', 'Manual', 'Existing')]
     [string]$UnlockerSource,
     [ValidateSet('Auto', 'Manual', 'Existing')]
@@ -70,6 +71,7 @@ $fakeNvapiDefaultIni = Join-Path $optiDir 'fakenvapi.default.ini'
 $bundledDlss = Join-Path $payload 'NVIDIA\DLSS\nvngx_dlss.dll'
 $installedDlss = Join-Path $optiDir 'nvngx_dlss.dll'
 $antiBlurDll = Join-Path $payload 'AntiPlayerMosaic\AntiPlayerMosaic.dll'
+$textureLoaderDll = Join-Path $payload 'TextureLoader\TextureLoader.dll'
 $reshadeDll = Join-Path $reshadeDir 'ReShade64.dll'
 $shaderDir = Join-Path $reshadeDir 'reshade-shaders'
 $unlocker = Join-Path $root 'unlockfps_nc.exe'
@@ -1168,7 +1170,7 @@ function Reset-PluginConfigurations {
         }
     }
     else {
-        foreach ($candidate in @($bridgeDll, $optiDll, $antiBlurDll, $reshadeDll)) {
+        foreach ($candidate in @($bridgeDll, $optiDll, $antiBlurDll, $textureLoaderDll, $reshadeDll)) {
             if (Test-Path -LiteralPath $candidate -PathType Leaf) { $loadedDlls.Add($candidate) }
         }
     }
@@ -1271,6 +1273,7 @@ if (-not $NonInteractive) {
     $DisableOptiScaler = -not (Read-YesNo -Prompt '启用 FSR Bridge + OptiScaler' -Default $true)
     $DisableAntiBlur = -not (Read-YesNo -Prompt '启用反虚化/隐藏 UID' -Default $true)
     $DisableHDR = -not (Read-YesNo -Prompt '启用 ReShade + RenoDX HDR' -Default $true)
+    $DisableTextureLoader = -not (Read-YesNo -Prompt '启用纹理/Mod 加载器（TextureLoader）' -Default $true)
     while ($FpsTarget -le 0) {
         $fpsInput = (Read-Host '请输入帧率上限（直接回车使用 300）').Trim()
         if ([string]::IsNullOrWhiteSpace($fpsInput)) {
@@ -1331,6 +1334,9 @@ if (-not $DisableOptiScaler) {
 if (-not $DisableAntiBlur) {
     Assert-File -Path $antiBlurDll
 }
+if (-not $DisableTextureLoader) {
+    Assert-File -Path $textureLoaderDll
+}
 if (-not $DisableHDR) {
     Install-ReShadeResources -Mode $ReShadeSource
     Assert-File -Path $reshadeDll
@@ -1367,6 +1373,9 @@ if (-not $DisableOptiScaler) {
 }
 if (-not $DisableAntiBlur) {
     $dllList.Add($antiBlurDll)
+}
+if (-not $DisableTextureLoader) {
+    $dllList.Add($textureLoaderDll)
 }
 
 $config = $null

@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Parameter(Mandatory = $true)][int]$ParentProcessId,
     [Parameter(Mandatory = $true)][string]$SourceDirectory,
     [Parameter(Mandatory = $true)][string]$TargetDirectory,
@@ -25,7 +25,8 @@ foreach ($relativePath in @(
     'payload\OptiScaler\OptiScaler\OptiScaler.ini',
     'payload\OptiScaler\OptiScaler\fakenvapi.ini',
     'payload\ReShade\ReShade.ini',
-    'payload\ReShade\ReShadePreset.ini'
+    'payload\ReShade\ReShadePreset.ini',
+    'payload\TextureLoader\TextureLoader.ini'
 )) {
     $preservedRelativePaths.Add($relativePath) | Out-Null
 }

@@ -28,6 +28,7 @@ $optiPath = Join-Path $optiDirectory 'OptiScaler.dll'
 $bridgePath = Join-Path $payloadDirectory 'Bridge\Dx11FsrBridge.dll'
 $antiBlurPath = Join-Path $payloadDirectory 'AntiPlayerMosaic\AntiPlayerMosaic.dll'
 $reShadePath = Join-Path $payloadDirectory 'ReShade\ReShade64.dll'
+$textureLoaderPath = Join-Path $payloadDirectory 'TextureLoader\TextureLoader.dll'
 $selfUpdateRepository = 'AizawaHikaru233/genshin_fsr_brigde'
 $selfUpdateHelperPath = Join-Path $scriptsDirectory 'Apply-PackageUpdate.ps1'
 $script:SelfUpdateStarted = $false
@@ -247,6 +248,7 @@ function Repair-RuntimePaths {
                 'optiscaler.dll' = $optiPath
                 'antiplayermosaic.dll' = $antiBlurPath
                 'reshade64.dll' = $reShadePath
+                'textureloader.dll' = $textureLoaderPath
             }
             $repairedList = [Collections.Generic.List[string]]::new()
             $seenPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -418,6 +420,7 @@ function Get-ModuleState {
         OptiScaler = $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $optiPath)
         AntiBlur = $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $antiBlurPath)
         HDR = $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $reShadePath) -and (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $SelectedGamePath) 'ReShade.ini') -PathType Leaf)
+        TextureLoader = $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $textureLoaderPath)
     }
 }
 
@@ -535,12 +538,14 @@ function Write-InstallCatalog {
     $bridgeVersion = Get-FileVersionLabel -Path $bridgePath
     $antiVersion = Get-FileVersionLabel -Path $antiBlurPath
     $reShadeVersion = Get-FileVersionLabel -Path $reShadePath
+    $textureLoaderVersion = Get-FileVersionLabel -Path $textureLoaderPath
     $renoDxVersion = Get-FileVersionLabel -Path $renoDxPath
     $state = Get-ModuleState -SelectedGamePath $SelectedGamePath
     $bridgeStatus = if ($state.Bridge) { '已安装' } else { '未安装' }
     $optiStatus = if ($state.OptiScaler) { '已安装' } else { '未安装' }
     $antiStatus = if ($state.AntiBlur) { '已安装' } else { '未安装' }
     $hdrStatus = if ($state.HDR) { '已安装' } else { '未安装' }
+    $textureLoaderStatus = if ($state.TextureLoader) { '已安装' } else { '未安装' }
     Write-Host ''
     Write-CatalogRow -Id '模块 ID' -Name '插件名' -Author '作者' -Version '当前版本' -Status '安装状态' -Header
     Write-CatalogRow -Id '------' -Name '--------------------' -Author '----------------' -Version '--------------------' -Status '------' -Header
@@ -548,12 +553,13 @@ function Write-InstallCatalog {
     Write-CatalogRow -Id '2.' -Name 'OptiScaler（DLSS/XeSS/FSR4 INT8，需 Bridge）' -Author 'OptiScaler' -Version $optiVersion -Status $optiStatus
     Write-CatalogRow -Id '3.' -Name '反虚化 / 隐藏 UID' -Author 'シリアCelia' -Version $antiVersion -Status $antiStatus
     Write-CatalogRow -Id '4.' -Name 'ReShade + RenoDX HDR' -Author 'crosire / Bilibili UID 3461582765951639' -Version "ReShade $reShadeVersion`nRenoDX $renoDxVersion" -Status $hdrStatus
+    Write-CatalogRow -Id '5.' -Name '纹理/Mod 加载器（TextureLoader）' -Author 'シリアCelia' -Version $textureLoaderVersion -Status $textureLoaderStatus
 }
 
 function Select-ModuleSet {
     param([string]$ActionName)
     $allowed = [Collections.Generic.List[int]]::new()
-    foreach ($id in @(1, 2, 3, 4)) { $allowed.Add($id) }
+    foreach ($id in @(1, 2, 3, 4, 5)) { $allowed.Add($id) }
     while ($true) {
         Write-Host "请输入需要${ActionName}的模块 ID" -ForegroundColor Yellow
         Write-Host ''
@@ -966,12 +972,14 @@ function Invoke-InstallWizard {
         OptiScaler = [bool]$state.OptiScaler
         AntiBlur = [bool]$state.AntiBlur
         HDR = [bool]$state.HDR
+        TextureLoader = [bool]$state.TextureLoader
     }
     foreach ($module in $selection) {
         if ($module -eq 1) { $desired.Bridge = $true }
         if ($module -eq 2) { $desired.OptiScaler = $true; $desired.Bridge = $true } # OptiScaler 捆绑 Bridge
         if ($module -eq 3) { $desired.AntiBlur = $true }
         if ($module -eq 4) { $desired.HDR = $true }
+        if ($module -eq 5) { $desired.TextureLoader = $true }
     }
     $unlockerSource = 'Existing'
     $optiSource = 'Existing'
@@ -1005,6 +1013,7 @@ function Invoke-InstallWizard {
     if ($desired.OptiScaler) { $arguments += @('-OptiScalerSource', $optiSource) } else { $arguments += '-DisableOptiScaler' }
     if (-not $desired.AntiBlur) { $arguments += '-DisableAntiBlur' }
     if ($desired.HDR) { $arguments += @('-ReShadeSource', $reShadeSource) } else { $arguments += '-DisableHDR' }
+    if (-not $desired.TextureLoader) { $arguments += '-DisableTextureLoader' }
     if ($desired.OptiScaler -and $optiSource -eq 'Manual') { $arguments += @('-OptiScalerPackagePath', $optiPackagePath) }
     $arguments += '-PreserveExistingConfigs'
     if ($NoShortcut) { $arguments += '-NoShortcut' }
@@ -1041,7 +1050,7 @@ function Invoke-UpdateWizard {
     }
     if ($selection.Count -eq 0) { return }
 
-    $isFullUpdateRequested = @(@(1, 2, 3, 4) | Where-Object { $_ -notin $selection }).Count -eq 0
+    $isFullUpdateRequested = @(@(1, 2, 3, 4, 5) | Where-Object { $_ -notin $selection }).Count -eq 0
     $shouldPreserveExistingConfigs = $PreserveExistingConfigs -or $isFullUpdateRequested
     if ($isFullUpdateRequested -and -not $SkipSelfUpdate) {
         if (Start-PackageSelfUpdate -ResumeGamePath $SelectedGamePath -ResumeUpdateAll) { return }
@@ -1053,6 +1062,7 @@ function Invoke-UpdateWizard {
         2 = [bool]$state.OptiScaler
         3 = [bool]$state.AntiBlur
         4 = [bool]$state.HDR
+        5 = [bool]$state.TextureLoader
     }
     $validSelection = [Collections.Generic.List[int]]::new()
     foreach ($module in $selection) {
@@ -1080,19 +1090,21 @@ function Invoke-UpdateWizard {
         if ($null -eq $reShadeSource) { return }
     }
 
-    $componentSelection = @($validSelection | Where-Object { $_ -in @(1, 2, 3, 4) })
+    $componentSelection = @($validSelection | Where-Object { $_ -in @(1, 2, 3, 4, 5) })
     if ($componentSelection.Count -gt 0) {
         $desired = [ordered]@{
             Bridge = [bool]$state.Bridge
             OptiScaler = [bool]$state.OptiScaler
             AntiBlur = [bool]$state.AntiBlur
             HDR = [bool]$state.HDR
+            TextureLoader = [bool]$state.TextureLoader
         }
         foreach ($module in $componentSelection) {
             if ($module -eq 1) { $desired.Bridge = $true }
             if ($module -eq 2) { $desired.OptiScaler = $true; $desired.Bridge = $true } # OptiScaler 捆绑 Bridge
             if ($module -eq 3) { $desired.AntiBlur = $true }
             if ($module -eq 4) { $desired.HDR = $true }
+            if ($module -eq 5) { $desired.TextureLoader = $true }
         }
         $arguments = @(
             '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $configureScript,
@@ -1103,6 +1115,7 @@ function Invoke-UpdateWizard {
         if ($desired.OptiScaler) { $arguments += @('-OptiScalerSource', $optiSource) } else { $arguments += '-DisableOptiScaler' }
         if (-not $desired.AntiBlur) { $arguments += '-DisableAntiBlur' }
         if ($desired.HDR) { $arguments += @('-ReShadeSource', $reShadeSource) } else { $arguments += '-DisableHDR' }
+        if (-not $desired.TextureLoader) { $arguments += '-DisableTextureLoader' }
         if ($shouldPreserveExistingConfigs) { $arguments += '-PreserveExistingConfigs' }
         if ($NoShortcut) { $arguments += '-NoShortcut' }
         Write-Host ''
@@ -1158,6 +1171,7 @@ function Invoke-UninstallWizard {
         Remove-DllFromConfig -Config $config -Paths @($reShadePath)
         if ($null -ne $config) { Set-JsonPropertyValue -Object $config -Name 'UseHDR' -Value $false | Out-Null }
     }
+    if (5 -in $selection) { Remove-DllFromConfig -Config $config -Paths @($textureLoaderPath) }
     if ($null -ne $config) { Save-FpsConfig -Config $config }
     Write-Host ''
     Write-Host '所选模块已停止加载，本地文件和配置均已保留。' -ForegroundColor Green
@@ -1253,7 +1267,7 @@ if ($ResumeUpdateAll) {
     Invoke-UpdateWizard `
         -SelectedGamePath $selectedGamePath `
         -FpsTarget $fpsTarget `
-        -PreselectedModules @(1, 2, 3, 4) `
+        -PreselectedModules @(1, 2, 3, 4, 5) `
         -SkipSelfUpdate `
         -PreserveExistingConfigs
     exit 0
@@ -1261,16 +1275,17 @@ if ($ResumeUpdateAll) {
 
 while ($true) {
     $moduleState = Get-ModuleState -SelectedGamePath $selectedGamePath
-    $installedCount = @(@($moduleState.Bridge, $moduleState.OptiScaler, $moduleState.AntiBlur, $moduleState.HDR) | Where-Object { $_ }).Count
+    $installedCount = @(@($moduleState.Bridge, $moduleState.OptiScaler, $moduleState.AntiBlur, $moduleState.HDR, $moduleState.TextureLoader) | Where-Object { $_ }).Count
     Write-Header -Title '原神插件管理器'
     Write-Host "[√] 游戏目录: $(Split-Path -Parent $selectedGamePath)" -ForegroundColor Green
     Write-Host "[√] 插件目录: $root" -ForegroundColor Green
-    Write-Host "    已安装 $installedCount / 4" -ForegroundColor DarkGray
+    Write-Host "    已安装 $installedCount / 5" -ForegroundColor DarkGray
     Write-Host ''
     Write-ModuleLine -Number 1 -Name 'FSR Bridge（FSR4）' -Installed $moduleState.Bridge -Path $bridgePath
     Write-ModuleLine -Number 2 -Name 'OptiScaler（DLSS/XeSS/FSR4 INT8）' -Installed $moduleState.OptiScaler -Path $optiPath
     Write-ModuleLine -Number 3 -Name '反虚化 / 隐藏 UID' -Installed $moduleState.AntiBlur -Path $antiBlurPath
     Write-ModuleLine -Number 4 -Name 'ReShade + RenoDX HDR' -Installed $moduleState.HDR -Path $reShadePath
+    Write-ModuleLine -Number 5 -Name '纹理/Mod 加载器（TextureLoader）' -Installed $moduleState.TextureLoader -Path $textureLoaderPath
     Write-Host "    FPS Unlocker 与管理脚本为基础组件，自动安装（当前帧率上限 $fpsTarget）" -ForegroundColor DarkGray
     Write-Host ''
     Write-Host '  1. 安装模块' -ForegroundColor Cyan
