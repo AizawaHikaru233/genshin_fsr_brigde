@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release', 'RelWithDebInfo', 'MinSizeRel')]
     [string]$Configuration = 'Release',
@@ -25,8 +25,12 @@ $reshadeRuntime = Join-Path $root 'SharedResources\ReShade\runtime'
 $bridgePackageConfig = Join-Path $root 'Dx11FsrBridge\Dx11FsrBridge.package.ini'
 $bridgeBuild = Join-Path $root 'build-package-bridge'
 $antiBuild = Join-Path $root 'build-package-antiplayermosaic'
+$tloaderSource = Join-Path $root 'TextureLoader'
+$tloaderBuild = Join-Path $root 'build-tloader-gdds'
+$tloaderRuntime = Join-Path $root 'SharedResources\TextureLoader\runtime'
 $script:bridgeDll = $null
 $script:antiDll = $null
+$script:tloaderDll = $null
 
 function Get-BridgeVersion {
     $version = [string](Get-Item -LiteralPath $bridgeDll).VersionInfo.FileVersion
@@ -56,8 +60,7 @@ function Invoke-Cmake {
 function Build-PackageComponents {
     # VS 18 的 MSBuild 编译器检测与 CMake 4.3 不兼容（最小项目也复现
     # "compiler identification unknown"），改用 Ninja 生成器（cl 直连，不依赖 MSBuild）。
-    Invoke-Cmake @(
-        '-S', (Join-Path $root 'Dx11FsrBridge'), '-B', $bridgeBuild, '-G', 'Ninja',
+    Invoke-Cmake @('-S', (Join-Path $root 'Dx11FsrBridge'), '-B', $bridgeBuild, '-G', 'Ninja',
         "-DCMAKE_BUILD_TYPE=$Configuration",
         '-DDX11FSRBRIDGE_RELEASE_RUNTIME=ON',
         '-DDX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=ON'
@@ -65,12 +68,17 @@ function Build-PackageComponents {
     Invoke-Cmake @('--build', $bridgeBuild)
     Invoke-Cmake @('-S', (Join-Path $root 'AntiPlayerMosaic'), '-B', $antiBuild, '-G', 'Ninja', "-DCMAKE_BUILD_TYPE=$Configuration")
     Invoke-Cmake @('--build', $antiBuild)
+    Invoke-Cmake @('-S', $tloaderSource, '-B', $tloaderBuild, '-G', 'Ninja', "-DCMAKE_BUILD_TYPE=$Configuration")
+    Invoke-Cmake @('--build', $tloaderBuild)
 
     $script:bridgeDll = Get-ChildItem -LiteralPath $bridgeBuild -Recurse -File -Filter 'Dx11FsrBridge.dll' |
         Select-Object -First 1 -ExpandProperty FullName
     $script:antiDll = Get-ChildItem -LiteralPath $antiBuild -Recurse -File -Filter 'AntiPlayerMosaic.dll' |
         Select-Object -First 1 -ExpandProperty FullName
-    if ([string]::IsNullOrWhiteSpace($script:bridgeDll) -or [string]::IsNullOrWhiteSpace($script:antiDll)) {
+    $script:tloaderDll = Get-ChildItem -LiteralPath $tloaderBuild -Recurse -File -Filter 'TextureLoader.dll' |
+        Select-Object -First 1 -ExpandProperty FullName
+    if ([string]::IsNullOrWhiteSpace($script:bridgeDll) -or [string]::IsNullOrWhiteSpace($script:antiDll) -or
+        [string]::IsNullOrWhiteSpace($script:tloaderDll)) {
         throw 'CMake 未生成必要的 FPS Unlock 包 DLL。'
     }
 }
@@ -214,13 +222,24 @@ function Prepare-FpsStage {
     $stagePayloadBridge = Join-Path $payload 'Bridge'
     $stagePayloadAnti = Join-Path $payload 'AntiPlayerMosaic'
     $stagePayloadReShade = Join-Path $payload 'ReShade'
+    $stagePayloadTextureLoader = Join-Path $payload 'TextureLoader'
     $stageOpti = Join-Path $payload 'OptiScaler'
     $stageAmd = Join-Path $payload 'AMD'
     $stageDefaults = Join-Path $payload 'default_config'
-    New-Item -ItemType Directory -Path $payload, $stagePayloadBridge, $stagePayloadAnti, $stagePayloadReShade, $stageOpti, $stageAmd, $stageDefaults -Force | Out-Null
+    New-Item -ItemType Directory -Path $payload, $stagePayloadBridge, $stagePayloadAnti, $stagePayloadReShade, $stagePayloadTextureLoader, $stageOpti, $stageAmd, $stageDefaults -Force | Out-Null
     Copy-Item -LiteralPath $bridgeDll -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.dll') -Force
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.ini') -Force
     Copy-Item -LiteralPath $antiDll -Destination (Join-Path $stagePayloadAnti 'AntiPlayerMosaic.dll') -Force
+    # TextureLoader（纹理/Mod 加载器）：DLL + ini + DirectStorage 运行时 + 空 Mods 目录
+    Copy-Item -LiteralPath $tloaderDll -Destination (Join-Path $stagePayloadTextureLoader 'TextureLoader.dll') -Force
+    Copy-Item -LiteralPath (Join-Path $tloaderRuntime 'TextureLoader.ini') -Destination (Join-Path $stagePayloadTextureLoader 'TextureLoader.ini') -Force
+    foreach ($name in @('dstorage.dll', 'dstoragecore.dll')) {
+        $source = Join-Path $tloaderBuild $name
+        if (Test-Path -LiteralPath $source -PathType Leaf) {
+            Copy-Item -LiteralPath $source -Destination (Join-Path $stagePayloadTextureLoader $name) -Force
+        }
+    }
+    New-Item -ItemType Directory -Path (Join-Path $stagePayloadTextureLoader 'Mods') -Force | Out-Null
     # ReShade：本地/国内完整包内置 ReShade64.dll；GitHub 合规包不内置（ReShade 官方指引
     # "Do NOT share the binaries"，由 Configure.ps1 在用户机器上从 reshade.me 官方下载）。
     # 两种包都携带 renodx Add-on（作者书面授权）与 ReShade BSD-3 许可文本。
@@ -262,16 +281,22 @@ function Prepare-FpsStage {
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $stageDefaults 'Dx11FsrBridge.ini') -Force
     Copy-Item -LiteralPath (Join-Path $optiRuntime 'OptiScaler.ini'), (Join-Path $optiRuntime 'OptiScaler-UpscalingFiles.json') -Destination $stageDefaults -Force
     Copy-Item -LiteralPath (Join-Path $reshadeRuntime 'ReShade.ini'), (Join-Path $reshadeRuntime 'ReShadePreset.ini') -Destination $stageDefaults -Force
+    Copy-Item -LiteralPath (Join-Path $tloaderRuntime 'TextureLoader.ini') -Destination (Join-Path $stageDefaults 'TextureLoader.ini') -Force
 
     # 外部组件 license 集中到独立 license 文件夹（只集中插件本身的 license；
     # OptiScaler 内部集成 SDK（FidelityFX/DirectX/XeSS）保持原样 OptiScaler\Licenses；
-    # 自有组件 Bridge/AntiPlayerMosaic 不在此列）。
+    # 自有组件 Bridge/AntiPlayerMosaic/TextureLoader 不在此列——TextureLoader 的 GPL 许可
+    # 与其 DirectStorage（MIT/MS）依赖文本一并集中）。
     $stageLicense = Join-Path $stage 'license'
     New-Item -ItemType Directory -Path $stageLicense -Force | Out-Null
     $licenseSources = @(
         @{ Source = (Join-Path $root 'SharedResources\OptiScaler-LICENSE.txt'); Target = 'OptiScaler-LICENSE.txt' },
         @{ Source = (Join-Path $root 'SharedResources\FpsUnlocker-LICENSE.txt'); Target = 'FPSUnlocker-LICENSE.txt' },
-        @{ Source = (Join-Path $reshadeRuntime 'LICENSE-ReShade-BSD-3-Clause.txt'); Target = 'ReShade-LICENSE.txt' }
+        @{ Source = (Join-Path $reshadeRuntime 'LICENSE-ReShade-BSD-3-Clause.txt'); Target = 'ReShade-LICENSE.txt' },
+        @{ Source = (Join-Path $tloaderSource 'LICENSE.GPL.txt'); Target = 'TextureLoader-LICENSE.txt' },
+        @{ Source = (Join-Path $tloaderSource 'third_party\dstorage\LICENSE.txt'); Target = 'DirectStorage-LICENSE.txt' },
+        @{ Source = (Join-Path $tloaderSource 'third_party\dstorage\LICENSE-CODE.txt'); Target = 'DirectStorage-LICENSE-CODE.txt' },
+        @{ Source = (Join-Path $tloaderSource 'third_party\dstorage\NOTICES.txt'); Target = 'DirectStorage-NOTICES.txt' }
     )
     foreach ($entry in $licenseSources) {
         if (Test-Path -LiteralPath $entry.Source -PathType Leaf) {
@@ -307,12 +332,16 @@ function Build-FpsPackage {
             'license\OptiScaler-LICENSE.txt', 'license\FPSUnlocker-LICENSE.txt', 'license\ReShade-LICENSE.txt',
             'payload\Bridge\Dx11FsrBridge.dll', 'payload\Bridge\Dx11FsrBridge.ini',
             'payload\AntiPlayerMosaic\AntiPlayerMosaic.dll',
+            'payload\TextureLoader\TextureLoader.dll', 'payload\TextureLoader\TextureLoader.ini',
+            'payload\TextureLoader\dstorage.dll', 'payload\TextureLoader\dstoragecore.dll',
             'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64',
             'payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin.txt',
             'payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin-permission.png',
             'payload\default_config\Dx11FsrBridge.ini', 'payload\default_config\OptiScaler.ini',
             'payload\default_config\OptiScaler-UpscalingFiles.json', 'payload\default_config\ReShade.ini',
-            'payload\default_config\ReShadePreset.ini',
+            'payload\default_config\ReShadePreset.ini', 'payload\default_config\TextureLoader.ini',
+            'license\TextureLoader-LICENSE.txt', 'license\DirectStorage-LICENSE.txt',
+            'license\DirectStorage-LICENSE-CODE.txt', 'license\DirectStorage-NOTICES.txt',
             'payload\OptiScaler\OptiScaler.dll',
             'payload\OptiScaler\amd_fidelityfx_dx12.dll', 'payload\OptiScaler\amd_fidelityfx_upscaler_dx12.dll',
             'payload\OptiScaler\libxell.dll', 'payload\OptiScaler\libxess.dll',
@@ -376,9 +405,10 @@ try {
     $amd = Join-Path $payload 'AMD'
     $nvidia = Join-Path $payload 'NVIDIA\DLSS'
     $reshade = Join-Path $payload 'ReShade'
+    $textureLoader = Join-Path $payload 'TextureLoader'
     $defaults = Join-Path $payload 'default_config'
 
-    New-Item -ItemType Directory -Path $bridge, $opti, $amd, $nvidia, $reshade, $defaults -Force | Out-Null
+    New-Item -ItemType Directory -Path $bridge, $opti, $amd, $nvidia, $reshade, $textureLoader, $defaults -Force | Out-Null
     Copy-Item -LiteralPath $bridgeDll -Destination (Join-Path $bridge 'Dx11FsrBridge.dll') -Force
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $bridge 'Dx11FsrBridge.ini') -Force
     Copy-DirectoryContents -Source $optiRuntime -Destination $opti
@@ -389,9 +419,20 @@ try {
     Copy-Item -LiteralPath (Join-Path $dlssRuntime 'nvngx_dlss.license.txt') -Destination $nvidia -Force
     Copy-DirectoryContents -Source $reshadeRuntime -Destination $reshade
     Remove-NonBundledReShadeEffects -ReShadeDirectory $reshade
+    # TextureLoader（纹理/Mod 加载器）
+    Copy-Item -LiteralPath $tloaderDll -Destination (Join-Path $textureLoader 'TextureLoader.dll') -Force
+    Copy-Item -LiteralPath (Join-Path $tloaderRuntime 'TextureLoader.ini') -Destination (Join-Path $textureLoader 'TextureLoader.ini') -Force
+    foreach ($name in @('dstorage.dll', 'dstoragecore.dll')) {
+        $source = Join-Path $tloaderBuild $name
+        if (Test-Path -LiteralPath $source -PathType Leaf) {
+            Copy-Item -LiteralPath $source -Destination (Join-Path $textureLoader $name) -Force
+        }
+    }
+    New-Item -ItemType Directory -Path (Join-Path $textureLoader 'Mods') -Force | Out-Null
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $defaults 'Dx11FsrBridge.ini') -Force
     Copy-Item -LiteralPath (Join-Path $optiRuntime 'OptiScaler.ini'), (Join-Path $optiRuntime 'OptiScaler-UpscalingFiles.json') -Destination $defaults -Force
     Copy-Item -LiteralPath (Join-Path $reshadeRuntime 'ReShade.ini'), (Join-Path $reshadeRuntime 'ReShadePreset.ini') -Destination $defaults -Force
+    Copy-Item -LiteralPath (Join-Path $tloaderRuntime 'TextureLoader.ini') -Destination (Join-Path $defaults 'TextureLoader.ini') -Force
     Remove-Item -LiteralPath (Join-Path $reshade 'ReShade.ini'), (Join-Path $reshade 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
 
     # 外部组件 license 集中（同 FPS 包：只集中插件本身的 license）
@@ -400,7 +441,11 @@ try {
     $licenseSources = @(
         @{ Source = (Join-Path $root 'SharedResources\OptiScaler-LICENSE.txt'); Target = 'OptiScaler-LICENSE.txt' },
         @{ Source = (Join-Path $root 'SharedResources\FpsUnlocker-LICENSE.txt'); Target = 'FPSUnlocker-LICENSE.txt' },
-        @{ Source = (Join-Path $reshadeRuntime 'LICENSE-ReShade-BSD-3-Clause.txt'); Target = 'ReShade-LICENSE.txt' }
+        @{ Source = (Join-Path $reshadeRuntime 'LICENSE-ReShade-BSD-3-Clause.txt'); Target = 'ReShade-LICENSE.txt' },
+        @{ Source = (Join-Path $tloaderSource 'LICENSE.GPL.txt'); Target = 'TextureLoader-LICENSE.txt' },
+        @{ Source = (Join-Path $tloaderSource 'third_party\dstorage\LICENSE.txt'); Target = 'DirectStorage-LICENSE.txt' },
+        @{ Source = (Join-Path $tloaderSource 'third_party\dstorage\LICENSE-CODE.txt'); Target = 'DirectStorage-LICENSE-CODE.txt' },
+        @{ Source = (Join-Path $tloaderSource 'third_party\dstorage\NOTICES.txt'); Target = 'DirectStorage-NOTICES.txt' }
     )
     foreach ($entry in $licenseSources) {
         if (Test-Path -LiteralPath $entry.Source -PathType Leaf) {
@@ -418,12 +463,16 @@ try {
         'payload\OptiScaler\D3D12_Optiscaler\D3D12Core.dll',
         'payload\AMD\amd_fidelityfx_upscaler_dx12.dll', 'payload\AMD\FidelityFX_v2_LICENSE.md',
         'payload\NVIDIA\DLSS\nvngx_dlss.dll', 'payload\NVIDIA\DLSS\nvngx_dlss.license.txt',
+        'payload\TextureLoader\TextureLoader.dll', 'payload\TextureLoader\TextureLoader.ini',
+        'payload\TextureLoader\dstorage.dll', 'payload\TextureLoader\dstoragecore.dll',
         'payload\ReShade\ReShade64.dll', 'payload\ReShade\reshade-shaders\Addons\renodx-genshin.addon64',
         'payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin.txt',
         'payload\ReShade\reshade-shaders\NOTICE-RenoDX-genshin-permission.png',
         'payload\default_config\Dx11FsrBridge.ini', 'payload\default_config\OptiScaler.ini',
         'payload\default_config\OptiScaler-UpscalingFiles.json', 'payload\default_config\ReShade.ini',
-        'payload\default_config\ReShadePreset.ini'
+        'payload\default_config\ReShadePreset.ini', 'payload\default_config\TextureLoader.ini',
+        'license\TextureLoader-LICENSE.txt', 'license\DirectStorage-LICENSE.txt',
+        'license\DirectStorage-LICENSE-CODE.txt', 'license\DirectStorage-NOTICES.txt'
     )
     Assert-CleanPackage -Path $stage
 
