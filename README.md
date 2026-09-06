@@ -27,7 +27,7 @@
 
 包由构建脚本直接组装：安装器脚本位于 `tools/FpsUnlockInstaller/`，反馈与组件清单位于 `assets/FpsUnlockPackage/`，运行资源和默认配置位于 `SharedResources/`。GitHub 发布包不会内置 NVIDIA DLSS 组件与 ReShade 二进制，安装时由脚本从各自官方上游获取（DLSS 来自 NVIDIA Streamline、ReShade 来自 reshade.me）；本地分发包需要自行补齐相应组件。
 
-两个自有 DLL 是编译产物，不提交到仓库。要生成 GitHub 发布包，请在 Windows 上运行：
+要生成 GitHub 发布包，请在 Windows 上运行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release -GithubOnly
@@ -50,7 +50,7 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 - 通过 DX11 设备与上下文拦截获取原神的 FSR2 调用时机。
 - 为 FFX12 SDK 准备颜色、深度、运动向量、抖动和历史资源，并转接超分 dispatch。
 - 按显卡能力自动匹配 FSR 系列（FSR4/FSR3/FSR2），支持显卡上无需外部插件即可超分。
-- 将游戏渲染精度菜单扩展为 `0.2–0.9 + 原生`；`原生` 档位为游戏原本的 `1.0` 渲染精度。
+- 将游戏渲染精度菜单扩展为 `0.2–0.999`。
 - 运行时日志默认写入 DLL 同目录的 `Dx11FsrBridge.log`，用于排查加载与 Hook 状态。
 - **TextureLoader**（纹理/Mod 加载器）：3DMigoto 兼容的 `[TextureOverride]` Mod 加载（DDS 替换 + GDDS DirectStorage GPU 解压），默认从插件包内 `Mods` 目录加载。
 
@@ -58,8 +58,9 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 
 - 仓库根目录：FSR Bridge 源码、配置与构建文件。
 - `AntiPlayerMosaic/`：反虚化、隐藏 UID 与水下马赛克修复插件。
+- `FufuGraphicsPlugin/`：芙芙启动器的bootstrap、配置文件和安装脚本。
+- `RenoDX-Genshin/`：原神专用renodXHDR滤镜。
 - `TextureLoader/`：3DMigoto 兼容纹理替换 / Mod 加载器（DDS + GDDS）。
-- `third_party/`：Bridge 的构建依赖及其原始声明。
 
 ## 使用方法
 

@@ -2,7 +2,7 @@
 
 A graphics plugin for the Genshin Impact Windows DX11 client. It independently hooks the game's native FSR2 calls and forwards them to the AMD FFX12 official SDK for upscaling: FSR4/FSR3/FSR2 are provided directly on supported GPUs without any external plugin such as OptiScaler. OptiScaler can additionally be connected to extend the upscaler types (DLSS, XeSS, FSR4 INT8, etc.).
 
-This repository also includes the `AntiPlayerMosaic/` subproject. It is an independently built plugin for fixing Genshin Impact's mosaic effects and hiding the UID. See the README in that directory for details.
+This repository also includes the `AntiPlayerMosaic/` and `TextureLoader/` subprojects: the former is an independently built plugin for fixing Genshin Impact's mosaic effects and hiding the UID; the latter is a 3DMigoto-compatible texture replacement / Mod loader (DDS replacement plus GDDS DirectStorage GPU decompression). See the README and NOTICE in each directory for details.
 
 For the Chinese documentation, see [README.md](README.md).
 
@@ -27,7 +27,7 @@ The frame-generation feature in the `frame-generation` branch is built against `
 
 Packages are assembled directly by the build script: installer scripts live in `tools/FpsUnlockInstaller/`, package feedback and component metadata live in `assets/FpsUnlockPackage/`, and runtime resources and default configuration live in `SharedResources/`. GitHub release packages do not bundle the NVIDIA DLSS component or ReShade binaries; the installer downloads them from their official upstream sources at install time (DLSS from NVIDIA Streamline, ReShade from reshade.me). Local distributions must complete those components on their own.
 
-The two first-party DLLs are build outputs and are not committed to the repository. To generate the GitHub release package, run the following command on Windows:
+To generate the GitHub release package, run the following command on Windows:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release -GithubOnly
@@ -51,14 +51,17 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 - Intercepts DX11 device and context activity to obtain the timing of Genshin Impact's FSR2 calls.
 - Prepares color, depth, motion-vector, jitter, and history resources for the FFX12 SDK and forwards the upscaling dispatch.
 - Auto-matches the FSR series by GPU capability (FSR4/FSR3/FSR2); upscaling works on supported GPUs without external plugins.
-- Extends the in-game render-scale menu to `0.2–0.9 + 0.999`; `0.999` replaces the original highest menu slot.
+- Extends the in-game render-scale menu to `0.2–0.999`.
 - Writes runtime logs to `Dx11FsrBridge.log` beside the DLL by default for load and hook diagnostics.
+- **TextureLoader** (texture/Mod loader): 3DMigoto-compatible `[TextureOverride]` Mod loading (DDS replacement + GDDS DirectStorage GPU decompression), loading from the package `Mods` directory by default.
 
 ## Repository Layout
 
 - Repository root: FSR Bridge source, configuration, and build files.
 - `AntiPlayerMosaic/`: anti-aliasing blur removal, UID hiding, and underwater mosaic fix plugin.
-- `third_party/`: Bridge build dependencies and their original notices.
+- `FufuGraphicsPlugin/`: FuFu Launcher bootstrap, configuration files, and install scripts.
+- `RenoDX-Genshin/`: Genshin-specific RenoDX HDR shader add-on.
+- `TextureLoader/`: 3DMigoto-compatible texture replacement / Mod loader (DDS + GDDS).
 
 ## Usage
 
@@ -85,7 +88,7 @@ Then build all release packages:
 powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release
 ```
 
-`-FetchUpstream` combines both steps. The three first-party DLLs (Bridge / AntiPlayerMosaic / FufuGraphicsPlugin) are compiled automatically by the build script with the Ninja generator; no manual cmake invocation is needed.
+`-FetchUpstream` combines both steps. The four first-party DLLs (Bridge / AntiPlayerMosaic / TextureLoader / FufuGraphicsPlugin) are compiled automatically by the build script with the Ninja generator; no manual cmake invocation is needed.
 
 ## Logs and Issue Feedback
 
@@ -96,8 +99,9 @@ If the game fails to start, FSR cannot be activated, switching upscalers causes 
 2. `payload/OptiScaler/OptiScaler.log` and `payload/OptiScaler/OptiScaler.ini` (when using OptiScaler)
 3. `payload/ReShade/ReShade.log` (for ReShade-related issues)
 4. `payload/AntiPlayerMosaic/AntiPlayerMosaic.log` (for anti-mosaic, UID, or underwater mosaic issues)
-5. `FSR-Bridge-Plugin.log` from the FuFu plugin directory (when using the FuFu Launcher plugin)
-6. GPU model, game version, the stage at which the issue occurs, and the selected upscaling mode
+5. `payload/TextureLoader/TextureLoader.log` (for texture replacement / Mod loading issues)
+6. `FSR-Bridge-Plugin.log` from the FuFu plugin directory (when using the FuFu Launcher plugin)
+7. GPU model, game version, the stage at which the issue occurs, and the selected upscaling mode
 
 When further diagnostics are needed, temporarily change `LogLevel` under `Log` in `OptiScaler.ini` (when OptiScaler is used) to `1 (Debug)` or `0 (Trace)`. Restore the release setting after diagnostics to avoid additional overhead.
 Do not submit game account details, login information, or screenshots containing personal information to a public Issue.

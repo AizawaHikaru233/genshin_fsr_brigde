@@ -10,7 +10,7 @@
 | 产物 | `TextureLoader.dll`（~180 KB，随宿主插件加载器 DllList 注入） |
 | 许可证 | GPL-3.0-or-later（`LICENSE.GPL.txt` + `NOTICE.md` 完整溯源） |
 | 构建 | CMake + Ninja（依赖系统 Windows SDK 与仓库内 `third_party/`） |
-| 配置 | `TextureLoader.ini`（`mods_dir`、`observe_only`、`log_level`、`vram_threshold`、`max_texture_side`） |
+| 配置 | `TextureLoader.ini`（`mods_dir`、`observe_only`、`log_level`、`vram_threshold`、`max_texture_side`、`async_load`） |
 
 ### 核心链路
 
@@ -57,9 +57,9 @@
 |---|---|
 | 极速通道：`g_activeCount==0` 时单条 volatile 读直接透传 | 未启用替换时零开销 |
 | 紧凑活跃数组替代 `unordered_set` + 共享锁 | 消除 93 万次/秒绑定 × 锁的原子操作开销 |
-| 异步 DDS/GDDS 加载（`AsyncLoadThread` 消费 `g_loadQueue`） | 切换角色掉帧大幅下降（渲染线程不阻塞于磁盘 IO + 建纹理） |
+| 异步 DDS/GDDS 加载（`AsyncLoadThread` 消费 `g_loadQueue`；`async_load` 留空按厂商自动：NVIDIA→同步（后台线程建纹理曾触发驱动崩溃，已修复）、AMD/Intel→异步） | 切换角色掉帧大幅下降（渲染线程不阻塞于磁盘 IO + 建纹理） |
 | 渲染线程延迟释放（`QueueRelease`/`FlushPendingRelease`） | 非渲染线程不直接 Release D3D11 对象——修复 AMD 驱动内 UAF（快速切换角色崩溃） |
-| 显存容量驱动淘汰（`VramMonitorThread` 每 2s 查 `IDXGIAdapter3::QueryVideoMemoryInfo`） | 可用显存低于阈值（`vram_threshold`，默认 15%）时按**大小优先 + LRU** 淘汰 `refcount==0` 的缓存；未达阈值不清理 |
+| 显存压力驱动淘汰 v2（`VramMonitorThread` 查 `IDXGIAdapter3::QueryVideoMemoryInfo`，探针频率按压力 5s/3s/1.5s/0.8s 自适应；四分区 Comfort/Mild/Pressure/Critical + P 压力系数） | 可用显存低于阈值（`vram_threshold`，留空按容量自适应 4GB→20%…24GB→13%）时淘汰 `refcount==0` 缓存：LRU 为主、大纹理优先；热豁免：30s 内重载的纹理 5min 内不再淘汰；未达阈值不清理 |
 
 并发安全：`g_hasReplacement` 读写统一 `g_hitLock`（曾因 `unordered_set` 并发读写在高频切角色
 时崩溃，已修复）；`g_replacements` 全量 `g_lock`；淘汰/加载/绑定三线程经引用计数安全互操作。
