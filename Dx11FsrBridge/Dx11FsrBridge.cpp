@@ -3974,7 +3974,7 @@ void load_config()
     // 完成交接，FFX 与游戏后续渲染并行（消除每帧硬停 → GPU 满载）。
     // 设 0 回退旧同步行为（dispatch 内等待+拷贝）。
     ffx12::set_async_upscale(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12AsyncUpscale", 0, config_path.c_str()) != 0);
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12AsyncUpscale", 1, config_path.c_str()) != 0);
     ffx12::set_hdr_input(g_config.ffx12_hdr_input);
     ffx12::set_auto_exposure(g_config.ffx12_auto_exposure);
     ffx12::set_non_linear(g_config.ffx12_non_linear);

@@ -278,6 +278,32 @@ function Get-NvidiaVideoControllers {
     })
 }
 
+# AMD RDNA2（RX 6000 系，Navi 21/22/23/24 + RDNA2 核显）Device ID。
+# 用途：Ffx12AsyncUpscale 默认值——RDNA2 在游戏 HDR 渲染下输出目标逐帧双缓冲
+# 交替，与异步交叠的单槽 pending 错位（黑屏与正常画面交替），故默认同步。
+# 注：0x73F0（RX 6600/6650 XT，Navi 23）曾误归 RDNA3，此处归位。
+$script:AmdRdna2DevIds = @(
+    '73BF','73A5','73AF','73A2','73AB','73AE',
+    '73DF','73E3','73E1','73E4','73DE',
+    '73FF','73EF','73F1','73E9','73E8','73EA','73E0','73F0',
+    '743F','7422','7421','7423','7424','7431',
+    '1638','164C','1681'
+)
+
+function Test-AmdRdna2Gpu {
+    # 任一张 RDNA2 卡存在即视为需要同步模式（保守：优先避免闪烁）
+    foreach ($controller in @(Get-VideoControllersOnce)) {
+        $name = [string]$controller.Name
+        $pnp = [string]$controller.PNPDeviceID
+        $vendor = if ($pnp -match '(?i)VEN_([0-9A-F]{4})') { $matches[1].ToUpperInvariant() } else { '' }
+        if ($vendor -ne '1002' -and $name -notmatch '(?i)AMD|Radeon') { continue }
+        $dev = if ($pnp -match '(?i)DEV_([0-9A-F]{4})') { $matches[1].ToUpperInvariant() } else { '' }
+        if ($dev -in $script:AmdRdna2DevIds) { return $true }
+        if ($name -match '(?i)\bRX\s*6\d{3}(?!\d)') { return $true }
+    }
+    return $false
+}
+
 # Device ID 精确分类（核显名字通常只是 "AMD Radeon(TM) Graphics"，
 # 不含型号，名字匹配识别不到）。Device ID 来源于 GPU 硬件 ID 汇总表。
 $script:AmdFp8DevIds = @('7550', '7551', '7590')
@@ -1317,6 +1343,15 @@ if ($bridgeEnabled) {
     $amdUpscalerDll = Join-Path $payload 'AMD\amd_fidelityfx_upscaler_dx12.dll'
     if (-not (Test-Path -LiteralPath $amdUpscalerDll -PathType Leaf)) {
         throw (Convert-InstallerText -Value "FSR Bridge 依赖不完整：缺少 $amdUpscalerDll")
+    }
+    # 托管设置：按 GPU 架构写 Ffx12AsyncUpscale（RDNA2/RX 6000 系默认同步，
+    # 其余显卡默认异步）。异步交叠在 RDNA2 + HDR 下会与单槽 pending 的输出
+    # 目标错位，出现黑屏与正常画面交替。
+    $bridgeIni = Join-Path $bridgeDir 'Dx11FsrBridge.ini'
+    if (Test-Path -LiteralPath $bridgeIni -PathType Leaf) {
+        $rdna2Gpu = Test-AmdRdna2Gpu
+        Set-IniValue -Path $bridgeIni -Section 'Dx11FsrBridge' -Key 'Ffx12AsyncUpscale' -Value $(if ($rdna2Gpu) { '0' } else { '1' })
+        Write-Host ("Bridge 异步交叠: {0}" -f $(if ($rdna2Gpu) { '同步（检测到 AMD RDNA2 / RX 6000 系）' } else { '异步（默认）' })) -ForegroundColor DarkGray
     }
 }
 if (-not $DisableOptiScaler) {

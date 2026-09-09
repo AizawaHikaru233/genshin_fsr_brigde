@@ -63,13 +63,14 @@ bool g_gpu_only_transport_available = false;
 bool g_uses_on12_queue = false;
 
 // 异步交叠（async upscale）：
-//   false（默认）= dispatch 内提交+等待+拷贝（同步，v2.1.0 行为）
-//   true         = dispatch 只提交 FFX（不等待），Present 前 finish_pending
+//   true（默认）= dispatch 只提交 FFX（不等待），Present 前 finish_pending
 //                  等待并拷贝输出——FFX 与游戏后续 GPU 工作并行（跨帧交叠）
-// 注意：开启后 Bridge 的交接发生在 Present 阶段，与 OptiScaler 的 Present hook
-// 交错；A 卡 6000 系（RDNA2）实测出现画面闪烁（人物界面进出时概率复现），
-// 故默认关闭，需要时由 ini Ffx12AsyncUpscale=1 显式启用。
-bool g_async_upscale = false;
+//   false        = dispatch 内提交+等待+拷贝（同步，输出目标始终与 Present 一致）
+// 注意：异步要求输出目标在 dispatch 与 Present 之间不变。AMD RDNA2（RX 6000 系）
+// 在游戏 HDR 渲染下输出目标逐帧双缓冲交替，会与单槽 pending 错位（黑屏与正常
+// 画面交替）——安装器/芙芙启动器按显卡写入 ini Ffx12AsyncUpscale=0（RDNA2）或
+// =1（其他显卡）；此处缺省值为非 RDNA2 的默认。
+bool g_async_upscale = true;
 // 挂起的异步 FFX：有未 finish 的提交时记录待等 fence 值、输出目标与游戏 context。
 // 仅 g_async_upscale 时使用；由 dispatch（提交）与 finish_pending（完成）串行访问，
 // 受 g_mutex 保护（见 dispatch 入口）。

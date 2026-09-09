@@ -447,6 +447,7 @@ struct DetectedFsr4Policy
 {
     bool supported = false;
     bool prefer_fp8 = false;
+    bool rdna2 = false; // AMD RX 6000 系：Ffx12AsyncUpscale 默认同步（HDR 下异步会闪烁）
     std::wstring gpu_name;
 };
 
@@ -502,7 +503,7 @@ static Fsr4GpuClass classify_amd_fsr4(std::uint32_t device_id)
     static constexpr std::uint32_t int8_ids[] = {
         // RDNA3 dGPU (RX 7000, Navi 3x)
         0x744C, 0x7448, 0x7449, 0x744A, 0x744B, 0x745E, 0x7460, 0x7461,
-        0x7470, 0x747E, 0x73F0, 0x7480, 0x7481, 0x7483, 0x7487, 0x748B,
+        0x7470, 0x747E, 0x7480, 0x7481, 0x7483, 0x7487, 0x748B,
         0x7489, 0x7499, 0x749F,
         // RDNA3 iGPU (740M/760M/780M)
         0x15BF, 0x15C8, 0x164F, 0x1900, 0x1901,
@@ -516,6 +517,30 @@ static Fsr4GpuClass classify_amd_fsr4(std::uint32_t device_id)
         if (device_id == id)
             return Fsr4GpuClass::Int8;
     return Fsr4GpuClass::Unsupported;
+}
+
+// AMD（VEN_1002）RDNA2（RX 6000 系，Navi 21/22/23/24 与 RDNA2 核显）。
+// 用途：Ffx12AsyncUpscale 的默认值——RDNA2 在游戏 HDR 渲染下输出目标逐帧
+// 双缓冲交替，与异步交叠的单槽 pending 错位（黑屏与正常画面交替），故默认同步。
+// 注：0x73F0（RX 6600/6650 XT，Navi 23）历史上被误归 RDNA3，此处归位。
+static bool is_amd_rdna2_device(std::uint32_t device_id)
+{
+    static constexpr std::uint32_t ids[] = {
+        // Navi 21 (RX 6900/6800)
+        0x73BF, 0x73A5, 0x73AF, 0x73A2, 0x73AB, 0x73AE,
+        // Navi 22 (RX 6700/6750)
+        0x73DF, 0x73E3, 0x73E1, 0x73E4, 0x73DE,
+        // Navi 23 (RX 6600/6650)
+        0x73FF, 0x73EF, 0x73F1, 0x73E9, 0x73E8, 0x73EA, 0x73E0, 0x73F0,
+        // Navi 24 (RX 6500/6400)
+        0x743F, 0x7422, 0x7421, 0x7423, 0x7424, 0x7431,
+        // RDNA2 iGPU (Van Gogh / Rembrandt)
+        0x1638, 0x164C, 0x1681,
+    };
+    for (const std::uint32_t id : ids)
+        if (device_id == id)
+            return true;
+    return false;
 }
 
 // NVIDIA（VEN_10DE）16-50 系（GTX 16 + RTX 20/30/40/50）→ INT8。
@@ -606,6 +631,7 @@ DetectedFsr4Policy detect_fsr4_gpu_policy()
         const std::wstring name = desc.Description;
         bool fp8 = false;
         bool int8 = false;
+        bool rdna2 = false;
         // Device ID 精确分类优先（核显/独显都覆盖），名字匹配仅作变体兜底。
         if (desc.VendorId == 0x10DE)
         {
@@ -616,6 +642,8 @@ DetectedFsr4Policy detect_fsr4_gpu_policy()
             const Fsr4GpuClass cls = classify_amd_fsr4(desc.DeviceId);
             fp8 = (cls == Fsr4GpuClass::Fp8);
             int8 = (cls == Fsr4GpuClass::Int8);
+            if (is_amd_rdna2_device(desc.DeviceId))
+                rdna2 = true;
         }
         else if (desc.VendorId == 0x8086)
         {
@@ -640,16 +668,26 @@ DetectedFsr4Policy detect_fsr4_gpu_policy()
                     fp8 = true;
                 else if (name_contains_series(name, L"RX", { L"7" }) || name_contains_series(name, L"PRO", { L"W7" }))
                     int8 = true;
+                else if (name_contains_series(name, L"RX", { L"6" }))
+                    rdna2 = true; // RX 6000 系（Device ID 未收录时的型号兜底）
             }
         }
 
-        if (!fp8 && !int8)
+        if (!fp8 && !int8 && !rdna2)
             continue;
+        // RDNA2 只记录架构标志（FSR4 本身不支持它），不参与 supported/prefer_fp8 竞争。
+        if (rdna2)
+            best.rdna2 = true;
         if (!best.supported || (fp8 && !best.prefer_fp8))
         {
-            best.supported = true;
-            best.prefer_fp8 = fp8;
-            best.gpu_name = name;
+            if (fp8 || int8)
+            {
+                best.supported = true;
+                best.prefer_fp8 = fp8;
+                best.gpu_name = name;
+            }
+            else if (best.gpu_name.empty())
+                best.gpu_name = name;
         }
         if (best.prefer_fp8)
             break;
@@ -784,6 +822,21 @@ bool ensure_missing_component_configurations(const BootstrapConfig &config)
             write_log("config_initialize_failed component=bridge");
             success = false;
         }
+        // 托管设置：按 GPU 架构写 Ffx12AsyncUpscale 默认值。RDNA2（RX 6000 系）
+        // 在游戏 HDR 渲染下输出目标逐帧双缓冲交替，与异步交叠的单槽 pending
+        // 错位（黑屏与正常画面交替）→ 默认同步；其余显卡默认异步（性能优先）。
+        const DetectedFsr4Policy gpu = detect_fsr4_gpu_policy();
+        const char *async_value = gpu.rdna2 ? "0" : "1";
+        if (!set_ini_value_utf8(bridge_ini, "Dx11FsrBridge", "Ffx12AsyncUpscale", async_value))
+        {
+            write_log("config_initialize_failed component=bridge reason=async_upscale_write");
+            success = false;
+        }
+        else
+        {
+            write_log(std::string("bridge_async_upscale_managed gpu=") + wide_to_utf8(gpu.gpu_name) +
+                " rdna2=" + (gpu.rdna2 ? "1" : "0") + " value=" + async_value);
+        }
     }
     if (!config.optiscaler_path.empty())
     {
@@ -860,10 +913,17 @@ bool reset_all_configurations(const BootstrapConfig &config)
 
     if (!config.bridge_path.empty())
     {
-        reset_file(
-            default_directory / L"Dx11FsrBridge.ini",
-            config.bridge_path.parent_path() / L"Dx11FsrBridge.ini",
-            "bridge");
+        const std::filesystem::path bridge_ini = config.bridge_path.parent_path() / L"Dx11FsrBridge.ini";
+        reset_file(default_directory / L"Dx11FsrBridge.ini", bridge_ini, "bridge");
+        // 重置后重新应用托管设置（模板值是通用默认，需按显卡收敛）
+        const DetectedFsr4Policy gpu = detect_fsr4_gpu_policy();
+        const char *async_value = gpu.rdna2 ? "0" : "1";
+        if (file_exists(bridge_ini) &&
+            !set_ini_value_utf8(bridge_ini, "Dx11FsrBridge", "Ffx12AsyncUpscale", async_value))
+        {
+            write_log("config_reset_failed component=bridge reason=async_upscale_write");
+            success = false;
+        }
     }
 
     if (!config.optiscaler_path.empty())
