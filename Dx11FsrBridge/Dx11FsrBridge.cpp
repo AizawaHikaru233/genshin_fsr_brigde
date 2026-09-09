@@ -542,8 +542,11 @@ std::ofstream g_ps_trace_stream;
 std::atomic_uint32_t g_ps_trace_count = 0;
 std::atomic_uint64_t g_texture_trace_until_tick = 0;
 std::atomic_uint32_t g_texture_trace_count = 0;
-std::atomic_uint64_t g_trace_ps_cb0_key = 0;
 #endif
+// jitter 数据源定位（功能性，正式版保留）：记录当前目标 draw 的 PS cb0。
+// 快照链只跟踪这一个 buffer（全量跟踪每帧 Map/Unmap 会导致 3 FPS），
+// target_jitter_pixels 依赖它的 g_buffer_snapshots 内容读取 TAA 抖动。
+std::atomic_uint64_t g_trace_ps_cb0_key = 0;
 std::atomic_uint64_t g_current_ps_hash = 0;
 std::atomic_uint64_t g_mode2_fast_target_ps_hash = 0;
 std::atomic_uint64_t g_mode2_fast_target_ps_key = 0;
@@ -3971,7 +3974,7 @@ void load_config()
     // 完成交接，FFX 与游戏后续渲染并行（消除每帧硬停 → GPU 满载）。
     // 设 0 回退旧同步行为（dispatch 内等待+拷贝）。
     ffx12::set_async_upscale(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12AsyncUpscale", 1, config_path.c_str()) != 0);
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12AsyncUpscale", 0, config_path.c_str()) != 0);
     ffx12::set_hdr_input(g_config.ffx12_hdr_input);
     ffx12::set_auto_exposure(g_config.ffx12_auto_exposure);
     ffx12::set_non_linear(g_config.ffx12_non_linear);
@@ -7459,9 +7462,7 @@ void register_cb0_for_jitter(ID3D11Buffer *constant_buffer)
     D3D11_BUFFER_DESC desc {};
     constant_buffer->GetDesc(&desc);
     const std::uint64_t key = reinterpret_cast<std::uint64_t>(constant_buffer);
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_trace_ps_cb0_key.store(key, std::memory_order_relaxed);
-#endif
     if (key != 0 && desc.ByteWidth != 0)
     {
         std::lock_guard lock(g_buffer_info_mutex);
@@ -7686,9 +7687,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(UINT element_
         }
     }
 
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_trace_ps_cb0_key.store(g_state.ps_cbs[0].resource_key, std::memory_order_relaxed);
-#endif
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_config.fsr2_fast_state_tracking && g_config.fsr2_translation_mode == 2 && fast_target_hash == 0)
     {
@@ -7934,9 +7933,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     }
     stage_log("identify_end ok");
 
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_trace_ps_cb0_key.store(constant_buffer_key, std::memory_order_relaxed);
-#endif
     register_cb0_for_jitter(constant_buffer);
 
     // 正缓存写入（仅识别成功路径——值语义指纹，UI 切换/地址复用无关）
@@ -8041,9 +8038,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(
         if (!identified)
             return std::nullopt;
 
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         g_trace_ps_cb0_key.store(constant_buffer_key, std::memory_order_relaxed);
-#endif
         return identified;
     }
 #endif
@@ -11957,11 +11952,10 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
 HRESULT STDMETHODCALLTYPE hooked_map(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource, D3D11_MAP map_type, UINT map_flags, D3D11_MAPPED_SUBRESOURCE *mapped)
 {
     const HRESULT hr = g_original_map(context, resource, subresource, map_type, map_flags, mapped);
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (SUCCEEDED(hr) && resource != nullptr && mapped != nullptr && mapped->pData != nullptr)
     {
         const auto key = reinterpret_cast<std::uint64_t>(resource);
-        // 仅跟踪 trace 目标 cb0（性能：游戏每帧大量 Map/Unmap，全量跟踪导致 3 FPS）
+        // 仅跟踪 jitter 目标 cb0（性能：游戏每帧大量 Map/Unmap，全量跟踪导致 3 FPS）
         if (key != g_trace_ps_cb0_key.load(std::memory_order_relaxed))
             return hr;
         std::lock_guard lock(g_buffer_info_mutex);
@@ -11969,13 +11963,11 @@ HRESULT STDMETHODCALLTYPE hooked_map(ID3D11DeviceContext *context, ID3D11Resourc
         if (it != g_buffer_info.end() && it->second.byte_width != 0)
             g_mapped_buffers[key] = { mapped->pData, it->second.byte_width };
     }
-#endif
     return hr;
 }
 
 void STDMETHODCALLTYPE hooked_unmap(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource)
 {
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (resource != nullptr)
     {
         const auto key = reinterpret_cast<std::uint64_t>(resource);
@@ -11999,7 +11991,6 @@ void STDMETHODCALLTYPE hooked_unmap(ID3D11DeviceContext *context, ID3D11Resource
             g_mapped_buffers.erase(mapped_it);
         }
     }
-#endif // !DX11FSRBRIDGE_RELEASE_RUNTIME
     g_original_unmap(context, resource, subresource);
 }
 
@@ -12114,18 +12105,12 @@ void STDMETHODCALLTYPE hooked_update_subresource(ID3D11DeviceContext *context, I
     if (dst != nullptr && src_data != nullptr)
     {
         const auto key = reinterpret_cast<std::uint64_t>(dst);
-        // 仅跟踪 trace 目标 cb0（性能：全量跟踪导致 3 FPS；多视图新鲜度改由 sdk234 直接读回解决）
-#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-        // 正式版：不跟踪任何 buffer 快照（cb0 跟踪链已移除）
-        g_original_update_subresource(context, dst, dst_subresource, dst_box, src_data, src_row_pitch, src_depth_pitch);
-        return;
-#else
+        // 仅跟踪 jitter 目标 cb0（性能：全量跟踪导致 3 FPS；多视图新鲜度改由 sdk234 直接读回解决）
         if (key != g_trace_ps_cb0_key.load(std::memory_order_relaxed))
         {
             g_original_update_subresource(context, dst, dst_subresource, dst_box, src_data, src_row_pitch, src_depth_pitch);
             return;
         }
-#endif
         std::lock_guard lock(g_buffer_info_mutex);
         const auto it = g_buffer_info.find(key);
         if (it != g_buffer_info.end())

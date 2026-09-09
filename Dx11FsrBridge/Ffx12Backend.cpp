@@ -63,10 +63,13 @@ bool g_gpu_only_transport_available = false;
 bool g_uses_on12_queue = false;
 
 // 异步交叠（async upscale）：
-//   true（默认）= dispatch 只提交 FFX（不等待），Present 前 finish_pending
+//   false（默认）= dispatch 内提交+等待+拷贝（同步，v2.1.0 行为）
+//   true         = dispatch 只提交 FFX（不等待），Present 前 finish_pending
 //                  等待并拷贝输出——FFX 与游戏后续 GPU 工作并行（跨帧交叠）
-//   false        = dispatch 内提交+等待+拷贝（旧同步行为，可回退）
-bool g_async_upscale = true;
+// 注意：开启后 Bridge 的交接发生在 Present 阶段，与 OptiScaler 的 Present hook
+// 交错；A 卡 6000 系（RDNA2）实测出现画面闪烁（人物界面进出时概率复现），
+// 故默认关闭，需要时由 ini Ffx12AsyncUpscale=1 显式启用。
+bool g_async_upscale = false;
 // 挂起的异步 FFX：有未 finish 的提交时记录待等 fence 值、输出目标与游戏 context。
 // 仅 g_async_upscale 时使用；由 dispatch（提交）与 finish_pending（完成）串行访问，
 // 受 g_mutex 保护（见 dispatch 入口）。

@@ -9,11 +9,32 @@ option(DX11FSRBRIDGE_BUILD_FAMILY_TEST "Build the Fsr2FamilyTakeover state-machi
 # The bridge deliberately uses the deployed ffx-api runtime provider.  The
 # static open-SDK host was tested in-game and produced a black output, while
 # this provider has a known-good render path and exposes 2.3.4/3.1.5/4.1.1.
-set(FFX_API_INCLUDE_ROOT
-    "D:/DLSSG2FSR4/dependencies/FidelityFX-SDK/ffx-api/include/ffx_api"
-    CACHE PATH "Path to the FidelityFX ffx-api include directory")
-if(NOT EXISTS "${FFX_API_INCLUDE_ROOT}/ffx_api.h")
-    message(FATAL_ERROR "FidelityFX ffx-api headers were not found: ${FFX_API_INCLUDE_ROOT}")
+#
+# 头文件来源：AMD FidelityFX SDK。其许可限定"binary form only"再分发，故不
+# vendor 进仓库；默认取 OptiScaler 源码树的 FidelityFX-SDK-v2 子模块，并在
+# 配置阶段 staging 到构建目录（保持 SDK 的 api/include 与 upscalers/include
+# 两层结构——ffx_upscale.h 内部用 "../../api/include/ffx_api.h" 相对包含，
+# 扁平化会破坏它）。
+# 前置：git -C OptiScaler-src submodule update --init external/FidelityFX-SDK-v2
+# 也可用 -DFFX_SDK_KIT_ROOT=<...>/Kits/FidelityFX 指定其它 SDK 快照。
+set(FFX_SDK_KIT_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/../OptiScaler-src/external/FidelityFX-SDK-v2/Kits/FidelityFX"
+    CACHE PATH "Path to the FidelityFX SDK Kits/FidelityFX directory")
+set(FFX_API_STAGE_ROOT
+    "${CMAKE_BINARY_DIR}/ffx-sdk-stage"
+    CACHE PATH "Build-time staging root for the FidelityFX SDK headers")
+if(EXISTS "${FFX_SDK_KIT_ROOT}/api/include/ffx_api.h" AND
+   EXISTS "${FFX_SDK_KIT_ROOT}/upscalers/include/ffx_upscale.h")
+    # file(COPY <dir>) 复制的是目录内容，故显式给出目标子目录以保留 SDK 层次。
+    file(COPY "${FFX_SDK_KIT_ROOT}/api/include/" DESTINATION "${FFX_API_STAGE_ROOT}/api/include")
+    file(COPY "${FFX_SDK_KIT_ROOT}/upscalers/include/" DESTINATION "${FFX_API_STAGE_ROOT}/upscalers/include")
+endif()
+set(FFX_API_INCLUDE_ROOT "${FFX_API_STAGE_ROOT}/api/include")
+set(FFX_UPSCALER_INCLUDE_ROOT "${FFX_API_STAGE_ROOT}/upscalers/include")
+if(NOT EXISTS "${FFX_API_INCLUDE_ROOT}/ffx_api.h" OR
+   NOT EXISTS "${FFX_UPSCALER_INCLUDE_ROOT}/ffx_upscale.h")
+    message(FATAL_ERROR "FidelityFX ffx-api headers were not found under ${FFX_API_STAGE_ROOT} "
+        "(init OptiScaler-src submodule external/FidelityFX-SDK-v2, or pass -DFFX_SDK_KIT_ROOT=...)")
 endif()
 
 add_library(Dx11FsrBridge SHARED
@@ -65,6 +86,7 @@ target_include_directories(Dx11FsrBridge PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/detours"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
     "${FFX_API_INCLUDE_ROOT}"
+    "${FFX_UPSCALER_INCLUDE_ROOT}"
 )
 target_link_libraries(Dx11FsrBridge PRIVATE
     d3d11
