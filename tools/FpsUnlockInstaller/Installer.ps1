@@ -1302,6 +1302,16 @@ $shouldShowPathWarning = [string]::IsNullOrWhiteSpace([string]$state.GamePath) -
 if ($shouldShowPathWarning -and (Show-PathCompatibilityWarning -GameExePath $selectedGamePath)) { Pause-Menu }
 $fpsTarget = [int]$state.FpsTarget
 Repair-RuntimePaths -SelectedGamePath $selectedGamePath
+
+# NVIDIA 显卡检测：启动阶段真实计算一次，供模块列表 / 目录 / 可选集合 / 参数注入各处门控使用。
+# TextureLoader 在 N 卡上存在无法修复的纹理加载严重错误：隐藏并停用。
+# 注意：这里必须真的调用检测函数。只在顶部把 $script:nvidiaGpu 初始化为 $false 而不计算，
+# 会让下面所有门控变成死代码（模块 5 仍会显示并可选中）。
+$script:nvidiaGpu = @(Get-NvidiaVideoControllers).Count -gt 0
+if ($script:nvidiaGpu) {
+    Write-Host '检测到 NVIDIA 显卡：TextureLoader 在 N 卡上不可用，已隐藏并停用。' -ForegroundColor Yellow
+}
+
 if (-not (Invoke-FoundationSetup -SelectedGamePath $selectedGamePath -FpsTarget ([ref]$fpsTarget))) { exit 1 }
 Invoke-NvidiaDlssSetup
 Save-State -SelectedGamePath $selectedGamePath -FpsTarget $fpsTarget
