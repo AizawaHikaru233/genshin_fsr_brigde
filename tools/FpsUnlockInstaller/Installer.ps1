@@ -32,6 +32,8 @@ $textureLoaderPath = Join-Path $payloadDirectory 'TextureLoader\TextureLoader.dl
 $selfUpdateRepository = 'AizawaHikaru233/genshin_fsr_brigde'
 $selfUpdateHelperPath = Join-Path $scriptsDirectory 'Apply-PackageUpdate.ps1'
 $script:SelfUpdateStarted = $false
+$script:CachedVideoControllers = $null # Win32_VideoController 查询缓存（严格模式下必须先初始化）
+$script:nvidiaGpu = $false # NVIDIA 显卡检测结果，启动阶段计算（严格模式下必须先初始化）
 $nonFrameGenerationEdition = Test-Path -LiteralPath (Join-Path $root 'NonFrameGeneration.edition') -PathType Leaf
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) '原神.lnk'
 $legacyShortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) '原神整合版.lnk'
@@ -409,6 +411,28 @@ function Test-ConfiguredDll {
     return $false
 }
 
+function Get-VideoControllersOnce {
+    # 每会话只查询一次 Win32_VideoController（CIM/WMI 查询 ~100-500ms）
+    if ($null -eq $script:CachedVideoControllers) {
+        try {
+            $script:CachedVideoControllers = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
+        }
+        catch {
+            try { $script:CachedVideoControllers = @(Get-WmiObject -Class Win32_VideoController -ErrorAction Stop) } catch { $script:CachedVideoControllers = @() }
+        }
+    }
+    return @($script:CachedVideoControllers)
+}
+
+function Get-NvidiaVideoControllers {
+    $controllers = @(Get-VideoControllersOnce)
+    return @($controllers | Where-Object {
+        ([string]$_.PNPDeviceID -match '(?i)VEN_10DE') -or
+        ([string]$_.AdapterCompatibility -match '(?i)NVIDIA') -or
+        ([string]$_.Name -match '(?i)NVIDIA')
+    })
+}
+
 function Get-ModuleState {
     param([string]$SelectedGamePath)
     $config = Get-FpsConfig
@@ -420,7 +444,8 @@ function Get-ModuleState {
         OptiScaler = $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $optiPath)
         AntiBlur = $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $antiBlurPath)
         HDR = $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $reShadePath) -and (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $SelectedGamePath) 'ReShade.ini') -PathType Leaf)
-        TextureLoader = $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $textureLoaderPath)
+        # NVIDIA 显卡上 TextureLoader 一律视为未安装（隐藏且停用）
+        TextureLoader = (-not $script:nvidiaGpu) -and $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $textureLoaderPath)
     }
 }
 
@@ -553,13 +578,18 @@ function Write-InstallCatalog {
     Write-CatalogRow -Id '2.' -Name 'OptiScaler（DLSS/XeSS/FSR4 INT8，需 Bridge）' -Author 'OptiScaler' -Version $optiVersion -Status $optiStatus
     Write-CatalogRow -Id '3.' -Name '反虚化 / 隐藏 UID' -Author 'シリアCelia' -Version $antiVersion -Status $antiStatus
     Write-CatalogRow -Id '4.' -Name 'ReShade + RenoDX HDR' -Author 'crosire / Bilibili UID 3461582765951639' -Version "ReShade $reShadeVersion`nRenoDX $renoDxVersion" -Status $hdrStatus
-    Write-CatalogRow -Id '5.' -Name '纹理/Mod 加载器（TextureLoader）' -Author 'シリアCelia' -Version $textureLoaderVersion -Status $textureLoaderStatus
+    # NVIDIA 显卡上不显示 TextureLoader（模块 5）一行
+    if (-not $script:nvidiaGpu) {
+        Write-CatalogRow -Id '5.' -Name '纹理/Mod 加载器（TextureLoader）' -Author 'シリアCelia' -Version $textureLoaderVersion -Status $textureLoaderStatus
+    }
 }
 
 function Select-ModuleSet {
     param([string]$ActionName)
     $allowed = [Collections.Generic.List[int]]::new()
-    foreach ($id in @(1, 2, 3, 4, 5)) { $allowed.Add($id) }
+    # NVIDIA 显卡上 TextureLoader（模块 5）不可选
+    $availableIds = if ($script:nvidiaGpu) { @(1, 2, 3, 4) } else { @(1, 2, 3, 4, 5) }
+    foreach ($id in $availableIds) { $allowed.Add($id) }
     while ($true) {
         Write-Host "请输入需要${ActionName}的模块 ID" -ForegroundColor Yellow
         Write-Host ''
@@ -979,7 +1009,11 @@ function Invoke-InstallWizard {
         if ($module -eq 2) { $desired.OptiScaler = $true; $desired.Bridge = $true } # OptiScaler 捆绑 Bridge
         if ($module -eq 3) { $desired.AntiBlur = $true }
         if ($module -eq 4) { $desired.HDR = $true }
-        if ($module -eq 5) { $desired.TextureLoader = $true }
+        if ($module -eq 5) {
+            # NVIDIA 显卡上不允许启用 TextureLoader
+            if ($script:nvidiaGpu) { Write-Host 'TextureLoader 在 NVIDIA 显卡上不可用，已跳过模块 5。' -ForegroundColor Yellow }
+            else { $desired.TextureLoader = $true }
+        }
     }
     $unlockerSource = 'Existing'
     $optiSource = 'Existing'
@@ -1013,7 +1047,7 @@ function Invoke-InstallWizard {
     if ($desired.OptiScaler) { $arguments += @('-OptiScalerSource', $optiSource) } else { $arguments += '-DisableOptiScaler' }
     if (-not $desired.AntiBlur) { $arguments += '-DisableAntiBlur' }
     if ($desired.HDR) { $arguments += @('-ReShadeSource', $reShadeSource) } else { $arguments += '-DisableHDR' }
-    if ($desired.TextureLoader) { $arguments += '-EnableTextureLoader' } else { $arguments += '-DisableTextureLoader' }
+    if ((-not $script:nvidiaGpu) -and $desired.TextureLoader) { $arguments += '-EnableTextureLoader' } else { $arguments += '-DisableTextureLoader' }
     if ($desired.OptiScaler -and $optiSource -eq 'Manual') { $arguments += @('-OptiScalerPackagePath', $optiPackagePath) }
     $arguments += '-PreserveExistingConfigs'
     if ($NoShortcut) { $arguments += '-NoShortcut' }
@@ -1049,8 +1083,12 @@ function Invoke-UpdateWizard {
         @(Select-ModuleSet -ActionName '更新')
     }
     if ($selection.Count -eq 0) { return }
+    # NVIDIA 显卡上 TextureLoader（模块 5）不可用：不进入更新流程
+    if ($script:nvidiaGpu) { $selection = @($selection | Where-Object { $_ -ne 5 }) }
+    if ($selection.Count -eq 0) { return }
 
-    $isFullUpdateRequested = @(@(1, 2, 3, 4, 5) | Where-Object { $_ -notin $selection }).Count -eq 0
+    $selectableIds = if ($script:nvidiaGpu) { @(1, 2, 3, 4) } else { @(1, 2, 3, 4, 5) }
+    $isFullUpdateRequested = @($selectableIds | Where-Object { $_ -notin $selection }).Count -eq 0
     $shouldPreserveExistingConfigs = $PreserveExistingConfigs -or $isFullUpdateRequested
     if ($isFullUpdateRequested -and -not $SkipSelfUpdate) {
         if (Start-PackageSelfUpdate -ResumeGamePath $SelectedGamePath -ResumeUpdateAll) { return }
@@ -1062,7 +1100,8 @@ function Invoke-UpdateWizard {
         2 = [bool]$state.OptiScaler
         3 = [bool]$state.AntiBlur
         4 = [bool]$state.HDR
-        5 = [bool]$state.TextureLoader
+        # NVIDIA 显卡上 TextureLoader 一律视为未安装
+        5 = (-not $script:nvidiaGpu) -and [bool]$state.TextureLoader
     }
     $validSelection = [Collections.Generic.List[int]]::new()
     foreach ($module in $selection) {
@@ -1104,7 +1143,11 @@ function Invoke-UpdateWizard {
             if ($module -eq 2) { $desired.OptiScaler = $true; $desired.Bridge = $true } # OptiScaler 捆绑 Bridge
             if ($module -eq 3) { $desired.AntiBlur = $true }
             if ($module -eq 4) { $desired.HDR = $true }
-            if ($module -eq 5) { $desired.TextureLoader = $true }
+            if ($module -eq 5) {
+                # NVIDIA 显卡上不允许启用 TextureLoader
+                if ($script:nvidiaGpu) { Write-Host 'TextureLoader 在 NVIDIA 显卡上不可用，已跳过模块 5。' -ForegroundColor Yellow }
+                else { $desired.TextureLoader = $true }
+            }
         }
         $arguments = @(
             '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $configureScript,
@@ -1115,7 +1158,7 @@ function Invoke-UpdateWizard {
         if ($desired.OptiScaler) { $arguments += @('-OptiScalerSource', $optiSource) } else { $arguments += '-DisableOptiScaler' }
         if (-not $desired.AntiBlur) { $arguments += '-DisableAntiBlur' }
         if ($desired.HDR) { $arguments += @('-ReShadeSource', $reShadeSource) } else { $arguments += '-DisableHDR' }
-        if ($desired.TextureLoader) { $arguments += '-EnableTextureLoader' } else { $arguments += '-DisableTextureLoader' }
+        if ((-not $script:nvidiaGpu) -and $desired.TextureLoader) { $arguments += '-EnableTextureLoader' } else { $arguments += '-DisableTextureLoader' }
         if ($shouldPreserveExistingConfigs) { $arguments += '-PreserveExistingConfigs' }
         if ($NoShortcut) { $arguments += '-NoShortcut' }
         Write-Host ''
@@ -1275,17 +1318,21 @@ if ($ResumeUpdateAll) {
 
 while ($true) {
     $moduleState = Get-ModuleState -SelectedGamePath $selectedGamePath
+    # NVIDIA 显卡上 TextureLoader（模块 5）不可用：不计入总数、也不列出该行
+    $visibleModuleIds = if ($script:nvidiaGpu) { @(1, 2, 3, 4) } else { @(1, 2, 3, 4, 5) }
     $installedCount = @(@($moduleState.Bridge, $moduleState.OptiScaler, $moduleState.AntiBlur, $moduleState.HDR, $moduleState.TextureLoader) | Where-Object { $_ }).Count
     Write-Header -Title '原神插件管理器'
     Write-Host "[√] 游戏目录: $(Split-Path -Parent $selectedGamePath)" -ForegroundColor Green
     Write-Host "[√] 插件目录: $root" -ForegroundColor Green
-    Write-Host "    已安装 $installedCount / 5" -ForegroundColor DarkGray
+    Write-Host "    已安装 $installedCount / $($visibleModuleIds.Count)" -ForegroundColor DarkGray
     Write-Host ''
     Write-ModuleLine -Number 1 -Name 'FSR Bridge（FSR4）' -Installed $moduleState.Bridge -Path $bridgePath
     Write-ModuleLine -Number 2 -Name 'OptiScaler（DLSS/XeSS/FSR4 INT8）' -Installed $moduleState.OptiScaler -Path $optiPath
     Write-ModuleLine -Number 3 -Name '反虚化 / 隐藏 UID' -Installed $moduleState.AntiBlur -Path $antiBlurPath
     Write-ModuleLine -Number 4 -Name 'ReShade + RenoDX HDR' -Installed $moduleState.HDR -Path $reShadePath
-    Write-ModuleLine -Number 5 -Name '纹理/Mod 加载器（TextureLoader）' -Installed $moduleState.TextureLoader -Path $textureLoaderPath
+    if (-not $script:nvidiaGpu) {
+        Write-ModuleLine -Number 5 -Name '纹理/Mod 加载器（TextureLoader）' -Installed $moduleState.TextureLoader -Path $textureLoaderPath
+    }
     Write-Host "    FPS Unlocker 与管理脚本为基础组件，自动安装（当前帧率上限 $fpsTarget）" -ForegroundColor DarkGray
     Write-Host ''
     Write-Host '  1. 安装模块' -ForegroundColor Cyan

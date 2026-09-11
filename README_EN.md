@@ -53,7 +53,27 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 - Auto-matches the FSR series by GPU capability (FSR4/FSR3/FSR2); upscaling works on supported GPUs without external plugins.
 - Extends the in-game render-scale menu to `0.2–0.999`.
 - Writes runtime logs to `Dx11FsrBridge.log` beside the DLL by default for load and hook diagnostics.
-- **TextureLoader** (texture/Mod loader): 3DMigoto-compatible `[TextureOverride]` Mod loading (DDS replacement + GDDS DirectStorage GPU decompression), loading from the package `Mods` directory by default.
+- **TextureLoader** (texture/Mod loader, **AMD only**): 3DMigoto-compatible `[TextureOverride]` Mod loading (DDS replacement + GDDS DirectStorage GPU decompression), loading from the package `Mods` directory by default. **This component has an unfixable texture-loading defect on NVIDIA GPUs** — see "GPU Support and the NVIDIA Limitation of TextureLoader" below.
+
+## GPU Support and the NVIDIA Limitation of TextureLoader
+
+| Component | AMD | NVIDIA | Intel |
+| --- | --- | --- | --- |
+| FSR Bridge (FSR4/FSR3/FSR2) | ✅ | ✅ (incl. DLSS/XeSS/FSR4 INT8) | ✅ (XeSS) |
+| OptiScaler / Anti-Mosaic / ReShade + RenoDX | ✅ | ✅ | ✅ |
+| **TextureLoader (texture/Mod loader)** | ✅ Supported | ❌ **Unavailable** | ⚠️ Untested |
+
+**TextureLoader is only recommended for AMD users, and by default it can only be enabled on AMD GPUs.**
+
+On NVIDIA GPUs this component produces an **unfixable severe texture-loading defect**. The author does not own an NVIDIA card and could only rely on repeated testing by community members, so the root cause was never located. The following were ruled out: the Mod texture files themselves (all 3139 DDS files verified as valid BC3), format and SRV view handling (every logged field matches the AMD machine exactly, `hr=0`), hash matching and ini overrides, threading (identical thread topology on both machines), cross-machine file differences (byte-identical FNV fingerprints), alpha-channel content, and reuse of the initial-data buffer by subsequent loads (that defect was fixed, yet the NVIDIA output is still wrong). The only factor that cannot be reproduced locally is **the NVIDIA driver's texture creation / upload timing**.
+
+Every distribution channel therefore behaves as follows:
+
+- On detecting an NVIDIA GPU, the **FuFu Launcher plugin package** and the **GitHub release package** will **directly hide and disable TextureLoader's configuration and installation entries**: the toggle is not shown, not prompted for, and cannot be enabled. Even if `EnableTextureLoader=1` is written into the ini by hand, the plugin will not load the DLL.
+- **NVIDIA users who want this feature** are welcome to fork the repository, fix it, and submit a Pull Request.
+- **You can also sponsor an NVIDIA GPU for the author**, who will then attempt to locate and fix the issue.
+
+> AMD users are unaffected: interactive installation still asks whether to enable it (default No), and it can be toggled at any time from the plugin configuration screen.
 
 ## Repository Layout
 

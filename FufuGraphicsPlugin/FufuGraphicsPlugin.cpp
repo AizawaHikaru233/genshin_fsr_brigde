@@ -26,7 +26,10 @@ struct BootstrapConfig
     bool enable_bridge = true;
     bool enable_optiscaler = true;
     bool enable_reshade = true;
-    bool enable_texture_loader = true;
+    // TextureLoader 为可选组件（opt-in）：config.ini 中**没有该键即视为关闭**。
+    // 这与发布包一致（模板里 Value=0），而且现在是必需语义——模板 config.ini 已移除该项
+    // 以便在 NVIDIA 机器上隐藏该开关，此时键缺失必须落到"关闭"而不是"开启"。
+    bool enable_texture_loader = false;
     bool reset_configurations = false;
     std::filesystem::path bridge_path;
     std::filesystem::path optiscaler_path;
@@ -605,6 +608,41 @@ static bool is_intel_arc_device(std::uint32_t device_id)
 {
     return (device_id >= 0x5600 && device_id <= 0x56FF) ||
            (device_id >= 0xE200 && device_id <= 0xE2FF);
+}
+
+// 本机是否存在 NVIDIA 显示适配器。
+// 用途：TextureLoader 在 NVIDIA 上存在无法修复的纹理加载严重错误（作者无 N 卡，无法定位
+// 根因），故在 NVIDIA 机器上强制停用该组件——不加载 DLL，也不读写其配置。
+// 策略取保守方向：只要存在任一非软件 NVIDIA 适配器即判定为真（覆盖核显 + N 卡独显的混合机型）。
+bool has_nvidia_adapter()
+{
+    IDXGIFactory1 *factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&factory))) ||
+        factory == nullptr)
+    {
+        return false;
+    }
+    bool found = false;
+    for (UINT index = 0;; ++index)
+    {
+        IDXGIAdapter1 *adapter = nullptr;
+        if (factory->EnumAdapters1(index, &adapter) != S_OK || adapter == nullptr)
+            break;
+        DXGI_ADAPTER_DESC1 desc {};
+        const HRESULT result = adapter->GetDesc1(&desc);
+        adapter->Release();
+        if (FAILED(result) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0)
+            continue;
+        const std::wstring name = lower(desc.Description);
+        if (desc.VendorId == 0x10DE || name.find(L"nvidia") != std::wstring::npos ||
+            name.find(L"geforce") != std::wstring::npos)
+        {
+            found = true;
+            break;
+        }
+    }
+    factory->Release();
+    return found;
 }
 
 DetectedFsr4Policy detect_fsr4_gpu_policy()
@@ -1236,6 +1274,15 @@ BootstrapConfig load_config()
             L"payload\\TextureLoader\\TextureLoader.dll",
             L"..\\payload\\TextureLoader\\TextureLoader.dll",
         });
+    }
+    // TextureLoader 在 NVIDIA 上存在无法修复的纹理加载严重错误（作者无 N 卡，无法定位根因），
+    // 故在 NVIDIA 机器上强制停用：即便 ini 写了 EnableTextureLoader=1 也不生效。
+    // 停用后既不加载 DLL，也不写/重置其 ini（ensure/reset 两处都以该标志为门）。
+    // 说明见 TextureLoader/README.md 与根 README 的 GPU 支持矩阵。
+    if (config.enable_texture_loader && has_nvidia_adapter())
+    {
+        config.enable_texture_loader = false;
+        write_log("texture_loader_disabled reason=nvidia_gpu_unsupported");
     }
     return config;
 }

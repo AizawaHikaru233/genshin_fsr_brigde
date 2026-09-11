@@ -55,55 +55,64 @@ end
 install.log("OptiScaler 运行目录: " .. opti_dir)
 
 install.set_progress(82, "正在写入插件配置")
-install.write_config(plugin_dir, {
-    General = {
-        Name = "原神FSR2桥接插件",
-        Description = "支持把原神的FSR2转换为FSR4（A卡7000/9000）、DLSS/XeSS/FSR4 INT8（其余显卡）",
-        Developer = "シリアCelia",
-        File = "FSR-Bridge-Plugin.dll",
-        Version = "2.2.0"
-    },
-    EnableBridge = {
-        Name = "启用 FSR Bridge",
-        Type = "bool",
-        Value = "1"
-    },
-    EnableOptiScaler = {
-        Name = "启用 OptiScaler（需要 Bridge）",
-        Type = "bool",
-        Value = "1"
-    },
-    EnableReShade = {
-        Name = "启用 ReShade",
-        Type = "bool",
-        Value = is_nvidia and "0" or "1"
-    },
-    EnableTextureLoader = {
+-- TextureLoader 在 NVIDIA 上存在无法修复的纹理加载严重错误（作者无 N 卡，无法定位根因）。
+-- 故 N 卡机器上**不写入 EnableTextureLoader / TextureLoaderModPath 两个配置项**——
+-- 启动器的插件配置界面因此不会显示该开关（隐藏）；插件侧另有强制停用兜底，
+-- 即使 ini 里残留 EnableTextureLoader=1 也不会加载（停用）。
+-- 详见 TextureLoader/README.md 与根 README 的 GPU 支持矩阵。
+local plugin_config = {}
+plugin_config.General = {
+    Name = "原神FSR2桥接插件",
+    Description = "支持把原神的FSR2转换为FSR4（A卡7000/9000）、DLSS/XeSS/FSR4 INT8（其余显卡）",
+    Developer = "シリアCelia",
+    File = "FSR-Bridge-Plugin.dll",
+    Version = "2.2.0"
+}
+plugin_config.EnableBridge = {
+    Name = "启用 FSR Bridge",
+    Type = "bool",
+    Value = "1"
+}
+plugin_config.EnableOptiScaler = {
+    Name = "启用 OptiScaler（需要 Bridge）",
+    Type = "bool",
+    Value = "1"
+}
+plugin_config.EnableReShade = {
+    Name = "启用 ReShade",
+    Type = "bool",
+    Value = is_nvidia and "0" or "1"
+}
+if not is_nvidia then
+    plugin_config.EnableTextureLoader = {
         Name = "启用纹理/Mod 加载器",
         Type = "bool",
         Value = "0"
-    },
-    TextureLoaderModPath = {
+    }
+    plugin_config.TextureLoaderModPath = {
         Name = "Mod 加载路径（留空 = 插件目录内 Mods）",
         Type = "string",
         Value = ""
-    },
-    IssueFeedback = {
-        Name = "问题反馈",
-        Type = "string",
-        Value = "https://github.com/AizawaHikaru233/genshin_fsr_brigde/issues"
-    },
-    CommunityGroup = {
-        Name = "交流群",
-        Type = "string",
-        Value = "928147257"
-    },
-    ResetConfigurations = {
-        Name = "重置所有配置文件（自行更换插件版本或出现问题时使用）",
-        Type = "bool",
-        Value = "1"
     }
-})
+else
+    install.log("检测到 NVIDIA 显卡：TextureLoader 配置项已隐藏（该组件在 N 卡上不可用）")
+end
+plugin_config.IssueFeedback = {
+    Name = "问题反馈",
+    Type = "string",
+    Value = "https://github.com/AizawaHikaru233/genshin_fsr_brigde/issues"
+}
+plugin_config.CommunityGroup = {
+    Name = "交流群",
+    Type = "string",
+    Value = "928147257"
+}
+plugin_config.ResetConfigurations = {
+    Name = "重置所有配置文件（自行更换插件版本或出现问题时使用）",
+    Type = "bool",
+    Value = "1"
+}
+install.write_config(plugin_dir, plugin_config)
 
 install.set_progress(90, "正在准备组件初始配置")
 if install.file_exists(plugin_dir .. "\\FSR4Policy.ini") then

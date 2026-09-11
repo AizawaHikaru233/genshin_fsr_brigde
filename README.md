@@ -52,7 +52,27 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 - 按显卡能力自动匹配 FSR 系列（FSR4/FSR3/FSR2），支持显卡上无需外部插件即可超分。
 - 将游戏渲染精度菜单扩展为 `0.2–0.999`。
 - 运行时日志默认写入 DLL 同目录的 `Dx11FsrBridge.log`，用于排查加载与 Hook 状态。
-- **TextureLoader**（纹理/Mod 加载器）：3DMigoto 兼容的 `[TextureOverride]` Mod 加载（DDS 替换 + GDDS DirectStorage GPU 解压），默认从插件包内 `Mods` 目录加载。
+- **TextureLoader**（纹理/Mod 加载器，**仅推荐 A 卡**）：3DMigoto 兼容的 `[TextureOverride]` Mod 加载（DDS 替换 + GDDS DirectStorage GPU 解压），默认从插件包内 `Mods` 目录加载。**该组件在 NVIDIA 显卡上存在无法修复的纹理加载严重错误**，见下方「GPU 支持与 TextureLoader 的 N 卡限制」。
+
+## GPU 支持与 TextureLoader 的 N 卡限制
+
+| 组件 | AMD | NVIDIA | Intel |
+| --- | --- | --- | --- |
+| FSR Bridge（FSR4/FSR3/FSR2） | ✅ | ✅（含 DLSS/XeSS/FSR4 INT8） | ✅（XeSS） |
+| OptiScaler / 反虚化 / ReShade + RenoDX | ✅ | ✅ | ✅ |
+| **TextureLoader（纹理/Mod 加载器）** | ✅ 支持 | ❌ **不可用** | ⚠️ 未验证 |
+
+**TextureLoader 仅推荐 A 卡用户使用，且默认仅对 A 卡开放启用。**
+
+本组件在 NVIDIA 显卡上会出现**无法修复的纹理加载严重错误**。项目作者没有 N 卡，只能依靠 QQ 群群友协助反复测试，始终无法定位根因——已排除 mod 贴图文件本身（3139 个 DDS 全量校验均为合法 BC3）、格式与 SRV 视图处理（N 卡日志字段与 A 卡逐项一致且 `hr=0`）、哈希匹配与 ini 覆盖、线程路径（两机同构）、跨机文件差异（FNV 指纹逐位一致）、alpha 通道内容，以及初始数据缓冲被后继加载复用（该缺陷已修复，但 N 卡画面仍异常）。唯一无法在本地复现的环节是 **N 卡驱动的纹理创建 / 上载时机**。
+
+因此发布渠道一律按下列方式处理：
+
+- **芙芙启动器插件包**与 **GitHub 发布包**在检测到 NVIDIA 显卡时，会**直接隐藏并停用 TextureLoader 的配置项与安装项**：不显示开关、不询问、不允许启用；即使手动在 ini 中写入 `EnableTextureLoader=1`，插件也不会加载该 DLL。
+- **N 卡用户如果想用**：欢迎自行拉取本仓库源码修复，然后提交合并请求（Pull Request）。
+- **也可以赞助作者一张 NVIDIA 显卡**，作者会尝试定位并修复该问题。
+
+> A 卡用户不受影响：交互式安装仍会询问是否启用（默认否），之后可在插件配置界面随时开关。
 
 ## 仓库结构
 
