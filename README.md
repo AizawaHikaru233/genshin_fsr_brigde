@@ -52,15 +52,33 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 - 按显卡能力自动匹配 FSR 系列（FSR4/FSR3/FSR2），支持显卡上无需外部插件即可超分。
 - 将游戏渲染精度菜单扩展为 `0.2–0.999`。
 - 运行时日志默认写入 DLL 同目录的 `Dx11FsrBridge.log`，用于排查加载与 Hook 状态。
-- **TextureLoader**（纹理/Mod 加载器，**仅推荐 A 卡**）：3DMigoto 兼容的 `[TextureOverride]` Mod 加载（DDS 替换 + GDDS DirectStorage GPU 解压），默认从插件包内 `Mods` 目录加载。**该组件在 NVIDIA 显卡上存在无法修复的纹理加载严重错误**，见下方「GPU 支持与 TextureLoader 的 N 卡限制」。
+- **TextureLoader**（纹理/Mod 加载器，**仅推荐 A 卡**）：3DMigoto 兼容的 `[TextureOverride]` Mod 加载（DDS 替换 + GDDS DirectStorage GPU 解压），默认从插件包内 `Mods` 目录加载。**该组件在 NVIDIA 显卡上存在无法修复的纹理加载严重错误**，见下方「GPU 支持与 N 卡注意事项」。
 
-## GPU 支持与 TextureLoader 的 N 卡限制
+## GPU 支持与 N 卡注意事项
 
 | 组件 | AMD | NVIDIA | Intel |
 | --- | --- | --- | --- |
 | FSR Bridge（FSR4/FSR3/FSR2） | ✅ | ✅（含 DLSS/XeSS/FSR4 INT8） | ✅（XeSS） |
-| OptiScaler / 反虚化 / ReShade + RenoDX | ✅ | ✅ | ✅ |
+| OptiScaler（DLSS/XeSS/FSR4 INT8） | ✅ | ✅ | ✅ |
+| 反虚化 / 隐藏 UID、ReShade + RenoDX | ✅ | ✅ | ✅ |
+| **OptiScaler + ReShade 同时启用** | ✅ | ⚠️ **可能不稳定** | ✅ |
 | **TextureLoader（纹理/Mod 加载器）** | ✅ 支持 | ❌ **不可用** | ⚠️ 未验证 |
+
+### ⚠️ N 卡上 OptiScaler 与 ReShade 同时启用可能不稳定
+
+**单独使用 OptiScaler、或单独使用 ReShade，都没有问题；两者同时启用时，在 NVIDIA 环境下可能出现异常或不稳定。** 这取决于二者的加载顺序与 N 卡驱动之间的交互，与本项目代码无关——本项目只负责按默认顺序把它们加载起来。
+
+若遇到异常：
+
+- **先单独排查**：暂时只启用其中一个，确认问题是否消失；
+- 到 [OptiScaler 官方仓库](https://github.com/optiscaler/OptiScaler) 或本项目 [Issues](https://github.com/AizawaHikaru233/genshin_fsr_brigde/issues) 反馈，并附上游戏目录下的 `OptiScaler.log` 与 `ReShade.log`；
+- 若仍不稳定，建议**二者只保留一个**：FSR Bridge 自身的 FSR4/FSR3/FSR2 不依赖它们——需要 DLSS/XeSS/FSR4 INT8 时启用 OptiScaler，需要 HDR 时启用 ReShade。
+
+### TextureLoader 在 N 卡上不可用
+
+**TextureLoader 仅推荐 A 卡用户使用，且默认仅对 A 卡开放启用。**
+
+### TextureLoader 在 N 卡上不可用
 
 **TextureLoader 仅推荐 A 卡用户使用，且默认仅对 A 卡开放启用。**
 

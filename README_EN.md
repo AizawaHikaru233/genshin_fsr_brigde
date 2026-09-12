@@ -53,15 +53,29 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 - Auto-matches the FSR series by GPU capability (FSR4/FSR3/FSR2); upscaling works on supported GPUs without external plugins.
 - Extends the in-game render-scale menu to `0.2–0.999`.
 - Writes runtime logs to `Dx11FsrBridge.log` beside the DLL by default for load and hook diagnostics.
-- **TextureLoader** (texture/Mod loader, **AMD only**): 3DMigoto-compatible `[TextureOverride]` Mod loading (DDS replacement + GDDS DirectStorage GPU decompression), loading from the package `Mods` directory by default. **This component has an unfixable texture-loading defect on NVIDIA GPUs** — see "GPU Support and the NVIDIA Limitation of TextureLoader" below.
+- **TextureLoader** (texture/Mod loader, **AMD only**): 3DMigoto-compatible `[TextureOverride]` Mod loading (DDS replacement + GDDS DirectStorage GPU decompression), loading from the package `Mods` directory by default. **This component has an unfixable texture-loading defect on NVIDIA GPUs** — see "GPU Support and NVIDIA Caveats" below.
 
-## GPU Support and the NVIDIA Limitation of TextureLoader
+## GPU Support and NVIDIA Caveats
 
 | Component | AMD | NVIDIA | Intel |
 | --- | --- | --- | --- |
 | FSR Bridge (FSR4/FSR3/FSR2) | ✅ | ✅ (incl. DLSS/XeSS/FSR4 INT8) | ✅ (XeSS) |
-| OptiScaler / Anti-Mosaic / ReShade + RenoDX | ✅ | ✅ | ✅ |
+| OptiScaler (DLSS/XeSS/FSR4 INT8) | ✅ | ✅ | ✅ |
+| Anti-Mosaic / Hide UID, ReShade + RenoDX | ✅ | ✅ | ✅ |
+| **OptiScaler + ReShade enabled together** | ✅ | ⚠️ **May be unstable** | ✅ |
 | **TextureLoader (texture/Mod loader)** | ✅ Supported | ❌ **Unavailable** | ⚠️ Untested |
+
+### ⚠️ On NVIDIA, enabling OptiScaler and ReShade together may be unstable
+
+**Using OptiScaler alone, or ReShade alone, is fine; enabling both at the same time may misbehave or be unstable on NVIDIA.** That depends on how the two interact with NVIDIA drivers and on their load order, not on this project's code — this project only loads them in the default order.
+
+If you run into trouble:
+
+- **Isolate first**: temporarily enable only one of the two and check whether the problem disappears;
+- Report it to the [OptiScaler upstream repository](https://github.com/optiscaler/OptiScaler) or this project's [Issues](https://github.com/AizawaHikaru233/genshin_fsr_brigde/issues), attaching `OptiScaler.log` and `ReShade.log` from the game directory;
+- If it is still unstable, **keep only one of the two**: FSR Bridge's own FSR4/FSR3/FSR2 depends on neither — enable OptiScaler for DLSS/XeSS/FSR4 INT8, enable ReShade for HDR.
+
+### TextureLoader is unavailable on NVIDIA
 
 **TextureLoader is only recommended for AMD users, and by default it can only be enabled on AMD GPUs.**
 
