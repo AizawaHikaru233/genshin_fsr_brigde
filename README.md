@@ -78,10 +78,6 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 
 **TextureLoader 仅推荐 A 卡用户使用，且默认仅对 A 卡开放启用。**
 
-### TextureLoader 在 N 卡上不可用
-
-**TextureLoader 仅推荐 A 卡用户使用，且默认仅对 A 卡开放启用。**
-
 本组件在 NVIDIA 显卡上会出现**无法修复的纹理加载严重错误**。项目作者没有 N 卡，只能依靠 QQ 群群友协助反复测试，始终无法定位根因——已排除 mod 贴图文件本身（3139 个 DDS 全量校验均为合法 BC3）、格式与 SRV 视图处理（N 卡日志字段与 A 卡逐项一致且 `hr=0`）、哈希匹配与 ini 覆盖、线程路径（两机同构）、跨机文件差异（FNV 指纹逐位一致）、alpha 通道内容，以及初始数据缓冲被后继加载复用（该缺陷已修复，但 N 卡画面仍异常）。唯一无法在本地复现的环节是 **N 卡驱动的纹理创建 / 上载时机**。
 
 因此发布渠道一律按下列方式处理：
