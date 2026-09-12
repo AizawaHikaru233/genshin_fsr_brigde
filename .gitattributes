@@ -1,0 +1,5 @@
+# FufuLauncher 的 Lua 安装脚本由宿主按行（CRLF）解析：
+# 若文件是 LF，宿主会把 install.write_config 的整张表当成一行，
+# 识别不到 section 结构 → 静默不写 config.ini（无任何报错）。
+# 这里显式固定为 CRLF，避免编辑器/工具链把它转成 LF。
+*.lua text eol=crlf
