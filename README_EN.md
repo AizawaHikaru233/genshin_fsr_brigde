@@ -9,7 +9,16 @@ For the Chinese documentation, see [README.md](README.md).
 ## Support Scope and Risk Notice
 
 - Intended for the Chinese and Global Windows DX11 clients of Genshin Impact.
-- Updated for Genshin Impact `7.0`. With the current feature-query hooks, ordinary future game updates are expected not to require another compatibility update.
+- Adapted for and verified against Genshin Impact `7.0`. **New game versions require
+  re-verification**: this project hooks the game's internal FSR2 calls and il2cpp methods
+  (including RVA and prologue byte matching), and game updates may change those internal
+  structures. The bridge abandons the hook and falls back when signatures no longer match
+  (it will not crash), but **upscaling may stop working** until this project is updated.
+  See [GPU Support and NVIDIA Caveats](#gpu-support-and-nvidia-caveats).
+- Feature and hardware prerequisites: which FSR tier (FSR4/FSR3/FSR2) is actually available
+  depends on the **GPU model and driver version** (for example FSR4 requires RDNA4 and a
+  matching driver). Every "on supported GPUs" statement below refers to the range listed in
+  that section — please confirm your GPU is covered before proceeding.
 - This project is not affiliated with, endorsed by, or authorized by `HoYoverse`, `miHoYo`, `Genshin Impact`, or `原神`. All related names and trademarks belong to their respective owners.
 - Third-party DLLs, injectors, mods, and graphics plugins may violate game rules and could result in account restrictions or bans. Users must evaluate the risks themselves and accept full responsibility.
 
