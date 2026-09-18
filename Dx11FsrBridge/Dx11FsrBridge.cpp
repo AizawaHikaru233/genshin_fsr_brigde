@@ -247,6 +247,10 @@ struct Config
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     bool ffx12_probe = false; // 一次性槽位/cb0 探测（诊断用，默认关）
 #endif
+    // 后端输出读回采样（诊断）。**默认关**：它会 CopySubresourceRegion + Flush +
+    // 同步 Map(READ)，阻塞渲染线程直到 GPU 画完，期间 GPU 空转。
+    // 此前无条件运行，是正式版里唯一持续存在的 GPU 同步点。
+    bool ffx12_readback_probes = false;
     bool ffx12_feature_fallback = true; // 特征识别兜底：1=运行时特征优先+已有样本(硬编码)兜底；0=纯特征识别（验证用——关闭所有版本特定样本）
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     bool optiscaler_bridge_probe = false; // 遗留 OptiScaler 候选桥路径（frames.jsonl 记录，默认关）
@@ -4002,6 +4006,9 @@ void load_config()
     }
     // 诊断 shader dump 也必须在 RELEASE 分支读取（非 RELEASE 分支的读取不生效）
     g_config.dump_pixel_shaders = GetPrivateProfileIntW(L"Dx11FsrBridge", L"DumpPixelShaders", 0, config_path.c_str()) != 0;
+    // 后端输出读回采样（诊断，默认关）。开启会引入同步 GPU 等待 → 掉帧，仅排查用。
+    g_config.ffx12_readback_probes =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ReadbackProbes", 0, config_path.c_str()) != 0;
     g_config.trace_pixel_shader_draws =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"TracePixelShaderDraws", 0, config_path.c_str()) != 0;
     // ---- 以下键此前**只在非 RELEASE 分支读取**，而生产构建定义
@@ -10746,7 +10753,13 @@ bool try_fsr2_translation_draw(
                             " (pqdec=PQ解码输出; ffxout=ffxDispatch输出; pqenc=PQ编码输出; mvdec=motion解码)");
                     }
 #endif
-                    if (dcount == 1 || dcount % 1024 == 0)
+                    // ⚠️ 诊断采样会**阻塞渲染线程**：append_tex_samples 内部做
+                    //   CopySubresourceRegion → Flush() → Map(READ)
+                    // 同步等待 GPU 画完，期间 GPU 空转（典型的"CPU 卡住、GPU 闲着"）。
+                    // 此前它无条件运行（每 1024 次 dispatch 触发两次），是正式版里
+                    // 唯一持续存在的 GPU 同步点。改为由 Ffx12ReadbackProbes 显式开启，
+                    // 默认关；排查画面问题时再打开。
+                    if (g_config.ffx12_readback_probes && (dcount == 1 || dcount % 1024 == 0))
                     {
                         // 读回 ffx12 后端输出与游戏 rtv1 的 5 点采样：
                         // 判断后端是否有画面内容（四角+中央），定位"空转"还是"显示链未用"
