@@ -569,9 +569,8 @@ static OptiOutput opti_output_current()
     }
     return g_opti_output.load(std::memory_order_relaxed);
 }
-// 显卡路由（定义于 initialize 之前；设备创建 hook 先于定义处使用，需前置声明）
-static void apply_adapter_route(std::uint32_t vendor, std::uint32_t device, const std::wstring &desc,
-                                const char *source);
+// 显卡信息记录（**已不做路由**；定义于 initialize 之前，设备创建 hook 先于定义处使用）
+static void record_adapter_info(std::uint32_t vendor, const std::wstring &desc);
 static void route_from_d3d11_device(ID3D11Device *d3d11_device);
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 std::mutex g_ps_trace_mutex;
@@ -1148,7 +1147,7 @@ static void append_tex_samples(std::string &out, const char *tag,
                 if (a > mvmax)
                     mvmax = a;
             }
-            out += "0x" + hex64(raw) + " r=" + std::to_string(r) + " g=" + std::to_string(g) +
+            out += hex64(raw) + " r=" + std::to_string(r) + " g=" + std::to_string(g) +
                 " b=" + std::to_string(b) + " sgn=" + std::to_string(sr) + "," +
                 std::to_string(sg) + "," + std::to_string(b * 2.0f - 1.0f);
         }
@@ -1160,7 +1159,7 @@ static void append_tex_samples(std::string &out, const char *tag,
         }
         else
         {
-            out += "0x" + hex64(raw) + " fmt=" + std::to_string(static_cast<std::uint32_t>(td.Format));
+            out += hex64(raw) + " fmt=" + std::to_string(static_cast<std::uint32_t>(td.Format));
         }
     }
     if (report_mvmax)
@@ -6065,6 +6064,193 @@ void record_hdr_composite_target_bind(const ResourceInfo &target)
         " swapchain_backbuffer=" + std::to_string(is_known_swapchain_backbuffer(target.resource_key) ? 1 : 0));
 }
 
+// HDR→SDR tone-map 的「保存/恢复立即上下文状态」助手。
+//
+// 为什么需要它：tone-map 有两条入口（swapchain 后处理 tone_map_hdr_backbuffer_to_sdr、
+// 合成 draw 拦截 try_hdr_sdr_tone_map_draw），两条都手工保存/恢复同一组十几个状态，
+// 逐行重复约 50 行，且**两处已经不一致**：
+//   - 后处理入口用 `VSGetShader(..., instances, &count)` 连 class instance 一起存/恢复；
+//   - draw 入口用 `VSGetShader(..., nullptr, nullptr)` 只存 shader，恢复时同样丢 instances。
+//     一旦游戏在该 PS/VS 上绑了 class instance，拦截后就会被静默清掉。
+// 现在统一由本结构保存并恢复（含 class instances），并顺带修掉泄漏：
+// 旧 draw 入口保存了 viewport/blend/depth/rasterizer 却只 Release 了其中一部分。
+struct ToneMapContextState
+{
+    ID3D11RenderTargetView *rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] {};
+    ID3D11DepthStencilView *dsv = nullptr;
+    D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] {};
+    UINT viewport_count = static_cast<UINT>(std::size(viewports));
+    ID3D11InputLayout *layout = nullptr;
+    D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    ID3D11VertexShader *vs = nullptr;
+    std::array<ID3D11ClassInstance *, 256> vs_instances {};
+    UINT vs_instance_count = static_cast<UINT>(vs_instances.size());
+    ID3D11PixelShader *ps = nullptr;
+    std::array<ID3D11ClassInstance *, 256> ps_instances {};
+    UINT ps_instance_count = static_cast<UINT>(ps_instances.size());
+    ID3D11ShaderResourceView *srv0 = nullptr;
+    ID3D11SamplerState *sampler0 = nullptr;
+    ID3D11Buffer *cb0 = nullptr;
+    ID3D11BlendState *blend = nullptr;
+    FLOAT blend_factor[4] {};
+    UINT sample_mask = 0;
+    ID3D11DepthStencilState *depth = nullptr;
+    UINT stencil_ref = 0;
+    ID3D11RasterizerState *rasterizer = nullptr;
+
+    ToneMapContextState() = default;
+    ToneMapContextState(const ToneMapContextState &) = delete;
+    ToneMapContextState &operator=(const ToneMapContextState &) = delete;
+    ~ToneMapContextState() { release(); }
+
+    void release()
+    {
+        for (ID3D11RenderTargetView *rtv : rtvs)
+            if (rtv != nullptr)
+                rtv->Release();
+        for (ID3D11ClassInstance *instance : vs_instances)
+            if (instance != nullptr)
+                instance->Release();
+        for (ID3D11ClassInstance *instance : ps_instances)
+            if (instance != nullptr)
+                instance->Release();
+        if (dsv != nullptr) dsv->Release();
+        if (layout != nullptr) layout->Release();
+        if (vs != nullptr) vs->Release();
+        if (ps != nullptr) ps->Release();
+        if (srv0 != nullptr) srv0->Release();
+        if (sampler0 != nullptr) sampler0->Release();
+        if (cb0 != nullptr) cb0->Release();
+        if (blend != nullptr) blend->Release();
+        if (depth != nullptr) depth->Release();
+        if (rasterizer != nullptr) rasterizer->Release();
+        dsv = nullptr; layout = nullptr; vs = nullptr; ps = nullptr;
+        srv0 = nullptr; sampler0 = nullptr; cb0 = nullptr;
+        blend = nullptr; depth = nullptr; rasterizer = nullptr;
+        for (ID3D11RenderTargetView *&rtv : rtvs) rtv = nullptr;
+        for (ID3D11ClassInstance *&instance : vs_instances) instance = nullptr;
+        for (ID3D11ClassInstance *&instance : ps_instances) instance = nullptr;
+    }
+
+    void save(ID3D11DeviceContext *context)
+    {
+        context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, &dsv);
+        context->RSGetViewports(&viewport_count, viewports);
+        context->IAGetInputLayout(&layout);
+        context->IAGetPrimitiveTopology(&topology);
+        context->VSGetShader(&vs, vs_instances.data(), &vs_instance_count);
+        context->PSGetShader(&ps, ps_instances.data(), &ps_instance_count);
+        context->PSGetShaderResources(0, 1, &srv0);
+        context->PSGetSamplers(0, 1, &sampler0);
+        context->PSGetConstantBuffers(0, 1, &cb0);
+        context->OMGetBlendState(&blend, blend_factor, &sample_mask);
+        context->OMGetDepthStencilState(&depth, &stencil_ref);
+        context->RSGetState(&rasterizer);
+    }
+
+    // 恢复时优先走已缓存的原始 vtable 函数（ScopedContextVtableBypass 期间直接调用
+    // context->X() 会被自己的钩子再拦一次）。
+    void restore(ID3D11DeviceContext *context) const
+    {
+        if (g_original_om_set_render_targets != nullptr)
+            g_original_om_set_render_targets(context, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, dsv);
+        else
+            context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, dsv);
+        if (viewport_count != 0)
+        {
+            if (g_original_rs_set_viewports != nullptr)
+                g_original_rs_set_viewports(context, viewport_count, viewports);
+            else
+                context->RSSetViewports(viewport_count, viewports);
+        }
+        context->IASetInputLayout(layout);
+        context->IASetPrimitiveTopology(topology);
+        if (g_original_vs_set_shader != nullptr)
+            g_original_vs_set_shader(context, vs, vs_instances.data(), vs_instance_count);
+        else
+            context->VSSetShader(vs, vs_instances.data(), vs_instance_count);
+        if (g_original_ps_set_shader != nullptr)
+            g_original_ps_set_shader(context, ps, ps_instances.data(), ps_instance_count);
+        else
+            context->PSSetShader(ps, ps_instances.data(), ps_instance_count);
+        ID3D11ShaderResourceView *views[1] = { srv0 };
+        if (g_original_ps_set_shader_resources != nullptr)
+            g_original_ps_set_shader_resources(context, 0, 1, views);
+        else
+            context->PSSetShaderResources(0, 1, views);
+        context->PSSetSamplers(0, 1, &sampler0);
+        context->PSSetConstantBuffers(0, 1, &cb0);
+        context->OMSetBlendState(blend, blend_factor, sample_mask);
+        context->OMSetDepthStencilState(depth, stencil_ref);
+        context->RSSetState(rasterizer);
+    }
+};
+
+// 绑定 tone-map 的输入/输出并画全屏三角，然后恢复传入的上下文状态。
+// 两条入口共用同一段绑定序列——这正是此前逐行重复、容易只改一边的部分。
+void tone_map_bind_and_draw(ID3D11DeviceContext *context, const HdrSdrToneMapResources &resources,
+                            const ToneMapContextState &state)
+{
+    const D3D11_VIEWPORT viewport {
+        0.0f, 0.0f,
+        static_cast<float>(resources.width), static_cast<float>(resources.height),
+        0.0f, 1.0f,
+    };
+    struct ToneMapConstants
+    {
+        float paper_white;
+        float peak;
+        float pq_input;
+        float padding;
+    } constants {
+        static_cast<float>(g_config.hdr_sdr_tone_map_paper_white),
+        static_cast<float>(std::max(g_config.hdr_sdr_tone_map_peak, g_config.hdr_sdr_tone_map_paper_white)),
+        g_config.hdr_sdr_tone_map_pq_input ? 1.0f : 0.0f,
+        0.0f,
+    };
+
+    if (g_original_om_set_render_targets != nullptr)
+        g_original_om_set_render_targets(context, 1, &resources.target_view, nullptr);
+    else
+        context->OMSetRenderTargets(1, &resources.target_view, nullptr);
+    if (g_original_rs_set_viewports != nullptr)
+        g_original_rs_set_viewports(context, 1, &viewport);
+    else
+        context->RSSetViewports(1, &viewport);
+    context->IASetInputLayout(nullptr);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    if (g_original_vs_set_shader != nullptr)
+        g_original_vs_set_shader(context, resources.vertex_shader, nullptr, 0);
+    else
+        context->VSSetShader(resources.vertex_shader, nullptr, 0);
+    if (g_original_ps_set_shader != nullptr)
+        g_original_ps_set_shader(context, resources.pixel_shader, nullptr, 0);
+    else
+        context->PSSetShader(resources.pixel_shader, nullptr, 0);
+    if (g_original_ps_set_shader_resources != nullptr)
+        g_original_ps_set_shader_resources(context, 0, 1, &resources.source_view);
+    else
+        context->PSSetShaderResources(0, 1, &resources.source_view);
+    context->PSSetSamplers(0, 1, &resources.sampler);
+    context->UpdateSubresource(resources.constants, 0, nullptr, &constants, 0, 0);
+    context->PSSetConstantBuffers(0, 1, &resources.constants);
+    context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+    context->OMSetDepthStencilState(nullptr, 0);
+    context->RSSetState(nullptr);
+    if (g_original_draw != nullptr)
+        g_original_draw(context, 3, 0);
+    else
+        context->Draw(3, 0);
+    // 解绑 SRV0：tone-map 的源纹理马上可能被上层复用为渲染目标，
+    // 留着绑定会触发 D3D11 的 "resource still bound" 警告并阻止后续写。
+    ID3D11ShaderResourceView *null_view = nullptr;
+    if (g_original_ps_set_shader_resources != nullptr)
+        g_original_ps_set_shader_resources(context, 0, 1, &null_view);
+    else
+        context->PSSetShaderResources(0, 1, &null_view);
+    state.restore(context);
+}
+
 bool is_hdr_sdr_tone_map_composite_draw(UINT element_count)
 {
     if (!g_config.hdr_sdr_tone_map || !g_config.hdr_swapchain_spoof || element_count != 3 ||
@@ -6562,58 +6748,13 @@ void tone_map_hdr_backbuffer_to_sdr(IDXGISwapChain *swapchain, std::uint64_t fra
     }
 
     auto &resources = g_hdr_sdr_tone_map_resources;
-    ID3D11RenderTargetView *saved_render_targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] {};
-    ID3D11DepthStencilView *saved_depth_stencil = nullptr;
-    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved_render_targets, &saved_depth_stencil);
-
-    D3D11_VIEWPORT saved_viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] {};
-    UINT saved_viewport_count = static_cast<UINT>(std::size(saved_viewports));
-    context->RSGetViewports(&saved_viewport_count, saved_viewports);
-
-    ID3D11InputLayout *saved_input_layout = nullptr;
-    context->IAGetInputLayout(&saved_input_layout);
-    D3D11_PRIMITIVE_TOPOLOGY saved_topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
-    context->IAGetPrimitiveTopology(&saved_topology);
-    ID3D11VertexShader *saved_vertex_shader = nullptr;
-    std::array<ID3D11ClassInstance *, 256> saved_vertex_instances {};
-    UINT saved_vertex_instance_count = static_cast<UINT>(saved_vertex_instances.size());
-    context->VSGetShader(&saved_vertex_shader, saved_vertex_instances.data(), &saved_vertex_instance_count);
-    ID3D11PixelShader *saved_pixel_shader = nullptr;
-    std::array<ID3D11ClassInstance *, 256> saved_pixel_instances {};
-    UINT saved_pixel_instance_count = static_cast<UINT>(saved_pixel_instances.size());
-    context->PSGetShader(&saved_pixel_shader, saved_pixel_instances.data(), &saved_pixel_instance_count);
-    ID3D11ShaderResourceView *saved_source_view = nullptr;
-    context->PSGetShaderResources(0, 1, &saved_source_view);
-    ID3D11SamplerState *saved_sampler = nullptr;
-    context->PSGetSamplers(0, 1, &saved_sampler);
-    ID3D11Buffer *saved_constant_buffer = nullptr;
-    context->PSGetConstantBuffers(0, 1, &saved_constant_buffer);
-    ID3D11BlendState *saved_blend_state = nullptr;
-    FLOAT saved_blend_factor[4] {};
-    UINT saved_sample_mask = 0;
-    context->OMGetBlendState(&saved_blend_state, saved_blend_factor, &saved_sample_mask);
-    ID3D11DepthStencilState *saved_depth_state = nullptr;
-    UINT saved_stencil_ref = 0;
-    context->OMGetDepthStencilState(&saved_depth_state, &saved_stencil_ref);
-    ID3D11RasterizerState *saved_rasterizer_state = nullptr;
-    context->RSGetState(&saved_rasterizer_state);
-
-    struct ToneMapConstants
-    {
-        float paper_white;
-        float peak;
-        float pq_input;
-        float padding;
-    } constants {
-        static_cast<float>(g_config.hdr_sdr_tone_map_paper_white),
-        static_cast<float>(std::max(g_config.hdr_sdr_tone_map_peak, g_config.hdr_sdr_tone_map_paper_white)),
-        g_config.hdr_sdr_tone_map_pq_input ? 1.0f : 0.0f,
-        0.0f,
-    };
+    ToneMapContextState state;
+    state.save(context);
 
     {
         ScopedInternalBridgeDispatch internal_dispatch_scope;
         ScopedContextVtableBypass context_vtable_bypass(context);
+        // 后处理入口没有「游戏 draw 要落到源纹理」这一步：直接把后备缓冲拷进 source_copy。
         if (g_original_om_set_render_targets != nullptr)
             g_original_om_set_render_targets(context, 0, nullptr, nullptr);
         else
@@ -6622,117 +6763,9 @@ void tone_map_hdr_backbuffer_to_sdr(IDXGISwapChain *swapchain, std::uint64_t fra
             g_original_copy_resource(context, resources.source_copy, target_texture);
         else
             context->CopyResource(resources.source_copy, target_texture);
-        context->UpdateSubresource(resources.constants, 0, nullptr, &constants, 0, 0);
-        if (g_original_om_set_render_targets != nullptr)
-            g_original_om_set_render_targets(context, 1, &resources.target_view, nullptr);
-        else
-            context->OMSetRenderTargets(1, &resources.target_view, nullptr);
-        const D3D11_VIEWPORT viewport {
-            0.0f, 0.0f,
-            static_cast<float>(resources.width), static_cast<float>(resources.height),
-            0.0f, 1.0f,
-        };
-        if (g_original_rs_set_viewports != nullptr)
-            g_original_rs_set_viewports(context, 1, &viewport);
-        else
-            context->RSSetViewports(1, &viewport);
-        context->IASetInputLayout(nullptr);
-        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        if (g_original_vs_set_shader != nullptr)
-            g_original_vs_set_shader(context, resources.vertex_shader, nullptr, 0);
-        else
-            context->VSSetShader(resources.vertex_shader, nullptr, 0);
-        if (g_original_ps_set_shader != nullptr)
-            g_original_ps_set_shader(context, resources.pixel_shader, nullptr, 0);
-        else
-            context->PSSetShader(resources.pixel_shader, nullptr, 0);
-        if (g_original_ps_set_shader_resources != nullptr)
-            g_original_ps_set_shader_resources(context, 0, 1, &resources.source_view);
-        else
-            context->PSSetShaderResources(0, 1, &resources.source_view);
-        context->PSSetSamplers(0, 1, &resources.sampler);
-        context->PSSetConstantBuffers(0, 1, &resources.constants);
-        context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
-        context->OMSetDepthStencilState(nullptr, 0);
-        context->RSSetState(nullptr);
-        if (g_original_draw != nullptr)
-            g_original_draw(context, 3, 0);
-        else
-            context->Draw(3, 0);
-        ID3D11ShaderResourceView *null_view = nullptr;
-        if (g_original_ps_set_shader_resources != nullptr)
-            g_original_ps_set_shader_resources(context, 0, 1, &null_view);
-        else
-            context->PSSetShaderResources(0, 1, &null_view);
-        if (g_original_om_set_render_targets != nullptr)
-            g_original_om_set_render_targets(context, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
-                saved_render_targets, saved_depth_stencil);
-        else
-            context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
-                saved_render_targets, saved_depth_stencil);
-        if (saved_viewport_count != 0)
-        {
-            if (g_original_rs_set_viewports != nullptr)
-                g_original_rs_set_viewports(context, saved_viewport_count, saved_viewports);
-            else
-                context->RSSetViewports(saved_viewport_count, saved_viewports);
-        }
-        context->IASetInputLayout(saved_input_layout);
-        context->IASetPrimitiveTopology(saved_topology);
-        if (g_original_vs_set_shader != nullptr)
-            g_original_vs_set_shader(context, saved_vertex_shader, saved_vertex_instances.data(), saved_vertex_instance_count);
-        else
-            context->VSSetShader(saved_vertex_shader, saved_vertex_instances.data(), saved_vertex_instance_count);
-        if (g_original_ps_set_shader != nullptr)
-            g_original_ps_set_shader(context, saved_pixel_shader, saved_pixel_instances.data(), saved_pixel_instance_count);
-        else
-            context->PSSetShader(saved_pixel_shader, saved_pixel_instances.data(), saved_pixel_instance_count);
-        if (g_original_ps_set_shader_resources != nullptr)
-            g_original_ps_set_shader_resources(context, 0, 1, &saved_source_view);
-        else
-            context->PSSetShaderResources(0, 1, &saved_source_view);
-        context->PSSetSamplers(0, 1, &saved_sampler);
-        context->PSSetConstantBuffers(0, 1, &saved_constant_buffer);
-        context->OMSetBlendState(saved_blend_state, saved_blend_factor, saved_sample_mask);
-        context->OMSetDepthStencilState(saved_depth_state, saved_stencil_ref);
-        context->RSSetState(saved_rasterizer_state);
+        tone_map_bind_and_draw(context, resources, state);
     }
-
-    if (saved_input_layout != nullptr)
-        saved_input_layout->Release();
-    if (saved_vertex_shader != nullptr)
-        saved_vertex_shader->Release();
-    for (ID3D11ClassInstance *instance : saved_vertex_instances)
-    {
-        if (instance != nullptr)
-            instance->Release();
-    }
-    if (saved_pixel_shader != nullptr)
-        saved_pixel_shader->Release();
-    for (ID3D11ClassInstance *instance : saved_pixel_instances)
-    {
-        if (instance != nullptr)
-            instance->Release();
-    }
-    if (saved_source_view != nullptr)
-        saved_source_view->Release();
-    if (saved_sampler != nullptr)
-        saved_sampler->Release();
-    if (saved_constant_buffer != nullptr)
-        saved_constant_buffer->Release();
-    if (saved_blend_state != nullptr)
-        saved_blend_state->Release();
-    if (saved_depth_state != nullptr)
-        saved_depth_state->Release();
-    if (saved_rasterizer_state != nullptr)
-        saved_rasterizer_state->Release();
-    for (ID3D11RenderTargetView *render_target : saved_render_targets)
-    {
-        if (render_target != nullptr)
-            render_target->Release();
-    }
-    if (saved_depth_stencil != nullptr)
-        saved_depth_stencil->Release();
+    // 析构释放所有保存的引用（含 class instances、viewport/blend/depth/rasterizer）。
 
     if (!g_hdr_sdr_tone_map_logged.exchange(true, std::memory_order_relaxed))
     {
@@ -11669,97 +11702,24 @@ bool try_hdr_sdr_tone_map_draw(ID3D11DeviceContext *context, UINT element_count,
     device->Release();
     auto &resources = g_hdr_sdr_tone_map_resources;
 
-    ID3D11RenderTargetView *saved_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] {};
-    ID3D11DepthStencilView *saved_dsv = nullptr;
-    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved_rtvs, &saved_dsv);
-    D3D11_VIEWPORT saved_viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] {};
-    UINT saved_viewport_count = static_cast<UINT>(std::size(saved_viewports));
-    context->RSGetViewports(&saved_viewport_count, saved_viewports);
-    ID3D11InputLayout *saved_layout = nullptr;
-    context->IAGetInputLayout(&saved_layout);
-    D3D11_PRIMITIVE_TOPOLOGY saved_topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
-    context->IAGetPrimitiveTopology(&saved_topology);
-    ID3D11VertexShader *saved_vs = nullptr;
-    context->VSGetShader(&saved_vs, nullptr, nullptr);
-    ID3D11PixelShader *saved_ps = nullptr;
-    context->PSGetShader(&saved_ps, nullptr, nullptr);
-    ID3D11ShaderResourceView *saved_srv0 = nullptr;
-    context->PSGetShaderResources(0, 1, &saved_srv0);
-    ID3D11SamplerState *saved_sampler = nullptr;
-    context->PSGetSamplers(0, 1, &saved_sampler);
-    ID3D11Buffer *saved_cb0 = nullptr;
-    context->PSGetConstantBuffers(0, 1, &saved_cb0);
-    ID3D11BlendState *saved_blend = nullptr;
-    FLOAT saved_blend_factor[4] {};
-    UINT saved_sample_mask = 0;
-    context->OMGetBlendState(&saved_blend, saved_blend_factor, &saved_sample_mask);
-    ID3D11DepthStencilState *saved_depth = nullptr;
-    UINT saved_stencil_ref = 0;
-    context->OMGetDepthStencilState(&saved_depth, &saved_stencil_ref);
-    ID3D11RasterizerState *saved_rasterizer = nullptr;
-    context->RSGetState(&saved_rasterizer);
+    ToneMapContextState state;
+    state.save(context);
 
-    const D3D11_VIEWPORT viewport { 0.0f, 0.0f, static_cast<float>(resources.width),
-        static_cast<float>(resources.height), 0.0f, 1.0f };
-    struct ToneMapConstants
-    {
-        float paper_white;
-        float peak;
-        float pq_input;
-        float padding;
-    } constants {
-        static_cast<float>(g_config.hdr_sdr_tone_map_paper_white),
-        static_cast<float>(std::max(g_config.hdr_sdr_tone_map_peak, g_config.hdr_sdr_tone_map_paper_white)),
-        g_config.hdr_sdr_tone_map_pq_input ? 1.0f : 0.0f,
-        0.0f,
-    };
     {
         ScopedInternalBridgeDispatch internal_dispatch_scope;
         ScopedContextVtableBypass context_vtable_bypass(context);
-        context->OMSetRenderTargets(1, &resources.source_target_view, nullptr);
-        context->RSSetViewports(1, &viewport);
-        std::forward<DrawCall>(draw_call)();
-
-        context->OMSetRenderTargets(1, &original_target, nullptr);
-        context->IASetInputLayout(nullptr);
-        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        context->VSSetShader(resources.vertex_shader, nullptr, 0);
-        context->PSSetShader(resources.pixel_shader, nullptr, 0);
-        context->PSSetShaderResources(0, 1, &resources.source_view);
-        context->PSSetSamplers(0, 1, &resources.sampler);
-        context->UpdateSubresource(resources.constants, 0, nullptr, &constants, 0, 0);
-        context->PSSetConstantBuffers(0, 1, &resources.constants);
-        context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
-        context->OMSetDepthStencilState(nullptr, 0);
-        context->RSSetState(nullptr);
-        context->Draw(3, 0);
-
-        context->PSSetShaderResources(0, 1, &saved_srv0);
-        context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved_rtvs, saved_dsv);
-        if (saved_viewport_count != 0)
-            context->RSSetViewports(saved_viewport_count, saved_viewports);
-        context->IASetInputLayout(saved_layout);
-        context->IASetPrimitiveTopology(saved_topology);
-        context->VSSetShader(saved_vs, nullptr, 0);
-        context->PSSetShader(saved_ps, nullptr, 0);
-        context->PSSetSamplers(0, 1, &saved_sampler);
-        context->PSSetConstantBuffers(0, 1, &saved_cb0);
-        context->OMSetBlendState(saved_blend, saved_blend_factor, saved_sample_mask);
-        context->OMSetDepthStencilState(saved_depth, saved_stencil_ref);
-        context->RSSetState(saved_rasterizer);
+        // 第一段：让游戏原合成 draw 落到 tone-map 的源纹理（离屏）。
+        {
+            const D3D11_VIEWPORT viewport { 0.0f, 0.0f, static_cast<float>(resources.width),
+                static_cast<float>(resources.height), 0.0f, 1.0f };
+            context->OMSetRenderTargets(1, &resources.source_target_view, nullptr);
+            context->RSSetViewports(1, &viewport);
+            std::forward<DrawCall>(draw_call)();
+        }
+        // 第二段：tone-map 源纹理 → 游戏原始目标。
+        tone_map_bind_and_draw(context, resources, state);
     }
-
-    for (auto *rtv : saved_rtvs) if (rtv != nullptr) rtv->Release();
-    if (saved_dsv != nullptr) saved_dsv->Release();
-    if (saved_layout != nullptr) saved_layout->Release();
-    if (saved_vs != nullptr) saved_vs->Release();
-    if (saved_ps != nullptr) saved_ps->Release();
-    if (saved_srv0 != nullptr) saved_srv0->Release();
-    if (saved_sampler != nullptr) saved_sampler->Release();
-    if (saved_cb0 != nullptr) saved_cb0->Release();
-    if (saved_blend != nullptr) saved_blend->Release();
-    if (saved_depth != nullptr) saved_depth->Release();
-    if (saved_rasterizer != nullptr) saved_rasterizer->Release();
+    // 析构释放所有保存的引用（含 class instances、viewport/blend/depth/rasterizer）。
     target_texture->Release();
     original_target->Release();
 
@@ -11788,6 +11748,52 @@ bool try_spatial_copy_draw(ID3D11DeviceContext *context, UINT element_count, Dra
     return true;
 }
 
+// FSR2 合成族预处理 pass 跳过判定（draw / draw_indexed 共用）。
+//
+// 为什么需要缓存：这段判定对**每个 3 顶点 draw** 都要跑一次，而 PSGetShader 是 COM 调用
+// （内部 AddRef/Release），lookup_pixel_shader_info 又要取全局 shader 表锁 + unordered_map
+// 查找。UI/精灵等 3 顶点 draw 每帧成百上千次，落在渲染线程热路径上。
+// 立即上下文（immediate context）只有一个 PS 绑定槽，相邻 draw 复用同一 PS 是常态
+// （典型成片精灵批次），因此单条目缓存命中率很高。
+// 只在渲染线程使用，无需加锁；缓存键是 PS 指针，D3D11 shader 对象生命周期内地址稳定。
+bool fsr2_family_should_skip_draw(ID3D11DeviceContext *context)
+{
+    if (!g_config.fsr2_family_skip)
+        return false;
+    // cached_ps 由缓存持有引用：D3D11 对象地址在释放后可能被复用，不持引用就会
+    // 把"新对象的地址恰好等于旧对象"误判为缓存命中。只在渲染线程访问，无需加锁。
+    static ID3D11PixelShader *cached_ps = nullptr;
+    static std::uint64_t cached_hash = 0;
+
+    ID3D11PixelShader *ps = nullptr;
+    context->PSGetShader(&ps, nullptr, nullptr);
+
+    std::uint64_t hash = 0;
+    if (ps != nullptr && ps == cached_ps)
+    {
+        hash = cached_hash;           // 命中：省掉一次全局 shader 表加锁查找
+    }
+    else
+    {
+        hash = ps ? lookup_pixel_shader_info(ps).hash : 0;
+        // 只在查到时才更新缓存：hash==0 表示该 PS 不在桥的 shader 表里（未追踪），
+        // 把它缓存下来会让同一个未追踪 PS 每次都走"未命中"分支，缓存等于白做。
+        if (hash != 0)
+        {
+            if (cached_ps != nullptr)
+                cached_ps->Release();
+            cached_ps = ps;
+            cached_hash = hash;
+            ps->AddRef();
+        }
+    }
+    if (ps != nullptr)
+        ps->Release();                // PSGetShader 给的引用
+
+    return hash != 0 &&
+        fsr2_family_takeover::should_skip_pre(hash, GetTickCount64(), g_config.fsr2_family_expire_ms);
+}
+
 void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT index_count, UINT start_index_location, INT base_vertex_location)
 {
     // passthrough 机制已整体移除（实测让 OptiScaler 丢失 FFX 输入识别）。
@@ -11813,23 +11819,14 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
     poll_fsr2_transient_capture_hotkey();
 #endif
     // Phase 1：FSR2 合成族预处理 pass 跳过（仅当上一帧累积 pass 被桥成功替换且未超时）
-    if (g_config.fsr2_family_skip && index_count == 3)
+    if (index_count == 3 && fsr2_family_should_skip_draw(context))
     {
-        ID3D11PixelShader *family_ps = nullptr;
-        context->PSGetShader(&family_ps, nullptr, nullptr);
-        const std::uint64_t family_ps_hash = family_ps ? lookup_pixel_shader_info(family_ps).hash : 0;
-        if (family_ps)
-            family_ps->Release();
-        if (family_ps_hash != 0 &&
-            fsr2_family_takeover::should_skip_pre(family_ps_hash, GetTickCount64(), g_config.fsr2_family_expire_ms))
-        {
-            static std::atomic_uint64_t family_skip_log_count { 0 };
-            const std::uint64_t log_count = family_skip_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (log_count == 1 || log_count % 1024 == 0)
-                LOG_DEBUG(blog::cat::upscale, "fsr2_family_skip_draw hash=" + hex64(family_ps_hash) +
-                    " total=" + std::to_string(fsr2_family_takeover::skipped_count()));
-            return;
-        }
+        static std::atomic_uint64_t family_skip_log_count { 0 };
+        const std::uint64_t log_count = family_skip_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (log_count == 1 || log_count % 1024 == 0)
+            LOG_DEBUG(blog::cat::upscale, "fsr2_family_skip_draw indexed=1 total=" +
+                std::to_string(fsr2_family_takeover::skipped_count()));
+        return;
     }
     const auto target_draw_info = inspect_target_upscaler_draw(context, index_count);
     if (target_draw_info && g_config.fsr2_translation_mode >= 3)
@@ -11928,30 +11925,24 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
     poll_fsr2_transient_capture_hotkey();
 #endif
     // Phase 1：FSR2 合成族预处理 pass 跳过（同上）
-    if (g_config.fsr2_family_skip && vertex_count == 3)
+    if (vertex_count == 3 && fsr2_family_should_skip_draw(context))
     {
-        ID3D11PixelShader *family_ps = nullptr;
-        context->PSGetShader(&family_ps, nullptr, nullptr);
-        const std::uint64_t family_ps_hash = family_ps ? lookup_pixel_shader_info(family_ps).hash : 0;
-        if (family_ps)
-            family_ps->Release();
-        if (family_ps_hash != 0 &&
-            fsr2_family_takeover::should_skip_pre(family_ps_hash, GetTickCount64(), g_config.fsr2_family_expire_ms))
         {
             static std::atomic_uint64_t family_skip_log_count { 0 };
             const std::uint64_t log_count = family_skip_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
             if (log_count == 1 || log_count % 1024 == 0)
-                LOG_DEBUG(blog::cat::upscale, "fsr2_family_skip_draw hash=" + hex64(family_ps_hash) +
-                    " total=" + std::to_string(fsr2_family_takeover::skipped_count()));
-            // 一次性 PRE-pass cb0 探测（诊断用，Ffx12Probe=1 时启用；正式版不编译）
+                LOG_DEBUG(blog::cat::upscale, "fsr2_family_skip_draw indexed=0 total=" +
+                    std::to_string(fsr2_family_takeover::skipped_count()));
+        }
+        // 一次性 PRE-pass cb0 探测（诊断用，Ffx12Probe=1 时启用；正式版不编译）
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-            if (g_config.ffx12_probe)
+        if (g_config.ffx12_probe)
+        {
+            static std::atomic_int pre_cb0_probe_round { 0 };
+            static std::atomic_bool pre_cb0_done { false };
+            const int pre_round = pre_cb0_probe_round.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (!pre_cb0_done.load(std::memory_order_relaxed) && pre_round <= 96)
             {
-                static std::atomic_int pre_cb0_probe_round { 0 };
-                static std::atomic_bool pre_cb0_done { false };
-                const int pre_round = pre_cb0_probe_round.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (!pre_cb0_done.load(std::memory_order_relaxed) && pre_round <= 96)
-                {
                 ID3D11Buffer *pre_cb = nullptr;
                 context->PSGetConstantBuffers(0, 1, &pre_cb);
                 if (pre_cb)
@@ -11977,11 +11968,10 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
                     }
                     pre_cb->Release();
                 }
-                }
             }
-#endif
-            return;
         }
+#endif
+        return;
     }
     const auto target_draw_info = inspect_target_upscaler_draw(context, vertex_count);
     if (target_draw_info && g_config.fsr2_translation_mode >= 3)
@@ -13254,16 +13244,14 @@ static bool contains_ci(const std::wstring &hay, const wchar_t *needle)
     return false;
 }
 
-static void apply_adapter_route(std::uint32_t vendor, std::uint32_t device, const std::wstring &desc,
-                                const char *source)
+// 记录显卡信息供焦点框显示。**名字曾经是 apply_adapter_route，但它已不做任何路由**：
+// 显卡型号识别与 402c 双路径已移除，所有显卡统一走默认 provider
+// （Ffx12DllPath，默认 payload\AMD\amd_fidelityfx_upscaler_dx12.dll）。
+// provider 的 ffxQueryDescGetVersions 按 GPU 能力返回最高支持版本，降级链 4→3→2 兜底；
+// RDNA2 等需要 4.0.2c 的用户自行替换 SDK 文件（见 ini 备注）。
+// 旧签名还带 device/source 两个参数，函数体里直接 (void) 丢弃——调用方以为在传路由依据。
+static void record_adapter_info(std::uint32_t vendor, const std::wstring &desc)
 {
-    // 不再做显卡型号识别与 402c 双路径——所有显卡统一走默认 provider
-    // （Ffx12DllPath，默认 payload\AMD\amd_fidelityfx_upscaler_dx12.dll）。
-    // provider 的 ffxQueryDescGetVersions 按 GPU 能力返回最高支持版本，降级链 4→3→2 兜底；
-    // RDNA2 等需要 4.0.2c 的用户自行替换 SDK 文件（见 ini 备注）。
-    // 本函数仅保留焦点框的显卡/SDK 记录。
-    (void)device;
-    (void)source;
     if (g_route_applied)
         return;
     if (vendor == 0)
@@ -13287,7 +13275,7 @@ static void route_from_d3d11_device(ID3D11Device *d3d11_device)
         dxgi_device == nullptr)
         return;
     IDXGIAdapter *adapter = nullptr;
-    std::uint32_t vendor = 0, device_id = 0;
+    std::uint32_t vendor = 0;
     std::wstring desc_text;
     if (SUCCEEDED(dxgi_device->GetAdapter(&adapter)) && adapter != nullptr)
     {
@@ -13295,14 +13283,13 @@ static void route_from_d3d11_device(ID3D11Device *d3d11_device)
         if (SUCCEEDED(adapter->GetDesc(&desc)))
         {
             vendor = desc.VendorId;
-            device_id = desc.DeviceId;
             desc_text = desc.Description;
         }
         adapter->Release();
     }
     dxgi_device->Release();
     if (vendor != 0)
-        apply_adapter_route(vendor, device_id, desc_text, "device");
+        record_adapter_info(vendor, desc_text);
 }
 
 void initialize()
