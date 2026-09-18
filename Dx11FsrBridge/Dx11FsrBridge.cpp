@@ -3761,7 +3761,6 @@ void update_osd_from_dispatch(std::uint32_t phase, UINT group_x, UINT group_y, U
 void load_config()
 {
     const std::filesystem::path config_path = g_module_dir / L"Dx11FsrBridge.ini";
-#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_config.enabled = GetPrivateProfileIntW(L"Dx11FsrBridge", L"Enabled", 1, config_path.c_str()) != 0;
     g_config.enable_logging = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableLogging", 1, config_path.c_str()) != 0;
     g_logging_enabled.store(g_config.enable_logging, std::memory_order_relaxed);
@@ -4003,6 +4002,46 @@ void load_config()
     }
     // 诊断 shader dump 也必须在 RELEASE 分支读取（非 RELEASE 分支的读取不生效）
     g_config.dump_pixel_shaders = GetPrivateProfileIntW(L"Dx11FsrBridge", L"DumpPixelShaders", 0, config_path.c_str()) != 0;
+    g_config.trace_pixel_shader_draws =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"TracePixelShaderDraws", 0, config_path.c_str()) != 0;
+    // ---- 以下键此前**只在非 RELEASE 分支读取**，而生产构建定义
+    // DX11FSRBRIDGE_RELEASE_RUNTIME=1 → 这些开关在生产里从未生效（ini 里设了也没用，
+    // 与配置文档/部署脚本的说法不符）。合并双分支时一并补进唯一实现。----
+    // 纹理创建追踪（热键触发的限时追踪；TraceTextureCreates 由部署脚本写入）
+    g_config.trace_texture_creates =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"TraceTextureCreates", 0, config_path.c_str()) != 0;
+    g_config.texture_trace_hotkey = static_cast<std::uint32_t>(
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"TextureTraceHotkey", VK_F11, config_path.c_str()));
+    g_config.texture_trace_duration_ms = static_cast<std::uint32_t>(std::max<INT>(
+        1, GetPrivateProfileIntW(L"Dx11FsrBridge", L"TextureTraceDurationMs", 10000, config_path.c_str())));
+    g_config.texture_trace_limit = static_cast<std::uint32_t>(std::max<INT>(
+        1, GetPrivateProfileIntW(L"Dx11FsrBridge", L"TextureTraceLimit", 128, config_path.c_str())));
+    // 像素着色器替换（target hash 为 16 进制字符串）
+    {
+        wchar_t hash_buf[32] {};
+        GetPrivateProfileStringW(L"Dx11FsrBridge", L"TargetPixelShaderHash", L"78057A29AF6C2D99", hash_buf,
+                                 static_cast<DWORD>(std::size(hash_buf)), config_path.c_str());
+        wchar_t *hash_end = nullptr;
+        const unsigned long long parsed = std::wcstoull(hash_buf, &hash_end, 16);
+        if (hash_end != hash_buf)
+            g_config.target_pixel_shader_hash = parsed;
+        g_config.pixel_shader_replacement_mode = static_cast<std::uint32_t>(
+            GetPrivateProfileIntW(L"Dx11FsrBridge", L"PixelShaderReplacementMode", 0, config_path.c_str()));
+    }
+    g_config.pixel_shader_trace_limit = static_cast<std::uint32_t>(std::max<INT>(
+        1, GetPrivateProfileIntW(L"Dx11FsrBridge", L"PixelShaderTraceLimit", 512, config_path.c_str())));
+    // FSR2 锐化：**此前只在非 RELEASE 分支读取**，导致 sdk_in.enable_sharpening 那处
+    // "日志撒谎修复"在生产里拿到的永远是默认 0 —— 等于该功能从未生效。
+    g_config.fsr2_sharpness_percent = static_cast<std::uint32_t>(std::clamp<INT>(
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2SharpnessPercent", 0, config_path.c_str()), 0, 100));
+    g_config.fsr2_gpu_timing =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2GpuTiming", 0, config_path.c_str()) != 0;
+    g_config.fsr2_trace_color_producers =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2TraceColorProducers", 0, config_path.c_str()) != 0;
+    g_config.fsr2_early_output_probe =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2EarlyOutputProbe", 0, config_path.c_str()) != 0;
+    g_config.fsr2_early_output_probe_frames = static_cast<std::uint32_t>(std::max<INT>(
+        1, GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2EarlyOutputProbeFrames", 60, config_path.c_str())));
     {
         wchar_t buf[520] {};
         GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12DllPath", L"", buf,
@@ -4098,167 +4137,6 @@ void load_config()
     g_config.render_scale_menu =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"RenderScaleMenu", 1, config_path.c_str()) != 0;
 #endif
-#else
-    g_config.enabled = GetPrivateProfileIntW(L"Dx11FsrBridge", L"Enabled", 1, config_path.c_str()) != 0;
-    g_config.enable_logging = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableLogging", 0, config_path.c_str()) != 0;
-    g_logging_enabled.store(g_config.enable_logging, std::memory_order_relaxed);
-    g_config.target_process_id = GetPrivateProfileIntW(L"Dx11FsrBridge", L"TargetProcessId", 0, config_path.c_str());
-    wchar_t name_buffer[260] {};
-    GetPrivateProfileStringW(L"Dx11FsrBridge", L"TargetProcessName", L"", name_buffer, static_cast<DWORD>(std::size(name_buffer)), config_path.c_str());
-    g_config.target_process_name = name_buffer;
-    g_config.log_all_dispatch = GetPrivateProfileIntW(L"Dx11FsrBridge", L"LogAllDispatch", 0, config_path.c_str()) != 0;
-    g_config.log_resource_ops = GetPrivateProfileIntW(L"Dx11FsrBridge", L"LogResourceOps", 0, config_path.c_str()) != 0;
-    g_config.log_loader_activity = GetPrivateProfileIntW(L"Dx11FsrBridge", L"LogLoaderActivity", 0, config_path.c_str()) != 0;
-    g_config.log_interesting_dispatch_details = GetPrivateProfileIntW(L"Dx11FsrBridge", L"LogInterestingDispatchDetails", 0, config_path.c_str()) != 0;
-    g_config.hook_present = GetPrivateProfileIntW(L"Dx11FsrBridge", L"HookPresent", 0, config_path.c_str()) != 0;
-    g_config.final_scene_probe = GetPrivateProfileIntW(L"Dx11FsrBridge", L"FinalSceneProbe", 0, config_path.c_str()) != 0;
-    g_config.final_scene_probe_limit = std::clamp<std::uint32_t>(
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"FinalSceneProbeLimit", 6, config_path.c_str())),
-        1u,
-        16u);
-    g_config.final_scene_probe_signature_limit = std::clamp<std::uint32_t>(
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"FinalSceneProbeSignatureLimit", 128, config_path.c_str())),
-        1u,
-        4096u);
-    g_config.final_scene_snapshot =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"FinalSceneSnapshot", 0, config_path.c_str()) != 0;
-    g_config.final_scene_snapshot_interval_frames = std::clamp<std::uint32_t>(
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(
-            L"Dx11FsrBridge", L"FinalSceneSnapshotIntervalFrames", 240, config_path.c_str())),
-        1u,
-        3600u);
-    g_config.final_scene_optifg_input =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"FinalSceneOptiFgInput", 0, config_path.c_str()) != 0;
-    g_config.dlssg_dxgi_workaround = GetPrivateProfileIntW(L"Dx11FsrBridge", L"DlssgDxgiWorkaround", -1, config_path.c_str());
-    g_config.hdr_swapchain_spoof =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSwapchainSpoof", 0, config_path.c_str()) != 0;
-    g_config.hdr_swapchain_force =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSwapchainForce", 0, config_path.c_str()) != 0;
-    g_config.hdr_environment_probe =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrEnvironmentProbe", 0, config_path.c_str()) != 0;
-    g_config.hdr_output_desc_probe =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrOutputDescProbe", 0, config_path.c_str()) != 0;
-    g_config.hdr_output_desc_spoof =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrOutputDescSpoof", 0, config_path.c_str()) != 0;
-    g_config.native_ldr_swapchain_unorm =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NativeLdrSwapchainUnorm", 0, config_path.c_str()) != 0;
-    g_config.dx11_on12_swapchain =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Dx11On12Swapchain", 0, config_path.c_str()) != 0;
-    g_config.native_ldr_final_target_unorm =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NativeLdrFinalTargetUnorm", 0, config_path.c_str()) != 0;
-    g_config.hdr_sdr_tone_map =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSdrToneMap", 0, config_path.c_str()) != 0;
-    g_config.hdr_sdr_tone_map_pq_input =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSdrToneMapPqInput", 1, config_path.c_str()) != 0;
-    g_config.hdr_sdr_tone_map_paper_white = std::clamp<std::uint32_t>(
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(
-            L"Dx11FsrBridge", L"HdrSdrToneMapPaperWhite", 80, config_path.c_str())),
-        1u,
-        1000u);
-    g_config.hdr_sdr_tone_map_peak = std::clamp<std::uint32_t>(
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(
-            L"Dx11FsrBridge", L"HdrSdrToneMapPeak", 100, config_path.c_str())),
-        1u,
-        10000u);
-    g_config.hdr_composite_probe =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrCompositeProbe", 0, config_path.c_str()) != 0;
-    g_config.hdr_composite_probe_limit = std::clamp<std::uint32_t>(
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(
-            L"Dx11FsrBridge", L"HdrCompositeProbeLimit", 32, config_path.c_str())),
-        1u,
-        512u);
-    g_config.capture_metadata_only = GetPrivateProfileIntW(L"Dx11FsrBridge", L"CaptureMetadataOnly", 1, config_path.c_str()) != 0;
-    g_config.dump_compute_shaders = GetPrivateProfileIntW(L"Dx11FsrBridge", L"DumpComputeShaders", 0, config_path.c_str()) != 0;
-    g_config.dump_pixel_shaders = GetPrivateProfileIntW(L"Dx11FsrBridge", L"DumpPixelShaders", 0, config_path.c_str()) != 0;
-    g_config.trace_pixel_shader_draws = GetPrivateProfileIntW(L"Dx11FsrBridge", L"TracePixelShaderDraws", 0, config_path.c_str()) != 0;
-    g_config.trace_texture_creates = GetPrivateProfileIntW(L"Dx11FsrBridge", L"TraceTextureCreates", 0, config_path.c_str()) != 0;
-    g_config.texture_trace_hotkey = static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"TextureTraceHotkey", VK_F11, config_path.c_str()));
-    g_config.texture_trace_duration_ms = std::max<std::uint32_t>(1000u,
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"TextureTraceDurationMs", 10000, config_path.c_str())));
-    g_config.texture_trace_limit = std::max<std::uint32_t>(1u,
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"TextureTraceLimit", 128, config_path.c_str())));
-    // 渲染精度 hook 总开关（非正式版这一份与正式版分支保持一致）。
-    g_config.render_scale_menu =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"RenderScaleMenu", 1, config_path.c_str()) != 0;
-    wchar_t trace_hash_buffer[64] {};
-    GetPrivateProfileStringW(L"Dx11FsrBridge", L"TracePixelShaderHash", L"78057A29AF6C2D99", trace_hash_buffer, static_cast<DWORD>(std::size(trace_hash_buffer)), config_path.c_str());
-    wchar_t *trace_hash_end = nullptr;
-    g_config.trace_pixel_shader_hash = std::wcstoull(trace_hash_buffer, &trace_hash_end, 16);
-    g_config.pixel_shader_trace_limit = static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"PixelShaderTraceLimit", 512, config_path.c_str()));
-    wchar_t target_hash_buffer[64] {};
-    GetPrivateProfileStringW(L"Dx11FsrBridge", L"TargetPixelShaderHash", L"78057A29AF6C2D99", target_hash_buffer, static_cast<DWORD>(std::size(target_hash_buffer)), config_path.c_str());
-    wchar_t *target_hash_end = nullptr;
-    g_config.target_pixel_shader_hash = std::wcstoull(target_hash_buffer, &target_hash_end, 16);
-    g_config.pixel_shader_replacement_mode = static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"PixelShaderReplacementMode", 0, config_path.c_str()));
-#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
-    g_config.enable_fsr2_get_proc_address_shim = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableFsr2GetProcAddressShim", 0, config_path.c_str()) != 0;
-    g_config.fsr2_translation_mode = static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2TranslationMode", 0, config_path.c_str()));
-    g_config.fsr2_fast_state_tracking =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2FastStateTracking", 0, config_path.c_str()) != 0;
-    g_config.fsr2_mode2_on_demand_state =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2Mode2OnDemandState", 1, config_path.c_str()) != 0;
-    g_config.fsr2_output_validation_target = static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2OutputValidationTarget", 0, config_path.c_str()));
-    g_config.fsr2_motion_vectors_jittered =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2MotionVectorsJittered", 0, config_path.c_str()) != 0;
-    g_config.fsr2_positive_motion_vector_scale =
-        // 同上：+renderSize 为游戏原生运动约定下的正确符号（见 sdk234 配置块注释）。
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2MotionVectorScaleMode", 1, config_path.c_str()) == 1;
-    g_config.fsr2_use_reactive_mask =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2UseReactiveMask", 0, config_path.c_str()) != 0;
-    g_config.fsr2_use_transparency_mask =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2UseTransparencyMask", 0, config_path.c_str()) != 0;
-    g_config.fsr2_jitter_mode = static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2JitterMode", 0, config_path.c_str()));
-    g_config.fsr2_dump_input_textures = static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2DumpInputTextures", 0, config_path.c_str()));
-    g_config.fsr2_compare_output_capture =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2CompareOutputCapture", 0, config_path.c_str()) != 0;
-    g_config.fsr2_sharpness_percent = std::min<std::uint32_t>(
-        100u,
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(
-            L"Dx11FsrBridge", L"Fsr2SharpnessPercent", 0, config_path.c_str())));
-    g_config.fsr2_hdr10_pq_color =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2Hdr10PqColor", 0, config_path.c_str()) != 0;
-    g_config.fsr2_use_native_exposure =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2UseNativeExposure", 1, config_path.c_str()) != 0;
-    g_config.fsr2_fast_metadata_copy =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2FastMetadataCopy", 0, config_path.c_str()) != 0;
-    g_config.fsr2_compact_linear_output =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2CompactLinearOutput", 0, config_path.c_str()) != 0;
-    g_config.fsr2_lock_color_producer_shader =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2LockColorProducerShader", 1, config_path.c_str()) != 0;
-    g_config.fsr2_gpu_timing =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2GpuTiming", 0, config_path.c_str()) != 0;
-    g_config.fsr2_reset_on_color_path_change =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2ResetOnColorPathChange", 0, config_path.c_str()) != 0;
-    g_config.fsr2_reset_on_optiscaler_config_change =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2ResetOnOptiScalerConfigChange", 0, config_path.c_str()) != 0;
-    g_config.fsr2_optiscaler_config_reset_frames = std::clamp<std::uint32_t>(
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(
-            L"Dx11FsrBridge", L"Fsr2OptiScalerConfigResetFrames", 4, config_path.c_str())),
-        1u,
-        16u);
-    g_config.fsr2_reset_on_optiscaler_log_change =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2ResetOnOptiScalerLogChange", 0, config_path.c_str()) != 0;
-    g_config.fsr2_optiscaler_log_reset_duration_ms = std::clamp<std::uint32_t>(
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(
-            L"Dx11FsrBridge", L"Fsr2OptiScalerLogResetDurationMs", 4000, config_path.c_str())),
-        250u,
-        10000u);
-    g_config.fsr2_auto_recover_upscaler_ms = static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2AutoRecoverUpscalerMs", 0, config_path.c_str()));
-    g_config.fsr2_trace_color_producers =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2TraceColorProducers", 0, config_path.c_str()) != 0;
-    g_config.fsr2_early_output_probe =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2EarlyOutputProbe", 0, config_path.c_str()) != 0;
-    g_config.fsr2_early_output_probe_frames = static_cast<std::uint32_t>(std::max<UINT>(
-        1u,
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2EarlyOutputProbeFrames", 60, config_path.c_str())));
-    g_config.block_dx11_on12_upscalers =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"BlockDx11On12Upscalers", 1, config_path.c_str()) != 0;
-#endif
     g_config.show_osd = GetPrivateProfileIntW(L"Dx11FsrBridge", L"ShowOSD", 0, config_path.c_str()) != 0;
     g_config.ffx12_feature_fallback =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FeatureFallback", 1, config_path.c_str()) != 0;
@@ -4276,7 +4154,6 @@ void load_config()
     wchar_t label_buffer[128] {};
     GetPrivateProfileStringW(L"Dx11FsrBridge", L"RunLabel", L"", label_buffer, static_cast<DWORD>(std::size(label_buffer)), config_path.c_str());
     g_config.run_label = label_buffer;
-#endif
 }
 
 bool process_matches()
