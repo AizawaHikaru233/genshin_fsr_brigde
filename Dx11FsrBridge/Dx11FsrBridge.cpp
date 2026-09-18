@@ -13484,6 +13484,51 @@ void initialize_once()
 }
 }
 
+// 后端/日志器的最终停机，**只能由 atexit 调用**（见下）。
+//
+// ⚠️ 为什么不能放在 DllMain(DLL_PROCESS_DETACH) 里：
+// DllMain 期间持有 **loader lock**，此时 ffx12::shutdown() 会
+//   1) 取 g_mutex —— 渲染线程可能正持锁卡在 GPU fence 等待里 → DllMain 无限阻塞；
+//   2) Reset() 一批 D3D12 COM 对象 —— 其析构会走进 d3d12.dll，在 loader lock 下
+//      是经典的卸载期死锁/崩溃面；
+//   3) FreeLibrary 预加载的 ffx-api runtime（g_process_exiting 只挡住了进程终止那一支，
+//      但 FreeLibrary 在 DllMain 里本身就是被明确劝阻的操作）。
+// 表现就是"游戏窗口关了、进程不退出"。
+//
+// atexit 处理器在 CRT 退出流程里执行，此时 loader lock 已释放、其它线程已终止，
+// 可以安全做真正的释放。
+std::once_flag g_final_shutdown_once;
+
+// 停机追踪：**不经过 blog**，直接 fopen/fprintf/fclose 追加。
+// 原因：detach 里调过 blog::shutdown() 之后日志器已 g_active=false，
+// 后续的 LOG_* 会被静默丢弃——那样"卡在哪一步"就没有证据了。
+// 这个 sink 在 CRT 退出流程里同样可用（只用 CRT 文件 API，不碰 loader）。
+void shutdown_trace(const char *step)
+{
+    if (g_log_path.empty())
+        return;
+    FILE *f = nullptr;
+    // 必须走宽字符重载：注入目录常含中文，窄串会被按系统 ACP(936) 解释成乱码 → 打不开。
+    if (_wfopen_s(&f, g_log_path.c_str(), L"a") != 0 || f == nullptr)
+        return;
+    SYSTEMTIME st {};
+    GetLocalTime(&st);
+    std::fprintf(f, "%04u-%02u-%02u %02u:%02u:%02u.%03u [SHUTDOWN] %s\n",
+                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, step);
+    std::fclose(f);
+}
+
+void final_shutdown()
+{
+    std::call_once(g_final_shutdown_once, []()
+        {
+            shutdown_trace("final_shutdown_begin");
+            ffx12::shutdown();
+            shutdown_trace("final_shutdown_end");
+            blog::shutdown();
+        });
+}
+
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 {
     if (reason == DLL_PROCESS_ATTACH)
@@ -13493,18 +13538,30 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         initialize_once();
         if (g_active)
             initialize_render_scale_menu(module, &log_line, g_config.render_scale_menu);
+        // 注册到 CRT 退出流程：进程正常退出时在这里做真正的资源释放。
+        // 注册失败不致命（退化为"交给 OS 回收"，与旧行为一致）。
+        std::atexit(&final_shutdown);
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
-        // lpReserved != nullptr ⇒ 进程正在终止（而非 FreeLibrary 卸载本 DLL）。
-        // 这条信息必须传给后端：进程终止时已持有 loader lock，不能 FreeLibrary。
+        // 这里**只做 loader-lock 安全的事**：
+        //   - il2cpp_callsite::shutdown()：只 VirtualProtect/VirtualFree，安全；
+        //   - blog::shutdown()：只 join 自己的写线程 + 关文件，不碰 loader，安全。
+        // 真正的 D3D12/COM 释放交给 atexit 的 final_shutdown()。
+        //
+        // 这几行 shutdown_trace 是**死锁定位用的可证伪证据**（直接写文件，不走日志器）：
+        //   有 detach_begin 无 detach_after_il2cpp ⇒ 卡在 il2cpp_callsite::shutdown；
+        //   有 detach_after_il2cpp 无 detach_after_log ⇒ 卡在 blog::shutdown；
+        //   三行都有但无 final_shutdown_begin ⇒ 卡在 DllMain 返回之后的 CRT/loader 卸载；
+        //   有 final_shutdown_begin 无 final_shutdown_end ⇒ 卡在 ffx12::shutdown。
+        // 上一轮"窗口关了进程不退出"的成因：ffx12::shutdown 曾在 detach 里取 g_mutex，
+        // 而渲染线程可能正持该锁卡在 GPU fence 等待上（dispatch 全程持锁）。
+        shutdown_trace("detach_begin");
         if (reserved != nullptr)
             ffx12::set_process_exiting();
         il2cpp_callsite::shutdown();
-        // 顺序：先停 D3D12/FFX 后端，再停日志器（后端 shutdown 可能还要写日志）。
-        // 旧实现两处都不调用：FFX 后端资源与 ffx-api runtime 句柄留到进程回收，
-        // 日志器 writer 线程仍在跑、文件由 OS 关闭，尾部日志有丢失窗口。
-        ffx12::shutdown();
+        shutdown_trace("detach_after_il2cpp");
+        LOG_INFO(blog::cat::core, "detach_after_il2cpp");
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         {
             std::lock_guard lock(g_ps_trace_mutex);
@@ -13518,7 +13575,10 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         g_osd_running = false;
         if (g_osd_window != nullptr)
             PostMessageW(g_osd_window, WM_CLOSE, 0, 0);
+        // 排空并关闭日志文件。即使 atexit 因宿主直接 TerminateProcess 而没跑到，
+        // 尾部日志也已经落盘。
         blog::shutdown();
+        shutdown_trace("detach_after_log");
     }
     return TRUE;
 }

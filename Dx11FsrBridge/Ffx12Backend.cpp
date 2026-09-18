@@ -56,6 +56,11 @@ std::vector<PreloadEntry> g_preloaded;
 // （Windows 明确不建议在 DllMain 里调用 FreeLibrary）。此时把句柄交给 OS 回收即可。
 std::atomic<bool> g_process_exiting { false };
 
+// 停机已开始标志：由 shutdown() 在取到 g_mutex 之前置位。
+// dispatch() 入口检查它并立即返回——避免 atexit 里的 shutdown 正在释放 D3D12 资源时，
+// 仍有渲染线程进来并发使用这些资源（atexit 执行时机不保证所有线程都已退出）。
+std::atomic<bool> g_shutting_down { false };
+
 ComPtr<ID3D11Device> g_d11dev;
 ComPtr<ID3D11On12Device2> g_on12dev;
 ComPtr<ID3D12Device> g_d12dev;
@@ -2133,6 +2138,8 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
         return true;
     if (game_device == nullptr)
         return false;
+    // 允许 shutdown 之后重新 init（测试/设备重建路径）：清掉停机标志。
+    g_shutting_down.store(false, std::memory_order_release);
     g_d11dev = game_device;
     // 清理：On12 引导已移除（不发生产品路线）。自建 D3D12 设备 + 共享句柄互操作。
     g_gpu_only_transport_available = false; // enabled only after direct gpu-interop dispatch lands.
@@ -2496,6 +2503,9 @@ bool init(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
 
 void shutdown()
 {
+    // 先置停机标志再取锁：这样正在等 g_mutex 的 dispatch() 拿到锁后会立刻退出，
+    // 而不是继续使用即将被释放的 D3D12 资源。
+    g_shutting_down.store(true, std::memory_order_release);
     std::lock_guard lock(g_mutex);
     if (!g_active.exchange(false, std::memory_order_acq_rel))
         return;
@@ -2681,7 +2691,15 @@ void recover_device_removed_locked()
 
 bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::uint64_t instance_key)
 {
+    // 停机中：立即返回，不取 g_mutex、不碰 D3D12 资源。
+    // 在取锁**之前**判定是必须的——shutdown() 可能已持锁在释放资源，此时再进来等锁
+    // 只会白等，拿到锁之后用的还是已被 Reset 的 ComPtr。
+    if (g_shutting_down.load(std::memory_order_acquire))
+        return false;
     std::lock_guard lock(g_mutex);
+    // 拿到锁后再判一次：等锁期间 shutdown() 可能已经开始。
+    if (g_shutting_down.load(std::memory_order_acquire))
+        return false;
     const std::uint64_t t_dispatch_start = qpc_us();
     g_dispatch_counter.fetch_add(1, std::memory_order_relaxed);
     g_last_ffx_dispatch_rc.store(kFfxDispatchNotReached, std::memory_order_relaxed);
