@@ -83,17 +83,64 @@ function Set-IniValue {
             [void]$out.Add($line)
         }
     }
-    if (-not $found) { [void]$out.Add("$Key=$Value") }
+    if (-not $found) {
+        # ⚠️ 新键必须写进它所属的段，不能无脑追加到文件末尾。
+        # 旧实现直接 Add 到末尾：而 Add-LogSection 会把 [Log] / [Log.Categories] 追加到
+        # 文件最后 → 之后所有新键都落进 [Log.Categories] 段，被当成"分类名=等级"。
+        # 实测后果：queue_capacity / Ffx12PresentProbe 落进 [Log.Categories]，
+        # 日志里出现 `categories=...,Ffx12PresentProbe=ERROR`，而桥**从未读到这两个键**。
+        $section = if ($Key -in @('level','to_file','to_debugger','truncate_on_start','max_file_kb','rotate_keep','queue_capacity','compat_prefix','debugger_max_per_sec')) { '[Log]' } else { '[Dx11FsrBridge]' }
+        $sectionStart = -1
+        $sectionEnd = $out.Count
+        for ($i = 0; $i -lt $out.Count; ++$i) {
+            if ($out[$i] -match '^\s*\[') {
+                if ($sectionStart -ge 0) { $sectionEnd = $i; break }
+                if ($out[$i] -match ('^\s*' + [regex]::Escape($section) + '\s*$')) { $sectionStart = $i }
+            }
+        }
+        if ($sectionStart -lt 0) {
+            [void]$out.Add("$section")
+            [void]$out.Add("$Key=$Value")
+        } else {
+            # 插到该段末尾（下一个段头之前），并跳过段尾空行
+            $insertAt = $sectionEnd
+            while ($insertAt -gt $sectionStart + 1 -and $out[$insertAt - 1].Trim() -eq '') { $insertAt-- }
+            $out.Insert($insertAt, "$Key=$Value")
+        }
+    }
     [IO.File]::WriteAllLines($Path, $out.ToArray(), [Text.UTF8Encoding]::new($false))
 }
 
 function Add-LogSection {
     param([string]$Path)
-    $text = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
+    $lines = [IO.File]::ReadAllLines($Path, [Text.Encoding]::UTF8)
+    $text = $lines -join "`n"
     if ($text -match '(?m)^\s*\[Log\]\s*$') { return $false }  # 已有，不重复加
-    $block = "`r`n; ==================== 日志系统（取代按内容猜等级）====================`r`n" +
-             ($logSection -join "`r`n") + "`r`n"
-    [IO.File]::AppendAllText($Path, $block, [Text.UTF8Encoding]::new($false))
+    # ⚠️ 必须插到 [Log.*] 子段（如 [Log.Categories]）**之前**，不能追加到文件末尾：
+    # 追加到末尾会让 [Log] 位于 [Log.Categories] 之后，语义颠倒；
+    # 且后续 Set-IniValue 的新键会落进 [Log.Categories]（见 Set-IniValue 注释）。
+    $block = @(
+        '; ==================== 日志系统（取代按内容猜等级）===================='
+    ) + $logSection
+    $insertAt = -1
+    for ($i = 0; $i -lt $lines.Count; ++$i) {
+        if ($lines[$i] -match '^\s*\[Log\.') { $insertAt = $i; break }
+    }
+    $out = New-Object System.Collections.ArrayList
+    if ($insertAt -lt 0) {
+        foreach ($line in $lines) { [void]$out.Add($line) }
+        [void]$out.Add('')
+        foreach ($line in $block) { [void]$out.Add($line) }
+    } else {
+        for ($i = 0; $i -lt $lines.Count; ++$i) {
+            if ($i -eq $insertAt) {
+                foreach ($line in $block) { [void]$out.Add($line) }
+                [void]$out.Add('')
+            }
+            [void]$out.Add($lines[$i])
+        }
+    }
+    [IO.File]::WriteAllLines($Path, $out.ToArray(), [Text.UTF8Encoding]::new($false))
     return $true
 }
 
