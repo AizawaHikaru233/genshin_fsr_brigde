@@ -251,6 +251,8 @@ struct Config
     // 同步 Map(READ)，阻塞渲染线程直到 GPU 画完，期间 GPU 空转。
     // 此前无条件运行，是正式版里唯一持续存在的 GPU 同步点。
     bool ffx12_readback_probes = false;
+    // Present 参数/帧间隔诊断（默认关）。用于定位"焦点窗口下帧数降低"是否来自呈现限速。
+    bool ffx12_present_probe = false;
     bool ffx12_feature_fallback = true; // 特征识别兜底：1=运行时特征优先+已有样本(硬编码)兜底；0=纯特征识别（验证用——关闭所有版本特定样本）
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     bool optiscaler_bridge_probe = false; // 遗留 OptiScaler 候选桥路径（frames.jsonl 记录，默认关）
@@ -4009,6 +4011,9 @@ void load_config()
     // 后端输出读回采样（诊断，默认关）。开启会引入同步 GPU 等待 → 掉帧，仅排查用。
     g_config.ffx12_readback_probes =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ReadbackProbes", 0, config_path.c_str()) != 0;
+    // Present 参数/帧间隔诊断（默认关）。仅记录 sync_interval/flags/帧间隔/前台状态。
+    g_config.ffx12_present_probe =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12PresentProbe", 0, config_path.c_str()) != 0;
     g_config.trace_pixel_shader_draws =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"TracePixelShaderDraws", 0, config_path.c_str()) != 0;
     // ---- 以下键此前**只在非 RELEASE 分支读取**，而生产构建定义
@@ -6712,6 +6717,42 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
     if (g_logging_enabled.load(std::memory_order_relaxed))
         LOG_INFO(blog::cat::core, "present frame=" + std::to_string(frame_index) +
             " size=" + std::to_string(backbuffer_width) + "x" + std::to_string(backbuffer_height));
+    // ---- Present 参数与帧间隔诊断（Ffx12PresentProbe=1）----
+    //
+    // 目的：判定"焦点窗口下帧数降低、失焦恢复"是否来自呈现路径被限速。
+    // 记录三项只读信息，**不改变任何行为**：
+    //   sync_interval / flags —— 游戏请求的垂直同步与呈现标志（焦点切换时若变化，
+    //                            说明游戏自己改了呈现模式，与桥无关）
+    //   dt_ms                —— 与上一次 Present 的间隔（直接反映限速）
+    //   focused              —— 本进程窗口是否为前台窗口（对照用）
+    // 全部按 500ms 限流，避免自身成为日志负担。
+    if (g_config.ffx12_present_probe)
+    {
+        static std::atomic_uint64_t last_probe_tick { 0 };
+        static std::uint64_t last_present_tick = 0;
+        const ULONGLONG probe_now = GetTickCount64();
+        std::uint64_t last_probe = last_probe_tick.load(std::memory_order_relaxed);
+        if (probe_now - last_probe >= 500 &&
+            last_probe_tick.compare_exchange_strong(last_probe, probe_now, std::memory_order_relaxed))
+        {
+            const double dt_ms = last_present_tick != 0
+                ? static_cast<double>(probe_now - last_present_tick)
+                : 0.0;
+            const HWND foreground = GetForegroundWindow();
+            const DWORD foreground_pid = foreground != nullptr
+                ? GetWindowThreadProcessId(foreground, nullptr)
+                : 0;
+            char flags_buf[16] {};
+            std::snprintf(flags_buf, sizeof(flags_buf), "0x%08X", static_cast<unsigned>(flags));
+            LOG_INFO(blog::cat::core, "present_probe frame=" + std::to_string(frame_index) +
+                " sync_interval=" + std::to_string(sync_interval) +
+                " flags=" + flags_buf +
+                " dt_ms=" + std::to_string(dt_ms) +
+                " focused=" + std::to_string(foreground_pid == GetCurrentProcessId() ? 1 : 0) +
+                " async=" + std::to_string(ffx12::async_upscale_enabled() ? 1 : 0));
+        }
+        last_present_tick = probe_now;
+    }
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME) && defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     static std::atomic_uint64_t last_runtime_status_tick { 0 };
     const ULONGLONG now = GetTickCount64();
@@ -12524,7 +12565,9 @@ void update_swapchain_backbuffer_resources(IDXGISwapChain *swapchain)
 bool swapchain_present_hook_needed()
 {
     return g_config.hook_present || g_config.final_scene_probe || g_config.final_scene_snapshot ||
-        g_config.final_scene_optifg_input || g_config.hdr_composite_probe;
+        g_config.final_scene_optifg_input || g_config.hdr_composite_probe ||
+        // 呈现诊断需要 Present 钩子才能观测 sync_interval/flags/帧间隔
+        g_config.ffx12_present_probe;
 }
 
 bool swapchain_control_hook_needed()
