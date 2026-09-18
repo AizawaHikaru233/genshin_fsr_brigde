@@ -36,10 +36,6 @@ namespace ffx12
 {
 namespace
 {
-// 停机追踪：与桥侧 shutdown_trace 同一格式，直接追加写日志文件。
-// 必须用 _wfsopen(_SH_DENYNO)：日志器的 ofstream 全程持有该文件，默认共享模式
-// （独占）会让每次写入都静默失败——这正是此前几轮诊断全部落空的根因。
-std::mutex g_ffx12_trace_mutex;
 
 std::atomic_bool g_active { false };
 // timed_mutex：shutdown() 必须带超时取锁 —— dispatch() 全程持此锁且中间会阻塞在
@@ -2502,34 +2498,6 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
     return true;
 }
 
-// 停机追踪实现（定义在匿名命名空间之外的 ffx12 命名空间，供 shutdown() 使用）。
-// 日志路径由桥在 initialize() 里通过 set_shutdown_trace_path() 注入。
-std::wstring g_shutdown_trace_path;
-
-void set_shutdown_trace_path(const wchar_t *path)
-{
-    if (path == nullptr)
-        return;
-    std::lock_guard<std::mutex> lock(g_ffx12_trace_mutex);
-    g_shutdown_trace_path = path;
-}
-
-void ffx12_shutdown_trace(const char *step)
-{
-    std::lock_guard<std::mutex> lock(g_ffx12_trace_mutex);
-    if (g_shutdown_trace_path.empty())
-        return;
-    // _SH_DENYNO：与日志器的 ofstream 共享同一文件（否则每次都静默失败）。
-    FILE *f = _wfsopen(g_shutdown_trace_path.c_str(), L"a", _SH_DENYNO);
-    if (f == nullptr)
-        return;
-    SYSTEMTIME st {};
-    GetLocalTime(&st);
-    std::fprintf(f, "%04u-%02u-%02u %02u:%02u:%02u.%03u [SHUTDOWN] %s\n",
-                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, step);
-    std::fclose(f);
-}
-
 bool init(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
 {
     std::lock_guard<std::timed_mutex> lock(g_mutex);
@@ -2558,23 +2526,18 @@ void shutdown()
     std::unique_lock<std::timed_mutex> lock(g_mutex, std::defer_lock);
     if (!lock.try_lock_for(std::chrono::milliseconds(500)))
     {
-        ffx12_shutdown_trace("ffx12_shutdown lock_timeout");
         return;
     }
-    ffx12_shutdown_trace("ffx12_shutdown lock_acquired");
 
     if (!g_active.exchange(false, std::memory_order_acq_rel))
     {
-        ffx12_shutdown_trace("ffx12_shutdown inactive");
         return;
     }
-    ffx12_shutdown_trace("ffx12_shutdown begin");
     for (SdkContext &sc : g_sdk_ctxs)
     {
         if (sc.created)
             destroy_context(sc);
     }
-    ffx12_shutdown_trace("ffx12_shutdown ctxs_destroyed");
     g_sdk_ctxs.clear();
     release_shared(g_tex_color);
     release_shared(g_tex_depth);
@@ -2628,7 +2591,6 @@ void shutdown()
     g_gpu_only_transport_available = false;
     g_queue.Reset();
     g_d12dev.Reset();
-    ffx12_shutdown_trace("ffx12_shutdown devices_reset");
     // preload 缓存：**每个**候选句柄都要释放。旧实现只 FreeLibrary(g_sdk_module)，
     // 而 g_sdk_module 只是 g_preloaded 里第一个命中项，其余候选（默认 4.1.1 + 402c
     // 两个）的句柄永久泄漏。g_sdk_module 就是其中一个元素，故整表释放即可，
@@ -2654,7 +2616,6 @@ void shutdown()
     g_sdk_module = nullptr;
     g_runtime = {};
     g_sdk_version_id = 0;
-    ffx12_shutdown_trace("ffx12_shutdown end");
     // b0 缓存失效：缓冲已释放，重建后必须重新上传一次。
     g_motion_cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();
     g_motion_cb_uploaded_flip = std::numeric_limits<float>::quiet_NaN();

@@ -132,3 +132,4 @@ SharedResources/OptiScaler/runtime/OptiScaler.dll
 scripts/apply-logging.ps1
 scripts/strip-jitter-rscalemenu.ps1
 scripts/strip-logfixes.ps1
+scripts/strip-exit-diagnostics.ps1

@@ -46,9 +46,6 @@ bool init(ID3D11Device *game_device, const wchar_t *sdk_dll_path);
 void shutdown();
 // 由 DllMain(DLL_PROCESS_DETACH, lpReserved != nullptr) 调用：进程终止时禁止 FreeLibrary。
 void set_process_exiting();
-// 停机追踪：把日志路径交给后端，使 shutdown() 内部能逐步写 [SHUTDOWN] 标记
-// （用于定位"进程残留"卡在哪一步）。桥在 initialize() 里调用一次。
-void set_shutdown_trace_path(const wchar_t *path);
 bool active();
 // 设置 ffx-api runtime DLL 路径。
 void set_sdk_dll_path(const wchar_t *path);

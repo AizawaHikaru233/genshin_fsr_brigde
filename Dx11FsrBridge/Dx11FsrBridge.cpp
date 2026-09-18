@@ -44,14 +44,6 @@
 namespace
 {
 std::once_flag g_initialize_once;
-// 退出看门狗线程体（定义见文件末尾的匿名命名空间块）。
-// 声明必须与定义**同为内部链接**（都在匿名命名空间里），否则 MSVC 会把
-// 匿名命名空间内的声明当成另一个实体 → LNK2001。
-DWORD WINAPI exit_watchdog_proc(LPVOID);
-// 停机追踪（定义见文件末尾；initialize 里创建看门狗时就要用）。
-void shutdown_trace(const char *step);
-// 停机标记专用文件（独立于日志，用于判定 DllMain(DETACH) 是否执行）。
-void shutdown_marker(const char *step);
 constexpr std::size_t k_context_vtable_size = 128;
 constexpr std::size_t k_context4_vtable_size = 149;
 constexpr std::size_t k_device_vtable_size = 80;
@@ -13306,9 +13298,6 @@ void initialize()
     DWORD length = GetModuleFileNameW(g_module, module_path, MAX_PATH);
     g_module_dir = std::filesystem::path(std::wstring(module_path, module_path + length)).parent_path();
     g_log_path = g_module_dir / L"Dx11FsrBridge.log";
-    // 把日志路径交给 FFX12 后端：shutdown() 内部要逐步写 [SHUTDOWN] 标记，
-    // 用于定位"窗口关了进程不退出"卡在哪一步。
-    ffx12::set_shutdown_trace_path(g_log_path.c_str());
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_frames_path = g_module_dir / L"Dx11FsrBridge.frames.jsonl";
     g_similarity_path = g_module_dir / L"Dx11FsrBridge.similarity.txt";
@@ -13487,26 +13476,6 @@ void initialize()
     install_create_hooks_for_loaded_modules();
     install_loader_hooks_for_loaded_modules();
     install_hdr_environment_probe_for_loaded_modules();
-
-    // 退出看门狗（诊断）：游戏主窗口消失后 dump 各线程栈，用于定位"进程残留"。
-    // 这是**临时诊断设施**——问题定位后应移除（它会在退出阶段挂起线程回溯栈）。
-    // 这里显式记录创建结果：上一版看门狗完全静默，无法区分"线程没起来"与
-    // "起来了但没触发"，只能靠这一行区分。
-    {
-        const HANDLE watchdog = CreateThread(nullptr, 0, exit_watchdog_proc, nullptr, 0, nullptr);
-        const DWORD create_error = watchdog == nullptr ? GetLastError() : 0;
-        shutdown_trace(watchdog != nullptr ? "exit_watchdog thread_created"
-                                           : "exit_watchdog thread_create_failed");
-        if (watchdog != nullptr)
-            CloseHandle(watchdog);
-        else
-        {
-            char buf[64] {};
-            std::snprintf(buf, sizeof(buf), "exit_watchdog create_error=%lu",
-                          static_cast<unsigned long>(create_error));
-            shutdown_trace(buf);
-        }
-    }
 }
 
 void initialize_once()
@@ -13516,375 +13485,37 @@ void initialize_once()
 }
 
 // ---------------------------------------------------------------------------
-// 退出看门狗实现（独立匿名命名空间块，与顶部声明同为内部链接）
-// ---------------------------------------------------------------------------
-namespace
-{
-
-// 后端/日志器的最终停机，**只能由 atexit 调用**（见下）。
-//
-// ⚠️ 为什么不能放在 DllMain(DLL_PROCESS_DETACH) 里：
-// DllMain 期间持有 **loader lock**，此时 ffx12::shutdown() 会
-//   1) 取 g_mutex —— 渲染线程可能正持锁卡在 GPU fence 等待里 → DllMain 无限阻塞；
-//   2) Reset() 一批 D3D12 COM 对象 —— 其析构会走进 d3d12.dll，在 loader lock 下
-//      是经典的卸载期死锁/崩溃面；
-//   3) FreeLibrary 预加载的 ffx-api runtime（g_process_exiting 只挡住了进程终止那一支，
-//      但 FreeLibrary 在 DllMain 里本身就是被明确劝阻的操作）。
-// 表现就是"游戏窗口关了、进程不退出"。
-//
-// atexit 处理器在 CRT 退出流程里执行，此时 loader lock 已释放、其它线程已终止，
-// 可以安全做真正的释放。
-std::once_flag g_final_shutdown_once;
-
-// 停机追踪：**不经过 blog**，直接写文件追加。
-//
-// ⚠️ 必须用 _wfsopen(_SH_DENYNO) 而不是 _wfopen_s：
-// _wfopen_s 走默认共享模式（独占），而日志器的 std::ofstream **在整个进程生命周期内
-// 一直持有该文件** → 每次调用都会以"文件被占用"静默失败。
-// 实测证据：PowerShell 以 FileShare.None 打开日志后，第二次独占打开必定抛异常；
-// 这正是"看门狗一行都没输出""[SHUTDOWN] 标记从未出现"的真正原因——
-// **标记不是没执行，是根本写不进去**，此前基于"标记缺失"的全部推论都无效。
-// _SH_DENYNO 允许共享，于是能与日志器并存。
-std::mutex g_shutdown_trace_mutex;
-
-void shutdown_trace(const char *step)
-{
-    if (g_log_path.empty())
-        return;
-    std::lock_guard<std::mutex> lock(g_shutdown_trace_mutex);
-    // 宽字符路径：注入目录常含中文，窄串会被按系统 ACP(936) 解释成乱码 → 打不开。
-    FILE *f = _wfsopen(g_log_path.c_str(), L"a", _SH_DENYNO);
-    if (f == nullptr)
-        return;
-    SYSTEMTIME st {};
-    GetLocalTime(&st);
-    std::fprintf(f, "%04u-%02u-%02u %02u:%02u:%02u.%03u [SHUTDOWN] %s\n",
-                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, step);
-    std::fclose(f);
-}
-
-// 进程退出时的最终停机。
+// 进程退出时的最终停机（由 atexit 调用）
 //
 // ⚠️ **不要在这里调用 ffx12::shutdown()** —— 这是"游戏窗口关了、进程不退出"的根因，
 // 也是相对基线版本的回归（基线从不调用 ffx12::shutdown）。
 //
-// 逐步标记实测（2026-09-18，修复 shutdown_trace 共享模式后才拿到）：
+// 逐步标记实测（2026-09-18）：
 //   [SHUTDOWN] final_shutdown_begin
 //   [SHUTDOWN] ffx12_shutdown lock_acquired     ← try_lock_for(500ms) 成功
 //   [SHUTDOWN] ffx12_shutdown begin
 //   （再无 ctxs_destroyed）
 // 即卡在 `g_runtime.destroy(&sc.ctx, nullptr)`（AMD ffx-api 的 ffxDestroyContext）。
 // 那是第三方运行时代码，在设备已移除/驱动已开始卸载的状态下会阻塞不返回；
-// 我们既不能给它加超时，也不能在 loader lock 或 atexit 阶段安全地绕开它。
+// 既无法给它加超时，也不能在 atexit / loader lock 阶段安全绕开。
 //
 // 代价评估：跳过它只损失"释放 preload 的 ffx-api runtime 句柄"与"D3D12 COM 对象
 // 引用计数归零"——进程正在退出，这些由 OS 无条件回收，**没有任何功能损失**。
 // 反过来，为了这点收益把整个进程钉死在退出路径上，是不可接受的。
 // 结论：**退出路径不做 FFX 后端释放**（与基线行为一致）。
 //
-// 正常使用中真正需要收尾的是日志器（排空队列 + 关文件），它在 DllMain(DETACH) 里
-// 已经做过一次；这里再调一次是幂等的（shutdown() 内部有 g_active 交换保护）。
+// 真正需要收尾的是日志器（排空队列 + 关文件），它在 DllMain(DETACH) 里已经做过一次；
+// 这里再调一次是幂等的（blog::shutdown() 内部有 g_active 交换保护）。
+// ---------------------------------------------------------------------------
+std::once_flag g_final_shutdown_once;
+
 void final_shutdown()
 {
     std::call_once(g_final_shutdown_once, []()
         {
-            shutdown_trace("final_shutdown_begin");
-            shutdown_marker("final_shutdown_begin");
             blog::shutdown();
-            shutdown_trace("final_shutdown_end");
-            shutdown_marker("final_shutdown_end");
         });
 }
-
-// 停机标记专用文件（**独立于日志**）。
-//
-// 为什么另开一个文件：诊断期间发现"日志里 0 条 [SHUTDOWN] 标记"，而无法区分三种成因——
-//   1) DllMain(DETACH) 根本没执行；
-//   2) 执行了但写共享日志时被日志器/轮转挡住；
-//   3) 写到一半进程就没了。
-// 写一个**只被停机路径使用**的文件可以一次性排除 2：没有并发写者，也不受日志轮转影响。
-// 文件存在即证明 DETACH 执行过；内容行数即证明走到了哪一步。
-void shutdown_marker(const char *step)
-{
-    if (g_module_dir.empty())
-        return;
-    const std::filesystem::path path = g_module_dir / L"Dx11FsrBridge.shutdown.txt";
-    FILE *f = _wfsopen(path.c_str(), L"a", _SH_DENYNO);
-    if (f == nullptr)
-        return;
-    SYSTEMTIME st {};
-    GetLocalTime(&st);
-    std::fprintf(f, "%04u-%02u-%02u %02u:%02u:%02u.%03u %s\n",
-                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, step);
-    std::fclose(f);
-}
-
-// ---------------------------------------------------------------------------
-// 退出看门狗（诊断）
-//
-// 背景：连续两轮"游戏窗口关了、进程不退出"，而 DllMain(DLL_PROCESS_DETACH) 的
-// [SHUTDOWN] 标记**从未出现**——说明卡点在游戏自身退出流程里，早于 DLL 卸载。
-// 光看日志无法回答"卡在谁的代码里"，所以这里在游戏主窗口消失后，枚举本进程所有
-// 线程、挂起并回溯栈，把每个栈帧归属的模块写进日志。
-//
-// 输出形如：
-//   exit_watchdog main_window_gone hwnd=... threads=3
-//   exit_watchdog thread tid=1234 suspend=0 rip=Dx11FsrBridge.dll+0x1A2B frames=...
-//       #0 Dx11FsrBridge.dll+0x1A2B
-//       #1 d3d11.dll+0x9C40
-//       ...
-// 卡在 Dx11FsrBridge.dll+偏移 ⇒ 桥的责任；卡在 d3d11/nvwgf2umx/kernel32 ⇒ 游戏/驱动。
-// ---------------------------------------------------------------------------
-
-bool is_game_main_window(HWND window)
-{
-    if (!IsWindowVisible(window))
-        return false;
-    if (GetWindow(window, GW_OWNER) != nullptr)
-        return false;
-    const LONG style = GetWindowLongW(window, GWL_STYLE);
-    if ((style & WS_CHILD) != 0)
-        return false;
-    if (GetWindowTextLengthW(window) == 0)
-        return false;
-    return GetWindowThreadProcessId(window, nullptr) != 0;
-}
-
-struct WindowSearch
-{
-    HWND found = nullptr;
-};
-
-BOOL CALLBACK find_main_window_proc(HWND window, LPARAM param)
-{
-    auto *search = reinterpret_cast<WindowSearch *>(param);
-    if (is_game_main_window(window))
-    {
-        search->found = window;
-        return FALSE;
-    }
-    return TRUE;
-}
-
-// 把地址归属写成 "模块名+0x偏移"；不属于任何模块时写裸地址。
-std::string describe_address(std::uintptr_t address)
-{
-    HMODULE module = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCWSTR>(address), &module) &&
-        module != nullptr)
-    {
-        wchar_t name[MAX_PATH] {};
-        if (GetModuleFileNameW(module, name, MAX_PATH) != 0)
-        {
-            const std::wstring path(name);
-            const std::size_t slash = path.find_last_of(L"\\/");
-            const std::wstring base = slash == std::wstring::npos ? path : path.substr(slash + 1);
-            char buffer[64] {};
-            std::snprintf(buffer, sizeof(buffer), "+0x%llX",
-                          static_cast<unsigned long long>(address - reinterpret_cast<std::uintptr_t>(module)));
-            return narrow(base) + buffer;
-        }
-    }
-    char raw[32] {};
-    std::snprintf(raw, sizeof(raw), "0x%llX", static_cast<unsigned long long>(address));
-    return raw;
-}
-
-// 回溯一个线程的栈。只做"读栈 + 判断地址是否落在可执行内存"，
-// 不做 unwind（无 SEH/unwind 信息也能给出调用链的大致归属）。
-void dump_thread_stack(std::string &out, HANDLE thread, DWORD tid, const CONTEXT &context, int max_frames)
-{
-    out += "exit_watchdog thread tid=" + std::to_string(tid) +
-        " rip=" + describe_address(static_cast<std::uintptr_t>(context.Rip)) +
-        " rsp=" + hex64(context.Rsp) + " frames=";
-
-    std::vector<std::uintptr_t> frames;
-    frames.push_back(static_cast<std::uintptr_t>(context.Rip));
-    const auto *stack = reinterpret_cast<const std::uintptr_t *>(context.Rsp);
-    MEMORY_BASIC_INFORMATION mbi {};
-    for (int i = 0; i < 512 && static_cast<int>(frames.size()) < max_frames; ++i)
-    {
-        std::uintptr_t value = 0;
-        // 每次读栈前确认该页可读，避免回溯本身触发访问违例。
-        if (VirtualQuery(stack + i, &mbi, sizeof(mbi)) == 0)
-            break;
-        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0)
-            break;
-        if (!ReadProcessMemory(GetCurrentProcess(), stack + i, &value, sizeof(value), nullptr))
-            break;
-        if (value < 0x10000)
-            continue;
-        HMODULE module = nullptr;
-        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               reinterpret_cast<LPCWSTR>(value), &module) &&
-            module != nullptr)
-            frames.push_back(value);
-    }
-    out += std::to_string(frames.size());
-    for (std::size_t i = 0; i < frames.size(); ++i)
-        out += "\n    #" + std::to_string(i) + " " + describe_address(frames[i]);
-    (void)thread;
-}
-
-// 数出本进程当前线程数。
-std::size_t count_process_threads()
-{
-    const DWORD self_pid = GetCurrentProcessId();
-    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snapshot == INVALID_HANDLE_VALUE)
-        return 0;
-    std::size_t count = 0;
-    THREADENTRY32 entry {};
-    entry.dwSize = sizeof(entry);
-    if (Thread32First(snapshot, &entry))
-    {
-        do
-        {
-            if (entry.th32OwnerProcessID == self_pid)
-                ++count;
-        } while (Thread32Next(snapshot, &entry));
-    }
-    CloseHandle(snapshot);
-    return count;
-}
-
-void dump_all_thread_stacks(const char *reason)
-{
-    const DWORD self_pid = GetCurrentProcessId();
-    std::vector<DWORD> threads;
-    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snapshot != INVALID_HANDLE_VALUE)
-    {
-        THREADENTRY32 entry {};
-        entry.dwSize = sizeof(entry);
-        if (Thread32First(snapshot, &entry))
-        {
-            do
-            {
-                if (entry.th32OwnerProcessID == self_pid)
-                    threads.push_back(entry.th32ThreadID);
-            } while (Thread32Next(snapshot, &entry));
-        }
-        CloseHandle(snapshot);
-    }
-    std::string head = std::string("exit_watchdog ") + reason + " threads=" + std::to_string(threads.size());
-    shutdown_trace(head.c_str());
-
-    const DWORD self_tid = GetCurrentThreadId();
-    for (const DWORD tid : threads)
-    {
-        if (tid == self_tid)
-            continue;
-        const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
-                                         FALSE, tid);
-        if (thread == nullptr)
-            continue;
-        if (SuspendThread(thread) == static_cast<DWORD>(-1))
-        {
-            CloseHandle(thread);
-            continue;
-        }
-        CONTEXT context {};
-        context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-        std::string frames;
-        if (GetThreadContext(thread, &context))
-            dump_thread_stack(frames, thread, tid, context, 24);
-        ResumeThread(thread);
-        CloseHandle(thread);
-        if (!frames.empty())
-            shutdown_trace(frames.c_str());
-    }
-}
-
-// 看门狗主循环。
-//
-// 触发条件**不依赖窗口识别**（上一版依赖 EnumWindows 找主窗口，一旦识别失败就
-// 完全静默，等于白装）。改用两个与实测残留特征直接对应的条件：
-//   A) 主窗口消失（识别得到时）后再等 3 秒；
-//   B) 本进程线程数跌到 <= 1 并持续 15 秒 —— "窗口关了、进程不退出"实测就是这个形态
-//      （只剩 1 个线程、CPU 增量 0）。
-// 任一条件成立即 dump 所有线程栈。另外每 30 秒写一行心跳，证明看门狗确实在跑。
-DWORD WINAPI exit_watchdog_proc(LPVOID)
-{
-    shutdown_trace("exit_watchdog started");
-
-    // 找主窗口（找不到也不影响后续判定）。
-    HWND main_window = nullptr;
-    for (int i = 0; i < 600 && main_window == nullptr; ++i)
-    {
-        WindowSearch search;
-        EnumWindows(find_main_window_proc, reinterpret_cast<LPARAM>(&search));
-        main_window = search.found;
-        if (main_window == nullptr)
-            Sleep(100);
-    }
-    shutdown_trace(main_window != nullptr ? "exit_watchdog armed window=1"
-                                          : "exit_watchdog armed window=0");
-
-    DWORD window_gone_tick = 0;
-    DWORD single_thread_tick = 0;
-    DWORD last_heartbeat = GetTickCount();
-    bool dumped = false;
-
-    for (;;)
-    {
-        Sleep(500);
-
-        // 心跳：每 30 秒一行，证明线程活着。
-        const DWORD now = GetTickCount();
-        if (now - last_heartbeat >= 30000)
-        {
-            last_heartbeat = now;
-            const std::size_t threads = count_process_threads();
-            std::string beat = "exit_watchdog heartbeat threads=" + std::to_string(threads);
-            if (main_window != nullptr && !IsWindow(main_window))
-                beat += " window=gone";
-            else if (main_window != nullptr)
-                beat += " window=alive";
-            shutdown_trace(beat.c_str());
-        }
-
-        if (dumped)
-            continue;
-
-        // 条件 A：主窗口消失。
-        bool trigger_a = false;
-        if (main_window != nullptr && !IsWindow(main_window))
-        {
-            if (window_gone_tick == 0)
-                window_gone_tick = now;
-            else if (now - window_gone_tick >= 3000)
-                trigger_a = true;
-        }
-
-        // 条件 B：线程数跌到 <= 1 并持续 15 秒。
-        bool trigger_b = false;
-        if (count_process_threads() <= 1)
-        {
-            if (single_thread_tick == 0)
-                single_thread_tick = now;
-            else if (now - single_thread_tick >= 15000)
-                trigger_b = true;
-        }
-        else
-        {
-            single_thread_tick = 0;
-        }
-
-        if (trigger_a || trigger_b)
-        {
-            dumped = true;
-            dump_all_thread_stacks(trigger_a ? "window_gone" : "single_thread");
-            shutdown_trace("exit_watchdog done");
-        }
-    }
-    return 0;
-}
-
-} // 退出看门狗实现块结束（匿名命名空间）
 
 // ⚠️ DllMain 必须留在**全局作用域**：放进匿名命名空间会变成内部链接，
 // 链接器就找不到它，转而使用 CRT 的 dll_dllmain_stub.obj 里的空实现——
@@ -13911,20 +13542,10 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         //   - blog::shutdown()：只 join 自己的写线程 + 关文件，不碰 loader，安全。
         // 真正的 D3D12/COM 释放交给 atexit 的 final_shutdown()。
         //
-        // 这几行 shutdown_trace 是**死锁定位用的可证伪证据**（直接写文件，不走日志器）：
-        //   有 detach_begin 无 detach_after_il2cpp ⇒ 卡在 il2cpp_callsite::shutdown；
-        //   有 detach_after_il2cpp 无 detach_after_log ⇒ 卡在 blog::shutdown；
-        //   三行都有但无 final_shutdown_begin ⇒ 卡在 DllMain 返回之后的 CRT/loader 卸载；
-        //   有 final_shutdown_begin 无 final_shutdown_end ⇒ 卡在 ffx12::shutdown。
-        // 上一轮"窗口关了进程不退出"的成因：ffx12::shutdown 曾在 detach 里取 g_mutex，
         // 而渲染线程可能正持该锁卡在 GPU fence 等待上（dispatch 全程持锁）。
-        shutdown_trace("detach_begin");
-        shutdown_marker("detach_begin");
         if (reserved != nullptr)
             ffx12::set_process_exiting();
         il2cpp_callsite::shutdown();
-        shutdown_trace("detach_after_il2cpp");
-        shutdown_marker("detach_after_il2cpp");
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         {
             std::lock_guard lock(g_ps_trace_mutex);
@@ -13941,8 +13562,6 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         // 排空并关闭日志文件。即使 atexit 因宿主直接 TerminateProcess 而没跑到，
         // 尾部日志也已经落盘。
         blog::shutdown();
-        shutdown_trace("detach_after_log");
-        shutdown_marker("detach_after_log");
     }
     return TRUE;
 }
