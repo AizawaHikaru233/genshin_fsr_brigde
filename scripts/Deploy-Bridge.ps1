@@ -48,6 +48,9 @@ $configValues = [ordered]@{
     # 渲染精度接管**无条件常开、无法隔离**；显式写入可避免它再次因"键不存在"而
     # 依赖代码默认值（那样一旦默认值变动就无人察觉）。
     'RenderScaleMenu'      = '1'
+    # 异步写队列深度。必须在这里写：Add-LogSection 只在**没有** [Log] 段时才补整段，
+    # 而已部署的 ini 都已有 [Log] 段 → 段内的新键永远不会被补上（实测 queue_capacity 缺失）。
+    'queue_capacity'       = '8192'
 }
 $logSection = @(
     '[Log]',
