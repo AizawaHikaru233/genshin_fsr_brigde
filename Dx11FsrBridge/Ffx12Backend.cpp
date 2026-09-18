@@ -75,7 +75,7 @@ HANDLE g_fence_event = nullptr;
 UINT64 g_fence_value = 0;
 bool g_dx11on12_available = false;
 bool g_gpu_only_transport_available = false;
-bool g_uses_on12_queue = false;
+bool g_uses_on12_queue = false;   // 恒 false：On12 引导路径已移除（保留供 interop 上报）
 
 // 异步交叠（async upscale）：
 //   true（默认）= dispatch 只提交 FFX（不等待），Present 前 finish_pending
@@ -293,62 +293,6 @@ bool g_non_linear = true;       // 非线性色彩空间（OptiScaler 日志：F
 bool g_use_pq_chain = false;    // PQ 链开关（2026-08-24 定案：游戏原生直喂 PQ 值 + HDR|NON_LINEAR|AUTO_EXPOSURE
                                 // 标志（initFlags 0x129），不做 PqToLinear/LinearToPq；本开关保留旧链作对照）
 
-// half → float（readback 诊断用）
-static float debug_half_to_float(std::uint16_t h)
-{
-    const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000u) << 16;
-    const std::uint32_t exp = (h >> 10) & 0x1Fu;
-    const std::uint32_t mant = h & 0x3FFu;
-    std::uint32_t f = 0;
-    if (exp == 0)
-        f = sign | (mant << 13);
-    else if (exp == 31)
-        f = sign | 0x7F800000u | (mant << 13);
-    else
-        f = sign | ((exp + 112u) << 23) | (mant << 13);
-    float out = 0.0f;
-    std::memcpy(&out, &f, 4);
-    return out;
-}
-
-static std::uint16_t float_to_half(float value)
-{
-    std::uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    const std::uint32_t sign = (bits >> 16) & 0x8000u;
-    const std::uint32_t exp = (bits >> 23) & 0xffu;
-    const std::uint32_t mant = bits & 0x7fffffu;
-    if (exp == 0xffu)
-        return static_cast<std::uint16_t>(sign | 0x7c00u | (mant ? 0x0200u : 0));
-    int e = static_cast<int>(exp) - 127 + 15;
-    if (e <= 0)
-    {
-        if (e < -10)
-            return static_cast<std::uint16_t>(sign);
-        const std::uint32_t m = mant | 0x800000u;
-        return static_cast<std::uint16_t>(sign | ((m >> (14 - e)) + ((m >> (13 - e)) & 1u)));
-    }
-    if (e >= 31)
-        return static_cast<std::uint16_t>(sign | 0x7c00u);
-    return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(e) << 10) |
-                                       ((mant + 0x1000u) >> 13));
-}
-
-static const std::uint16_t *motion_decode_lut()
-{
-    static const std::array<std::uint16_t, 1024> lut = [] {
-        std::array<std::uint16_t, 1024> values {};
-        for (std::uint32_t i = 0; i < 1024; ++i)
-        {
-            const float c = static_cast<float>(i) / 1023.0f;
-            const float d = c - 0.498039f;
-            const float v = (d < 0.0f ? 1.0f : (d > 0.0f ? -1.0f : 0.0f)) * 4.0f * d * d;
-            values[i] = float_to_half(v);
-        }
-        return values;
-    }();
-    return lut.data();
-}
 
 // 读取 D3D12 info queue 消息（诊断；正式版不编译）
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
@@ -491,9 +435,7 @@ UINT g_up_motion_cvt_pitch = 0;
 ComPtr<ID3D12DescriptorHeap> g_mv_heap;         // [SRV(motion源), UAV(cvt)]，shader-visible
 UINT g_mv_heap_inc = 0;
 ComPtr<ID3D12RootSignature> g_mv_rs;
-ComPtr<ID3D12PipelineState> g_mv_pso;
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-ComPtr<ID3D12PipelineState> g_mv_pso_test; // 金丝雀：常数输出 0.5（诊断 pass 是否执行）
 bool g_motion_decode_test = false;
 #endif
 D3D12_RESOURCE_STATES g_motion_src_state = D3D12_RESOURCE_STATE_COMMON;  // 共享源（D3D11 互操作）
@@ -505,10 +447,7 @@ ComPtr<ID3D12Resource> g_tex_output_linear;    // R16G16B16A16_FLOAT display 尺
 ComPtr<ID3D12DescriptorHeap> g_pq_in_heap;     // [SRV(color源), UAV(color_linear)]
 ComPtr<ID3D12DescriptorHeap> g_pq_out_heap;    // [SRV(output_linear), UAV(输出共享)]
 ComPtr<ID3D12RootSignature> g_pq_rs;           // 通用 SRV+UAV 根签名
-ComPtr<ID3D12PipelineState> g_pq_decode_pso;   // PqToLinear
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-ComPtr<ID3D12PipelineState> g_pq_decode_test_pso; // PqToLinear 常数注入测试（0.5）
-ComPtr<ID3D12PipelineState> g_pq_encode_mark_pso; // LinearToPq + 输出标记（诊断）
 bool g_output_mark = false;                    // 输出标记开关（诊断）
 bool g_decode_test = false;                    // 解码常数注入测试（诊断：判断 pass 执行 vs SRV 读）
 #endif
@@ -572,46 +511,12 @@ UINT g_rb_depth_own_pitch = 0;
 UINT g_rb_motion_own_pitch = 0;
 #endif
 
-// 版本标记 pass（2026-08-24：全程可见的 SDK 版本标记，画在 enc 上，与窗口无关）：
-// 边框 24px + 左上角块 110px，颜色编码版本（2.3.4 红 / 3.1.5 绿 / 4.1.1 蓝）。
-static const char *g_marker_hlsl = R"(
-RWTexture2D<float4> img : register(u0);
-[numthreads(8, 8, 1)]
-void main(uint3 id : SV_DispatchThreadID)
-{
-    uint2 dims;
-    img.GetDimensions(dims.x, dims.y);
-    const uint bw = 24u;
-    const uint cb = 110u;
-    bool border = (id.x < bw) || (id.y < bw) || (id.x >= dims.x - bw) || (id.y >= dims.y - bw);
-    bool corner = (id.x < cb) && (id.y < cb);
-    if (border || corner)
-    {
-        #if defined(FFX12_MARKER_315)
-            img[id.xy] = float4(0.0, 1.0, 0.0, 1.0);
-        #elif defined(FFX12_MARKER_411)
-            img[id.xy] = float4(0.0, 0.0, 1.0, 1.0);
-        #else
-            img[id.xy] = float4(1.0, 0.0, 0.0, 1.0);
-        #endif
-    }
-}
-)";
-ComPtr<ID3D12PipelineState> g_marker_234_pso;
-ComPtr<ID3D12PipelineState> g_marker_315_pso;
-ComPtr<ID3D12PipelineState> g_marker_411_pso;
+// 标记目标纹理的 D3D12 侧（enc）状态跟踪。原版本标记 PSO/HLSL 已移除
+// （它们从未被创建，marker_pso_for_version 也无调用点），但**堆与状态跟踪仍在用**：
+// ensure_marker_heap_for 会为 enc 建 shader-visible 描述符堆并记录其状态。
 ComPtr<ID3D12DescriptorHeap> g_marker_heap;
 D3D12_RESOURCE_STATES g_marker_enc_state = D3D12_RESOURCE_STATE_COMMON;
 
-// 根据选中的版本返回对应标记 PSO
-ID3D12PipelineState *marker_pso_for_version()
-{
-    if (g_version_name == "3.1.5")
-        return g_marker_315_pso.Get();
-    if (g_version_name == "4.1.1")
-        return g_marker_411_pso.Get();
-    return g_marker_234_pso.Get();
-}
 // 版本标记堆创建（起 CPU/On12/GPU-interop 共用；定义在
 // ensure_output_landing_resources 之后）。enc 为标记目标纹理的 D3D12 侧。
 bool ensure_marker_heap_for(ID3D12Resource *enc);
@@ -828,7 +733,7 @@ ComPtr<ID3D11Texture2D> make_shared_texture(UINT w, UINT h, DXGI_FORMAT fmt, UIN
     // An On12 game device already shares ownership with g_d12dev through its
     // queue.  Legacy shared handles are not valid/needed there; the texture is
     // only the D3D11 landing target for the transitional CPU path.
-    d.MiscFlags = g_uses_on12_queue ? 0u : D3D11_RESOURCE_MISC_SHARED;
+    d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
     ComPtr<ID3D11Texture2D> t;
     if (FAILED(g_d11dev->CreateTexture2D(&d, nullptr, &t)))
         return nullptr;
@@ -837,8 +742,6 @@ ComPtr<ID3D11Texture2D> make_shared_texture(UINT w, UINT h, DXGI_FORMAT fmt, UIN
 
 bool open_on_d3d12(SharedTex &st)
 {
-    if (g_uses_on12_queue)
-        return st.d11 != nullptr;
     if (st.d12)
         return true;
     if (!st.d11)
@@ -1425,7 +1328,7 @@ bool ensure_pq_resources()
 
 bool ensure_motion_decode_resources()
 {
-    if (g_tex_motion_cvt && g_mv_heap && (g_uses_on12_queue || (g_up_motion_cvt && g_up_motion_cvt_ptr)))
+    if (g_tex_motion_cvt && g_mv_heap && g_up_motion_cvt && g_up_motion_cvt_ptr)
         return true;
     if (g_render_w == 0 || g_render_h == 0 || !g_d12dev)
         return false;
@@ -1445,31 +1348,27 @@ bool ensure_motion_decode_resources()
                                                  D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                  IID_PPV_ARGS(&g_tex_motion_cvt))))
         return false;
-    if (!g_uses_on12_queue)
-    {
-        // Legacy interop needs this CPU decoded upload.  The On12 branch below
-        // reads the unwrapped game motion texture in the GPU decode pass.
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
-        g_d12dev->GetCopyableFootprints(&res_desc, 0, 1, 0, &fp, nullptr, nullptr, nullptr);
-        g_up_motion_cvt_pitch = fp.Footprint.RowPitch;
-        D3D12_RESOURCE_DESC ub {};
-        ub.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        ub.Width = fp.Footprint.RowPitch * static_cast<UINT64>(g_render_h);
-        ub.Height = 1;
-        ub.DepthOrArraySize = 1;
-        ub.MipLevels = 1;
-        ub.SampleDesc.Count = 1;
-        ub.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        D3D12_HEAP_PROPERTIES uhp {};
-        uhp.Type = D3D12_HEAP_TYPE_UPLOAD;
-        if (FAILED(g_d12dev->CreateCommittedResource(&uhp, D3D12_HEAP_FLAG_NONE, &ub,
-                                                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                      IID_PPV_ARGS(&g_up_motion_cvt))))
-            return false;
-        D3D12_RANGE ur {0, 0};
-        if (FAILED(g_up_motion_cvt->Map(0, &ur, &g_up_motion_cvt_ptr)) || !g_up_motion_cvt_ptr)
-            return false;
-    }
+    // 旧 interop 需要这份 CPU 解码的 upload buffer（On12 分支已移除，恒走此路径）。
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
+    g_d12dev->GetCopyableFootprints(&res_desc, 0, 1, 0, &fp, nullptr, nullptr, nullptr);
+    g_up_motion_cvt_pitch = fp.Footprint.RowPitch;
+    D3D12_RESOURCE_DESC ub {};
+    ub.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    ub.Width = fp.Footprint.RowPitch * static_cast<UINT64>(g_render_h);
+    ub.Height = 1;
+    ub.DepthOrArraySize = 1;
+    ub.MipLevels = 1;
+    ub.SampleDesc.Count = 1;
+    ub.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES uhp {};
+    uhp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    if (FAILED(g_d12dev->CreateCommittedResource(&uhp, D3D12_HEAP_FLAG_NONE, &ub,
+                                                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                  IID_PPV_ARGS(&g_up_motion_cvt))))
+        return false;
+    D3D12_RANGE ur {0, 0};
+    if (FAILED(g_up_motion_cvt->Map(0, &ur, &g_up_motion_cvt_ptr)) || !g_up_motion_cvt_ptr)
+        return false;
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     // 链中点采样 readback（金丝雀：motion 输入非 0 → cvt 非 0 即证明 cmdlist 执行 + 自有 UAV 写正常，诊断）
     if (!create_readback_for_texture(g_tex_motion_cvt.Get(), g_rb_motion_cvt, g_rb_motion_cvt_pitch))
@@ -1507,7 +1406,7 @@ bool ensure_motion_decode_resources()
 bool ensure_pool(const FrameInput &input)
 {
     const bool pool_ok =
-        (g_uses_on12_queue ? g_tex_output_enc != nullptr : g_tex_color.d11 != nullptr) &&
+        g_tex_color.d11 != nullptr &&
         (!g_gpu_interop_ready ||
          (g_tex_motion.d11 != nullptr && g_tex_depth_share.d11 != nullptr && g_tex_output.d11 != nullptr)) &&
         g_render_w == input.render_w && g_render_h == input.render_h &&
@@ -2564,10 +2463,7 @@ void shutdown()
     g_shared_fence_value = 0;
     g_gpu_interop_ready = false;
     g_active.store(false, std::memory_order_release);
-    g_pq_decode_pso.Reset();
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    g_pq_decode_test_pso.Reset();
-    g_pq_encode_mark_pso.Reset();
 #endif
     g_pq_encode_pso.Reset();
     if (g_fence_event)
