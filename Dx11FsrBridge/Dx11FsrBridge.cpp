@@ -44,6 +44,10 @@
 namespace
 {
 std::once_flag g_initialize_once;
+// 退出看门狗线程体（定义见文件末尾的匿名命名空间块）。
+// 声明必须与定义**同为内部链接**（都在匿名命名空间里），否则 MSVC 会把
+// 匿名命名空间内的声明当成另一个实体 → LNK2001。
+DWORD WINAPI exit_watchdog_proc(LPVOID);
 constexpr std::size_t k_context_vtable_size = 128;
 constexpr std::size_t k_context4_vtable_size = 149;
 constexpr std::size_t k_device_vtable_size = 80;
@@ -13476,6 +13480,11 @@ void initialize()
     install_create_hooks_for_loaded_modules();
     install_loader_hooks_for_loaded_modules();
     install_hdr_environment_probe_for_loaded_modules();
+
+    // 退出看门狗（诊断）：游戏主窗口消失后 dump 各线程栈，用于定位"进程残留"。
+    // 这是**临时诊断设施**——问题定位后应移除（它会在退出阶段挂起线程回溯栈）。
+    if (const HANDLE watchdog = CreateThread(nullptr, 0, exit_watchdog_proc, nullptr, 0, nullptr))
+        CloseHandle(watchdog);
 }
 
 void initialize_once()
@@ -13483,6 +13492,12 @@ void initialize_once()
     std::call_once(g_initialize_once, []() { initialize(); });
 }
 }
+
+// ---------------------------------------------------------------------------
+// 退出看门狗实现（独立匿名命名空间块，与顶部声明同为内部链接）
+// ---------------------------------------------------------------------------
+namespace
+{
 
 // 后端/日志器的最终停机，**只能由 atexit 调用**（见下）。
 //
@@ -13529,6 +13544,198 @@ void final_shutdown()
         });
 }
 
+// ---------------------------------------------------------------------------
+// 退出看门狗（诊断）
+//
+// 背景：连续两轮"游戏窗口关了、进程不退出"，而 DllMain(DLL_PROCESS_DETACH) 的
+// [SHUTDOWN] 标记**从未出现**——说明卡点在游戏自身退出流程里，早于 DLL 卸载。
+// 光看日志无法回答"卡在谁的代码里"，所以这里在游戏主窗口消失后，枚举本进程所有
+// 线程、挂起并回溯栈，把每个栈帧归属的模块写进日志。
+//
+// 输出形如：
+//   exit_watchdog main_window_gone hwnd=... threads=3
+//   exit_watchdog thread tid=1234 suspend=0 rip=Dx11FsrBridge.dll+0x1A2B frames=...
+//       #0 Dx11FsrBridge.dll+0x1A2B
+//       #1 d3d11.dll+0x9C40
+//       ...
+// 卡在 Dx11FsrBridge.dll+偏移 ⇒ 桥的责任；卡在 d3d11/nvwgf2umx/kernel32 ⇒ 游戏/驱动。
+// ---------------------------------------------------------------------------
+
+bool is_game_main_window(HWND window)
+{
+    if (!IsWindowVisible(window))
+        return false;
+    if (GetWindow(window, GW_OWNER) != nullptr)
+        return false;
+    const LONG style = GetWindowLongW(window, GWL_STYLE);
+    if ((style & WS_CHILD) != 0)
+        return false;
+    if (GetWindowTextLengthW(window) == 0)
+        return false;
+    return GetWindowThreadProcessId(window, nullptr) != 0;
+}
+
+struct WindowSearch
+{
+    HWND found = nullptr;
+};
+
+BOOL CALLBACK find_main_window_proc(HWND window, LPARAM param)
+{
+    auto *search = reinterpret_cast<WindowSearch *>(param);
+    if (is_game_main_window(window))
+    {
+        search->found = window;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+// 把地址归属写成 "模块名+0x偏移"；不属于任何模块时写裸地址。
+std::string describe_address(std::uintptr_t address)
+{
+    HMODULE module = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(address), &module) &&
+        module != nullptr)
+    {
+        wchar_t name[MAX_PATH] {};
+        if (GetModuleFileNameW(module, name, MAX_PATH) != 0)
+        {
+            const std::wstring path(name);
+            const std::size_t slash = path.find_last_of(L"\\/");
+            const std::wstring base = slash == std::wstring::npos ? path : path.substr(slash + 1);
+            char buffer[64] {};
+            std::snprintf(buffer, sizeof(buffer), "+0x%llX",
+                          static_cast<unsigned long long>(address - reinterpret_cast<std::uintptr_t>(module)));
+            return narrow(base) + buffer;
+        }
+    }
+    char raw[32] {};
+    std::snprintf(raw, sizeof(raw), "0x%llX", static_cast<unsigned long long>(address));
+    return raw;
+}
+
+// 回溯一个线程的栈。只做"读栈 + 判断地址是否落在可执行内存"，
+// 不做 unwind（无 SEH/unwind 信息也能给出调用链的大致归属）。
+void dump_thread_stack(std::string &out, HANDLE thread, DWORD tid, const CONTEXT &context, int max_frames)
+{
+    out += "exit_watchdog thread tid=" + std::to_string(tid) +
+        " rip=" + describe_address(static_cast<std::uintptr_t>(context.Rip)) +
+        " rsp=" + hex64(context.Rsp) + " frames=";
+
+    std::vector<std::uintptr_t> frames;
+    frames.push_back(static_cast<std::uintptr_t>(context.Rip));
+    const auto *stack = reinterpret_cast<const std::uintptr_t *>(context.Rsp);
+    MEMORY_BASIC_INFORMATION mbi {};
+    for (int i = 0; i < 512 && static_cast<int>(frames.size()) < max_frames; ++i)
+    {
+        std::uintptr_t value = 0;
+        // 每次读栈前确认该页可读，避免回溯本身触发访问违例。
+        if (VirtualQuery(stack + i, &mbi, sizeof(mbi)) == 0)
+            break;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0)
+            break;
+        if (!ReadProcessMemory(GetCurrentProcess(), stack + i, &value, sizeof(value), nullptr))
+            break;
+        if (value < 0x10000)
+            continue;
+        HMODULE module = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(value), &module) &&
+            module != nullptr)
+            frames.push_back(value);
+    }
+    out += std::to_string(frames.size());
+    for (std::size_t i = 0; i < frames.size(); ++i)
+        out += "\n    #" + std::to_string(i) + " " + describe_address(frames[i]);
+    (void)thread;
+}
+
+DWORD WINAPI exit_watchdog_proc(LPVOID)
+{
+    // 等主窗口出现（最多 60 秒）。
+    HWND main_window = nullptr;
+    for (int i = 0; i < 600 && main_window == nullptr; ++i)
+    {
+        WindowSearch search;
+        EnumWindows(find_main_window_proc, reinterpret_cast<LPARAM>(&search));
+        main_window = search.found;
+        if (main_window == nullptr)
+            Sleep(100);
+    }
+    if (main_window == nullptr)
+    {
+        shutdown_trace("exit_watchdog no_main_window");
+        return 0;
+    }
+    shutdown_trace("exit_watchdog armed");
+
+    // 等主窗口消失。
+    while (IsWindow(main_window))
+        Sleep(200);
+
+    // 窗口消失后再等一会：正常的退出流程通常 1~2 秒内就走到 DETACH。
+    Sleep(3000);
+
+    std::string report = "exit_watchdog main_window_gone threads=";
+    const DWORD self_pid = GetCurrentProcessId();
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    std::vector<DWORD> threads;
+    if (snapshot != INVALID_HANDLE_VALUE)
+    {
+        THREADENTRY32 entry {};
+        entry.dwSize = sizeof(entry);
+        if (Thread32First(snapshot, &entry))
+        {
+            do
+            {
+                if (entry.th32OwnerProcessID == self_pid)
+                    threads.push_back(entry.th32ThreadID);
+            } while (Thread32Next(snapshot, &entry));
+        }
+        CloseHandle(snapshot);
+    }
+    report += std::to_string(threads.size());
+    shutdown_trace(report.c_str());
+
+    const DWORD self_tid = GetCurrentThreadId();
+    for (const DWORD tid : threads)
+    {
+        if (tid == self_tid)
+            continue;
+        const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                                         FALSE, tid);
+        if (thread == nullptr)
+            continue;
+        if (SuspendThread(thread) == static_cast<DWORD>(-1))
+        {
+            CloseHandle(thread);
+            continue;
+        }
+        CONTEXT context {};
+        context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        std::string frames;
+        if (GetThreadContext(thread, &context))
+            dump_thread_stack(frames, thread, tid, context, 24);
+        ResumeThread(thread);
+        CloseHandle(thread);
+        if (!frames.empty())
+            shutdown_trace(frames.c_str());
+    }
+    shutdown_trace("exit_watchdog done");
+    return 0;
+}
+
+} // 退出看门狗实现块结束（匿名命名空间）
+
+// ⚠️ DllMain 必须留在**全局作用域**：放进匿名命名空间会变成内部链接，
+// 链接器就找不到它，转而使用 CRT 的 dll_dllmain_stub.obj 里的空实现——
+// 表现为 DLL 体积骤降（575KB → 77KB）且桥完全不工作（initialize 从不执行），
+// 而构建过程**没有任何报错**。map 文件里 DllMain 归属 MSVCRT:dll_dllmain_stub.obj
+// 就是该症状的判定依据。
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 {
     if (reason == DLL_PROCESS_ATTACH)
@@ -13561,7 +13768,6 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID reserved)
             ffx12::set_process_exiting();
         il2cpp_callsite::shutdown();
         shutdown_trace("detach_after_il2cpp");
-        LOG_INFO(blog::cat::core, "detach_after_il2cpp");
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         {
             std::lock_guard lock(g_ps_trace_mutex);
