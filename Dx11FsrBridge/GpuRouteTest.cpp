@@ -2,6 +2,25 @@
 // (desktop "GPU id summary: AMD RDNA2-4 + NVIDIA RTX16-50" reference). Inputs
 // are exactly what the bridge can obtain at runtime: VendorId + DeviceId + Description.
 // ASCII-only source.
+//
+// ============================================================================
+// ⚠️ OBSOLETE / 已废弃（2026-09-19 标注，审核报告）
+//
+// 本文件测试的 `classify_gpu_arch` **在生产代码中已不存在**。
+// 移除它的提交：`3894f22 feat(bridge): drop GPU classification and 402c dual-path
+// - single default SDK`。当前生产侧统一使用默认 provider，不再按 GPU 架构路由
+// （`Dx11FsrBridge.cpp` 第 578 行注释亦已写明"显卡信息记录（**已不做路由**）"）。
+//
+// 因此本文件**不是**对生产逻辑的测试，而是一份**历史参考表**（GPU id → 架构的
+// 完整映射，含 RDNA1-4 / NVIDIA 16-50 / Intel Arc / iGPU 的 id 与描述回退规则）。
+//
+// 为什么保留而非删除：该表有**资料价值**——若将来需要恢复按架构路由，
+// 或需要判断某个 device id 属于哪一代，这张表是现成的权威参考（含 id 区间回退）。
+//
+// 注意：`main()` 的退出码是**正确的**（`fail == 0 ? 0 : 1`），并非"恒 return 0"。
+// 本文件也**未列入** `CMakeLists.txt` 任何 target —— 需手工编译运行：
+//   cl /std:c++20 /EHsc /utf-8 GpuRouteTest.cpp && GpuRouteTest.exe
+// ============================================================================
 #include <cstdio>
 #include <cstring>
 #include <cwctype>

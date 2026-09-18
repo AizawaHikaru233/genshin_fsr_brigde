@@ -6,6 +6,7 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
+#include <cmath>   // std::fabs（结果断言需要）
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -265,14 +266,25 @@ int main()
     fence->SetEventOnCompletion(fv, ev);
     WaitForSingleObject(ev, INFINITE);
 
+    // ---- 断言（2026-09-19，审核报告高严重度：此前只 printf 期望值、无 CHECK、
+    //      main 恒 return 0 → 无论结果对错都"通过"，等于空转）----
+    int failures = 0;
     {
         D3D12_RANGE r {0, static_cast<SIZE_T>(pitch_cl) * H};
         void *p = nullptr;
         rb_cl->Map(0, &r, &p);
         std::uint16_t hf[4] {};
         std::memcpy(hf, static_cast<std::uint8_t *>(p) + (H / 2) * pitch_cl + (W / 2) * 8, 8);
+        const float c0 = half2float(hf[0]), c1 = half2float(hf[1]), c2 = half2float(hf[2]);
         std::printf("RESULT color_linear center = (%.3f, %.3f, %.3f, %.3f) [expect 0.5,0.5,0.5]\n",
-                    half2float(hf[0]), half2float(hf[1]), half2float(hf[2]), half2float(hf[3]));
+                    c0, c1, c2, half2float(hf[3]));
+        // 容忍半精度往返误差（0.5 在 fp16 中可精确表示，故容差取很小值即可）
+        constexpr float kTol = 0.01f;
+        const bool cl_ok = std::fabs(c0 - 0.5f) <= kTol &&
+                           std::fabs(c1 - 0.5f) <= kTol &&
+                           std::fabs(c2 - 0.5f) <= kTol;
+        std::printf("%s color_linear center is 0.5,0.5,0.5\n", cl_ok ? "PASS" : "FAIL");
+        if (!cl_ok) ++failures;
         rb_cl->Unmap(0, nullptr);
     }
     {
@@ -282,7 +294,11 @@ int main()
         std::uint32_t raw = 0;
         std::memcpy(&raw, static_cast<std::uint8_t *>(p) + (H / 2) * pitch_co + (W / 2) * 4, 4);
         std::printf("RESULT color_own center = 0x%08X [expect 0x00000000 untouched]\n", raw);
+        const bool co_ok = raw == 0x00000000u;
+        std::printf("%s color_own untouched\n", co_ok ? "PASS" : "FAIL");
+        if (!co_ok) ++failures;
         rb_co->Unmap(0, nullptr);
     }
-    return 0;
+    std::printf("\n%s (%d failure(s))\n", failures == 0 ? "ALL PASS" : "FAILED", failures);
+    return failures == 0 ? 0 : 1;
 }

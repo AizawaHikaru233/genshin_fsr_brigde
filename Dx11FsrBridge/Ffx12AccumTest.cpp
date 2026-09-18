@@ -616,7 +616,12 @@ static void run_version(const char* version_name, std::uint64_t version_id,
 }
 
 // 单版本安全运行（SEH 捕获崩溃；无 C++ 对象，允许 __try）
-static void safe_run_version(const char* name, std::uint64_t id, ID3D12Device* dev, ID3D12CommandQueue* queue,
+// 返回 true = 本次运行正常完成；false = 崩溃（SEH 捕获）或运行失败。
+//
+// 2026-09-19（审核报告高严重度）：旧签名是 `void` —— SEH 捕获到崩溃后**只打印
+// "!!! CRASHED !!!" 而不告知调用方**，`main` 无从累计失败，于是**崩溃的测试
+// 也算"通过"**（恒 return 0）。现在把结果返回给调用方，由 main 汇总为退出码。
+static bool safe_run_version(const char* name, std::uint64_t id, ID3D12Device* dev, ID3D12CommandQueue* queue,
                              ID3D12CommandAllocator* alloc, ID3D12GraphicsCommandList* list,
                              ID3D12Fence* fence, HANDLE ev, const PfnSet& pfn, const TestIo& io,
                              std::uint32_t ctx_flags, const char* flags_tag,
@@ -625,6 +630,7 @@ static void safe_run_version(const char* name, std::uint64_t id, ID3D12Device* d
     std::printf(">>> running version %s (id=%llu) flags=0x%03X %s jit=%s\n", name, static_cast<unsigned long long>(id),
                 ctx_flags, flags_tag, jit_tag);
     std::fflush(stdout);
+    bool ok = true;
     __try
     {
         run_version(name, id, dev, queue, alloc, list, fence, ev, pfn, io, ctx_flags, flags_tag, jit_mode, jit_tag, use_reactive);
@@ -632,8 +638,10 @@ static void safe_run_version(const char* name, std::uint64_t id, ID3D12Device* d
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         std::printf("!!! version %s CRASHED (SEH 0x%08X) !!!\n", name, static_cast<unsigned>(GetExceptionCode()));
+        ok = false;
     }
     std::fflush(stdout);
+    return ok;
 }
 
 int main(int argc, char** argv)
@@ -922,6 +930,7 @@ int main(int argc, char** argv)
     const std::uint32_t combos_flags[] = {0x000u, 0x008u, 0x020u, 0x001u, 0x100u, 0x129u};
     const char* combos_tag[] = {"f0", "di", "ae", "hdr", "nl", "ingame"};
     const std::size_t combo_n = sizeof(combos_flags) / sizeof(combos_flags[0]);
+    int failures = 0;   // 崩溃/运行失败的次数（决定进程退出码）
     for (std::size_t ci = 0; ci < combo_n; ++ci)
     {
         std::printf("main: ===== flag combo %s (0x%03X) =====\n", combos_tag[ci], combos_flags[ci]);
@@ -931,8 +940,9 @@ int main(int argc, char** argv)
             {
                 if (!names[i] || names[i][0] == '\0' || want != names[i])
                     continue;
-                safe_run_version(names[i], ids[i], dev.Get(), queue.Get(), alloc.Get(), list.Get(),
-                                 fence.Get(), ev, pfn, io, combos_flags[ci], combos_tag[ci], 0, "jit", false);
+                if (!safe_run_version(names[i], ids[i], dev.Get(), queue.Get(), alloc.Get(), list.Get(),
+                                      fence.Get(), ev, pfn, io, combos_flags[ci], combos_tag[ci], 0, "jit", false))
+                    ++failures;
                 break;
             }
         }
@@ -950,8 +960,9 @@ int main(int argc, char** argv)
             {
                 if (!names[i] || names[i][0] == '\0' || std::string("2.3.4") != names[i])
                     continue;
-                safe_run_version(names[i], ids[i], dev.Get(), queue.Get(), alloc.Get(), list.Get(),
-                                 fence.Get(), ev, pfn, io, 0x129u, "ingame", jit_modes[jm], jit_tags[jm], false);
+                if (!safe_run_version(names[i], ids[i], dev.Get(), queue.Get(), alloc.Get(), list.Get(),
+                                      fence.Get(), ev, pfn, io, 0x129u, "ingame", jit_modes[jm], jit_tags[jm], false))
+                    ++failures;
                 break;
             }
         }
@@ -964,11 +975,17 @@ int main(int argc, char** argv)
     {
         if (!names[i] || names[i][0] == '\0' || std::string("4.1.1") != names[i])
             continue;
-        safe_run_version(names[i], ids[i], dev.Get(), queue.Get(), alloc.Get(), list.Get(),
-                         fence.Get(), ev, pfn, io, 0x008u, "di_reactive", 0, "jit", true);
+        if (!safe_run_version(names[i], ids[i], dev.Get(), queue.Get(), alloc.Get(), list.Get(),
+                              fence.Get(), ev, pfn, io, 0x008u, "di_reactive", 0, "jit", true))
+            ++failures;
         break;
     }
 
-    std::printf("DONE\n");
-    return 0;
+    // 2026-09-19（审核报告高严重度）：退出码必须反映实际结果。
+    // 旧实现恒 `return 0` → 崩溃的版本也报"成功"，测试等于空转。
+    // 判定口径：**任一版本运行崩溃（SEH）即失败**。
+    // 注意：这里**不**对累积/收敛统计设阈值——那些数值随版本与 flag 组合而变，
+    // 是**观察数据**而非通过/失败判据（其含义见上方打印的解读说明）。
+    std::printf("DONE (%d failure(s) out of the runs above)\n", failures);
+    return failures == 0 ? 0 : 1;
 }
