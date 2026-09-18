@@ -7786,8 +7786,35 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
 
     std::array<ID3D11RenderTargetView *, 2> render_targets {};
     context->OMGetRenderTargets(static_cast<UINT>(render_targets.size()), render_targets.data(), nullptr);
+
+    // ⚠️ 双 RTV 预筛必须放在**最前面**——它只是两个指针判空，是整个函数最便宜的检查。
+    //
+    // 旧实现的顺序是反的：先 safe_read_resource_info(rtv0)（内部 GetResource +
+    // GetType + QueryInterface + GetDesc，约 4~5 次 COM 调用），再在 <3840 时做
+    // PSGetShaderResources + 7×read_resource_info 的低分辨率诊断，**最后**才做
+    // 这个指针判空。而实测绝大多数 draw 都是单 RTV（rtv1=0）→ 它们付出完整内省
+    // 代价后才被拒绝。
+    //
+    // 说明（诚实记录）：本次重排**未测出可观察的帧数收益**。当时用 Ffx12DrawProbe
+    // 测到 avg_ns 2591→2600（无变化），据此一度推断"该路径不是瓶颈"——但那个
+    // 探针数字后来被证明**几乎全是探针自身开销**（分段计时显示钩子实际逻辑约 1ns）。
+    // 也就是说：这条路径本来就很便宜，重排它是**正确但收益微小**的整理，不是性能修复。
+    // 保留重排的理由：判空确实应该先于昂贵的资源内省，这是正确的顺序。
+    if (render_targets[0] == nullptr || render_targets[1] == nullptr)
+    {
+        log_fail(std::string("stage=prescreen rtv0=") + (render_targets[0] != nullptr ? "1" : "0") +
+            " rtv1=" + (render_targets[1] != nullptr ? "1" : "0"));
+        for (ID3D11RenderTargetView *render_target : render_targets)
+        {
+            if (render_target != nullptr)
+                render_target->Release();
+        }
+        return std::nullopt;
+    }
+
     // 低分辨率候选 draw 诊断（TAAU 渲染精度 <1 时应出现低分辨率 rtv0）——
-    // 记录其 RTV/SRV 特征判断国际服 TAAU 布局（前 12 次，独立于单 RTV diag）。
+    // 记录其 RTV/SRV 特征判断国际服 TAAU 布局（前 12 次）。
+    // 放在预筛之后：只有真正双 RTV 的候选 draw（极少）才值得付这个代价。
     {
         ResourceInfo rtv0_info {};
         safe_read_resource_info(render_targets[0], L"fsr2_diag_rtv0", rtv0_info);
@@ -7817,32 +7844,14 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
             }
         }
     }
-    // 双 RTV 硬预筛（稳定安全——1.1.5/1.2.3 同）：国际服 TAAU 为双 RTV
-    // （1.1.5 实测 render=2304x1296 output=3840x2160——output_metadata+output_color）。
-    // 单 RTV 放行曾导致启动崩溃（普通 draw 误入 identify）——不再放行。
-    if (render_targets[0] == nullptr || render_targets[1] == nullptr)
-    {
-        log_fail(std::string("stage=prescreen rtv0=") + (render_targets[0] != nullptr ? "1" : "0") +
-            " rtv1=" + (render_targets[1] != nullptr ? "1" : "0"));
-        for (ID3D11RenderTargetView *render_target : render_targets)
-        {
-            if (render_target != nullptr)
-                render_target->Release();
-        }
-        return std::nullopt;
-    }
-    const bool single_rtv = render_targets[1] == nullptr;
-    if (single_rtv)
-        log_fail("stage=prescreen_single_rtv rtv0=1 rtv1=0 proceeding_to_identify");
-
-    // 阶段日志（崩溃定位）：单 RTV 放行路径每步记录（限量前 16 次——崩溃点=最后一行）
+    // 阶段日志（崩溃定位）：到达此处的 draw 已是双 RTV 候选（预筛已在上方完成）
     static std::atomic_uint32_t on_demand_stage_count { 0 };
     const auto stage_log = [](std::string &&msg) {
         if (on_demand_stage_count.fetch_add(1, std::memory_order_relaxed) >= 16)
             return;
         LOG_DEBUG(blog::cat::upscale, "fsr2_stage " + msg);
     };
-    stage_log(std::string("identify_begin single_rtv=") + (single_rtv ? "1" : "0"));
+    stage_log("identify_begin dual_rtv=1");
 
     std::array<ID3D11ShaderResourceView *, 7> shader_resources {};
     ID3D11Buffer *constant_buffer = nullptr;
@@ -11741,6 +11750,19 @@ bool fsr2_family_should_skip_draw(ID3D11DeviceContext *context)
     return hash != 0 &&
         fsr2_family_takeover::should_skip_pre(hash, GetTickCount64(), g_config.fsr2_family_expire_ms);
 }
+
+// ---------------------------------------------------------------------------
+// ⚠️ 已移除：绘制钩子内的每-draw 计时探针（原 Ffx12DrawProbe）
+//
+// 曾在此处用 RAII 对每次 draw 计时（2× QueryPerformanceCounter + 4 个原子操作）。
+// 实测（80,000 draw/s）：它自身就吃掉 **7~8% 帧数**（用户实测关闭后 +15 帧）。
+// 更糟的是**它污染了自己的测量结果**：分段计时显示钩子的实际逻辑耗时约 **1ns**，
+// 而探针报告 avg_ns=2583 —— 那个数字几乎全是探针自身开销，
+// 由此得出的"桥占 CPU 21.69%"结论是错的。
+//
+// 教训：给纳秒级函数加微秒级探针，测到的是探针。若要再测此路径，
+// 必须用**极低采样率**（如每 4096 次 draw 只测 1 次），且先验证探针本身无扰动。
+// ---------------------------------------------------------------------------
 
 void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT index_count, UINT start_index_location, INT base_vertex_location)
 {
