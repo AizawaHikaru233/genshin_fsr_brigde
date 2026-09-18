@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(Dx11FsrBridge LANGUAGES C CXX RC)
 
-option(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL "Build the standard FSR2 translation exports" OFF)
+option(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL "Build the standard FSR2 translation exports" ON)
 option(DX11FSRBRIDGE_RELEASE_RUNTIME "Build the release runtime" ON)
 option(DX11FSRBRIDGE_BUILD_FAMILY_TEST "Build the Fsr2FamilyTakeover state-machine test" OFF)
 
@@ -49,6 +49,17 @@ add_library(Dx11FsrBridge SHARED
 
 # 旧方案已彻底移除：Fsr2TranslationLayer（旧翻译层）与 Dx11On12Swapchain（On12 引导）
 # 不再编译进 DLL；OptiScaler 以新 ffx12 链路为基底接入。
+#
+# ⚠️ 默认值必须是 ON（曾经是 OFF，是个静默失效陷阱）：
+# 宏名里的 "EXPERIMENTAL" 已名不副实——它现在包住的是**在用的生产路径**：
+#   - try_fsr2_translation_draw（draw 翻译派发主链）
+#   - fsr2_family_skip（合成族预处理跳过，ini 里 Fsr2FamilySkip 默认 =1）
+#   - Fsr2TranslationMode 的 mode-2 按需识别路径
+#   - 一批 FSR2 内省/统计（format_bytes_per_pixel、translation dispatch 计数等）
+# 仓库里**没有任何构建脚本**传这个宏，此前它只存在于本机 build 目录的 CMakeCache
+# （DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL:BOOL=ON）。也就是说：
+# 任何全新 clone / CI / 换机构建都会拿到 OFF → 翻译层整块消失，而 ini 里
+# Fsr2FamilySkip=1 仍在声称"已跳过预处理"——配置与二进制不一致，且无任何报错。
 if(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL=1)
 endif()
