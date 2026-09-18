@@ -13561,14 +13561,34 @@ void shutdown_trace(const char *step)
     std::fclose(f);
 }
 
+// 进程退出时的最终停机。
+//
+// ⚠️ **不要在这里调用 ffx12::shutdown()** —— 这是"游戏窗口关了、进程不退出"的根因，
+// 也是相对基线版本的回归（基线从不调用 ffx12::shutdown）。
+//
+// 逐步标记实测（2026-09-18，修复 shutdown_trace 共享模式后才拿到）：
+//   [SHUTDOWN] final_shutdown_begin
+//   [SHUTDOWN] ffx12_shutdown lock_acquired     ← try_lock_for(500ms) 成功
+//   [SHUTDOWN] ffx12_shutdown begin
+//   （再无 ctxs_destroyed）
+// 即卡在 `g_runtime.destroy(&sc.ctx, nullptr)`（AMD ffx-api 的 ffxDestroyContext）。
+// 那是第三方运行时代码，在设备已移除/驱动已开始卸载的状态下会阻塞不返回；
+// 我们既不能给它加超时，也不能在 loader lock 或 atexit 阶段安全地绕开它。
+//
+// 代价评估：跳过它只损失"释放 preload 的 ffx-api runtime 句柄"与"D3D12 COM 对象
+// 引用计数归零"——进程正在退出，这些由 OS 无条件回收，**没有任何功能损失**。
+// 反过来，为了这点收益把整个进程钉死在退出路径上，是不可接受的。
+// 结论：**退出路径不做 FFX 后端释放**（与基线行为一致）。
+//
+// 正常使用中真正需要收尾的是日志器（排空队列 + 关文件），它在 DllMain(DETACH) 里
+// 已经做过一次；这里再调一次是幂等的（shutdown() 内部有 g_active 交换保护）。
 void final_shutdown()
 {
     std::call_once(g_final_shutdown_once, []()
         {
             shutdown_trace("final_shutdown_begin");
-            ffx12::shutdown();
-            shutdown_trace("final_shutdown_end");
             blog::shutdown();
+            shutdown_trace("final_shutdown_end");
         });
 }
 
