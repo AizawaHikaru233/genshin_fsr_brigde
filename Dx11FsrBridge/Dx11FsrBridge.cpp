@@ -13654,36 +13654,33 @@ void dump_thread_stack(std::string &out, HANDLE thread, DWORD tid, const CONTEXT
     (void)thread;
 }
 
-DWORD WINAPI exit_watchdog_proc(LPVOID)
+// 数出本进程当前线程数。
+std::size_t count_process_threads()
 {
-    // 等主窗口出现（最多 60 秒）。
-    HWND main_window = nullptr;
-    for (int i = 0; i < 600 && main_window == nullptr; ++i)
-    {
-        WindowSearch search;
-        EnumWindows(find_main_window_proc, reinterpret_cast<LPARAM>(&search));
-        main_window = search.found;
-        if (main_window == nullptr)
-            Sleep(100);
-    }
-    if (main_window == nullptr)
-    {
-        shutdown_trace("exit_watchdog no_main_window");
-        return 0;
-    }
-    shutdown_trace("exit_watchdog armed");
-
-    // 等主窗口消失。
-    while (IsWindow(main_window))
-        Sleep(200);
-
-    // 窗口消失后再等一会：正常的退出流程通常 1~2 秒内就走到 DETACH。
-    Sleep(3000);
-
-    std::string report = "exit_watchdog main_window_gone threads=";
     const DWORD self_pid = GetCurrentProcessId();
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+        return 0;
+    std::size_t count = 0;
+    THREADENTRY32 entry {};
+    entry.dwSize = sizeof(entry);
+    if (Thread32First(snapshot, &entry))
+    {
+        do
+        {
+            if (entry.th32OwnerProcessID == self_pid)
+                ++count;
+        } while (Thread32Next(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    return count;
+}
+
+void dump_all_thread_stacks(const char *reason)
+{
+    const DWORD self_pid = GetCurrentProcessId();
     std::vector<DWORD> threads;
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snapshot != INVALID_HANDLE_VALUE)
     {
         THREADENTRY32 entry {};
@@ -13698,8 +13695,8 @@ DWORD WINAPI exit_watchdog_proc(LPVOID)
         }
         CloseHandle(snapshot);
     }
-    report += std::to_string(threads.size());
-    shutdown_trace(report.c_str());
+    std::string head = std::string("exit_watchdog ") + reason + " threads=" + std::to_string(threads.size());
+    shutdown_trace(head.c_str());
 
     const DWORD self_tid = GetCurrentThreadId();
     for (const DWORD tid : threads)
@@ -13725,7 +13722,90 @@ DWORD WINAPI exit_watchdog_proc(LPVOID)
         if (!frames.empty())
             shutdown_trace(frames.c_str());
     }
-    shutdown_trace("exit_watchdog done");
+}
+
+// 看门狗主循环。
+//
+// 触发条件**不依赖窗口识别**（上一版依赖 EnumWindows 找主窗口，一旦识别失败就
+// 完全静默，等于白装）。改用两个与实测残留特征直接对应的条件：
+//   A) 主窗口消失（识别得到时）后再等 3 秒；
+//   B) 本进程线程数跌到 <= 1 并持续 15 秒 —— "窗口关了、进程不退出"实测就是这个形态
+//      （只剩 1 个线程、CPU 增量 0）。
+// 任一条件成立即 dump 所有线程栈。另外每 30 秒写一行心跳，证明看门狗确实在跑。
+DWORD WINAPI exit_watchdog_proc(LPVOID)
+{
+    shutdown_trace("exit_watchdog started");
+
+    // 找主窗口（找不到也不影响后续判定）。
+    HWND main_window = nullptr;
+    for (int i = 0; i < 600 && main_window == nullptr; ++i)
+    {
+        WindowSearch search;
+        EnumWindows(find_main_window_proc, reinterpret_cast<LPARAM>(&search));
+        main_window = search.found;
+        if (main_window == nullptr)
+            Sleep(100);
+    }
+    shutdown_trace(main_window != nullptr ? "exit_watchdog armed window=1"
+                                          : "exit_watchdog armed window=0");
+
+    DWORD window_gone_tick = 0;
+    DWORD single_thread_tick = 0;
+    DWORD last_heartbeat = GetTickCount();
+    bool dumped = false;
+
+    for (;;)
+    {
+        Sleep(500);
+
+        // 心跳：每 30 秒一行，证明线程活着。
+        const DWORD now = GetTickCount();
+        if (now - last_heartbeat >= 30000)
+        {
+            last_heartbeat = now;
+            const std::size_t threads = count_process_threads();
+            std::string beat = "exit_watchdog heartbeat threads=" + std::to_string(threads);
+            if (main_window != nullptr && !IsWindow(main_window))
+                beat += " window=gone";
+            else if (main_window != nullptr)
+                beat += " window=alive";
+            shutdown_trace(beat.c_str());
+        }
+
+        if (dumped)
+            continue;
+
+        // 条件 A：主窗口消失。
+        bool trigger_a = false;
+        if (main_window != nullptr && !IsWindow(main_window))
+        {
+            if (window_gone_tick == 0)
+                window_gone_tick = now;
+            else if (now - window_gone_tick >= 3000)
+                trigger_a = true;
+        }
+
+        // 条件 B：线程数跌到 <= 1 并持续 15 秒。
+        bool trigger_b = false;
+        if (count_process_threads() <= 1)
+        {
+            if (single_thread_tick == 0)
+                single_thread_tick = now;
+            else if (now - single_thread_tick >= 15000)
+                trigger_b = true;
+        }
+        else
+        {
+            single_thread_tick = 0;
+        }
+
+        if (trigger_a || trigger_b)
+        {
+            dumped = true;
+            dump_all_thread_stacks(trigger_a ? "window_gone" : "single_thread");
+            shutdown_trace("exit_watchdog done");
+        }
+    }
     return 0;
 }
 

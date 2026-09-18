@@ -72,7 +72,9 @@ std::atomic<std::uint32_t> g_debugger_in_window { 0 };
 std::atomic<std::uint64_t> g_debugger_window_start { 0 };
 
 std::thread g_writer;
-std::mutex g_file_mutex;
+// timed_mutex：shutdown() 需要在 DllMain(loader lock) 里带超时取锁，
+// 拿不到就放弃收尾而不是把主线程钉死（见 shutdown() 末尾注释）。
+std::timed_mutex g_file_mutex;
 
 // 兼容模式：旧 log_line 行按前缀归类（过渡开关）
 std::atomic<bool> g_compat_prefix { false };
@@ -187,7 +189,7 @@ void writer_loop()
             --g_size;
         }
         {
-            std::lock_guard<std::mutex> lock(g_file_mutex);
+            std::lock_guard<std::timed_mutex> lock(g_file_mutex);
             if (g_file.is_open())
             {
                 g_file << line << "\n";
@@ -200,7 +202,7 @@ void writer_loop()
     }
     // 收尾：残余（若有）落盘 + 关闭文件。此后 shutdown 可以安全地判定"文件已静止"。
     {
-        std::lock_guard<std::mutex> lock(g_file_mutex);
+        std::lock_guard<std::timed_mutex> lock(g_file_mutex);
         if (g_file.is_open())
         {
             g_file.flush();
@@ -435,7 +437,7 @@ void init(const Config &config)
         g_directory = config.directory_w;
         g_filename = config.filename_w.empty() ? std::wstring(L"Dx11FsrBridge.log") : config.filename_w;
         g_path = g_directory.empty() ? g_filename : (g_directory + L"\\" + g_filename);
-        std::lock_guard<std::mutex> lock(g_file_mutex);
+        std::lock_guard<std::timed_mutex> lock(g_file_mutex);
         open_file_locked(config.truncate_on_start);
         if (!g_file.is_open())
         {
@@ -496,13 +498,21 @@ void shutdown()
     // 只有确认 writer 已退出（文件由它关闭）时才在这里兜底 flush。
     // 若超时未退出（极罕见：线程卡在轮转的文件系统调用上），进程通常已在退出路径，
     // 此时**不要**去碰 g_file——那正是旧实现的数据竞争。
+    //
+    // 用 try_lock_for 而不是 lock()：本函数会在 DllMain(DLL_PROCESS_DETACH) 里被调用，
+    // 而 writer 线程可能正持 g_file_mutex 卡在轮转的 MoveFileExW/DeleteFileW 上。
+    // 阻塞等待就等于把主线程钉死在 loader lock 里——"窗口关了、进程不退出"的形态之一。
+    // 拿不到锁就直接放弃收尾（文件句柄交 OS 回收），绝不阻塞退出。
     if (g_writer_stopped.load(std::memory_order_acquire))
     {
-        std::lock_guard<std::mutex> lock(g_file_mutex);
-        if (g_file.is_open())
+        std::unique_lock<std::timed_mutex> lock(g_file_mutex, std::defer_lock);
+        if (lock.try_lock_for(std::chrono::milliseconds(50)))
         {
-            g_file.flush();
-            g_file.close();
+            if (g_file.is_open())
+            {
+                g_file.flush();
+                g_file.close();
+            }
         }
     }
 }
@@ -542,7 +552,7 @@ void log_effective_config()
     }
     bool file_open = false;
     {
-        std::lock_guard<std::mutex> lock(g_file_mutex);
+        std::lock_guard<std::timed_mutex> lock(g_file_mutex);
         file_open = g_file.is_open();
     }
     char buf[320] {};
@@ -556,7 +566,7 @@ void log_effective_config()
     // 注意这里用本文件内的转换，**不经过桥的 narrow()**——那条路径曾因
     // UTF-8/ACP 不一致而把中文目录毁掉。
     {
-        std::lock_guard<std::mutex> lock(g_file_mutex);
+        std::lock_guard<std::timed_mutex> lock(g_file_mutex);
         if (!g_path.empty())
         {
             const int needed = WideCharToMultiByte(CP_UTF8, 0, g_path.c_str(), -1, nullptr, 0, nullptr, nullptr);
