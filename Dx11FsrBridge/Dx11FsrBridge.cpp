@@ -4011,6 +4011,23 @@ void load_config()
     // 后端输出读回采样（诊断，默认关）。开启会引入同步 GPU 等待 → 掉帧，仅排查用。
     g_config.ffx12_readback_probes =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ReadbackProbes", 0, config_path.c_str()) != 0;
+    // ⚠️ Fsr2FastStateTracking —— 生产构建下**必须读**，且默认开启（=1）。
+    //
+    // 该键门控的是**状态镜像钩子的整体旁路**，共 11 处：
+    //   PSSetShaderResources / PSSetConstantBuffers / OMSetRenderTargets / RSSetViewports
+    //   在"已学到目标 PS hash"后**整钩子直接透传**，不再做每调用的资源内省；
+    //   PSSetShader 只记一个 hash；inspect_target_upscaler_draw 走廉价预筛。
+    //
+    // 而它在旧代码里**只在非 RELEASE 分支被读取**（生产构建定义
+    // DX11FSRBRIDGE_RELEASE_RUNTIME=1 → 恒为默认 false）→ 这些旁路**从未生效**，
+    // 每次资源绑定都执行 read_resource_info（GetResource/GetType/QueryInterface/
+    // GetDesc + AddRef/Release）。实测后果（用户报告，9800X3D）：
+    //   - 单核占用最高 80%（单线程热点）、GPU 空转（CPU 喂不上）
+    //   - 渲染精度 0.2 与 0.5 帧数无差别（瓶颈不在像素吞吐）
+    //   - 角色模型精度越高帧数越低（绑定调用数随 draw 数增长）
+    // 默认值取 1：这是该开关的设计意图（学到目标后旁路），也是发布配置期望的行为。
+    g_config.fsr2_fast_state_tracking =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2FastStateTracking", 1, config_path.c_str()) != 0;
     // Present 参数/帧间隔诊断（默认关）。仅记录 sync_interval/flags/帧间隔/前台状态。
     g_config.ffx12_present_probe =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12PresentProbe", 0, config_path.c_str()) != 0;
