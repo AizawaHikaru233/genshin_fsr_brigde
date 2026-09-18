@@ -76,6 +76,9 @@ struct PerInstanceParams
 PerInstanceParams g_inst_params[8] {};
 std::size_t g_inst_count = 0;
 std::mutex g_inst_mutex;
+// pending 环形槽溢出计数（审核报告：4 槽满时覆盖最旧 token 是静默的）。
+// 每次"该槽位已有未消费 token 却被覆盖"时 +1；桥侧可据此判断环形是否不足。
+std::atomic_uint64_t g_pending_overflow { 0 };
 
 // 由 stub 调用的计数 + 参数捕获入口（rcx=this, rdx=context）。
 // 字段偏移（7.0，getter 字节实证）：jitter Vector2@0x24, m_FrameIndex int@0x50,
@@ -96,12 +99,23 @@ __declspec(noinline) void on_render_enter(void *this_ptr, void *context_ptr)
         std::memcpy(&cp.frame_index, p + 0x50, 4);
         std::memcpy(&cp.jitter_x, p + 0x24, 4);
         std::memcpy(&cp.jitter_y, p + 0x28, 4);
-        g_params = cp;
-        const std::uint64_t generation =
-            g_params_generation.fetch_add(1, std::memory_order_release) + 1;
         // 按实例记录（保持全局兼容 + 每实例代次）
+        //
+        // ⚠️ 数据竞争修复（2026-09-19，审核报告）：
+        // 旧实现把 `g_params = cp` 与代次自增放在**锁外**（本行之前），而读方
+        // last_params() / last_params_for() 在锁外读 `g_params` → 撕裂读
+        // （读到一半新一半旧的 CapturedParams，导致 render/display 尺寸与
+        // jitter 来自不同帧）。现在**统一在 g_inst_mutex 内**写全局快照。
+        //
+        // 为什么复用 g_inst_mutex 而不是新开 g_params_mutex：本函数**先**持
+        // g_inst_mutex，读方 last_params_for() 也在 g_inst_mutex 内读全局快照。
+        // 若为全局快照另开一把锁，就会出现"读方持 A 求 B、写方持 B 求 A"的
+        // **锁序反转**。共用一把锁可保证锁序唯一。
         {
             std::lock_guard lock(g_inst_mutex);
+            const std::uint64_t generation =
+                g_params_generation.fetch_add(1, std::memory_order_release) + 1;
+            g_params = cp;
             const std::uint64_t inst = cp.instance;
             std::size_t slot = g_inst_count;
             for (std::size_t i = 0; i < g_inst_count; ++i)
@@ -132,6 +146,11 @@ __declspec(noinline) void on_render_enter(void *this_ptr, void *context_ptr)
             entry.generation = generation;
             entry.params = cp;
             RenderToken &token = entry.pending[entry.next_pending];
+            // 溢出可观测（审核报告）：该槽位若已存在未消费的 token（generation != 0
+            // 且非本次），说明 4 槽环形不足，旧实现会静默覆盖 → 桥侧表现为
+            // "某代次永远等不到 token"。这里计数，让情形可诊断而非静默。
+            if (token.generation != 0 && token.generation != generation)
+                g_pending_overflow.fetch_add(1, std::memory_order_relaxed);
             token.params = cp;
             token.generation = generation;
             token.capture_tick = GetTickCount64();
@@ -146,8 +165,24 @@ void write_u64(std::uint8_t *dst, std::uint64_t value)
 }
 
 // 构建 observe/skip 两种 stub。
-bool build_stub(bool skip_render, std::uint8_t *render, std::uint8_t *stub)
+//
+// 2026-09-19（审核报告）：旧签名 `bool build_stub(...)` **恒 return true** ——
+// 唯一的调用点也忽略返回值，失败分支不可达。但"恒成功"并非事实：stub 长度是
+// 按序言长度算出来的，若 k_patch_len 或指令序列变化而 k_stub_len 未同步，
+// 下面的 `while (p < k_stub_len)` 填充循环**不会**报错，反而会静默写出界。
+//
+// 因此改为 void + **编译期断言**（比运行时 bool 更强，且零运行时成本）：
+// 让"stub 放不下"在**编译期**就失败，而不是留一个永远为 true 的返回值。
+void build_stub(bool skip_render, std::uint8_t *render, std::uint8_t *stub)
 {
+    // 逐项长度（与下方指令序列一一对应，改动时编译器会强制同步）
+    constexpr std::size_t k_prologue = 4 + 5 + 5 + 10 + 2;   // sub rsp / 两次 save / mov rax+call rax
+    constexpr std::size_t k_observe_extra = 5 + 5 + 4 + k_patch_len + 10 + 2;
+    constexpr std::size_t k_skip_extra = 4 + 1;
+    static_assert(k_prologue + k_observe_extra <= k_stub_len,
+                  "observe stub 超出 k_stub_len —— 同步调整 k_stub_len");
+    static_assert(k_prologue + k_skip_extra <= k_stub_len,
+                  "skip stub 超出 k_stub_len —— 同步调整 k_stub_len");
     const std::uint64_t counter = reinterpret_cast<std::uint64_t>(&on_render_enter);
     std::size_t p = 0;
     // Reserve shadow space plus two private save slots.  The earlier +0x18
@@ -186,7 +221,6 @@ bool build_stub(bool skip_render, std::uint8_t *render, std::uint8_t *stub)
     }
     while (p < k_stub_len)
         stub[p++] = 0x90; // nop 填充
-    return true;
 }
 
 } // namespace
@@ -353,8 +387,16 @@ std::uint64_t params_generation()
     return g_params_generation.load(std::memory_order_acquire);
 }
 
+std::uint64_t pending_overflow_count()
+{
+    return g_pending_overflow.load(std::memory_order_relaxed);
+}
+
 bool last_params(CapturedParams &out)
 {
+    // ⚠️ 必须持锁读：写方在 g_inst_mutex 内写 g_params（见 on_render_enter）。
+    // 锁外读会撕裂（读到的 render/display 尺寸与 jitter 可能来自不同帧）。
+    std::lock_guard lock(g_inst_mutex);
     out = g_params;
     return out.render_w != 0 && out.render_h != 0 && out.display_w != 0 && out.display_h != 0;
 }
@@ -364,7 +406,7 @@ bool last_params_for(std::uint64_t instance, CapturedParams &out, std::uint64_t 
     std::lock_guard lock(g_inst_mutex);
     if (instance == 0)
     {
-        // 兼容旧调用方：返回全局最新
+        // 兼容旧调用方：返回全局最新（已在 g_inst_mutex 内，读到的是一致快照）
         out = g_params;
         generation = g_params_generation.load(std::memory_order_relaxed);
         return out.render_w != 0 && out.render_h != 0 && out.display_w != 0 && out.display_h != 0;
@@ -574,8 +616,12 @@ bool install_camera(std::uint64_t exe_base, const Config &cfg)
         VirtualAlloc(nullptr, k_camera_stub_len, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     if (g_camera_stub == nullptr)
     {
-        std::memcpy(target, g_camera_saved, k_camera_patch_len);
-        VirtualProtect(target, k_camera_patch_len, old_protect, &old_protect);
+        // 2026-09-19（审核报告）：此处**不再**回写 g_camera_saved。
+        // 目标字节要到下面 `std::memcpy(target, patch, ...)` 才被修改，走到这里时
+        // target 仍是原始内容 → 旧实现的 memcpy 是**无效操作**（把读到的原字节
+        // 又写回去）。真正需要恢复的只有内存保护属性。
+        DWORD ignored = 0;
+        VirtualProtect(target, k_camera_patch_len, old_protect, &ignored);
         return false;
     }
     build_camera_stub(target, g_camera_stub);

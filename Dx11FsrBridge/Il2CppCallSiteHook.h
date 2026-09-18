@@ -66,6 +66,11 @@ bool latest_pending_render_token_for(std::uint64_t instance,
                                      std::uint32_t render_w, std::uint32_t render_h,
                                      RenderToken &out);
 bool consume_render_token_for(std::uint64_t instance, std::uint64_t generation);
+// 2026-09-19（审核报告）：pending 环形槽每实例只有 4 个，写满时**覆盖最旧** token。
+// 旧实现是静默的——桥侧只会看到"某个 Render 代次永远等不到 token"，
+// 却无从判断是识别失败还是被环形覆盖。此计数让该情形**可观测**：
+// 非零即说明 4 槽不足（同一实例在 4 次 Render 内未被消费），应扩大环形或查消费路径。
+std::uint64_t pending_overflow_count();
 // 已记录的实例列表（用于 draw→实例匹配）。
 void known_instances(std::uint64_t *out, std::size_t capacity, std::size_t &count);
 // 上一帧 jitter 需按实例隔离：桥用 instance 区分 jdelay 状态，故提供按实例的帧代次辅助。
