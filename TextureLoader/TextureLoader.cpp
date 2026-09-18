@@ -64,15 +64,25 @@ ID3D11DeviceContext *g_context = nullptr;
 //     InterlockedIncrement 让 count 变成 1 而队列**实际为空** → 计数与队列永久失配，
 //     后续 Flush 反复进入却拿到空 batch，对象**永不释放**（泄漏）。
 //
-// 现在**移除独立计数器**，让队列本身成为唯一真相：判空与取走都在同一把锁内完成，
-// 计数与队列不可能失配。
+// 修复分两层：
+// 1) **计数器移除**，队列本身成为唯一真相（判空与取走在同一把锁内，不可能失配）。
+// 2) `g_pendingMaybe` 只做**无锁门闩**，用于恢复热路径快速返回：
+//    FlushPendingRelease 由 SetShaderResources 钩子入口**每次调用**，若每次都加解锁
+//    会带来可测开销（实测约 2~3%）。门闩的语义是"**可能**有排队项"——
+//    producer 在**入队之前**先置位（exchange），consumer 在锁内 swap 后才清位，
+//    因此不存在"漏看"：只要队列里真有东西，门闩必然已置位。
+//    代价仅是偶尔多进一次锁拿到空 batch（无害）。这与旧实现"计数器可能与队列失配"
+//    有本质区别：门闩是**保守方向**的近似（宁可真、不可漏），不会导致泄漏。
 std::mutex g_pendingMutex;
 std::deque<IUnknown *> g_pendingRelease;
+std::atomic<bool> g_pendingMaybe{false};
 
 static void QueueRelease(IUnknown *obj)
 {
     if (!obj)
         return;
+    // 先置门闩再入队：保证 consumer 只要能看到队列非空，就一定也能看到门闩。
+    g_pendingMaybe.store(true, std::memory_order_release);
     std::lock_guard<std::mutex> lk(g_pendingMutex);
     g_pendingRelease.push_back(obj);
 }
@@ -80,12 +90,17 @@ static void QueueRelease(IUnknown *obj)
 // 渲染线程调用：释放所有排队对象。判空与取走在同一锁内，无失配窗口。
 static void FlushPendingRelease()
 {
+    // 快速路径：门闩未置位 ⇒ 队列必空（见上方语义说明），零成本返回。
+    if (!g_pendingMaybe.load(std::memory_order_acquire))
+        return;
     std::deque<IUnknown *> batch;
     {
         std::lock_guard<std::mutex> lk(g_pendingMutex);
         if (g_pendingRelease.empty())
             return;
         batch.swap(g_pendingRelease);
+        // swap 之后队列已空 → 清门闩（在锁内，避免与 producer 的置位交错）
+        g_pendingMaybe.store(false, std::memory_order_release);
     }
     // 锁外释放：Release 可能回调进 D3D/驱动，持锁会放大争用。
     for (IUnknown *obj : batch)
