@@ -50,6 +50,8 @@ std::once_flag g_initialize_once;
 DWORD WINAPI exit_watchdog_proc(LPVOID);
 // 停机追踪（定义见文件末尾；initialize 里创建看门狗时就要用）。
 void shutdown_trace(const char *step);
+// 停机标记专用文件（独立于日志，用于判定 DllMain(DETACH) 是否执行）。
+void shutdown_marker(const char *step);
 constexpr std::size_t k_context_vtable_size = 128;
 constexpr std::size_t k_context4_vtable_size = 149;
 constexpr std::size_t k_device_vtable_size = 80;
@@ -13587,9 +13589,34 @@ void final_shutdown()
     std::call_once(g_final_shutdown_once, []()
         {
             shutdown_trace("final_shutdown_begin");
+            shutdown_marker("final_shutdown_begin");
             blog::shutdown();
             shutdown_trace("final_shutdown_end");
+            shutdown_marker("final_shutdown_end");
         });
+}
+
+// 停机标记专用文件（**独立于日志**）。
+//
+// 为什么另开一个文件：诊断期间发现"日志里 0 条 [SHUTDOWN] 标记"，而无法区分三种成因——
+//   1) DllMain(DETACH) 根本没执行；
+//   2) 执行了但写共享日志时被日志器/轮转挡住；
+//   3) 写到一半进程就没了。
+// 写一个**只被停机路径使用**的文件可以一次性排除 2：没有并发写者，也不受日志轮转影响。
+// 文件存在即证明 DETACH 执行过；内容行数即证明走到了哪一步。
+void shutdown_marker(const char *step)
+{
+    if (g_module_dir.empty())
+        return;
+    const std::filesystem::path path = g_module_dir / L"Dx11FsrBridge.shutdown.txt";
+    FILE *f = _wfsopen(path.c_str(), L"a", _SH_DENYNO);
+    if (f == nullptr)
+        return;
+    SYSTEMTIME st {};
+    GetLocalTime(&st);
+    std::fprintf(f, "%04u-%02u-%02u %02u:%02u:%02u.%03u %s\n",
+                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, step);
+    std::fclose(f);
 }
 
 // ---------------------------------------------------------------------------
@@ -13892,10 +13919,12 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         // 上一轮"窗口关了进程不退出"的成因：ffx12::shutdown 曾在 detach 里取 g_mutex，
         // 而渲染线程可能正持该锁卡在 GPU fence 等待上（dispatch 全程持锁）。
         shutdown_trace("detach_begin");
+        shutdown_marker("detach_begin");
         if (reserved != nullptr)
             ffx12::set_process_exiting();
         il2cpp_callsite::shutdown();
         shutdown_trace("detach_after_il2cpp");
+        shutdown_marker("detach_after_il2cpp");
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         {
             std::lock_guard lock(g_ps_trace_mutex);
@@ -13913,6 +13942,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         // 尾部日志也已经落盘。
         blog::shutdown();
         shutdown_trace("detach_after_log");
+        shutdown_marker("detach_after_log");
     }
     return TRUE;
 }
