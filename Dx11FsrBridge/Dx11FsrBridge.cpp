@@ -13304,6 +13304,9 @@ void initialize()
     DWORD length = GetModuleFileNameW(g_module, module_path, MAX_PATH);
     g_module_dir = std::filesystem::path(std::wstring(module_path, module_path + length)).parent_path();
     g_log_path = g_module_dir / L"Dx11FsrBridge.log";
+    // 把日志路径交给 FFX12 后端：shutdown() 内部要逐步写 [SHUTDOWN] 标记，
+    // 用于定位"窗口关了进程不退出"卡在哪一步。
+    ffx12::set_shutdown_trace_path(g_log_path.c_str());
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_frames_path = g_module_dir / L"Dx11FsrBridge.frames.jsonl";
     g_similarity_path = g_module_dir / L"Dx11FsrBridge.similarity.txt";
