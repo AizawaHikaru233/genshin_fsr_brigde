@@ -14,6 +14,7 @@
 #include "Fsr2FamilyTakeover.h"
 #include "Il2CppCallSiteHook.h"
 #include "Ffx12Backend.h"
+#include "BridgeLogger.h"
 // 旧方案（On12 引导 / FSR2 翻译层）已移除，不再编译。
 
 #include <algorithm>
@@ -103,7 +104,24 @@ struct Config
     bool enabled = true;
     bool enable_logging = false;
     // 日志等级（LogLevel）：0=仅错误 1=核心状态（默认） 2=节流细节 3=全量（trace）
+    // 已废弃（保留仅为兼容旧 ini / 旧代码读取）；实际过滤由 logging 决定。
     int log_level = 1;
+    // 日志系统配置（[Log] 段）。等级由调用点显式声明，不做内容推断。
+    struct LoggingConfig
+    {
+        blog::Level level = blog::Level::Info;
+        bool to_file = true;
+        bool to_debugger = false;
+        bool truncate_on_start = true;
+        // 兼容模式（**默认关**）：未迁移的旧 log_line 行按消息前缀归类。
+        // 打开后才有"按内容猜分类/等级"的行为——那是旧方案的遗留。新代码一律经
+        // LOG_* 宏显式声明；未迁移的 log_line 落到 core/INFO，**不会再被静默丢弃**。
+        bool compat_prefix_categories = false;
+        std::uint32_t max_file_kb = 16384;
+        std::uint32_t rotate_keep = 2;
+        std::vector<std::pair<std::string, blog::Level>> categories;
+    };
+    LoggingConfig logging;
     DWORD target_process_id = 0;
     std::wstring target_process_name;
     bool log_all_dispatch = false;
@@ -1400,11 +1418,11 @@ void toggle_recording_mode(int mode)
             g_similarity_archives[archive_label] = g_similarity;
             write_similarity_report_to_path_locked(similarity_path_for_label(archive_label), g_similarity, archive_label);
             write_similarity_diff_locked();
-            log_line("similarity_recording_saved label=" + archive_label + " dispatch=" + std::to_string(g_similarity.dispatch_count) +
+            LOG_INFO(blog::cat::probe, "similarity_recording_saved label=" + archive_label + " dispatch=" + std::to_string(g_similarity.dispatch_count) +
                 " draw=" + std::to_string(g_similarity.draw_count));
         }
         reset_similarity_locked();
-        log_line("similarity_recording_reset label=" + label);
+        LOG_INFO(blog::cat::probe, "similarity_recording_reset label=" + label);
     }
 
     if (stopped && !switched)
@@ -1414,7 +1432,7 @@ void toggle_recording_mode(int mode)
         write_similarity_report_to_path_locked(similarity_path_for_label(archive_label), g_similarity, archive_label);
         write_similarity_report_to_path_locked(g_similarity_path, g_similarity, archive_label);
         write_similarity_diff_locked();
-        log_line("similarity_recording_saved label=" + archive_label + " dispatch=" + std::to_string(g_similarity.dispatch_count) +
+        LOG_INFO(blog::cat::probe, "similarity_recording_saved label=" + archive_label + " dispatch=" + std::to_string(g_similarity.dispatch_count) +
             " draw=" + std::to_string(g_similarity.draw_count));
     }
 #endif
@@ -1463,7 +1481,7 @@ void clear_mode_samples()
     std::ofstream(similarity_path_for_label("SMAA"), std::ios::trunc).close();
 #endif
 
-    log_line("mode_calibration_and_similarity_cleared");
+    LOG_INFO(blog::cat::core, "mode_calibration_and_similarity_cleared");
     set_osd_text(L"Dx11FsrBridge OSD\n已清空全部记录");
 }
 
@@ -1475,7 +1493,7 @@ void poll_mode_hotkeys()
         const ULONGLONG now = GetTickCount64();
         g_texture_trace_count.store(0, std::memory_order_relaxed);
         g_texture_trace_until_tick.store(now + g_config.texture_trace_duration_ms, std::memory_order_relaxed);
-        log_line("texture_trace_started duration_ms=" + std::to_string(g_config.texture_trace_duration_ms) +
+        LOG_INFO(blog::cat::probe, "texture_trace_started duration_ms=" + std::to_string(g_config.texture_trace_duration_ms) +
             " main_base=" + hex64(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))));
     }
 #endif
@@ -2291,7 +2309,7 @@ void maybe_dump_source_history(
     std::ofstream out(output_path, std::ios::trunc);
     if (!out)
     {
-        log_line(std::string("fsr2_") + log_label + "_dump_failed open=0");
+        LOG_DEBUG(blog::cat::upscale, std::string("fsr2_") + log_label + "_dump_failed open=0");
         return;
     }
 
@@ -2359,7 +2377,7 @@ void maybe_dump_source_history(
         }
     }
     out << "]}";
-    log_line(std::string("fsr2_") + log_label + "_dumped target=" + hex64(target_resource_key) +
+    LOG_DEBUG(blog::cat::upscale, std::string("fsr2_") + log_label + "_dumped target=" + hex64(target_resource_key) +
         " writes=" + std::to_string(target_writes.size()) +
         " related=" + std::to_string(related_writes.size()));
 }
@@ -3185,7 +3203,7 @@ void log_interesting_dispatch_details(UINT group_x, UINT group_y, UINT group_z)
     }
 
     if (phase_reset)
-        log_line("dispatch_phase phase=" + std::to_string(phase));
+        LOG_INFO(blog::cat::core, "dispatch_phase phase=" + std::to_string(phase));
 
     if (should_emit)
     {
@@ -3200,82 +3218,53 @@ void log_interesting_dispatch_details(UINT group_x, UINT group_y, UINT group_z)
     }
 }
 
-// 日志等级推断（替代白名单过滤）：按内容性质分级，LogLevel 放行
-//   0 = 错误（failed/error/invalid/...）
-//   1 = 核心状态（接管结果/GPU/SDK/版本/渲染精度/警告/焦点框）
-//   2 = 节流细节（dispatch 计数/抖动/timing/路径/识别过程）
-//   3 = 其余全部（trace：每帧 present、hook 数据、快照等）
-static int log_line_level(const std::string &line)
+
+// ---------------------------------------------------------------------------
+// 日志等级推断（**已废弃**，仅保留供兼容模式参考）
+//
+// 旧方案按消息内容猜等级：error_terms/info_terms/debug_terms 三张词表，未命中返回 3。
+// 这个设计的根本问题是**不可预测**：新增一行日志若没人记得往词表里加，它就会静默消失
+// 为此白排查两轮）。现在等级由调用点经 LOG_* 宏显式声明，此函数不再参与过滤。
+// 兼容模式下（[Log] compat_prefix=1）仅用于给旧 log_line 行一个兜底等级。
+// ---------------------------------------------------------------------------
+static int log_line_level_compat(const std::string &line)
 {
-    static constexpr std::array<std::string_view, 11> error_terms {
-        "failed", "failure", "error", "invalid", "mismatch", "exception",
-        "unavailable", "unresolved", "unsupported", "missing", "refusing"
+    static constexpr std::array<std::string_view, 6> error_terms {
+        "failed", "failure", "error", "invalid", "unsupported", "missing"
     };
-    static constexpr std::array<std::string_view, 8> info_terms {
-        "ffx12_gpu", "ffx12_sdk", "ffx12_version", "ffx12_result", "ffx12_failed",
-        "render_scale_menu", "fsr2_on_demand_identify_fail", "fsr2_il2cpp_rva_feature_match"
-    };
-    static constexpr std::array<std::string_view, 9> debug_terms {
-        "ffx12_dispatch", "ffx12_path", "ffx12_adapter", "timing",
-        "jit_norm", "jitter_px", "warning ", "ffx12_token", "ffx12_native_dump"
-    };
-    if (line.starts_with("Dx11FsrBridge active"))
-        return 1;
     for (std::string_view term : error_terms)
         if (line.find(term) != std::string::npos)
             return 0;
-    if (line.starts_with("warning ") || line.find("unexpected") != std::string::npos)
+    if (line.starts_with("warning "))
         return 1;
-    for (std::string_view term : info_terms)
-        if (line.find(term) != std::string::npos)
-            return 1;
-    for (std::string_view term : debug_terms)
-        if (line.find(term) != std::string::npos)
-            return 2;
-    return 3;
+    return 1;
 }
 
 void log_line(const std::string &line)
 {
     if (!g_logging_enabled.load(std::memory_order_relaxed))
         return;
-    // 等级放行：LogLevel >= 行等级才写
-    if (g_config.log_level < log_line_level(line))
-        return;
-    std::lock_guard lock(g_log_mutex);
-    static std::ofstream out(g_log_path, std::ios::app); // 常驻流：避免每次写盘开/关
-    SYSTEMTIME st {};
-    GetLocalTime(&st);
-    char prefix[64] {};
-    std::snprintf(prefix, sizeof(prefix), "%04u-%02u-%02u %02u:%02u:%02u.%03u ",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    out << prefix << line << "\n";
+    // 未迁移的调用点统一走 core/INFO：**不会再被静默丢弃**。
+    // 旧方案在词表未命中时按 level 3 处理并被 LogLevel=2 丢弃——这正是
+    // "探针在跑却零输出"的根因。需要按前缀归类可开 [Log] compat_prefix=1。
+    blog::write(blog::Level::Info, blog::cat::core, line);
 }
 
 void reset_log()
 {
+    // 日志器自带"启动清空/轮转"，这里不再直接截断文件。
+    // 保留函数以兼容既有调用点；如需清空请重建日志器。
     if (!g_logging_enabled.load(std::memory_order_relaxed))
         return;
-    std::lock_guard lock(g_log_mutex);
-    std::ofstream(g_log_path, std::ios::trunc).close();
+    blog::write(blog::Level::Info, blog::cat::core, "log_reset_requested (由日志器统一管理轮转/清空)");
 }
 
-// 焦点区域行——等级 1（核心状态），默认 LogLevel=1 时可见；
-// 用于分隔线/空行/关键信息框（启动/接管结果焦点区）。
+// 焦点区域行——核心状态（INFO 级），用于分隔线/空行/关键信息框（启动/接管结果焦点区）。
 void log_focus_line(const std::string &line)
 {
     if (!g_logging_enabled.load(std::memory_order_relaxed))
         return;
-    if (g_config.log_level < 1)
-        return;
-    std::lock_guard lock(g_log_mutex);
-    static std::ofstream out(g_log_path, std::ios::app); // 常驻流：避免每次写盘开/关
-    SYSTEMTIME st {};
-    GetLocalTime(&st);
-    char prefix[64] {};
-    std::snprintf(prefix, sizeof(prefix), "%04u-%02u-%02u %02u:%02u:%02u.%03u ",
-                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    out << prefix << line << "\n";
+    blog::write(blog::Level::Info, blog::cat::core, line);
 }
 
 // 接管信息焦点框——显卡型号 / SDK 路径 / FSR 实际版本 相邻输出，
@@ -4007,16 +3996,69 @@ void load_config()
     }
     g_config.ffx12_fail_closed =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FailClosed", 0, config_path.c_str()) != 0;
-    // 日志等级模式（替代白名单过滤）：0=仅错误 1=核心状态 2=节流细节 3=全量
+    // -----------------------------------------------------------------------
+    // 日志配置。新方案：显式等级 + 分类过滤（[Log] 段），不做内容推断。
+    // 旧键 LogLevel=0..3 / Ffx12FullLogging 仍然兼容（映射到新等级），
+    // 但 [Log] 段优先——它支持按子系统单独放开（例如只把 probe 调到 debug）。
+    // -----------------------------------------------------------------------
     {
-        const int lv = static_cast<int>(
-            GetPrivateProfileIntW(L"Dx11FsrBridge", L"LogLevel", 1, config_path.c_str()));
-        g_config.log_level = std::clamp(lv, 0, 3);
+        const int legacy = std::clamp(static_cast<int>(
+            GetPrivateProfileIntW(L"Dx11FsrBridge", L"LogLevel", 1, config_path.c_str())), 0, 3);
+        // 旧的 0..3 → 新 Level：0=仅错误 1=核心(INFO) 2=节流细节(DEBUG) 3=全量(TRACE)
+        static constexpr blog::Level k_legacy_map[4] {
+            blog::Level::Error, blog::Level::Info, blog::Level::Debug, blog::Level::Trace
+        };
+        g_config.logging.level = k_legacy_map[legacy];
+        if (GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FullLogging", 0, config_path.c_str()) != 0)
+            g_config.logging.level = blog::Level::Trace;
+
+        wchar_t level_text[32] {};
+        GetPrivateProfileStringW(L"Log", L"level", L"", level_text,
+                                 static_cast<DWORD>(std::size(level_text)), config_path.c_str());
+        blog::Level parsed {};
+        if (level_text[0] != L'\0' && blog::parse_level(narrow(level_text).c_str(), parsed))
+            g_config.logging.level = parsed;
+
+        g_config.logging.to_debugger =
+            GetPrivateProfileIntW(L"Log", L"to_debugger", 0, config_path.c_str()) != 0;
+        g_config.logging.to_file =
+            GetPrivateProfileIntW(L"Log", L"to_file", 1, config_path.c_str()) != 0;
+        g_config.logging.truncate_on_start =
+            GetPrivateProfileIntW(L"Log", L"truncate_on_start", 1, config_path.c_str()) != 0;
+        g_config.logging.compat_prefix_categories =
+            GetPrivateProfileIntW(L"Log", L"compat_prefix", 0, config_path.c_str()) != 0;
+        g_config.logging.max_file_kb = std::clamp<std::uint32_t>(
+            static_cast<std::uint32_t>(
+                GetPrivateProfileIntW(L"Log", L"max_file_kb", 16384, config_path.c_str())),
+            0u, 4u * 1024u * 1024u);
+        g_config.logging.rotate_keep = std::clamp<std::uint32_t>(
+            static_cast<std::uint32_t>(
+                GetPrivateProfileIntW(L"Log", L"rotate_keep", 2, config_path.c_str())),
+            0u, 8u);
+
+        // 分类覆盖：[Log.Categories] 段，每行 category=level
+        wchar_t section[4096] {};
+        const DWORD section_len = GetPrivateProfileSectionW(
+            L"Log.Categories", section, static_cast<DWORD>(std::size(section)), config_path.c_str());
+        g_config.logging.categories.clear();
+        for (DWORD offset = 0; offset < section_len;)
+        {
+            const std::wstring row(section + offset);
+            offset += static_cast<DWORD>(row.size()) + 1;
+            if (row.empty())
+                continue;
+            const std::size_t eq = row.find(L'=');
+            if (eq == std::wstring::npos || eq == 0)
+                continue;
+            const std::wstring key = row.substr(0, eq);
+            const std::wstring value = row.substr(eq + 1);
+            blog::Level cat_level {};
+            if (blog::parse_level(narrow(value).c_str(), cat_level))
+                g_config.logging.categories.emplace_back(narrow(key), cat_level);
+        }
+        g_bridge_log_level = legacy; // 保留旧字段供兼容读取
     }
-    // 兼容旧配置：Ffx12FullLogging=1 等价 LogLevel=3（全量日志）
-    if (GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FullLogging", 0, config_path.c_str()) != 0)
-        g_config.log_level = 3;
-    g_bridge_log_level = g_config.log_level;
+
 #endif
 #else
     g_config.enabled = GetPrivateProfileIntW(L"Dx11FsrBridge", L"Enabled", 1, config_path.c_str()) != 0;
@@ -4386,7 +4428,7 @@ bool dump_fsr2_input_texture(
     view->GetDesc(&view_desc);
     if (view_desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D)
     {
-        log_line("fsr2_input_dump_unsupported slot=" + std::to_string(slot) +
+        LOG_DEBUG(blog::cat::upscale, "fsr2_input_dump_unsupported slot=" + std::to_string(slot) +
             " view_dimension=" + std::to_string(static_cast<std::uint32_t>(view_desc.ViewDimension)));
         return false;
     }
@@ -4411,7 +4453,7 @@ bool dump_fsr2_input_texture(
     const std::uint32_t bytes_per_pixel = format_bytes_per_pixel(source_desc.Format);
     if (bytes_per_pixel == 0 || source_desc.SampleDesc.Count != 1)
     {
-        log_line("fsr2_input_dump_unsupported slot=" + std::to_string(slot) +
+        LOG_DEBUG(blog::cat::upscale, "fsr2_input_dump_unsupported slot=" + std::to_string(slot) +
             " resource_format=" + std::to_string(static_cast<std::uint32_t>(source_desc.Format)) +
             " view_format=" + std::to_string(static_cast<std::uint32_t>(view_desc.Format)) +
             " samples=" + std::to_string(source_desc.SampleDesc.Count));
@@ -4437,7 +4479,7 @@ bool dump_fsr2_input_texture(
         device->Release();
     if (FAILED(result) || staging == nullptr)
     {
-        log_line("fsr2_input_dump_create_failed slot=" + std::to_string(slot) +
+        LOG_DEBUG(blog::cat::upscale, "fsr2_input_dump_create_failed slot=" + std::to_string(slot) +
             " hr=" + std::to_string(static_cast<long>(result)));
         texture->Release();
         return false;
@@ -4451,7 +4493,7 @@ bool dump_fsr2_input_texture(
     result = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(result))
     {
-        log_line("fsr2_input_dump_map_failed slot=" + std::to_string(slot) +
+        LOG_DEBUG(blog::cat::upscale, "fsr2_input_dump_map_failed slot=" + std::to_string(slot) +
             " hr=" + std::to_string(static_cast<long>(result)));
         staging->Release();
         return false;
@@ -4492,7 +4534,7 @@ bool dump_fsr2_input_texture(
             << ",\"row_bytes\":" << row_bytes << "}";
     }
 
-    log_line("fsr2_input_dumped slot=" + std::to_string(slot) +
+    LOG_DEBUG(blog::cat::upscale, "fsr2_input_dumped slot=" + std::to_string(slot) +
         " name=" + narrow(output_stem) +
         " size=" + std::to_string(width) + "x" + std::to_string(height) +
         " resource_format=" + std::to_string(static_cast<std::uint32_t>(source_desc.Format)) +
@@ -4514,7 +4556,7 @@ bool dump_fsr2_render_target_texture(
     render_target->GetDesc(&render_target_desc);
     if (render_target_desc.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D)
     {
-        log_line("fsr2_output_dump_unsupported slot=" + std::to_string(slot) +
+        LOG_DEBUG(blog::cat::upscale, "fsr2_output_dump_unsupported slot=" + std::to_string(slot) +
             " view_dimension=" +
             std::to_string(static_cast<std::uint32_t>(render_target_desc.ViewDimension)));
         return false;
@@ -4551,7 +4593,7 @@ bool dump_fsr2_render_target_texture(
     texture->Release();
     if (FAILED(create_result) || view == nullptr)
     {
-        log_line("fsr2_output_dump_view_failed slot=" + std::to_string(slot) +
+        LOG_DEBUG(blog::cat::upscale, "fsr2_output_dump_view_failed slot=" + std::to_string(slot) +
             " hr=" + std::to_string(static_cast<long>(create_result)));
         return false;
     }
@@ -4585,7 +4627,7 @@ bool write_fsr2_constant_buffer_dump(
             << ",\"source\":\"" << source << "\"}";
     }
 
-    log_line("fsr2_input_dumped_cb0 bytes=" + std::to_string(size) +
+    LOG_DEBUG(blog::cat::upscale, "fsr2_input_dumped_cb0 bytes=" + std::to_string(size) +
         " resource=" + hex64(resource_key) + " source=" + source);
     return raw.good();
 }
@@ -4595,7 +4637,7 @@ bool dump_fsr2_constant_buffer(std::uint64_t resource_key)
     const std::vector<std::uint8_t> snapshot = lookup_buffer_snapshot(resource_key);
     if (snapshot.empty())
     {
-        log_line("fsr2_input_dump_cb0_missing resource=" + hex64(resource_key));
+        LOG_DEBUG(blog::cat::upscale, "fsr2_input_dump_cb0_missing resource=" + hex64(resource_key));
         return false;
     }
     return write_fsr2_constant_buffer_dump(
@@ -4625,7 +4667,7 @@ bool dump_fsr2_bound_constant_buffer(
         device->Release();
     if (FAILED(result) || staging == nullptr)
     {
-        log_line("fsr2_input_dump_cb0_create_failed bytes=" + std::to_string(source_desc.ByteWidth) +
+        LOG_DEBUG(blog::cat::upscale, "fsr2_input_dump_cb0_create_failed bytes=" + std::to_string(source_desc.ByteWidth) +
             " hr=" + std::to_string(static_cast<long>(result)));
         return false;
     }
@@ -4635,7 +4677,7 @@ bool dump_fsr2_bound_constant_buffer(
     result = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(result))
     {
-        log_line("fsr2_input_dump_cb0_map_failed bytes=" + std::to_string(source_desc.ByteWidth) +
+        LOG_DEBUG(blog::cat::upscale, "fsr2_input_dump_cb0_map_failed bytes=" + std::to_string(source_desc.ByteWidth) +
             " hr=" + std::to_string(static_cast<long>(result)));
         staging->Release();
         return false;
@@ -4698,7 +4740,7 @@ void maybe_dump_color_candidate_inputs(ID3D11DeviceContext *context, UINT elemen
     }
     else
     {
-        log_line("fsr2_input_dump_cb0_unbound");
+        LOG_DEBUG(blog::cat::upscale, "fsr2_input_dump_cb0_unbound");
     }
     g_fsr2_candidate_color_resource.store(candidate_color.resource_key, std::memory_order_relaxed);
     g_fsr2_candidate_sequence.store(g_color_source_sequence.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -4709,7 +4751,7 @@ void maybe_dump_color_candidate_inputs(ID3D11DeviceContext *context, UINT elemen
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     maybe_dump_color_source_history(context, candidate_color.resource_key);
 #endif
-    log_line("fsr2_color_candidate_dumped shader=" +
+    LOG_DEBUG(blog::cat::upscale, "fsr2_color_candidate_dumped shader=" +
         hex64(g_current_ps_hash.load(std::memory_order_relaxed)) +
         " output=" + hex64(target->resource_key));
 }
@@ -4949,7 +4991,7 @@ void capture_runtime_snapshot_if_requested()
         g_texture_trace_count.store(0, std::memory_order_relaxed);
         g_texture_trace_until_tick.store(now + g_config.texture_trace_duration_ms, std::memory_order_relaxed);
 #endif
-        log_line("texture_trace_started source=F12 duration_ms=" + std::to_string(g_config.texture_trace_duration_ms) +
+        LOG_INFO(blog::cat::probe, "texture_trace_started source=F12 duration_ms=" + std::to_string(g_config.texture_trace_duration_ms) +
             " main_base=" + hex64(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))));
     }
 
@@ -5121,7 +5163,7 @@ HRESULT STDMETHODCALLTYPE hooked_output_get_desc1(IDXGIOutput6 *output, DXGI_OUT
     if (call_index >= k_log_limit)
     {
         if (!g_hdr_output_desc_probe_suppressed_logged.exchange(true, std::memory_order_relaxed))
-            log_line("hdr_output_desc_probe query log limit reached");
+            LOG_DEBUG(blog::cat::probe, "hdr_output_desc_probe query log limit reached");
         return result;
     }
 
@@ -5159,7 +5201,7 @@ void install_hdr_output_desc_probe_from_adapter(IDXGIAdapter *adapter)
     const HRESULT enum_result = adapter->EnumOutputs(0, &output);
     if (FAILED(enum_result) || output == nullptr)
     {
-        log_line("hdr_output_desc_probe install_failed stage=EnumOutputs hr=" +
+        LOG_DEBUG(blog::cat::probe, "hdr_output_desc_probe install_failed stage=EnumOutputs hr=" +
             hex64(static_cast<std::uint32_t>(enum_result)));
         return;
     }
@@ -5170,7 +5212,7 @@ void install_hdr_output_desc_probe_from_adapter(IDXGIAdapter *adapter)
     output->Release();
     if (FAILED(query_result) || output6 == nullptr)
     {
-        log_line("hdr_output_desc_probe install_failed stage=QueryInterface hr=" +
+        LOG_DEBUG(blog::cat::probe, "hdr_output_desc_probe install_failed stage=QueryInterface hr=" +
             hex64(static_cast<std::uint32_t>(query_result)));
         return;
     }
@@ -5180,7 +5222,7 @@ void install_hdr_output_desc_probe_from_adapter(IDXGIAdapter *adapter)
     output6->Release();
     if (g_original_output_get_desc1 == nullptr)
     {
-        log_line("hdr_output_desc_probe install_failed stage=vtable");
+        LOG_DEBUG(blog::cat::probe, "hdr_output_desc_probe install_failed stage=vtable");
         return;
     }
 
@@ -5197,11 +5239,11 @@ void install_hdr_output_desc_probe_from_adapter(IDXGIAdapter *adapter)
 
     if (status == NO_ERROR)
     {
-        log_line("hdr_output_desc_probe installed method=IDXGIOutput6.GetDesc1");
+        LOG_DEBUG(blog::cat::probe, "hdr_output_desc_probe installed method=IDXGIOutput6.GetDesc1");
     }
     else
     {
-        log_line("hdr_output_desc_probe install_failed stage=Detours error=" + std::to_string(status));
+        LOG_DEBUG(blog::cat::probe, "hdr_output_desc_probe install_failed stage=Detours error=" + std::to_string(status));
         g_original_output_get_desc1 = nullptr;
     }
 }
@@ -5244,7 +5286,7 @@ void install_create_hooks_for_loaded_modules()
         log_line(summary);
         if (swapchain_hooks == 0 && device_hooks == 0)
         {
-            log_line("warning no d3d11 create import hooks found; possible reasons: already-created device, GetProcAddress path, or module loaded later");
+            LOG_WARN(blog::cat::core, "warning no d3d11 create import hooks found; possible reasons: already-created device, GetProcAddress path, or module loaded later");
         }
     }
 }
@@ -5465,7 +5507,7 @@ bool matches_final_scene_boundary(
             vertex_shader_hash == k_final_scene_vs &&
             !logged_expected_shader_mismatch.exchange(true, std::memory_order_relaxed))
         {
-            log_line("final_scene_optifg_boundary_rejected target=" + hex64(target.resource_key) +
+            LOG_INFO(blog::cat::probe, "final_scene_optifg_boundary_rejected target=" + hex64(target.resource_key) +
                 " backbuffer=" + std::to_string(is_backbuffer ? 1 : 0) +
                 " size=" + std::to_string(target.width) + "x" + std::to_string(target.height) +
                 " viewport=" + std::to_string(viewport_width) + "x" + std::to_string(viewport_height));
@@ -5505,7 +5547,7 @@ void queue_final_scene_snapshot(ID3D11DeviceContext *context, std::uint64_t fram
         resource->Release();
     if (FAILED(source_result) || source == nullptr)
     {
-        log_line("final_scene_snapshot_source_failed hr=" +
+        LOG_INFO(blog::cat::probe, "final_scene_snapshot_source_failed hr=" +
             std::to_string(static_cast<std::uint32_t>(source_result)));
         return;
     }
@@ -5556,7 +5598,7 @@ void queue_final_scene_snapshot(ID3D11DeviceContext *context, std::uint64_t fram
             {
                 g_final_scene_snapshot.texture->Release();
                 g_final_scene_snapshot.texture = nullptr;
-                log_line("final_scene_snapshot_query_create_failed hr=" +
+                LOG_INFO(blog::cat::probe, "final_scene_snapshot_query_create_failed hr=" +
                     std::to_string(static_cast<std::uint32_t>(query_result)));
             }
         }
@@ -5565,7 +5607,7 @@ void queue_final_scene_snapshot(ID3D11DeviceContext *context, std::uint64_t fram
         if (FAILED(texture_result) || g_final_scene_snapshot.texture == nullptr ||
             g_final_scene_snapshot.completion_query == nullptr)
         {
-            log_line("final_scene_snapshot_texture_create_failed hr=" +
+            LOG_INFO(blog::cat::probe, "final_scene_snapshot_texture_create_failed hr=" +
                 std::to_string(static_cast<std::uint32_t>(texture_result)));
             source->Release();
             return;
@@ -5573,7 +5615,7 @@ void queue_final_scene_snapshot(ID3D11DeviceContext *context, std::uint64_t fram
         g_final_scene_snapshot.width = source_desc.Width;
         g_final_scene_snapshot.height = source_desc.Height;
         g_final_scene_snapshot.format = source_desc.Format;
-        log_line("final_scene_snapshot_resources_created size=" +
+        LOG_INFO(blog::cat::probe, "final_scene_snapshot_resources_created size=" +
             std::to_string(source_desc.Width) + "x" + std::to_string(source_desc.Height) +
             " format=" + std::to_string(static_cast<std::uint32_t>(source_desc.Format)));
     }
@@ -5589,7 +5631,7 @@ void queue_final_scene_snapshot(ID3D11DeviceContext *context, std::uint64_t fram
     g_final_scene_snapshot.queued_frame = frame_index;
     g_final_scene_snapshot.queued_count++;
     g_final_scene_snapshot.pending = true;
-    log_line("final_scene_snapshot_queued frame=" + std::to_string(frame_index) +
+    LOG_INFO(blog::cat::probe, "final_scene_snapshot_queued frame=" + std::to_string(frame_index) +
         " count=" + std::to_string(g_final_scene_snapshot.queued_count) +
         " source=post_scene_pre_ui");
 }
@@ -5615,7 +5657,7 @@ void submit_final_scene_to_optiscaler(ID3D11DeviceContext *context, std::uint64_
     if (submit == nullptr)
     {
         if (!missing_export_logged.exchange(true, std::memory_order_relaxed))
-            log_line("final_scene_optifg_input_unavailable export=OptiScalerSubmitFinalSceneD3D11");
+            LOG_INFO(blog::cat::probe, "final_scene_optifg_input_unavailable export=OptiScalerSubmitFinalSceneD3D11");
         return;
     }
 
@@ -5636,7 +5678,7 @@ void submit_final_scene_to_optiscaler(ID3D11DeviceContext *context, std::uint64_
         const std::uint64_t count = accepted_count.fetch_add(1, std::memory_order_relaxed) + 1;
         if (count == 1 || count % 240 == 0)
         {
-            log_line("final_scene_optifg_input_accepted frame=" + std::to_string(frame_index) +
+            LOG_INFO(blog::cat::probe, "final_scene_optifg_input_accepted frame=" + std::to_string(frame_index) +
                 " count=" + std::to_string(count));
         }
     }
@@ -5668,7 +5710,7 @@ void poll_final_scene_snapshot(IDXGISwapChain *swapchain)
     {
         g_final_scene_snapshot.pending = false;
         g_final_scene_snapshot.completed_count++;
-        log_line("final_scene_snapshot_complete frame=" +
+        LOG_INFO(blog::cat::probe, "final_scene_snapshot_complete frame=" +
             std::to_string(g_final_scene_snapshot.queued_frame) +
             " queued=" + std::to_string(g_final_scene_snapshot.queued_count) +
             " completed=" + std::to_string(g_final_scene_snapshot.completed_count));
@@ -5899,7 +5941,7 @@ void record_hdr_composite_candidate(UINT element_count, bool indexed)
     }
 
     const std::uint32_t index = g_hdr_composite_probe_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    log_line("hdr_composite_candidate index=" + std::to_string(index) +
+    LOG_DEBUG(blog::cat::probe, "hdr_composite_candidate index=" + std::to_string(index) +
         " frame=" + std::to_string(frame_index) +
         " draw=" + std::string(indexed ? "indexed" : "nonindexed") +
         " elements=" + std::to_string(element_count) +
@@ -5938,7 +5980,7 @@ void record_hdr_composite_copy(const ResourceInfo &destination, const ResourceIn
     }
 
     const std::uint32_t index = g_hdr_composite_probe_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    log_line("hdr_composite_copy index=" + std::to_string(index) +
+    LOG_DEBUG(blog::cat::probe, "hdr_composite_copy index=" + std::to_string(index) +
         " kind=" + kind +
         " source=" + hex64(source.resource_key) +
         " source_size=" + std::to_string(source.width) + "x" + std::to_string(source.height) +
@@ -5974,7 +6016,7 @@ void record_hdr_composite_target_bind(const ResourceInfo &target)
     }
 
     const std::uint32_t index = g_hdr_composite_probe_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    log_line("hdr_composite_target_bind index=" + std::to_string(index) +
+    LOG_DEBUG(blog::cat::probe, "hdr_composite_target_bind index=" + std::to_string(index) +
         " target=" + hex64(target.resource_key) +
         " format=" + describe_dxgi_format(target.format) +
         " size=" + std::to_string(target.width) + "x" + std::to_string(target.height) +
@@ -6241,7 +6283,7 @@ bool acquire_hdr_sdr_tone_map_draw_resources(
                 &resources.pixel_shader);
         if (FAILED(shader_result) || resources.pixel_shader == nullptr)
         {
-            log_line("hdr_sdr_tone_map_draw_shader_create_failed hr=" +
+            LOG_DEBUG(blog::cat::hdr, "hdr_sdr_tone_map_draw_shader_create_failed hr=" +
                 std::to_string(static_cast<long>(shader_result)));
             release_hdr_sdr_tone_map_draw_resources_locked();
             return false;
@@ -6256,12 +6298,12 @@ bool acquire_hdr_sdr_tone_map_draw_resources(
             : resources.device->CreateBuffer(&buffer_desc, nullptr, &resources.constants);
         if (FAILED(buffer_result) || resources.constants == nullptr)
         {
-            log_line("hdr_sdr_tone_map_draw_constants_create_failed hr=" +
+            LOG_DEBUG(blog::cat::hdr, "hdr_sdr_tone_map_draw_constants_create_failed hr=" +
                 std::to_string(static_cast<long>(buffer_result)));
             release_hdr_sdr_tone_map_draw_resources_locked();
             return false;
         }
-        log_line("hdr_sdr_tone_map_draw_resources_ready");
+        LOG_DEBUG(blog::cat::hdr, "hdr_sdr_tone_map_draw_resources_ready");
     }
 
     resources.pixel_shader->AddRef();
@@ -6310,7 +6352,7 @@ bool ensure_hdr_sdr_tone_map_resources_locked(
         HRESULT result = device->CreateTexture2D(&source_desc, nullptr, &resources.source_copy);
         if (FAILED(result) || resources.source_copy == nullptr)
         {
-            log_line("hdr_sdr_tone_map_source_create_failed hr=" + std::to_string(static_cast<long>(result)) +
+            LOG_DEBUG(blog::cat::hdr, "hdr_sdr_tone_map_source_create_failed hr=" + std::to_string(static_cast<long>(result)) +
                 " format=" + describe_dxgi_format(target_desc.Format));
             release_hdr_sdr_tone_map_resources_locked();
             return false;
@@ -6324,7 +6366,7 @@ bool ensure_hdr_sdr_tone_map_resources_locked(
         result = device->CreateShaderResourceView(resources.source_copy, &view_desc, &resources.source_view);
         if (FAILED(result) || resources.source_view == nullptr)
         {
-            log_line("hdr_sdr_tone_map_srv_create_failed hr=" + std::to_string(static_cast<long>(result)));
+            LOG_DEBUG(blog::cat::hdr, "hdr_sdr_tone_map_srv_create_failed hr=" + std::to_string(static_cast<long>(result)));
             release_hdr_sdr_tone_map_resources_locked();
             return false;
         }
@@ -6336,7 +6378,7 @@ bool ensure_hdr_sdr_tone_map_resources_locked(
         result = device->CreateRenderTargetView(resources.source_copy, &target_view_desc, &resources.source_target_view);
         if (FAILED(result) || resources.source_target_view == nullptr)
         {
-            log_line("hdr_sdr_tone_map_intermediate_rtv_create_failed hr=" + std::to_string(static_cast<long>(result)));
+            LOG_DEBUG(blog::cat::hdr, "hdr_sdr_tone_map_intermediate_rtv_create_failed hr=" + std::to_string(static_cast<long>(result)));
             release_hdr_sdr_tone_map_resources_locked();
             return false;
         }
@@ -6352,7 +6394,7 @@ bool ensure_hdr_sdr_tone_map_resources_locked(
         }
         if (FAILED(result) || resources.vertex_shader == nullptr || resources.pixel_shader == nullptr)
         {
-            log_line("hdr_sdr_tone_map_shader_create_failed hr=" + std::to_string(static_cast<long>(result)));
+            LOG_DEBUG(blog::cat::hdr, "hdr_sdr_tone_map_shader_create_failed hr=" + std::to_string(static_cast<long>(result)));
             release_hdr_sdr_tone_map_resources_locked();
             return false;
         }
@@ -6375,12 +6417,12 @@ bool ensure_hdr_sdr_tone_map_resources_locked(
         }
         if (FAILED(result) || resources.sampler == nullptr || resources.constants == nullptr)
         {
-            log_line("hdr_sdr_tone_map_state_create_failed hr=" + std::to_string(static_cast<long>(result)));
+            LOG_DEBUG(blog::cat::hdr, "hdr_sdr_tone_map_state_create_failed hr=" + std::to_string(static_cast<long>(result)));
             release_hdr_sdr_tone_map_resources_locked();
             return false;
         }
 
-        log_line("hdr_sdr_tone_map_resources_created size=" +
+        LOG_DEBUG(blog::cat::hdr, "hdr_sdr_tone_map_resources_created size=" +
             std::to_string(target_desc.Width) + "x" + std::to_string(target_desc.Height) +
             " format=" + describe_dxgi_format(target_desc.Format));
     }
@@ -6652,7 +6694,7 @@ void tone_map_hdr_backbuffer_to_sdr(IDXGISwapChain *swapchain, std::uint64_t fra
 
     if (!g_hdr_sdr_tone_map_logged.exchange(true, std::memory_order_relaxed))
     {
-        log_line("hdr_sdr_tone_map_active frame=" + std::to_string(frame_index) +
+        LOG_DEBUG(blog::cat::hdr, "hdr_sdr_tone_map_active frame=" + std::to_string(frame_index) +
             " paper_white=" + std::to_string(g_config.hdr_sdr_tone_map_paper_white) +
             " peak=" + std::to_string(g_config.hdr_sdr_tone_map_peak) +
             " pq_input=" + std::to_string(g_config.hdr_sdr_tone_map_pq_input ? 1 : 0));
@@ -6672,7 +6714,7 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
     if (fsr2_query_mask != last_fsr2_query_mask)
     {
         last_fsr2_query_mask = fsr2_query_mask;
-        log_line("server_debug_fsr2_queries mask=" + hex64(fsr2_query_mask) +
+        LOG_INFO(blog::cat::core, "server_debug_fsr2_queries mask=" + hex64(fsr2_query_mask) +
             " create=" + std::to_string((fsr2_query_mask & (1u << 0)) != 0) +
             " dispatch=" + std::to_string((fsr2_query_mask & (1u << 1)) != 0) +
             " destroy=" + std::to_string((fsr2_query_mask & (1u << 2)) != 0) +
@@ -6709,7 +6751,7 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
 #endif
 
     if (g_logging_enabled.load(std::memory_order_relaxed))
-        log_line("present frame=" + std::to_string(frame_index) +
+        LOG_INFO(blog::cat::core, "present frame=" + std::to_string(frame_index) +
             " size=" + std::to_string(backbuffer_width) + "x" + std::to_string(backbuffer_height));
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME) && defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     static std::atomic_uint64_t last_runtime_status_tick { 0 };
@@ -6718,7 +6760,7 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
     if (now - last_tick >= 5000 &&
         last_runtime_status_tick.compare_exchange_strong(last_tick, now, std::memory_order_relaxed))
     {
-        log_line("fsr2_runtime_status frame=" + std::to_string(frame_index) +
+        LOG_DEBUG(blog::cat::upscale, "fsr2_runtime_status frame=" + std::to_string(frame_index) +
             " candidates=" + std::to_string(g_fsr2_translation_candidate_count.load(std::memory_order_relaxed)) +
             " dispatches=" + std::to_string(g_fsr2_translation_dispatch_count.load(std::memory_order_relaxed)) +
             " failures=" + std::to_string(g_fsr2_translation_failure_count.load(std::memory_order_relaxed))); // ：旧 shim 已移除
@@ -6748,7 +6790,7 @@ HRESULT STDMETHODCALLTYPE hooked_set_fullscreen_state(IDXGISwapChain *swapchain,
         const std::uint64_t count = skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
         if (count == 1 || count % 16 == 0)
         {
-            log_line("dlssg_dxgi_workaround skip_set_fullscreen_state fullscreen=0 count=" +
+            LOG_INFO(blog::cat::coexist, "dlssg_dxgi_workaround skip_set_fullscreen_state fullscreen=0 count=" +
                 std::to_string(count) + " target=" + hex64(reinterpret_cast<std::uint64_t>(target)));
         }
         return S_OK;
@@ -6778,7 +6820,7 @@ HRESULT STDMETHODCALLTYPE hooked_resize_buffers(
     if (g_config.native_ldr_swapchain_unorm && format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
     {
         effective_format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        log_line("native_ldr_resize_buffers_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM");
+        LOG_INFO(blog::cat::core, "native_ldr_resize_buffers_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM");
     }
     if (dlssg_dxgi_workaround_active() && swapchain != nullptr)
     {
@@ -6797,7 +6839,7 @@ HRESULT STDMETHODCALLTYPE hooked_resize_buffers(
                 const std::uint64_t count = skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (count == 1 || count % 16 == 0)
                 {
-                    log_line("dlssg_dxgi_workaround skip_noop_resize_buffers count=" +
+                    LOG_INFO(blog::cat::coexist, "dlssg_dxgi_workaround skip_noop_resize_buffers count=" +
                         std::to_string(count) + " request=" +
                         std::to_string(buffer_count) + "/" + std::to_string(width) + "x" +
                         std::to_string(height) + " fmt=" + std::to_string(static_cast<UINT>(format)) +
@@ -6844,7 +6886,7 @@ HRESULT STDMETHODCALLTYPE hooked_resize_target(IDXGISwapChain *swapchain, const 
                     std::to_string(target_parameters->Height) + " fmt=" +
                     std::to_string(static_cast<UINT>(target_parameters->Format));
             }
-            log_line("dlssg_dxgi_workaround skip_resize_target count=" +
+            LOG_INFO(blog::cat::coexist, "dlssg_dxgi_workaround skip_resize_target count=" +
                 std::to_string(count) + " target=" + detail);
         }
         return S_OK;
@@ -6891,7 +6933,7 @@ HRESULT STDMETHODCALLTYPE hooked_check_color_space_support(
 #endif
     if (should_log)
     {
-        log_line("dxgi_color_check swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)) +
+        LOG_DEBUG(blog::cat::hook, "dxgi_color_check swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)) +
             " caller=" + module_path_from_address(caller) +
             " requested=" + std::to_string(static_cast<unsigned>(color_space)) + "/" + color_space_name(color_space) +
             " physical_hr=" + hex64(static_cast<std::uint32_t>(physical_hr)) +
@@ -6921,7 +6963,7 @@ HRESULT STDMETHODCALLTYPE hooked_set_color_space1(
 #endif
     if (should_log)
     {
-        log_line("dxgi_color_set swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)) +
+        LOG_DEBUG(blog::cat::hook, "dxgi_color_set swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)) +
             " caller=" + module_path_from_address(caller) +
             " requested=" + std::to_string(static_cast<unsigned>(color_space)) + "/" + color_space_name(color_space) +
             " physical=" + std::to_string(static_cast<unsigned>(physical_color_space)) + "/" + color_space_name(physical_color_space) +
@@ -6983,7 +7025,7 @@ void apply_hdr_swapchain_force(IDXGISwapChain *swapchain)
     if (FAILED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3))) ||
         swapchain3 == nullptr)
     {
-        log_line("dxgi_hdr_force unavailable reason=no_IDXGISwapChain3");
+        LOG_DEBUG(blog::cat::hdr, "dxgi_hdr_force unavailable reason=no_IDXGISwapChain3");
         return;
     }
 
@@ -6994,7 +7036,7 @@ void apply_hdr_swapchain_force(IDXGISwapChain *swapchain)
     if (SUCCEEDED(check_hr) && (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0)
         set_hr = swapchain3->SetColorSpace1(requested_color_space);
 
-    log_line("dxgi_hdr_force requested=" + std::to_string(static_cast<unsigned>(requested_color_space)) + "/" +
+    LOG_DEBUG(blog::cat::hdr, "dxgi_hdr_force requested=" + std::to_string(static_cast<unsigned>(requested_color_space)) + "/" +
         color_space_name(requested_color_space) +
         " check_hr=" + hex64(static_cast<std::uint32_t>(check_hr)) +
         " support=" + hex64(support) +
@@ -7210,11 +7252,11 @@ void ensure_context_device_texture_hook(ID3D11DeviceContext *context)
     if (first_attempt)
     {
         void **device_vtable = *reinterpret_cast<void ***>(device);
-        log_line("device_create_texture_entry device=" + hex64(device_key) +
+        LOG_INFO(blog::cat::core, "device_create_texture_entry device=" + hex64(device_key) +
             " entry=" + hex64(reinterpret_cast<std::uintptr_t>(device_vtable[k_idx_device_create_texture_2d])) +
             " expected=" + hex64(reinterpret_cast<std::uintptr_t>(&hooked_create_texture_2d)));
         install_device_hooks(device);
-        log_line("context_device_texture_hook device=" + hex64(device_key));
+        LOG_DEBUG(blog::cat::hook, "context_device_texture_hook device=" + hex64(device_key));
     }
     device->Release();
 }
@@ -7303,7 +7345,7 @@ void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_
 #endif
 
     if (g_config.log_all_dispatch)
-        log_line("dispatch groups=" + std::to_string(group_x) + "x" + std::to_string(group_y) + "x" + std::to_string(group_z));
+        LOG_INFO(blog::cat::core, "dispatch groups=" + std::to_string(group_x) + "x" + std::to_string(group_y) + "x" + std::to_string(group_z));
 
     if (g_config.log_interesting_dispatch_details && should_log_interesting_dispatch(group_x, group_y, group_z))
         log_interesting_dispatch_details(group_x, group_y, group_z);
@@ -7311,7 +7353,7 @@ void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (const auto candidate = build_dispatch_candidate(group_x, group_y, group_z))
     {
-        log_line("fsr_candidate frame=" + std::to_string(candidate->frame_index) +
+        LOG_INFO(blog::cat::core, "fsr_candidate frame=" + std::to_string(candidate->frame_index) +
             " render=" + std::to_string(candidate->render_width) + "x" + std::to_string(candidate->render_height) +
             " output=" + std::to_string(candidate->output_width) + "x" + std::to_string(candidate->output_height) +
             " cs=" + hex64(candidate->compute_shader) +
@@ -7473,7 +7515,7 @@ void register_cb0_for_jitter(ID3D11Buffer *constant_buffer)
             registered.byte_width = desc.ByteWidth;
             registered.bind_flags = desc.BindFlags;
             registered.usage = desc.Usage;
-            log_line("mode2_on_demand_cb0_registered key=" + hex64(key) +
+            LOG_DEBUG(blog::cat::upscale, "mode2_on_demand_cb0_registered key=" + hex64(key) +
                 " bytes=" + std::to_string(desc.ByteWidth));
         }
     }
@@ -7682,7 +7724,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(UINT element_
         if (!fallback_shader_logged.load(std::memory_order_relaxed) &&
             !fallback_shader_logged.exchange(true, std::memory_order_relaxed))
         {
-            log_line("target_upscaler_signature_fallback ps=" + hex64(g_state.current_ps_hash) +
+            LOG_DEBUG(blog::cat::upscale, "target_upscaler_signature_fallback ps=" + hex64(g_state.current_ps_hash) +
                 " configured=" + hex64(g_config.target_pixel_shader_hash));
         }
     }
@@ -7693,7 +7735,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(UINT element_
     {
         g_mode2_fast_target_ps_hash.store(g_state.current_ps_hash, std::memory_order_relaxed);
         g_mode2_fast_target_ps_key.store(g_state.current_ps_shader, std::memory_order_relaxed);
-        log_line("mode2_fast_target_learned ps=" + hex64(g_state.current_ps_hash));
+        LOG_DEBUG(blog::cat::upscale, "mode2_fast_target_learned ps=" + hex64(g_state.current_ps_hash));
     }
 #endif
 
@@ -7722,7 +7764,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         if (now - last < 5000 ||
             !on_demand_fail_tick.compare_exchange_strong(last, now, std::memory_order_relaxed))
             return;
-        log_line("fsr2_on_demand_identify_fail " + detail);
+        LOG_DEBUG(blog::cat::upscale, "fsr2_on_demand_identify_fail " + detail);
     };
 
     std::array<ID3D11RenderTargetView *, 2> render_targets {};
@@ -7781,7 +7823,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     const auto stage_log = [](std::string &&msg) {
         if (on_demand_stage_count.fetch_add(1, std::memory_order_relaxed) >= 16)
             return;
-        log_line("fsr2_stage " + msg);
+        LOG_DEBUG(blog::cat::upscale, "fsr2_stage " + msg);
     };
     stage_log(std::string("identify_begin single_rtv=") + (single_rtv ? "1" : "0"));
 
@@ -7965,7 +8007,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     if (!identified_logged.load(std::memory_order_relaxed) &&
         !identified_logged.exchange(true, std::memory_order_relaxed))
     {
-        log_line("mode2_on_demand_target_identified render=" +
+        LOG_DEBUG(blog::cat::upscale, "mode2_on_demand_target_identified render=" +
             std::to_string(identified->render_width) + "x" + std::to_string(identified->render_height) +
             " output=" + std::to_string(identified->output_width) + "x" + std::to_string(identified->output_height) +
             " cb0=" + hex64(constant_buffer_key));
@@ -8137,7 +8179,7 @@ bool dlssg_framegen_selected()
         if (!logged_active)
         {
             logged_active = true;
-            log_line("dlssg_dxgi_workaround auto_enabled optiscaler_ini=" +
+            LOG_INFO(blog::cat::coexist, "dlssg_dxgi_workaround auto_enabled optiscaler_ini=" +
                 narrow(ini_path.wstring()) + " fg_output=" + narrow(output));
         }
         break;
@@ -8185,7 +8227,7 @@ void maybe_dump_same_frame_fsr2_inputs(ID3D11DeviceContext *context, UINT elemen
             view->Release();
     }
 
-    log_line("fsr2_same_frame_inputs_dumped raw_color=" +
+    LOG_DEBUG(blog::cat::upscale, "fsr2_same_frame_inputs_dumped raw_color=" +
         hex64(g_fsr2_candidate_color_resource.load(std::memory_order_relaxed)) +
         " late_color=" + hex64(draw_info->color_resource_key) +
         " sequence_begin=" + std::to_string(g_fsr2_candidate_sequence.load(std::memory_order_relaxed)) +
@@ -8369,7 +8411,7 @@ void observe_fsr2_dynamic_color_target(const TargetUpscalerDrawInfo &draw_info)
     if (dimensions_changed)
     {
         invalidate_fsr2_dynamic_color_path();
-        log_line("fsr2_dynamic_color_path_invalidated reason=dimensions_changed render=" +
+        LOG_DEBUG(blog::cat::upscale, "fsr2_dynamic_color_path_invalidated reason=dimensions_changed render=" +
             std::to_string(draw_info.render_width) + "x" + std::to_string(draw_info.render_height) +
             " output=" + std::to_string(draw_info.output_width) + "x" +
             std::to_string(draw_info.output_height));
@@ -8491,7 +8533,7 @@ void poll_fsr2_transient_capture_hotkey()
         g_fsr2_transient_capture_session.fetch_add(1, std::memory_order_relaxed) + 1;
     g_fsr2_transient_capture_sample.store(0, std::memory_order_relaxed);
     g_fsr2_transient_capture_frames_remaining.store(90, std::memory_order_release);
-    log_line("fsr2_transient_capture_started session=" + std::to_string(session) +
+    LOG_DEBUG(blog::cat::probe, "fsr2_transient_capture_started session=" + std::to_string(session) +
         " samples=90 snapshot_interval=10 hotkey=F11");
 }
 
@@ -8678,7 +8720,7 @@ bool begin_fsr2_transient_capture(
     }
 
     if (remaining == 1)
-        log_line("fsr2_transient_capture_target_sequence_complete session=" + std::to_string(session));
+        LOG_DEBUG(blog::cat::probe, "fsr2_transient_capture_target_sequence_complete session=" + std::to_string(session));
     return true;
 }
 
@@ -8855,14 +8897,14 @@ bool acquire_fsr2_color_replay_output(
                 g_fsr2_color_replay_output->Release();
                 g_fsr2_color_replay_output = nullptr;
             }
-            log_line("fsr2_color_replay_output_create_failed hr=" +
+            LOG_DEBUG(blog::cat::upscale, "fsr2_color_replay_output_create_failed hr=" +
                 std::to_string(static_cast<long>(result)));
             return false;
         }
         g_fsr2_color_replay_output_width = width;
         g_fsr2_color_replay_output_height = height;
         g_fsr2_color_replay_output_format = format;
-        log_line("fsr2_color_replay_output_created size=" + std::to_string(width) + "x" +
+        LOG_DEBUG(blog::cat::upscale, "fsr2_color_replay_output_created size=" + std::to_string(width) + "x" +
             std::to_string(height) + " format=" + std::to_string(static_cast<std::uint32_t>(format)));
     }
     else
@@ -8931,11 +8973,11 @@ ID3D11ShaderResourceView *acquire_fsr2_neutral_exposure_view(ID3D11DeviceContext
                 g_fsr2_neutral_exposure_texture->Release();
                 g_fsr2_neutral_exposure_texture = nullptr;
             }
-            log_line("fsr2_neutral_exposure_create_failed hr=" +
+            LOG_DEBUG(blog::cat::upscale, "fsr2_neutral_exposure_create_failed hr=" +
                 std::to_string(static_cast<long>(result)));
             return nullptr;
         }
-        log_line("fsr2_neutral_exposure_created value=1");
+        LOG_DEBUG(blog::cat::upscale, "fsr2_neutral_exposure_created value=1");
     }
     else
     {
@@ -9005,7 +9047,7 @@ void maybe_track_fsr2_color_candidate(ID3D11DeviceContext *context, UINT element
                 std::memory_order_relaxed);
             locked_shader_hash = g_fsr2_locked_color_producer_ps_hash.load(std::memory_order_relaxed);
             if (locked_shader_hash == producer_shader_hash)
-                log_line("fsr2_color_producer_shader_locked ps=" + hex64(producer_shader_hash));
+                LOG_DEBUG(blog::cat::upscale, "fsr2_color_producer_shader_locked ps=" + hex64(producer_shader_hash));
         }
         if (locked_shader_hash != 0 && producer_shader_hash != locked_shader_hash)
         {
@@ -9018,7 +9060,7 @@ void maybe_track_fsr2_color_candidate(ID3D11DeviceContext *context, UINT element
                 g_fsr2_rejected_color_producer_count.fetch_add(1, std::memory_order_relaxed) + 1;
             if (rejected_count <= 8 || rejected_count % 1024 == 0)
             {
-                log_line("fsr2_color_producer_shader_rejected count=" +
+                LOG_DEBUG(blog::cat::upscale, "fsr2_color_producer_shader_rejected count=" +
                     std::to_string(rejected_count) + " ps=" + hex64(producer_shader_hash) +
                     " locked=" + hex64(locked_shader_hash));
             }
@@ -9073,7 +9115,7 @@ void maybe_track_fsr2_color_candidate(ID3D11DeviceContext *context, UINT element
             target->resource_key, std::memory_order_relaxed);
         if (previous_output != target->resource_key)
         {
-            log_line("fsr2_dynamic_color_path_learned ps=" +
+            LOG_DEBUG(blog::cat::upscale, "fsr2_dynamic_color_path_learned ps=" +
                 hex64(g_current_ps_hash.load(std::memory_order_relaxed)) +
                 " output=" + hex64(target->resource_key) +
                 " input=" + hex64(candidate_color.resource_key) +
@@ -9240,7 +9282,7 @@ bool replay_fsr2_color_processing(
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     const std::uint64_t replay_index = g_fsr2_color_replay_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (replay_index == 1 || replay_index % 1024 == 0)
-        log_line("fsr2_color_replay_succeeded count=" + std::to_string(replay_index));
+        LOG_DEBUG(blog::cat::upscale, "fsr2_color_replay_succeeded count=" + std::to_string(replay_index));
 #endif
     return true;
 }
@@ -9374,7 +9416,7 @@ bool collect_fsr2_gpu_timing_slot(ID3D11DeviceContext *context, Fsr2GpuTimingSlo
     {
         const double divisor = static_cast<double>(g_fsr2_gpu_timing_sample_count);
         const double upscaler_average_ms = g_fsr2_gpu_timing_accumulated_ms[1] / divisor;
-        log_line("fsr2_gpu_timing samples=" + std::to_string(g_fsr2_gpu_timing_sample_count) +
+        LOG_DEBUG(blog::cat::upscale, "fsr2_gpu_timing samples=" + std::to_string(g_fsr2_gpu_timing_sample_count) +
             " prepare_ms=" + std::to_string(g_fsr2_gpu_timing_accumulated_ms[0] / divisor) +
             " upscaler_ms=" + std::to_string(upscaler_average_ms) +
             " metadata_ms=" + std::to_string(g_fsr2_gpu_timing_accumulated_ms[2] / divisor) +
@@ -9391,7 +9433,7 @@ bool collect_fsr2_gpu_timing_slot(ID3D11DeviceContext *context, Fsr2GpuTimingSlo
         {
             g_fsr2_gpu_timing_last_recovery_tick = now;
             g_fsr2_translation_recovery_requested.store(true, std::memory_order_release);
-            log_line("fsr2_upscaler_stall_detected upscaler_ms=" +
+            LOG_WARN(blog::cat::upscale, "fsr2_upscaler_stall_detected upscaler_ms=" +
                 std::to_string(upscaler_average_ms) + " recovery=requested");
         }
         g_fsr2_gpu_timing_accumulated_ms = {};
@@ -9446,7 +9488,7 @@ Fsr2GpuTimingSlot *begin_fsr2_gpu_timing(ID3D11DeviceContext *context)
         if (g_fsr2_gpu_timing_unavailable_streak == 120 ||
             g_fsr2_gpu_timing_unavailable_streak % 600 == 0)
         {
-            log_line("fsr2_gpu_queue_backlog unavailable_queries=" +
+            LOG_DEBUG(blog::cat::upscale, "fsr2_gpu_queue_backlog unavailable_queries=" +
                 std::to_string(g_fsr2_gpu_timing_unavailable_streak) +
                 " ring_size=" + std::to_string(g_fsr2_gpu_timing_slots.size()));
         }
@@ -9454,7 +9496,7 @@ Fsr2GpuTimingSlot *begin_fsr2_gpu_timing(ID3D11DeviceContext *context)
     }
     if (g_fsr2_gpu_timing_unavailable_streak >= 120)
     {
-        log_line("fsr2_gpu_queue_recovered unavailable_queries=" +
+        LOG_DEBUG(blog::cat::upscale, "fsr2_gpu_queue_recovered unavailable_queries=" +
             std::to_string(g_fsr2_gpu_timing_unavailable_streak));
     }
     g_fsr2_gpu_timing_unavailable_streak = 0;
@@ -9504,7 +9546,7 @@ bool consume_fsr2_optiscaler_config_reset()
                 g_fsr2_optiscaler_config_reset_frames_remaining.store(
                     g_config.fsr2_optiscaler_config_reset_frames,
                     std::memory_order_release);
-                log_line("fsr2_optiscaler_config_changed reset_frames=" +
+                LOG_INFO(blog::cat::coexist, "fsr2_optiscaler_config_changed reset_frames=" +
                     std::to_string(g_config.fsr2_optiscaler_config_reset_frames));
             }
         }
@@ -9553,7 +9595,7 @@ bool should_reset_for_optiscaler_log_activity()
             {
                 const ULONGLONG reset_until = now + g_config.fsr2_optiscaler_log_reset_duration_ms;
                 g_fsr2_optiscaler_log_reset_until_tick.store(reset_until, std::memory_order_release);
-                log_line("fsr2_optiscaler_log_activity reset_duration_ms=" +
+                LOG_INFO(blog::cat::coexist, "fsr2_optiscaler_log_activity reset_duration_ms=" +
                     std::to_string(g_config.fsr2_optiscaler_log_reset_duration_ms));
             }
         }
@@ -9595,7 +9637,7 @@ bool try_fsr2_translation_draw(
     {
         if (!g_fsr2_dx11on12_block_logged.load(std::memory_order_relaxed) &&
             !g_fsr2_dx11on12_block_logged.exchange(true, std::memory_order_relaxed))
-            log_line("fsr2_translation_blocked unsafe_dx11_on12_backend=1 fallback=original_draw");
+            LOG_WARN(blog::cat::upscale, "fsr2_translation_blocked unsafe_dx11_on12_backend=1 fallback=original_draw");
         return false;
     }
     if (g_fsr2_dx11on12_block_logged.load(std::memory_order_relaxed))
@@ -9616,7 +9658,7 @@ bool try_fsr2_translation_draw(
         g_fsr2_translation_candidate_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (candidate_index == 1)
     {
-        log_line("fsr2_translation_candidate render=" +
+        LOG_INFO(blog::cat::upscale, "fsr2_translation_candidate render=" +
             std::to_string(draw_info->render_width) + "x" + std::to_string(draw_info->render_height) +
             " output=" + std::to_string(draw_info->output_width) + "x" + std::to_string(draw_info->output_height) +
             " mode=" + std::to_string(translation_mode));
@@ -9806,7 +9848,7 @@ bool try_fsr2_translation_draw(
                 }
                 sdk234_insts[slot] = Sdk234InstState {};
                 sdk234_insts[slot].instance = match_inst;
-                log_line("ffx12_instance_new inst=" + hex64(match_inst & 0xFFFFFFFFull) +
+                LOG_INFO(blog::cat::upscale, "ffx12_instance_new inst=" + hex64(match_inst & 0xFFFFFFFFull) +
                     " frame=" + std::to_string(call_params.frame_index) +
                     " render=" + std::to_string(call_params.render_w) + "x" +
                     std::to_string(call_params.render_h));
@@ -9837,7 +9879,7 @@ bool try_fsr2_translation_draw(
             }
             st->last_sdk_output_gen = 0;
             const bool consumed = il2cpp_callsite::consume_render_token_for(match_inst, call_gen);
-            log_line("ffx12_result rc=" + std::string(reason) +
+            LOG_INFO(blog::cat::upscale, "ffx12_result rc=" + std::string(reason) +
                 " gen=" + std::to_string(call_gen) +
                 " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
                 " frame=" + std::to_string(call_params.frame_index) +
@@ -9859,7 +9901,7 @@ bool try_fsr2_translation_draw(
         if (sdk234_duplicate_game_frame)
         {
             ++st->duplicate_frame_count;
-            log_line("ffx12_duplicate_render_frame inst=" +
+            LOG_DEBUG(blog::cat::upscale, "ffx12_duplicate_render_frame inst=" +
                 hex64(match_inst & 0xFFFFFFFFull) +
                 " frame=" + std::to_string(call_params.frame_index) +
                 " gen=" + std::to_string(call_gen) +
@@ -9892,7 +9934,7 @@ bool try_fsr2_translation_draw(
                         std::lock_guard lock(g_state_mutex);
                         ps_h = g_state.current_ps_hash;
                     }
-                    log_line("ffx12_enter count=" + std::to_string(ec) +
+                    LOG_DEBUG(blog::cat::upscale, "ffx12_enter count=" + std::to_string(ec) +
                         " ps_hash=" + hex64(ps_h) +
                         " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
                         " frame=" + std::to_string(call_params.frame_index));
@@ -9979,7 +10021,7 @@ bool try_fsr2_translation_draw(
                         sdk234_output_repair_count.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (repair_count <= 8 || repair_count % 1024 == 0)
                     {
-                        log_line("ffx12_output_repair count=" + std::to_string(repair_count) +
+                        LOG_DEBUG(blog::cat::upscale, "ffx12_output_repair count=" + std::to_string(repair_count) +
                             " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
                             " age_ms=" + std::to_string(sdk234_now - st->last_dispatch_tick) +
                             " same_output=" + std::to_string(same_output ? 1 : 0) +
@@ -10042,7 +10084,7 @@ bool try_fsr2_translation_draw(
                         const std::uint64_t rc = sdk234_reuse_count.fetch_add(1, std::memory_order_relaxed) + 1;
                         if (rc <= 8 || rc % 1024 == 0)
                         {
-                            log_line("ffx12_reuse_generation count=" + std::to_string(rc) +
+                            LOG_DEBUG(blog::cat::upscale, "ffx12_reuse_generation count=" + std::to_string(rc) +
                                 " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
                                 " frame=" + std::to_string(call_params.frame_index) +
                                 " same_output=" + std::to_string(same_output ? 1 : 0) +
@@ -10085,7 +10127,7 @@ bool try_fsr2_translation_draw(
                     if (last_log == 0 || now_tick - last_log > 10000)
                     {
                         sdk234_inst_log_tick.store(now_tick, std::memory_order_relaxed);
-                        log_line("ffx12_instance inst=" +
+                        LOG_INFO(blog::cat::upscale, "ffx12_instance inst=" +
                             hex64(call_params.instance & 0xFFFFFFFFull) +
                             " frame=" + std::to_string(call_params.frame_index) +
                             " render=" + std::to_string(call_params.render_w) + "x" +
@@ -10127,7 +10169,7 @@ bool try_fsr2_translation_draw(
                                         depth_tex->Release();
                                         depth_tex = dsv_tex;
                                         if (dsl <= 4 || dsl % 256 == 0)
-                                            log_line("ffx12_depth_dsv switch fmt=" +
+                                            LOG_DEBUG(blog::cat::upscale, "ffx12_depth_dsv switch fmt=" +
                                                 std::to_string(dsv_fmt) +
                                                 " size=" + std::to_string(dtd.Width) + "x" +
                                                 std::to_string(dtd.Height));
@@ -10159,7 +10201,7 @@ bool try_fsr2_translation_draw(
                         if (st->last_gap_log_tick == 0 || now_tick - st->last_gap_log_tick > 5000)
                         {
                             st->last_gap_log_tick = now_tick;
-                            log_line("ffx12_reset reason=takeover_gap ms=" +
+                            LOG_DEBUG(blog::cat::upscale, "ffx12_reset reason=takeover_gap ms=" +
                                 std::to_string(now_tick - st->last_dispatch_tick) +
                                 " inst=" + hex64(match_inst & 0xFFFFFFFFull));
                         }
@@ -10178,7 +10220,7 @@ bool try_fsr2_translation_draw(
                         resource_dimension_mismatch_count.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (mismatch_count <= 8 || mismatch_count % 1024 == 0)
                     {
-                        log_line("ffx12_resource_dimensions count=" + std::to_string(mismatch_count) +
+                        LOG_DEBUG(blog::cat::upscale, "ffx12_resource_dimensions count=" + std::to_string(mismatch_count) +
                             " render=" + std::to_string(sdk_in.render_w) + "x" + std::to_string(sdk_in.render_h) +
                             " output=" + std::to_string(sdk_in.display_w) + "x" + std::to_string(sdk_in.display_h) +
                             " call_render=" + std::to_string(call_params.render_w) + "x" + std::to_string(call_params.render_h) +
@@ -10289,7 +10331,7 @@ bool try_fsr2_translation_draw(
                                             const std::uint64_t jc = jit_slot_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
                                             if (jc <= 16)
                                             {
-                                                log_line("ffx12_jit_slot inst=" + hex64(match_inst & 0xFFFFFFFFull) +
+                                                LOG_DEBUG(blog::cat::upscale, "ffx12_jit_slot inst=" + hex64(match_inst & 0xFFFFFFFFull) +
                                                     " slot=" + std::to_string(st->jit_slot) +
                                                     " v=(" + std::to_string(cb[st->jit_slot][0]) + "," +
                                                     std::to_string(cb[st->jit_slot][1]) + ")");
@@ -10651,7 +10693,7 @@ bool try_fsr2_translation_draw(
                                 }
                             }
                             fclose(f);
-                            log_line("ffx12_native_dump written=sdk234_native_dump.bin");
+                            LOG_DEBUG(blog::cat::upscale, "ffx12_native_dump written=sdk234_native_dump.bin");
                         }
                     }
                 }
@@ -10667,7 +10709,7 @@ bool try_fsr2_translation_draw(
                     st->reset_next = false;
                     if (!il2cpp_callsite::consume_render_token_for(match_inst, call_gen))
                     {
-                        log_line("ffx12_token_consume_miss inst=" +
+                        LOG_DEBUG(blog::cat::upscale, "ffx12_token_consume_miss inst=" +
                             hex64(match_inst & 0xFFFFFFFFull) +
                             " gen=" + std::to_string(call_gen));
                     }
@@ -10675,7 +10717,7 @@ bool try_fsr2_translation_draw(
                         sdk234_dispatch_count.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (dcount <= 8 || dcount % 1024 == 0)
                     {
-                        log_line("ffx12_result rc=DISPATCH_OK" +
+                        LOG_INFO(blog::cat::upscale, "ffx12_result rc=DISPATCH_OK" +
                             std::string(" gen=") + std::to_string(call_gen) +
                             " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
                             " frame=" + std::to_string(call_params.frame_index) +
@@ -10696,7 +10738,7 @@ bool try_fsr2_translation_draw(
                     {
                         std::uint64_t d11_luid = 0, d12_luid = 0;
                         ffx12::adapter_luids(d11_luid, d12_luid);
-                        log_line("ffx12_adapter d11_luid=" + hex64(d11_luid) +
+                        LOG_DEBUG(blog::cat::upscale, "ffx12_adapter d11_luid=" + hex64(d11_luid) +
                             " d12_luid=" + hex64(d12_luid) +
                             " match=" + std::to_string(d11_luid == d12_luid ? 1 : 0) +
                             " (DX11 render + D3D12 FSR2 共享纹理互操作，无 swapchain 转译)");
@@ -10711,7 +10753,7 @@ bool try_fsr2_translation_draw(
                         std::wstring sdk_msgs;
                         ffx12::get_sdk_messages(sdk_msgs);
                         HMODULE amdxc = GetModuleHandleW(L"amdxc64.dll");
-                        log_line("ffx12_path count=" + std::to_string(dcount) +
+                        LOG_DEBUG(blog::cat::upscale, "ffx12_path count=" + std::to_string(dcount) +
                             " version=" + ffx12::selected_version_name() +
                             " chain=pq_decode->ffx_dispatch->pq_encode" +
                             " out=" + hex64(reinterpret_cast<std::uint64_t>(output_tex)) +
@@ -10727,7 +10769,7 @@ bool try_fsr2_translation_draw(
                     {
                         bool on12 = false, gpu_only = false;
                         ffx12::interop_capabilities(on12, gpu_only);
-                        log_line("ffx12_transport count=" + std::to_string(dcount) +
+                        LOG_DEBUG(blog::cat::upscale, "ffx12_transport count=" + std::to_string(dcount) +
                             " on12_device=" + std::to_string(on12 ? 1 : 0) +
                             " gpu_only=" + std::to_string(gpu_only ? 1 : 0) +
                             " gpu_interop_ready=" +
@@ -10738,7 +10780,7 @@ bool try_fsr2_translation_draw(
                     {
                         float dp[16] {};
                         ffx12::debug_pixels(dp);
-                        log_line("ffx12_pipeline count=" + std::to_string(dcount) +
+                        LOG_DEBUG(blog::cat::upscale, "ffx12_pipeline count=" + std::to_string(dcount) +
                             " pqdec=" + std::to_string(dp[0]) + "," + std::to_string(dp[1]) + "," + std::to_string(dp[2]) +
                             " ffxout=" + std::to_string(dp[4]) + "," + std::to_string(dp[5]) + "," + std::to_string(dp[6]) +
                             " pqenc=" + std::to_string(dp[8]) + "," + std::to_string(dp[9]) + "," + std::to_string(dp[10]) +
@@ -10754,8 +10796,8 @@ bool try_fsr2_translation_draw(
                         append_tex_samples(bd, "", ffx12::debug_output_texture(), context);
                         std::string r1 = "rtv1";
                         append_tex_samples(r1, "", output_tex, context);
-                        log_line("ffx12_backend_samples count=" + std::to_string(dcount) + bd);
-                        log_line("ffx12_rtv1_samples count=" + std::to_string(dcount) + r1);
+                        LOG_DEBUG(blog::cat::upscale, "ffx12_backend_samples count=" + std::to_string(dcount) + bd);
+                        LOG_DEBUG(blog::cat::upscale, "ffx12_rtv1_samples count=" + std::to_string(dcount) + r1);
                     }
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
                     if (dcount == 1 || dcount % 1024 == 0)
@@ -10769,7 +10811,7 @@ bool try_fsr2_translation_draw(
                         ffx12::get_output_samples(os_raw, os_w, os_h, os_valid);
                         ffx12::ChainSampleData cs {};
                         ffx12::get_chain_samples(cs);
-                        log_line("ffx12_out_samples count=" + std::to_string(dcount) +
+                        LOG_DEBUG(blog::cat::upscale, "ffx12_out_samples count=" + std::to_string(dcount) +
                             " enc_valid=" + std::to_string(os_valid ? 1 : 0) +
                             " dims=" + std::to_string(os_w) + "x" + std::to_string(os_h) +
                             " enc_p0=0x" + hex64(os_raw[0]) + " p1=0x" + hex64(os_raw[1]) +
@@ -10815,7 +10857,7 @@ bool try_fsr2_translation_draw(
                         bool dbg_reset = false;
                         std::uint64_t dbg_recreates = 0;
                         ffx12::debug_state(dbg_reset, dbg_recreates);
-                        log_line("ffx12_dispatch count=" + std::to_string(dcount) +
+                        LOG_DEBUG(blog::cat::upscale, "ffx12_dispatch count=" + std::to_string(dcount) +
                             " inst=" + hex64(call_params.instance & 0xFFFFFFFFull) +
                             " render=" + std::to_string(sdk_in.render_w) + "x" +
                             std::to_string(sdk_in.render_h) +
@@ -10838,8 +10880,14 @@ bool try_fsr2_translation_draw(
                             " reset=" + std::to_string(dbg_reset ? 1 : 0) +
                             " recreates=" + std::to_string(dbg_recreates) +
                             " depth_inv=" + std::to_string(g_config.ffx12_depth_inverted ? 1 : 0) +
+                            // mv_decode 区分"配置值"与"是否真正接线"：该开关此前是**空开关**
+                            // （g_decode_motion 除赋值外无读取点，平方解码无条件执行），
+                            // 日志只打 0/1，看起来像在生效。
                             " mv_decode=" + std::to_string(g_config.ffx12_decode_motion ? 1 : 0) +
                             " reactive=" + std::to_string(sdk_in.use_reactive_mask ? 1 : 0) +
+                            // transparency 如实标注：桥取到了纹理、也赋值了开关，但后端**从未写进
+                            // dispatch**（transparencyAndComposition 全项目 0 次出现），
+                            // 且后端没有对应共享纹理 → 整条链未实现。
                             " transparency=" + std::to_string(sdk_in.use_transparency_mask ? 1 : 0) +
                             " hdr=" + std::to_string(g_config.ffx12_hdr_input ? 1 : 0) +
                             " autoexp=" + std::to_string(g_config.ffx12_auto_exposure ? 1 : 0) +
@@ -10926,7 +10974,7 @@ bool try_fsr2_translation_draw(
                     {
                         std::wstring msgs;
                         ffx12::get_sdk_messages(msgs);
-                        log_line("ffx12_failed count=" + std::to_string(fc) +
+                        LOG_ERROR(blog::cat::upscale, "ffx12_failed count=" + std::to_string(fc) +
                             " inst=" + hex64(call_params.instance & 0xFFFFFFFFull) +
                             " gen=" + std::to_string(call_gen) +
                             " frame=" + std::to_string(call_params.frame_index) +
@@ -10953,7 +11001,7 @@ bool try_fsr2_translation_draw(
                 const std::uint64_t nc = sdk234_null_count.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (nc <= 4 || nc % 256 == 0)
                 {
-                        log_line("ffx12_textures_null count=" + std::to_string(nc) +
+                        LOG_DEBUG(blog::cat::upscale, "ffx12_textures_null count=" + std::to_string(nc) +
                             " inst=" + hex64(call_params.instance & 0xFFFFFFFFull) +
                             " gen=" + std::to_string(call_gen) +
                         " color=" + std::to_string(color_tex ? 1 : 0) +
@@ -11008,7 +11056,7 @@ bool try_fsr2_translation_draw(
                                 ":f" + std::to_string(ip.frame_index);
                         }
                     }
-                    log_line("ffx12_skip count=" + std::to_string(sc) +
+                    LOG_DEBUG(blog::cat::upscale, "ffx12_skip count=" + std::to_string(sc) +
                         " rc=" + reason +
                         " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
                         " out=" + hex64(draw_out_ptr) +
@@ -11039,7 +11087,7 @@ bool try_fsr2_translation_draw(
             jitter_unavailable_count.fetch_add(1, std::memory_order_relaxed) + 1;
         if (miss_count <= 8 || miss_count % 1024 == 0)
         {
-            log_line("fsr2_jitter_unavailable count=" + std::to_string(miss_count) +
+            LOG_DEBUG(blog::cat::upscale, "fsr2_jitter_unavailable count=" + std::to_string(miss_count) +
                 " cb0=" + hex64(draw_info->constant_buffer_key) + " fallback=original_draw");
         }
         return false;
@@ -11057,7 +11105,7 @@ bool try_fsr2_translation_draw(
                 g_fsr2_stale_producer_fallback_count.fetch_add(1, std::memory_order_relaxed) + 1;
             if (fallback_count == 1 || fallback_count % 1024 == 0)
             {
-                log_line("fsr2_translation_fallback no_fresh_producer count=" +
+                LOG_DEBUG(blog::cat::upscale, "fsr2_translation_fallback no_fresh_producer count=" +
                     std::to_string(fallback_count) + " target=" +
                     hex64(draw_info->color_resource_key));
             }
@@ -11078,7 +11126,7 @@ bool try_fsr2_translation_draw(
             g_fsr2_color_path_switch_count.fetch_add(1, std::memory_order_relaxed) + 1;
         if (switch_count <= 8 || switch_count % 256 == 0)
         {
-            log_line("fsr2_color_path_switch count=" + std::to_string(switch_count) +
+            LOG_DEBUG(blog::cat::upscale, "fsr2_color_path_switch count=" + std::to_string(switch_count) +
                 " path=" + (use_late_composed_color ? std::string("late") : std::string("early")) +
                 " reset=" +
                     (g_config.fsr2_reset_on_color_path_change ? std::string("1") : std::string("0")));
@@ -11091,7 +11139,7 @@ bool try_fsr2_translation_draw(
             g_fsr2_late_composed_dispatch_count.fetch_add(1, std::memory_order_relaxed) + 1;
         if (late_dispatch_count == 1 || late_dispatch_count % 1024 == 0)
         {
-            log_line("fsr2_translation_path late_composed count=" +
+            LOG_DEBUG(blog::cat::upscale, "fsr2_translation_path late_composed count=" +
                 std::to_string(late_dispatch_count) + " target=" +
                 hex64(draw_info->color_resource_key));
         }
@@ -11219,7 +11267,7 @@ bool try_fsr2_translation_draw(
             alt_motion_key.store(0, std::memory_order_relaxed);
             alt_motion_since_tick.store(0, std::memory_order_relaxed);
             motion_mask_skip_logged_key.store(0, std::memory_order_relaxed);
-            log_line("fsr2_motion_mask_guard role_swap new_motion=" + hex64(current_motion_key) +
+            LOG_DEBUG(blog::cat::upscale, "fsr2_motion_mask_guard role_swap new_motion=" + hex64(current_motion_key) +
                 " new_color=" + hex64(current_color_key) + " resume=1");
         }
         else
@@ -11245,13 +11293,13 @@ bool try_fsr2_translation_draw(
                 alt_motion_key.store(0, std::memory_order_relaxed);
                 alt_motion_since_tick.store(0, std::memory_order_relaxed);
                 motion_mask_skip = false;
-                log_line("fsr2_motion_mask_guard relock new_motion=" + hex64(current_motion_key) +
+                LOG_DEBUG(blog::cat::upscale, "fsr2_motion_mask_guard relock new_motion=" + hex64(current_motion_key) +
                     " new_color=" + hex64(current_color_key) + " reason=stable_timeout");
             }
             else if (motion_mask_skip_logged_key.exchange(current_motion_key, std::memory_order_relaxed) !=
                 current_motion_key)
             {
-                log_line("fsr2_motion_mask_guard skip mask=" + hex64(current_motion_key) +
+                LOG_DEBUG(blog::cat::upscale, "fsr2_motion_mask_guard skip mask=" + hex64(current_motion_key) +
                     " main=" + hex64(locked_motion_key) +
                     " main_color=" + hex64(locked_color_key) +
                     " fallback=original_draw");
@@ -11270,7 +11318,7 @@ bool try_fsr2_translation_draw(
         if (now_tick - last_tick > 5000 &&
             dispatch_reject_log_tick.compare_exchange_strong(last_tick, now_tick, std::memory_order_relaxed))
         {
-            log_line(std::string("fsr2_dispatch_reject") +
+            LOG_DEBUG(blog::cat::upscale, std::string("fsr2_dispatch_reject") +
                 " v0=" + (views[0] != nullptr ? "1" : "0") +
                 " depth_ok=" + (depth_format_compatible ? "1" : "0") +
                 " mask_skip=" + (motion_mask_skip ? "1" : "0") +
@@ -11287,7 +11335,7 @@ bool try_fsr2_translation_draw(
                 ? depth_info.view_format : depth_info.format);
             if (last_rejected_depth_format.exchange(rejected_format, std::memory_order_relaxed) != rejected_format)
             {
-                log_line("fsr2_depth_guard rejected resource_format=" +
+                LOG_DEBUG(blog::cat::upscale, "fsr2_depth_guard rejected resource_format=" +
                     describe_dxgi_format(depth_info.format) +
                     " view_format=" + describe_dxgi_format(depth_info.view_format) +
                     " reason=not_r32_float");
@@ -11309,7 +11357,7 @@ bool try_fsr2_translation_draw(
     }
     if (depth_path_changed)
     {
-        log_line("fsr2_depth_guard resource_changed previous=" + hex64(previous_depth_state) +
+        LOG_DEBUG(blog::cat::upscale, "fsr2_depth_guard resource_changed previous=" + hex64(previous_depth_state) +
             " current=" + hex64(depth_state) + " reset=1");
     }
     render_targets[1]->GetResource(&output);
@@ -11332,7 +11380,7 @@ bool try_fsr2_translation_draw(
             const std::uint64_t cc = sdk234_cover_count.fetch_add(1, std::memory_order_relaxed) + 1;
             if (cc <= 4 || cc % 1024 == 0)
             {
-                log_line("ffx12_cover_skip output=" + hex64(reinterpret_cast<std::uint64_t>(output)) +
+                LOG_DEBUG(blog::cat::upscale, "ffx12_cover_skip output=" + hex64(reinterpret_cast<std::uint64_t>(output)) +
                     " count=" + std::to_string(cc) +
                     " age_ms=" + std::to_string(sdk234_out_age_ms));
             }
@@ -11472,10 +11520,10 @@ ID3D11PixelShader *acquire_spatial_copy_shader(ID3D11DeviceContext *context)
         if (FAILED(hr) || g_spatial_copy_shader == nullptr)
         {
             g_spatial_copy_create_failed = true;
-            log_line("pixel_shader_replacement_create_failed hr=" + std::to_string(static_cast<long>(hr)));
+            LOG_ERROR(blog::cat::core, "pixel_shader_replacement_create_failed hr=" + std::to_string(static_cast<long>(hr)));
             return nullptr;
         }
-        log_line("pixel_shader_replacement_ready mode=spatial_copy target=" + hex64(g_config.target_pixel_shader_hash));
+        LOG_INFO(blog::cat::core, "pixel_shader_replacement_ready mode=spatial_copy target=" + hex64(g_config.target_pixel_shader_hash));
     }
 
     if (g_spatial_copy_shader != nullptr)
@@ -11515,7 +11563,7 @@ bool begin_spatial_copy_draw(ID3D11DeviceContext *context, PixelShaderRestoreSta
     g_original_ps_set_shader(context, replacement, nullptr, 0);
     replacement->Release();
     if (g_replacement_draw_count.fetch_add(1, std::memory_order_relaxed) == 0)
-        log_line("pixel_shader_replacement_active mode=spatial_copy");
+        LOG_INFO(blog::cat::core, "pixel_shader_replacement_active mode=spatial_copy");
     return true;
 }
 
@@ -11668,7 +11716,7 @@ bool try_hdr_sdr_tone_map_draw(ID3D11DeviceContext *context, UINT element_count,
     static std::atomic_uint64_t applied_count { 0 };
     const auto count = applied_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (count == 1 || count % 1024 == 0)
-        log_line("hdr_sdr_tone_map_offscreen_applied count=" + std::to_string(count) +
+        LOG_DEBUG(blog::cat::hdr, "hdr_sdr_tone_map_offscreen_applied count=" + std::to_string(count) +
             " paper_white=" + std::to_string(g_config.hdr_sdr_tone_map_paper_white) +
             " peak=" + std::to_string(g_config.hdr_sdr_tone_map_peak) +
             " pq_input=" + std::to_string(g_config.hdr_sdr_tone_map_pq_input ? 1 : 0));
@@ -11701,7 +11749,7 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
     static std::atomic_bool hook_logged { false };
     if (!hook_logged.load(std::memory_order_relaxed) &&
         !hook_logged.exchange(true, std::memory_order_relaxed))
-        log_line("draw_indexed_hook_active");
+        LOG_INFO(blog::cat::core, "draw_indexed_hook_active");
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     record_color_source_call("draw_indexed", index_count, 0, 0);
     maybe_dump_target_color_chain(context, index_count);
@@ -11728,7 +11776,7 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
             static std::atomic_uint64_t family_skip_log_count { 0 };
             const std::uint64_t log_count = family_skip_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
             if (log_count == 1 || log_count % 1024 == 0)
-                log_line("fsr2_family_skip_draw hash=" + hex64(family_ps_hash) +
+                LOG_DEBUG(blog::cat::upscale, "fsr2_family_skip_draw hash=" + hex64(family_ps_hash) +
                     " total=" + std::to_string(fsr2_family_takeover::skipped_count()));
             return;
         }
@@ -11755,7 +11803,7 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
         static std::atomic_uint64_t family_notify_count { 0 };
         const std::uint64_t notify_seq = family_notify_count.fetch_add(1, std::memory_order_relaxed);
         if (notify_seq < 16)
-            log_line("fsr2_family_notify handled=" + std::to_string(fsr2_translation_handled ? 1 : 0) +
+            LOG_DEBUG(blog::cat::upscale, "fsr2_family_notify handled=" + std::to_string(fsr2_translation_handled ? 1 : 0) +
                 " render=" + std::to_string(target_draw_info->render_width) + "x" +
                 std::to_string(target_draw_info->render_height) +
                 (il2cpp_callsite::active()
@@ -11816,7 +11864,7 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
     static std::atomic_bool hook_logged { false };
     if (!hook_logged.load(std::memory_order_relaxed) &&
         !hook_logged.exchange(true, std::memory_order_relaxed))
-        log_line("draw_hook_active");
+        LOG_INFO(blog::cat::core, "draw_hook_active");
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     record_color_source_call("draw", vertex_count, 0, 0);
     maybe_dump_target_color_chain(context, vertex_count);
@@ -11843,7 +11891,7 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
             static std::atomic_uint64_t family_skip_log_count { 0 };
             const std::uint64_t log_count = family_skip_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
             if (log_count == 1 || log_count % 1024 == 0)
-                log_line("fsr2_family_skip_draw hash=" + hex64(family_ps_hash) +
+                LOG_DEBUG(blog::cat::upscale, "fsr2_family_skip_draw hash=" + hex64(family_ps_hash) +
                     " total=" + std::to_string(fsr2_family_takeover::skipped_count()));
             // 一次性 PRE-pass cb0 探测（诊断用，Ffx12Probe=1 时启用；正式版不编译）
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
@@ -12059,7 +12107,7 @@ void STDMETHODCALLTYPE hooked_copy_resource(ID3D11DeviceContext *context, ID3D11
         if (n < 64)
         {
             const char *role = reinterpret_cast<std::uint64_t>(src) == sdk_output ? "src" : "dst";
-            log_line("ffx12_copy_chain role=" + std::string(role) +
+            LOG_DEBUG(blog::cat::upscale, "ffx12_copy_chain role=" + std::string(role) +
                 " age_ms=" + std::to_string(sdk_age_ms) +
                 " dst=" + hex64(dst_info.resource_key) +
                 " src=" + hex64(src_info.resource_key) +
@@ -12068,7 +12116,7 @@ void STDMETHODCALLTYPE hooked_copy_resource(ID3D11DeviceContext *context, ID3D11
         }
     }
     if (g_config.log_resource_ops)
-        log_line("copy_resource dst=" + hex64(dst_info.resource_key) + " src=" + hex64(src_info.resource_key));
+        LOG_INFO(blog::cat::core, "copy_resource dst=" + hex64(dst_info.resource_key) + " src=" + hex64(src_info.resource_key));
     record_hdr_composite_copy(dst_info, src_info, "copy_resource");
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     record_color_source_copy(dst_info, src_info, "copy_resource");
@@ -12091,7 +12139,7 @@ void STDMETHODCALLTYPE hooked_copy_subresource_region(ID3D11DeviceContext *conte
     read_resource_info_from_resource(dst, L"copy_dst", dst_info);
     read_resource_info_from_resource(src, L"copy_src", src_info);
     if (g_config.log_resource_ops)
-        log_line("copy_subresource dst=" + hex64(dst_info.resource_key) + " src=" + hex64(src_info.resource_key) +
+        LOG_INFO(blog::cat::core, "copy_subresource dst=" + hex64(dst_info.resource_key) + " src=" + hex64(src_info.resource_key) +
             " dst_sub=" + std::to_string(dst_subresource) + " src_sub=" + std::to_string(src_subresource));
     record_hdr_composite_copy(dst_info, src_info, "copy_subresource");
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
@@ -12135,7 +12183,7 @@ void STDMETHODCALLTYPE hooked_clear_rtv(ID3D11DeviceContext *context, ID3D11Rend
         ResourceInfo info {};
         read_resource_info(rtv, L"rtv", info);
         if (g_config.log_resource_ops)
-            log_line("clear_rtv res=" + hex64(info.resource_key) + " size=" + std::to_string(info.width) + "x" + std::to_string(info.height) +
+            LOG_INFO(blog::cat::core, "clear_rtv res=" + hex64(info.resource_key) + " size=" + std::to_string(info.width) + "x" + std::to_string(info.height) +
                 " fmt=" + format_string(info.format) + " color=(" +
                 std::to_string(color[0]) + "," + std::to_string(color[1]) + "," + std::to_string(color[2]) + "," + std::to_string(color[3]) + ")");
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
@@ -12152,7 +12200,7 @@ void STDMETHODCALLTYPE hooked_clear_dsv(ID3D11DeviceContext *context, ID3D11Dept
         ResourceInfo info {};
         read_resource_info(dsv, L"dsv", info);
         if (g_config.log_resource_ops)
-            log_line("clear_dsv res=" + hex64(info.resource_key) + " size=" + std::to_string(info.width) + "x" + std::to_string(info.height) +
+            LOG_INFO(blog::cat::core, "clear_dsv res=" + hex64(info.resource_key) + " size=" + std::to_string(info.width) + "x" + std::to_string(info.height) +
                 " fmt=" + format_string(info.format) + " flags=" + std::to_string(flags) +
                 " depth=" + std::to_string(depth) + " stencil=" + std::to_string(stencil));
     }
@@ -12283,7 +12331,7 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
         const std::uint32_t observed_index = g_native_ldr_texture_create_observed_count.fetch_add(1, std::memory_order_relaxed) + 1;
         if (observed_index <= 16)
         {
-            log_line(std::string("native_ldr_texture_create_observed index=") + std::to_string(observed_index) +
+            LOG_INFO(blog::cat::core, std::string("native_ldr_texture_create_observed index=") + std::to_string(observed_index) +
                 " device=" + hex64(reinterpret_cast<std::uintptr_t>(device)) +
                 " format=" + describe_dxgi_format(desc->Format) +
                 " size=" + std::to_string(desc->Width) + "x" + std::to_string(desc->Height) +
@@ -12312,7 +12360,7 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
         const std::uint32_t candidate_index = g_native_ldr_final_target_candidate_count.fetch_add(1, std::memory_order_relaxed) + 1;
         if (candidate_index <= 32)
         {
-            log_line(std::string("native_ldr_final_target_candidate index=") + std::to_string(candidate_index) +
+            LOG_INFO(blog::cat::core, std::string("native_ldr_final_target_candidate index=") + std::to_string(candidate_index) +
                 " device=" + hex64(reinterpret_cast<std::uintptr_t>(device)) +
                 " format=29/R8G8B8A8_UNORM_SRGB size=" + std::to_string(desc->Width) + "x" + std::to_string(desc->Height) +
                 " bind=" + hex64(desc->BindFlags) +
@@ -12323,7 +12371,7 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
             effective_texture_desc = *desc;
             effective_texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             effective_desc = &effective_texture_desc;
-            log_line(std::string("native_ldr_final_target_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM") +
+            LOG_INFO(blog::cat::core, std::string("native_ldr_final_target_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM") +
                 " size=" + std::to_string(desc->Width) + "x" + std::to_string(desc->Height) +
                 " bind=0x" + hex64(desc->BindFlags));
         }
@@ -12362,7 +12410,7 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
     const HRESULT result = g_original_create_texture_2d(device, effective_desc, initial_data, texture);
     if (SUCCEEDED(result) && effective_desc != desc && texture != nullptr && *texture != nullptr)
     {
-        log_line(std::string("native_ldr_final_target_created device=") +
+        LOG_INFO(blog::cat::core, std::string("native_ldr_final_target_created device=") +
             hex64(reinterpret_cast<std::uintptr_t>(device)) +
             " resource=" + hex64(reinterpret_cast<std::uintptr_t>(*texture)) +
             " requested_format=29/R8G8B8A8_UNORM_SRGB created_format=28/R8G8B8A8_UNORM" +
@@ -12487,7 +12535,7 @@ void install_device_hooks(ID3D11Device *device)
                 return;
             const auto interface_key = reinterpret_cast<std::uint64_t>(extended);
             clone_and_patch_vtable(extended, k_device_vtable_size, texture_patches);
-            log_line(std::string("texture_device_interface_hook interface=") + interface_name +
+            LOG_DEBUG(blog::cat::hook, std::string("texture_device_interface_hook interface=") + interface_name +
                 " instance=" + hex64(interface_key));
             extended->Release();
         };
@@ -12532,7 +12580,7 @@ void update_swapchain_backbuffer_resources(IDXGISwapChain *swapchain)
             resource_keys += ",";
         resource_keys += hex64(resource_key);
     }
-    log_line("hdr_composite_backbuffers_registered count=" + std::to_string(resources.size()) +
+    LOG_DEBUG(blog::cat::probe, "hdr_composite_backbuffers_registered count=" + std::to_string(resources.size()) +
         " resources=" + resource_keys +
         " format=" + describe_dxgi_format(desc.BufferDesc.Format) +
         " size=" + std::to_string(desc.BufferDesc.Width) + "x" + std::to_string(desc.BufferDesc.Height));
@@ -12575,7 +12623,7 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
         }
         else
         {
-            log_line("dxgi_color_hooks_unavailable swapchain=" +
+            LOG_DEBUG(blog::cat::hook, "dxgi_color_hooks_unavailable swapchain=" +
                 hex64(reinterpret_cast<std::uintptr_t>(swapchain)) + " reason=no_IDXGISwapChain3");
             if (!should_hook_present && !should_hook_swapchain_controls)
                 return;
@@ -12636,7 +12684,7 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
         DXGI_SWAP_CHAIN_DESC desc {};
         if (SUCCEEDED(swapchain->GetDesc(&desc)))
         {
-            log_line("dxgi_color_hooks_active swapchain=" +
+            LOG_DEBUG(blog::cat::hook, "dxgi_color_hooks_active swapchain=" +
                 hex64(reinterpret_cast<std::uintptr_t>(hook_instance)) +
                 " format=" + describe_dxgi_format(desc.BufferDesc.Format) +
                 " size=" + std::to_string(desc.BufferDesc.Width) + "x" + std::to_string(desc.BufferDesc.Height) +
@@ -12754,7 +12802,7 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
         effective_swapchain_desc = *swapchain_desc;
         effective_swapchain_desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         effective_desc = &effective_swapchain_desc;
-        log_line("native_ldr_swapchain_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM api=CreateDeviceAndSwapChain");
+        LOG_INFO(blog::cat::hdr, "native_ldr_swapchain_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM api=CreateDeviceAndSwapChain");
     }
 
     const HRESULT hr = g_original_create_device_and_swapchain(
@@ -12787,7 +12835,7 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
                 k_color_diagnostics_enabled || hdr_swapchain_spoof_active() || hdr_swapchain_force_active())
                 install_swapchain_hooks(*swapchain);
         }
-        log_line("hooked D3D11CreateDeviceAndSwapChain");
+        LOG_INFO(blog::cat::core, "hooked D3D11CreateDeviceAndSwapChain");
     }
     return hr;
 }
@@ -12823,7 +12871,7 @@ HRESULT WINAPI hooked_create_device(
         install_factory_hooks_from_device(device != nullptr ? *device : nullptr);
         install_context_hooks(context != nullptr ? *context : nullptr);
         route_from_d3d11_device(device != nullptr ? *device : nullptr); // ：设备级路由补检
-        log_line("hooked D3D11CreateDevice");
+        LOG_INFO(blog::cat::core, "hooked D3D11CreateDevice");
     }
     return hr;
 }
@@ -12833,7 +12881,7 @@ HRESULT STDMETHODCALLTYPE hooked_factory_create_swap_chain(IDXGIFactory *factory
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
     const std::uint64_t request_id = g_dxgi_swapchain_request_id.fetch_add(1, std::memory_order_relaxed) + 1;
     void *const caller = _ReturnAddress();
-    log_line("dxgi_swapchain_request id=" + std::to_string(request_id) +
+    LOG_DEBUG(blog::cat::hook, "dxgi_swapchain_request id=" + std::to_string(request_id) +
         " api=CreateSwapChain caller=" + module_path_from_address(caller) +
         " factory=" + hex64(reinterpret_cast<std::uintptr_t>(factory)) +
         " device={" + describe_dxgi_swapchain_device(device) + "} " +
@@ -12848,12 +12896,12 @@ HRESULT STDMETHODCALLTYPE hooked_factory_create_swap_chain(IDXGIFactory *factory
         effective_swapchain_desc = *desc;
         effective_swapchain_desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         effective_desc = &effective_swapchain_desc;
-        log_line("native_ldr_swapchain_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM api=CreateSwapChain");
+        LOG_INFO(blog::cat::hdr, "native_ldr_swapchain_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM api=CreateSwapChain");
     }
 
     HRESULT hr = g_original_factory_create_swap_chain(factory, device, effective_desc, swapchain);
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
-    log_line("dxgi_swapchain_result id=" + std::to_string(request_id) +
+    LOG_DEBUG(blog::cat::hook, "dxgi_swapchain_result id=" + std::to_string(request_id) +
         " api=CreateSwapChain hr=" + hex32(static_cast<std::uint32_t>(hr)) +
         " swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain != nullptr ? *swapchain : nullptr)));
 #endif
@@ -12866,9 +12914,9 @@ HRESULT STDMETHODCALLTYPE hooked_factory_create_swap_chain(IDXGIFactory *factory
             k_color_diagnostics_enabled || hdr_swapchain_spoof_active() || hdr_swapchain_force_active())
             install_swapchain_hooks(swapchain != nullptr ? *swapchain : nullptr);
         if (desc != nullptr)
-            log_line("hooked CreateSwapChain size=" + std::to_string(desc->BufferDesc.Width) + "x" + std::to_string(desc->BufferDesc.Height));
+            LOG_INFO(blog::cat::core, "hooked CreateSwapChain size=" + std::to_string(desc->BufferDesc.Width) + "x" + std::to_string(desc->BufferDesc.Height));
         else
-            log_line("hooked CreateSwapChain");
+            LOG_INFO(blog::cat::core, "hooked CreateSwapChain");
     }
     return hr;
 }
@@ -12878,7 +12926,7 @@ HRESULT STDMETHODCALLTYPE hooked_factory2_create_swap_chain_for_hwnd(IDXGIFactor
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
     const std::uint64_t request_id = g_dxgi_swapchain_request_id.fetch_add(1, std::memory_order_relaxed) + 1;
     void *const caller = _ReturnAddress();
-    log_line("dxgi_swapchain_request id=" + std::to_string(request_id) +
+    LOG_DEBUG(blog::cat::hook, "dxgi_swapchain_request id=" + std::to_string(request_id) +
         " api=CreateSwapChainForHwnd caller=" + module_path_from_address(caller) +
         " factory=" + hex64(reinterpret_cast<std::uintptr_t>(factory)) +
         " restrict_output=" + hex64(reinterpret_cast<std::uintptr_t>(restrict_to_output)) +
@@ -12896,12 +12944,12 @@ HRESULT STDMETHODCALLTYPE hooked_factory2_create_swap_chain_for_hwnd(IDXGIFactor
         effective_swapchain_desc = *desc;
         effective_swapchain_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         effective_desc = &effective_swapchain_desc;
-        log_line("native_ldr_swapchain_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM api=CreateSwapChainForHwnd");
+        LOG_INFO(blog::cat::hdr, "native_ldr_swapchain_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM api=CreateSwapChainForHwnd");
     }
 
     HRESULT hr = g_original_factory2_create_swap_chain_for_hwnd(factory, device, hwnd, effective_desc, fullscreen_desc, restrict_to_output, swapchain);
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
-    log_line("dxgi_swapchain_result id=" + std::to_string(request_id) +
+    LOG_DEBUG(blog::cat::hook, "dxgi_swapchain_result id=" + std::to_string(request_id) +
         " api=CreateSwapChainForHwnd hr=" + hex32(static_cast<std::uint32_t>(hr)) +
         " swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain != nullptr ? *swapchain : nullptr)));
 #endif
@@ -12914,9 +12962,9 @@ HRESULT STDMETHODCALLTYPE hooked_factory2_create_swap_chain_for_hwnd(IDXGIFactor
             k_color_diagnostics_enabled || hdr_swapchain_spoof_active() || hdr_swapchain_force_active())
             install_swapchain_hooks(swapchain != nullptr ? *swapchain : nullptr);
         if (desc != nullptr)
-            log_line("hooked CreateSwapChainForHwnd size=" + std::to_string(desc->Width) + "x" + std::to_string(desc->Height));
+            LOG_INFO(blog::cat::core, "hooked CreateSwapChainForHwnd size=" + std::to_string(desc->Width) + "x" + std::to_string(desc->Height));
         else
-            log_line("hooked CreateSwapChainForHwnd");
+            LOG_INFO(blog::cat::core, "hooked CreateSwapChainForHwnd");
     }
     return hr;
 }
@@ -12981,7 +13029,7 @@ LONG WINAPI hooked_display_config_get_device_info(DISPLAYCONFIG_DEVICE_INFO_HEAD
     if (call_index >= k_log_limit)
     {
         if (!g_hdr_environment_probe_suppressed_logged.exchange(true, std::memory_order_relaxed))
-            log_line("hdr_environment_probe query log limit reached");
+            LOG_DEBUG(blog::cat::probe, "hdr_environment_probe query log limit reached");
         return result;
     }
 
@@ -13037,7 +13085,7 @@ LONG WINAPI hooked_display_config_set_device_info(DISPLAYCONFIG_DEVICE_INFO_HEAD
                 reinterpret_cast<const std::uint8_t *>(request) + sizeof(DISPLAYCONFIG_DEVICE_INFO_HEADER));
             requested_enabled = *value & 1u;
         }
-        log_line("hdr_output_desc_spoof blocked_system_hdr_change query=" +
+        LOG_INFO(blog::cat::hdr, "hdr_output_desc_spoof blocked_system_hdr_change query=" +
             std::to_string(request_type) + " enabled=" + std::to_string(requested_enabled));
         return ERROR_SUCCESS;
     }
@@ -13059,7 +13107,7 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR proc_name)
         {
             if (g_original_create_device_and_swapchain == nullptr)
                 g_original_create_device_and_swapchain = reinterpret_cast<create_device_and_swapchain_fn>(address);
-            log_line("GetProcAddress intercepted D3D11CreateDeviceAndSwapChain");
+            LOG_DEBUG(blog::cat::hook, "GetProcAddress intercepted D3D11CreateDeviceAndSwapChain");
             return reinterpret_cast<FARPROC>(&hooked_create_device_and_swapchain);
         }
 
@@ -13067,7 +13115,7 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR proc_name)
         {
             if (g_original_create_device == nullptr)
                 g_original_create_device = reinterpret_cast<create_device_fn>(address);
-            log_line("GetProcAddress intercepted D3D11CreateDevice");
+            LOG_DEBUG(blog::cat::hook, "GetProcAddress intercepted D3D11CreateDevice");
             return reinterpret_cast<FARPROC>(&hooked_create_device);
         }
     }
@@ -13077,7 +13125,7 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR proc_name)
     {
         if (g_original_display_config_get_device_info == nullptr)
             g_original_display_config_get_device_info = reinterpret_cast<display_config_get_device_info_fn>(address);
-        log_line("GetProcAddress intercepted DisplayConfigGetDeviceInfo");
+        LOG_DEBUG(blog::cat::hook, "GetProcAddress intercepted DisplayConfigGetDeviceInfo");
         return reinterpret_cast<FARPROC>(&hooked_display_config_get_device_info);
     }
 
@@ -13086,7 +13134,7 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR proc_name)
     {
         if (g_original_display_config_set_device_info == nullptr)
             g_original_display_config_set_device_info = reinterpret_cast<display_config_set_device_info_fn>(address);
-        log_line("GetProcAddress intercepted DisplayConfigSetDeviceInfo");
+        LOG_DEBUG(blog::cat::hook, "GetProcAddress intercepted DisplayConfigSetDeviceInfo");
         return reinterpret_cast<FARPROC>(&hooked_display_config_set_device_info);
     }
 
@@ -13200,7 +13248,27 @@ void initialize()
     if (!process_matches())
         return;
 
-    reset_log();
+    // 日志器初始化（替代旧的 reset_log 直接截断文件）：由日志器统一管理
+    // 多 sink / 等级+分类过滤 / 异步写盘 / 轮转。
+    {
+        blog::Config log_cfg;
+        log_cfg.enabled = g_config.enable_logging;
+        log_cfg.to_file = g_config.logging.to_file;
+        log_cfg.to_debugger = g_config.logging.to_debugger;
+        // ⚠️ 目录必须按**宽字符**传入：注入路径常含中文，窄串会被 ofstream 按系统
+        // ACP（中文 Windows=936/GBK）解释 → 路径乱码 → 文件打不开且不报错。
+        log_cfg.filename_w = L"Dx11FsrBridge.log";
+        log_cfg.directory_w = g_module_dir.wstring();
+        log_cfg.level = g_config.logging.level;
+        log_cfg.truncate_on_start = g_config.logging.truncate_on_start;
+        log_cfg.max_file_bytes =
+            static_cast<std::uint64_t>(g_config.logging.max_file_kb) * 1024ull;
+        log_cfg.rotate_keep = g_config.logging.rotate_keep;
+        log_cfg.compat_prefix_categories = g_config.logging.compat_prefix_categories;
+        blog::init(log_cfg);
+        for (const auto &entry : g_config.logging.categories)
+            blog::set_category_level(entry.first, entry.second);
+    }
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_config.trace_pixel_shader_draws)
@@ -13215,7 +13283,8 @@ void initialize()
 #endif
 
     g_active = true;
-    log_line("Dx11FsrBridge active pid=" + std::to_string(GetCurrentProcessId()));
+    LOG_INFO(blog::cat::core, "Dx11FsrBridge active pid=" + std::to_string(GetCurrentProcessId()));
+    blog::log_effective_config();
 #if defined(DX11FSRBRIDGE_SERVER_DEBUG_RUNTIME)
     wchar_t process_path[MAX_PATH] {};
     const DWORD process_path_length = GetModuleFileNameW(nullptr, process_path, static_cast<DWORD>(std::size(process_path)));
@@ -13236,7 +13305,7 @@ void initialize()
             }
         }
     }
-    log_line("build_profile=server_debug process=" +
+    LOG_INFO(blog::cat::core, "build_profile=server_debug process=" +
         narrow(std::wstring(process_path, process_path + process_path_length)) +
         " pe_timestamp=" + hex64(pe_timestamp) +
         " image_size=" + std::to_string(image_size) +
@@ -13263,11 +13332,11 @@ void initialize()
             hook_cfg.render_rva = detected_render;
             hook_cfg.update_cmd_buffer_rva = detected_ucb;
             hook_cfg.camera_rva = detected_camera;
-            log_line("fsr2_il2cpp_rva_feature_match render=0x" + hex64(detected_render) +
+            LOG_INFO(blog::cat::hook, "fsr2_il2cpp_rva_feature_match render=0x" + hex64(detected_render) +
                 " ucb=0x" + hex64(detected_ucb) +
                 " camera=0x" + hex64(detected_camera));
         }
-        log_line("ffx12_camera_config probe=" +
+        LOG_DEBUG(blog::cat::upscale, "ffx12_camera_config probe=" +
             std::to_string(g_config.ffx12_probe_camera ? 1 : 0) +
             " hook=" + std::to_string(g_config.ffx12_camera_hook ? 1 : 0) +
             " rva=" + hex64(g_config.ffx12_camera_rva) +
@@ -13281,12 +13350,12 @@ void initialize()
             log_line(camera_target);
         }
         if (il2cpp_callsite::install(exe_base, hook_cfg))
-            log_line("fsr2_il2cpp_hook_installed mode=" +
+            LOG_INFO(blog::cat::hook, "fsr2_il2cpp_hook_installed mode=" +
                 (g_config.fsr2_il2cpp_skip_render ? std::string("skip") : std::string("observe")) +
                 " render_va=" + hex64(exe_base + hook_cfg.render_rva));
         else
         {
-            log_line("fsr2_il2cpp_hook_failed render_rva=0x" + hex64(hook_cfg.render_rva) +
+            LOG_ERROR(blog::cat::hook, "fsr2_il2cpp_hook_failed render_rva=0x" + hex64(hook_cfg.render_rva) +
                 " skip=" + std::to_string(g_config.fsr2_il2cpp_skip_render ? 1 : 0) +
                 " fallback=draw_family_skip");
             // RVA 自动识别诊断：扫描 render/ucb 序言配对候选（国际服/版本更新偏移对齐）
@@ -13304,19 +13373,19 @@ void initialize()
         if (g_config.ffx12_camera_hook)
         {
             if (il2cpp_callsite::install_camera(exe_base, hook_cfg))
-                log_line("ffx12_camera_hook_installed va=" +
+                LOG_DEBUG(blog::cat::upscale, "ffx12_camera_hook_installed va=" +
                     hex64(exe_base + hook_cfg.camera_rva));
             else
-                log_line("ffx12_camera_hook_rejected rva=" +
+                LOG_DEBUG(blog::cat::upscale, "ffx12_camera_hook_rejected rva=" +
                     hex64(hook_cfg.camera_rva));
         }
         if (g_config.ffx12_projection_hook)
         {
             if (il2cpp_callsite::install_projection_setter(exe_base, hook_cfg))
-                log_line("ffx12_projection_hook_installed va=" +
+                LOG_DEBUG(blog::cat::upscale, "ffx12_projection_hook_installed va=" +
                     hex64(exe_base + hook_cfg.projection_setter_rva));
             else
-                log_line("ffx12_projection_hook_rejected rva=" +
+                LOG_DEBUG(blog::cat::upscale, "ffx12_projection_hook_rejected rva=" +
                     hex64(hook_cfg.projection_setter_rva));
         }
     }
@@ -13328,7 +13397,7 @@ void initialize()
     start_osd();
     set_osd_text(L"Dx11FsrBridge OSD\n等待 DX11 dispatch 数据");
 
-    log_line(std::string("d3d11_loaded=") + (GetModuleHandleW(L"d3d11.dll") != nullptr ? "1" : "0"));
+    LOG_DEBUG(blog::cat::hook, std::string("d3d11_loaded=") + (GetModuleHandleW(L"d3d11.dll") != nullptr ? "1" : "0"));
     install_create_hooks_for_loaded_modules();
     install_loader_hooks_for_loaded_modules();
     install_hdr_environment_probe_for_loaded_modules();

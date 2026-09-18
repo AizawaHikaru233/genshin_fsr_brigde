@@ -39,6 +39,7 @@ endif()
 
 add_library(Dx11FsrBridge SHARED
     Dx11FsrBridge.cpp
+    BridgeLogger.cpp
     Dx11FsrBridge.rc
     RenderScaleMenu.cpp
     Fsr2FamilyTakeover.cpp

@@ -127,3 +127,8 @@ ffx202-dl/
 SharedResources/NVIDIA/
 SharedResources/FpsUnlocker/
 SharedResources/OptiScaler/runtime/OptiScaler.dll
+
+# 一次性重建/迁移辅助脚本（本地工具，不属于发布内容）
+scripts/apply-logging.ps1
+scripts/strip-jitter-rscalemenu.ps1
+scripts/strip-logfixes.ps1
