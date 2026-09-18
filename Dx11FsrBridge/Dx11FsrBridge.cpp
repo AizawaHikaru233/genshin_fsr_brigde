@@ -123,7 +123,14 @@ struct Config
         bool compat_prefix_categories = false;
         std::uint32_t max_file_kb = 16384;
         std::uint32_t rotate_keep = 2;
+        // 异步写队列容量（条）。此前 Config::queue_capacity 从未被读取，
+        // 环形队列硬编码 16384，该字段是死配置。
+        std::uint32_t queue_capacity = 8192;
         std::vector<std::pair<std::string, blog::Level>> categories;
+        // load_config() 在 blog::init() **之前**执行，此时日志器还是关闭状态，
+        // 配置解析期的告警会被直接丢弃（"日志撒谎"的同类问题：报告了等于没报告）。
+        // 统一缓存到这里，init 之后立刻回放。
+        std::vector<std::string> pending_warnings;
     };
     LoggingConfig logging;
     DWORD target_process_id = 0;
@@ -977,6 +984,12 @@ void start_osd();
 void update_osd_from_dispatch(std::uint32_t phase, UINT group_x, UINT group_y, UINT group_z);
 bool dlssg_framegen_selected();
 bool dlssg_dxgi_workaround_active();
+// 交换链钩子决策的唯一来源：外层调用点与 install_swapchain_hooks 内部必须共用这些谓词，
+// 否则条件组合（例如只开 HdrCompositeProbe）下外层放行、内层提前 return，钩子静默不装。
+bool swapchain_present_hook_needed();
+bool swapchain_control_hook_needed();
+bool swapchain_color_hook_needed();
+bool swapchain_hook_needed();
 void update_swapchain_backbuffer_resources(IDXGISwapChain *swapchain);
 void record_hdr_composite_candidate(UINT element_count, bool indexed);
 void record_hdr_composite_target_bind(const ResourceInfo &target);
@@ -3237,28 +3250,23 @@ void log_interesting_dispatch_details(UINT group_x, UINT group_y, UINT group_z)
 // 旧方案按消息内容猜等级：error_terms/info_terms/debug_terms 三张词表，未命中返回 3。
 // 这个设计的根本问题是**不可预测**：新增一行日志若没人记得往词表里加，它就会静默消失
 // 为此白排查两轮）。现在等级由调用点经 LOG_* 宏显式声明，此函数不再参与过滤。
-// 兼容模式下（[Log] compat_prefix=1）仅用于给旧 log_line 行一个兜底等级。
+// 兼容模式下（[Log] compat_prefix=1）由 blog::write_compat_line 负责前缀归类，
+// 旧的 log_line_level_compat 已删除（它返回的等级从未被任何路径读取）。
 // ---------------------------------------------------------------------------
-static int log_line_level_compat(const std::string &line)
-{
-    static constexpr std::array<std::string_view, 6> error_terms {
-        "failed", "failure", "error", "invalid", "unsupported", "missing"
-    };
-    for (std::string_view term : error_terms)
-        if (line.find(term) != std::string::npos)
-            return 0;
-    if (line.starts_with("warning "))
-        return 1;
-    return 1;
-}
 
 void log_line(const std::string &line)
 {
     if (!g_logging_enabled.load(std::memory_order_relaxed))
         return;
-    // 未迁移的调用点统一走 core/INFO：**不会再被静默丢弃**。
+    // 未迁移的调用点默认统一走 core/INFO：**不会被静默丢弃**。
     // 旧方案在词表未命中时按 level 3 处理并被 LogLevel=2 丢弃——这正是
-    // "探针在跑却零输出"的根因。需要按前缀归类可开 [Log] compat_prefix=1。
+    // "探针在跑却零输出"的根因。
+    // [Log] compat_prefix=1 时改走前缀归类路径（hdr_/fsr2_/dlssg_ 等进对应分类）。
+    if (blog::compat_prefix_enabled())
+    {
+        blog::write_compat_line(line);
+        return;
+    }
     blog::write(blog::Level::Info, blog::cat::core, line);
 }
 
@@ -3954,8 +3962,10 @@ void load_config()
         g_config.ffx12_camera_far = std::clamp<float>(std::wcstof(far_buf, nullptr), 10.0f, 100000.0f);
     }
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    ffx12::set_motion_decode_test(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DecodeTest", 0, config_path.c_str()) != 0);
+    // 键归属（此前两行都写同一个 setter，第一行被第二行覆盖，等于死代码）：
+    //   Ffx12DecodeTest       -> g_decode_test（输出标记/解码测试）
+    //   Ffx12MotionDecodeTest -> g_motion_decode_test（motion 解码单独测试）
+    // 两者是后端里两个独立标志，不要再让其中一个写两次。
     ffx12::set_decode_test(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DecodeTest", 0, config_path.c_str()) != 0);
     ffx12::set_motion_decode_test(
@@ -4047,16 +4057,22 @@ void load_config()
             static_cast<std::uint32_t>(
                 GetPrivateProfileIntW(L"Log", L"rotate_keep", 2, config_path.c_str())),
             0u, 8u);
+        g_config.logging.queue_capacity = std::clamp<std::uint32_t>(
+            static_cast<std::uint32_t>(
+                GetPrivateProfileIntW(L"Log", L"queue_capacity", 8192, config_path.c_str())),
+            1024u, 262144u);
 
         // 分类覆盖：[Log.Categories] 段，每行 category=level
         wchar_t section[4096] {};
         const DWORD section_len = GetPrivateProfileSectionW(
             L"Log.Categories", section, static_cast<DWORD>(std::size(section)), config_path.c_str());
         g_config.logging.categories.clear();
-        for (DWORD offset = 0; offset < section_len;)
+        // 不按 section_len 迭代：缓冲区不足时 GetPrivateProfileSectionW 返回 nSize-2，
+        // 按该值推进可能踩到未写入区域。直接以双 NUL 结尾为准，天然不会越界。
+        for (const wchar_t *cursor = section; *cursor != L'\0';)
         {
-            const std::wstring row(section + offset);
-            offset += static_cast<DWORD>(row.size()) + 1;
+            const std::wstring row(cursor);
+            cursor += row.size() + 1;
             if (row.empty())
                 continue;
             const std::size_t eq = row.find(L'=');
@@ -4067,6 +4083,13 @@ void load_config()
             blog::Level cat_level {};
             if (blog::parse_level(narrow(value).c_str(), cat_level))
                 g_config.logging.categories.emplace_back(narrow(key), cat_level);
+        }
+        // 段被缓冲区截断时必须显式暴露：否则表现为"某个分类覆盖静默不生效"。
+        if (section_len >= static_cast<DWORD>(std::size(section)) - 2)
+        {
+            g_config.logging.pending_warnings.push_back("log_categories_section_truncated buffer=" +
+                std::to_string(std::size(section)) + " parsed=" +
+                std::to_string(g_config.logging.categories.size()));
         }
         g_bridge_log_level = legacy; // 保留旧字段供兼容读取
     }
@@ -9710,7 +9733,6 @@ bool try_fsr2_translation_draw(
             // 不同帧间 dt = QPC 实测真实帧间隔。
             std::uint64_t last_frame_index = 0;
             std::uint64_t last_dispatch_us = 0;
-            float last_dt_ms = 16.7f;
             std::uint64_t last_gap_log_tick = 0;
             std::uint64_t out_a = 0, out_b = 0;   // 该实例写过的输出（双缓冲）
             std::uint64_t out_a_tick = 0, out_b_tick = 0; // 各输出上次派发时间（每输出 gate）
@@ -10431,8 +10453,11 @@ bool try_fsr2_translation_draw(
                 // XeSS/DLSS 定向——jitter 夹紧 ±0.5（xessD3D12Execute 校验，
                 // 静态 AA 生效）；motion 方向/缩放/depth 归一化均实测无效果（OptiScaler 的
                 // XeSS 输出链路内部限制）→ 全部回退默认。FSR 输出完全不读取此分支（参数隔离）。
-                ffx12::set_motion_flip(1.0f);
-                ffx12::set_depth_scale(1.0f);
+                //
+                // 回退默认值由**后端初值**承担（Ffx12Backend.cpp: g_motion_flip/g_depth_scale
+                // 均 = 1.0f，且全工程只有这里写过它们）。旧实现在此处每帧无条件调用
+                // set_motion_flip(1.0)/set_depth_scale(1.0)，是恒等于默认值的空转；
+                // 真正需要省的开销（b0 每帧 UpdateSubresource）已在后端按"值未变则跳过上传"处理。
                 if (xess_or_dlss)
                 {
                     // XeSS/DLSS 定向——jitter 需 ≤±0.5（xessD3D12Execute 校验）。
@@ -10494,7 +10519,6 @@ bool try_fsr2_translation_draw(
                         st->last_dispatch_us = now_us;
                         st->last_frame_index = now_frame;
                     }
-                    st->last_dt_ms = sdk_in.frame_time_delta_ms;
                     st->last_frame_tick = GetTickCount64();
                 }
 
@@ -12612,6 +12636,33 @@ void update_swapchain_backbuffer_resources(IDXGISwapChain *swapchain)
         " size=" + std::to_string(desc.BufferDesc.Width) + "x" + std::to_string(desc.BufferDesc.Height));
 }
 
+// ---- 交换链钩子决策（唯一来源） ----
+// 这三个谓词同时被外层 CreateSwapChain* 调用点与 install_swapchain_hooks 内部使用。
+// 历史上两处各写一份条件，外层含 hdr_composite_probe、内层不含，导致
+// “只开 HdrCompositeProbe 时外层放行、内层 return，Present 钩子从未安装”。
+// 任何新增开关都必须只改这里。
+bool swapchain_present_hook_needed()
+{
+    return g_config.hook_present || g_config.final_scene_probe || g_config.final_scene_snapshot ||
+        g_config.final_scene_optifg_input || g_config.hdr_composite_probe;
+}
+
+bool swapchain_control_hook_needed()
+{
+    return dlssg_dxgi_workaround_active() || hdr_swapchain_force_active();
+}
+
+bool swapchain_color_hook_needed()
+{
+    return k_color_diagnostics_enabled || hdr_swapchain_spoof_active() || hdr_swapchain_force_active();
+}
+
+bool swapchain_hook_needed()
+{
+    return swapchain_present_hook_needed() || swapchain_control_hook_needed() || swapchain_color_hook_needed() ||
+        g_config.native_ldr_swapchain_unorm;
+}
+
 void install_swapchain_hooks(IDXGISwapChain *swapchain)
 {
     if (swapchain == nullptr)
@@ -12619,16 +12670,28 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
 
     update_swapchain_backbuffer_resources(swapchain);
 
-    const bool should_hook_present = g_config.hook_present || g_config.final_scene_probe ||
-        g_config.final_scene_snapshot || g_config.final_scene_optifg_input;
-    const bool should_hook_dlssg_dxgi = dlssg_dxgi_workaround_active();
-    const bool should_hook_general_swapchain_controls = should_hook_dlssg_dxgi || hdr_swapchain_force_active();
+    const bool should_hook_present = swapchain_present_hook_needed();
+    const bool should_hook_general_swapchain_controls = swapchain_control_hook_needed();
     const bool should_hook_native_ldr_resize = g_config.native_ldr_swapchain_unorm;
     const bool should_hook_swapchain_controls = should_hook_general_swapchain_controls || should_hook_native_ldr_resize;
-    const bool should_hook_color = k_color_diagnostics_enabled || hdr_swapchain_spoof_active() ||
-        hdr_swapchain_force_active();
+    const bool should_hook_color = swapchain_color_hook_needed();
     if (!should_hook_present && !should_hook_swapchain_controls && !should_hook_color)
+    {
+        // 外层放行却在这里返回，说明两侧条件又不一致了（历史 bug）。
+        LOG_WARN(blog::cat::hook, "swapchain_hook_decision install=0 reason=no_hook_flag"
+            " outer_needed=" + std::to_string(swapchain_hook_needed() ? 1 : 0) +
+            " present=" + std::to_string(should_hook_present ? 1 : 0) +
+            " controls=" + std::to_string(should_hook_swapchain_controls ? 1 : 0) +
+            " color=" + std::to_string(should_hook_color ? 1 : 0) +
+            " swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)));
         return;
+    }
+    LOG_DEBUG(blog::cat::hook, "swapchain_hook_decision install=1"
+        " present=" + std::to_string(should_hook_present ? 1 : 0) +
+        " controls=" + std::to_string(should_hook_swapchain_controls ? 1 : 0) +
+        " native_ldr_resize=" + std::to_string(should_hook_native_ldr_resize ? 1 : 0) +
+        " color=" + std::to_string(should_hook_color ? 1 : 0) +
+        " swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)));
 
     void *hook_instance = swapchain;
     std::size_t hook_method_count = k_swapchain_vtable_size;
@@ -12856,9 +12919,7 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
             DXGI_SWAP_CHAIN_DESC created_desc {};
             if (SUCCEEDED((*swapchain)->GetDesc(&created_desc)))
                 set_output_size(created_desc.BufferDesc.Width, created_desc.BufferDesc.Height, "CreateDeviceAndSwapChain");
-            if (g_config.hook_present || g_config.final_scene_probe || g_config.final_scene_snapshot ||
-                g_config.final_scene_optifg_input || dlssg_dxgi_workaround_active() ||
-                k_color_diagnostics_enabled || hdr_swapchain_spoof_active() || hdr_swapchain_force_active())
+            if (swapchain_hook_needed())
                 install_swapchain_hooks(*swapchain);
         }
         LOG_INFO(blog::cat::core, "hooked D3D11CreateDeviceAndSwapChain");
@@ -12935,9 +12996,7 @@ HRESULT STDMETHODCALLTYPE hooked_factory_create_swap_chain(IDXGIFactory *factory
     {
         if (desc != nullptr)
             set_output_size(desc->BufferDesc.Width, desc->BufferDesc.Height, "CreateSwapChain");
-        if (g_config.hook_present || g_config.final_scene_probe || g_config.final_scene_snapshot ||
-            g_config.final_scene_optifg_input || g_config.hdr_composite_probe || dlssg_dxgi_workaround_active() ||
-            k_color_diagnostics_enabled || hdr_swapchain_spoof_active() || hdr_swapchain_force_active())
+        if (swapchain_hook_needed())
             install_swapchain_hooks(swapchain != nullptr ? *swapchain : nullptr);
         if (desc != nullptr)
             LOG_INFO(blog::cat::core, "hooked CreateSwapChain size=" + std::to_string(desc->BufferDesc.Width) + "x" + std::to_string(desc->BufferDesc.Height));
@@ -12983,9 +13042,7 @@ HRESULT STDMETHODCALLTYPE hooked_factory2_create_swap_chain_for_hwnd(IDXGIFactor
     {
         if (desc != nullptr)
             set_output_size(desc->Width, desc->Height, "CreateSwapChainForHwnd");
-        if (g_config.hook_present || g_config.final_scene_probe || g_config.final_scene_snapshot ||
-            g_config.final_scene_optifg_input || g_config.hdr_composite_probe || dlssg_dxgi_workaround_active() ||
-            k_color_diagnostics_enabled || hdr_swapchain_spoof_active() || hdr_swapchain_force_active())
+        if (swapchain_hook_needed())
             install_swapchain_hooks(swapchain != nullptr ? *swapchain : nullptr);
         if (desc != nullptr)
             LOG_INFO(blog::cat::core, "hooked CreateSwapChainForHwnd size=" + std::to_string(desc->Width) + "x" + std::to_string(desc->Height));
@@ -13290,10 +13347,15 @@ void initialize()
         log_cfg.max_file_bytes =
             static_cast<std::uint64_t>(g_config.logging.max_file_kb) * 1024ull;
         log_cfg.rotate_keep = g_config.logging.rotate_keep;
+        log_cfg.queue_capacity = g_config.logging.queue_capacity;
         log_cfg.compat_prefix_categories = g_config.logging.compat_prefix_categories;
         blog::init(log_cfg);
         for (const auto &entry : g_config.logging.categories)
             blog::set_category_level(entry.first, entry.second);
+        // 回放配置解析期的告警（那时日志器还没起来，直接 LOG_* 会被丢弃）。
+        for (const std::string &warning : g_config.logging.pending_warnings)
+            LOG_WARN(blog::cat::config, warning);
+        g_config.logging.pending_warnings.clear();
     }
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
@@ -13435,7 +13497,7 @@ void initialize_once()
 }
 }
 
-BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
+BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
@@ -13447,7 +13509,15 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        // lpReserved != nullptr ⇒ 进程正在终止（而非 FreeLibrary 卸载本 DLL）。
+        // 这条信息必须传给后端：进程终止时已持有 loader lock，不能 FreeLibrary。
+        if (reserved != nullptr)
+            ffx12::set_process_exiting();
         il2cpp_callsite::shutdown();
+        // 顺序：先停 D3D12/FFX 后端，再停日志器（后端 shutdown 可能还要写日志）。
+        // 旧实现两处都不调用：FFX 后端资源与 ffx-api runtime 句柄留到进程回收，
+        // 日志器 writer 线程仍在跑、文件由 OS 关闭，尾部日志有丢失窗口。
+        ffx12::shutdown();
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         {
             std::lock_guard lock(g_ps_trace_mutex);
@@ -13461,6 +13531,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
         g_osd_running = false;
         if (g_osd_window != nullptr)
             PostMessageW(g_osd_window, WM_CLOSE, 0, 0);
+        blog::shutdown();
     }
     return TRUE;
 }

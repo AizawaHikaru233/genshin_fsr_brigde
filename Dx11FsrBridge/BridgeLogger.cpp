@@ -6,6 +6,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -35,9 +36,15 @@ std::mutex g_cat_mutex;
 std::unordered_map<std::string, Level> g_cat_levels;   // 分类覆盖
 std::atomic<bool> g_has_cat_overrides { false };       // 热路径快速判定（有覆盖才取锁）
 
-// 写入端的固定容量环形队列：满了丢最旧，保证调用线程永不阻塞。
-constexpr std::size_t k_max_queue = 16384;
-std::array<std::string, k_max_queue> g_queue;
+// 写入端的环形队列：满了丢最旧，保证调用线程永不阻塞。
+// 容量由 Config::queue_capacity 在 init() 中确定（此前该配置项从未被读取，是死配置）。
+// 用 vector 而非固定数组：8192 条 std::string 的固定数组本身就要 ~260KB 静态空间，
+// 而把上限做到 256K 条会白占 8MB。init() 只跑一次且发生在 writer 线程启动之前，
+// 因此这里的 resize 不需要与 push/writer 竞争。
+constexpr std::size_t k_queue_capacity_min = 1024;
+constexpr std::size_t k_queue_capacity_max = 262144;
+std::vector<std::string> g_queue;
+std::size_t g_queue_capacity = 8192;   // init() 设置；init 之前不写队列
 std::size_t g_head = 0;   // 读
 std::size_t g_tail = 0;   // 写
 std::size_t g_size = 0;
@@ -45,6 +52,9 @@ std::atomic<std::uint64_t> g_dropped { 0 };
 
 std::mutex g_queue_mutex;
 std::condition_variable g_queue_cv;
+
+// writer 线程真正退出前置位（shutdown 据此判定"可以安全碰文件了"）。
+std::atomic<bool> g_writer_stopped { true };
 
 // ---- sink 状态 ------------------------------------------------------------
 
@@ -153,7 +163,9 @@ void debugger_sink(const std::string &line)
     OutputDebugStringA("\n");
 }
 
-// 后台写线程：唯一碰文件的地方。detach 后自行退出，不阻塞卸载路径。
+// 后台写线程：唯一碰文件的地方。
+// 退出时由本线程自己 close 文件（而不是让 shutdown 抢先 close），
+// 否则 shutdown 的 flush/close 会与这里正在进行的 << 并发操作同一个 ofstream。
 void writer_loop()
 {
     for (;;)
@@ -166,12 +178,12 @@ void writer_loop()
             if (g_size == 0)
             {
                 if (!g_alive.load(std::memory_order_relaxed))
-                    return;
+                    break;   // 队列已排空且收到停止信号：走统一收尾
                 continue;
             }
             line = std::move(g_queue[g_head]);
             g_queue[g_head].clear();
-            g_head = (g_head + 1) % k_max_queue;
+            g_head = (g_head + 1) % g_queue_capacity;
             --g_size;
         }
         {
@@ -186,12 +198,27 @@ void writer_loop()
         if (g_to_debugger.load(std::memory_order_relaxed))
             debugger_sink(line);
     }
+    // 收尾：残余（若有）落盘 + 关闭文件。此后 shutdown 可以安全地判定"文件已静止"。
+    {
+        std::lock_guard<std::mutex> lock(g_file_mutex);
+        if (g_file.is_open())
+        {
+            g_file.flush();
+            g_file.close();
+        }
+    }
+    g_writer_stopped.store(true, std::memory_order_release);
 }
 
 // 兼容模式辅助：前缀 -> 分类。
 // ⚠️ 仅在 [Log] compat_prefix=1 时用于**未迁移的旧 log_line 调用点**；
 // 新代码一律经 LOG_*(分类, ...) 显式声明。保留它是为了让"还没迁移的二十来处调用点"
 // 在过渡期仍能进到正确分类，而不是因为漏迁移就静默消失——那是旧方案的原病。
+//
+// 匹配规则：**最长前缀优先**，且必须是 starts_with（行首）。
+// 旧实现用 `starts_with(p) || find(p) != npos`：find 让任意位置出现子串都算命中，
+// 例如 "optiscaler_not_loaded" 会被 "loaded" 类前缀抢走，短前缀（"fg_"、"hdr_"）
+// 误匹配面尤其大；而按表顺序取首个命中又让长前缀永远输给先出现的短前缀。
 std::string_view category_from_prefix(std::string_view line)
 {
     struct Entry { std::string_view prefix; std::string_view category; };
@@ -206,10 +233,17 @@ std::string_view category_from_prefix(std::string_view line)
         {"dlssg_", cat::coexist}, {"optiscaler", cat::coexist}, {"fg_", cat::fg},
         {"build_profile", cat::core}, {"warning", cat::core},
     }};
+    std::string_view best {};
+    std::size_t best_len = 0;
     for (const Entry &entry : table)
-        if (line.starts_with(entry.prefix) || line.find(entry.prefix) != std::string_view::npos)
-            return entry.category;
-    return cat::core;
+    {
+        if (line.starts_with(entry.prefix) && entry.prefix.size() > best_len)
+        {
+            best = entry.category;
+            best_len = entry.prefix.size();
+        }
+    }
+    return best.empty() ? cat::core : best;
 }
 
 // 兼容模式下的等级推断（**仅** log_line 兼容路径使用；
@@ -246,16 +280,16 @@ void push(std::string &&line)
 {
     {
         std::lock_guard<std::mutex> lock(g_queue_mutex);
-        if (g_size == k_max_queue)
+        if (g_size == g_queue_capacity)
         {
             // 队列满：丢最旧一条（保证调用线程永不阻塞；丢的是最老的诊断，不是最新的）
             g_queue[g_head].clear();
-            g_head = (g_head + 1) % k_max_queue;
+            g_head = (g_head + 1) % g_queue_capacity;
             --g_size;
             g_dropped.fetch_add(1, std::memory_order_relaxed);
         }
         g_queue[g_tail] = std::move(line);
-        g_tail = (g_tail + 1) % k_max_queue;
+        g_tail = (g_tail + 1) % g_queue_capacity;
         ++g_size;
     }
     g_queue_cv.notify_one();
@@ -385,6 +419,17 @@ void init(const Config &config)
     g_compat_prefix.store(config.compat_prefix_categories, std::memory_order_relaxed);
     g_dropped.store(0, std::memory_order_relaxed);
 
+    // 队列容量：配置值钳制到 [k_queue_capacity_min, k_queue_capacity_max]。
+    // 此处仍在单线程阶段（writer 尚未启动），resize 无需加锁。
+    {
+        const std::size_t requested = static_cast<std::size_t>(config.queue_capacity);
+        g_queue_capacity = std::clamp(requested, k_queue_capacity_min, k_queue_capacity_max);
+        g_queue.assign(g_queue_capacity, std::string {});
+        g_head = 0;
+        g_tail = 0;
+        g_size = 0;
+    }
+
     if (config.to_file)
     {
         g_directory = config.directory_w;
@@ -403,14 +448,16 @@ void init(const Config &config)
 
     g_alive.store(true, std::memory_order_relaxed);
     g_active.store(true, std::memory_order_relaxed);
+    g_writer_stopped.store(false, std::memory_order_relaxed);
     try
     {
         g_writer = std::thread(&writer_loop);
-        g_writer.detach(); // detach：卸载路径不 join，避免 DllMain 死锁（线程自行退出）
+        g_writer.detach(); // detach：卸载路径不 join，避免 DllMain 死锁（线程自行退出并关闭文件）
     }
     catch (...)
     {
         // 线程创建失败：退化为"只入队不落盘"（不抛异常给注入宿主）
+        g_writer_stopped.store(true, std::memory_order_relaxed);
     }
 }
 
@@ -418,8 +465,13 @@ void shutdown()
 {
     if (!g_active.exchange(false, std::memory_order_relaxed))
         return;
-    // 让 writer 把残余写完再自行退出；这里最多等 500ms，绝不无限阻塞。
-    const std::uint64_t deadline = GetTickCount64() + 500;
+    // 两阶段停机：
+    //   1) 等 writer 把队列排空（最多 500ms）；
+    //   2) 置 g_alive=false 通知 writer 收尾并**由它自己关闭文件**，
+    //      再等 g_writer_stopped 置位（最多 500ms）。
+    // 旧实现只做第 1 步就 flush+close：若 writer 还在 << 同一 ofstream，
+    // 就是并发访问同一个流对象（UB），且可能丢掉尾部若干行。
+    const std::uint64_t drain_deadline = GetTickCount64() + 500;
     for (;;)
     {
         {
@@ -427,17 +479,49 @@ void shutdown()
             if (g_size == 0)
                 break;
         }
-        if (GetTickCount64() >= deadline)
+        if (GetTickCount64() >= drain_deadline)
             break;
         Sleep(2);
     }
     g_alive.store(false, std::memory_order_relaxed);
     g_queue_cv.notify_all();
+
+    const std::uint64_t stop_deadline = GetTickCount64() + 500;
+    while (!g_writer_stopped.load(std::memory_order_acquire))
+    {
+        if (GetTickCount64() >= stop_deadline)
+            break;
+        Sleep(2);
+    }
+    // 只有确认 writer 已退出（文件由它关闭）时才在这里兜底 flush。
+    // 若超时未退出（极罕见：线程卡在轮转的文件系统调用上），进程通常已在退出路径，
+    // 此时**不要**去碰 g_file——那正是旧实现的数据竞争。
+    if (g_writer_stopped.load(std::memory_order_acquire))
     {
         std::lock_guard<std::mutex> lock(g_file_mutex);
         if (g_file.is_open())
+        {
             g_file.flush();
+            g_file.close();
+        }
     }
+}
+
+bool compat_prefix_enabled()
+{
+    return g_active.load(std::memory_order_relaxed) && g_compat_prefix.load(std::memory_order_relaxed);
+}
+
+void write_compat_line(std::string_view line)
+{
+    if (!compat_prefix_enabled())
+        return;
+    // 旧调用点没有显式等级，这里按内容给一个兜底等级（仅此路径使用）。
+    const Level level = level_from_prefix(line);
+    const std::string_view category = category_from_prefix(line);
+    if (!enabled(level, category))
+        return;
+    write(level, category, line);
 }
 
 void log_effective_config()
@@ -463,9 +547,10 @@ void log_effective_config()
     }
     char buf[320] {};
     std::snprintf(buf, sizeof(buf),
-                  "logger effective level=%s categories=%s file_open=%d file=%s",
+                  "logger effective level=%s categories=%s file_open=%d file=%s queue_capacity=%zu",
                   level_name(level()), cats.empty() ? "(none)" : cats.c_str(),
-                  file_open ? 1 : 0, file_open ? "ok" : "(OPEN FAILED)");
+                  file_open ? 1 : 0, file_open ? "ok" : "(OPEN FAILED)",
+                  g_queue_capacity);
     write(Level::Info, cat::config, buf);
     // 另记一行文件全路径（宽字符原样转 UTF-8）：排查"日志到底写哪了"时必需。
     // 注意这里用本文件内的转换，**不经过桥的 narrow()**——那条路径曾因

@@ -44,6 +44,8 @@ struct FrameInput
 // sdk_dll_path 是提供 ffxCreateContext/ffxDispatch 的运行时 DLL。失败返回 false。
 bool init(ID3D11Device *game_device, const wchar_t *sdk_dll_path);
 void shutdown();
+// 由 DllMain(DLL_PROCESS_DETACH, lpReserved != nullptr) 调用：进程终止时禁止 FreeLibrary。
+void set_process_exiting();
 bool active();
 // 设置 ffx-api runtime DLL 路径。
 void set_sdk_dll_path(const wchar_t *path);

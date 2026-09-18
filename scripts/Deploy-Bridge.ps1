@@ -58,6 +58,7 @@ $logSection = @(
     'truncate_on_start=1',
     'max_file_kb=16384',
     'rotate_keep=2',
+    'queue_capacity=8192',
     'compat_prefix=0',
     '',
     '[Log.Categories]',
@@ -160,7 +161,8 @@ foreach ($line in $summary) { Write-Host "  $line" }
 if (-not $Rollback) {
     Write-Host ""
     Write-Host "校验清单（下次采集时先看这几行）:" -ForegroundColor Cyan
-    Write-Host "  1. logger effective level=... categories=... file=...   ← 日志器生效确认"
-    Write-Host "  4. hooked D3D11CreateDevice / rtv_bind_target           ← D3D11 钩子是否装上"
+    Write-Host "  1. logger effective level=... categories=... file=... queue_capacity=...  ← 日志器生效确认"
+    Write-Host "  2. swapchain_hook_decision install=1 present=.. controls=.. color=..      ← 交换链钩子决策（本轮修复）"
+    Write-Host "  3. hooked D3D11CreateDevice / rtv_bind_target                            ← D3D11 钩子是否装上"
 }
 

@@ -16,6 +16,7 @@
 #include "ffx_upscale.h"
 #include "dx12/ffx_api_dx12.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <array>
@@ -23,6 +24,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -48,6 +50,11 @@ struct PreloadEntry
     HMODULE module;
 };
 std::vector<PreloadEntry> g_preloaded;
+
+// 进程退出标志：由 DllMain(DLL_PROCESS_DETACH, lpReserved != nullptr) 置位。
+// 进程终止时**禁止** FreeLibrary：那时已持有 loader lock，释放模块会死锁/崩溃
+// （Windows 明确不建议在 DllMain 里调用 FreeLibrary）。此时把句柄交给 OS 回收即可。
+std::atomic<bool> g_process_exiting { false };
 
 ComPtr<ID3D11Device> g_d11dev;
 ComPtr<ID3D11On12Device2> g_on12dev;
@@ -264,7 +271,13 @@ bool g_decode_motion = true;    // 游戏 motion 为 R10G10B10A2 平方编码
 std::uint32_t g_create_flags = 0; // 实际创建 flags（日志按真值输出，勿硬编码）
 float g_motion_flip = 1.0f;     // ：XeSS/DLSS 定向——motion 方向翻转（默认 +1 = FSR 方向）
 float g_depth_scale = 1.0f;     // ：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
-ComPtr<ID3D11Buffer> g_motion_cb;   // MotionParams 常数缓冲（b0: g_flip）
+ComPtr<ID3D11Buffer> g_motion_cb;   // MotionParams 常数缓冲（b0: g_flip / g_depth_scale）
+// b0 的**已上传值**缓存。b0 被两条独立路径写入（depth 提取写 g_depth_scale、
+// motion 解码写 g_motion_flip），因此必须**各自一份缓存**：共用一个变量时，
+// 两个值不同就会每帧互相判定"变了"而反复上传（比原来更糟）。
+// NaN 哨兵：初值不等于任何合法参数，保证首帧必定上传一次。
+float g_motion_cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();
+float g_motion_cb_uploaded_flip = std::numeric_limits<float>::quiet_NaN();
 bool g_motion_vectors_jittered = false; // 游戏配置：motion 是否已包含投影 jitter
 bool g_hdr_input = true;        // 游戏 10-bit HDR 管线（useRealType）
 bool g_auto_exposure = true;    // 自动曝光（OptiScaler 日志 initFlags 实证：AutoExposure=true）
@@ -1837,8 +1850,12 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
             if (g_motion_cb)
             {
                 // 复用 16B 常数缓冲（b0）：depth 提取用 g_depth_scale（XeSS 激活时归一化 [0,1]）
-                const float dscale[4] = {g_depth_scale, 0.0f, 0.0f, 0.0f};
-                game_context->UpdateSubresource(g_motion_cb.Get(), 0, nullptr, dscale, 0, 0);
+                if (g_motion_cb_uploaded_depth != g_depth_scale)
+                {
+                    const float dscale[4] = {g_depth_scale, 0.0f, 0.0f, 0.0f};
+                    game_context->UpdateSubresource(g_motion_cb.Get(), 0, nullptr, dscale, 0, 0);
+                    g_motion_cb_uploaded_depth = g_depth_scale;
+                }
                 ID3D11Buffer *cbs[] = {g_motion_cb.Get()};
                 game_context->CSSetConstantBuffers(0, 1, cbs);
             }
@@ -1874,8 +1891,12 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
         {
             if (g_motion_cb)
             {
-                const float flip[4] = {g_motion_flip, 0.0f, 0.0f, 0.0f};
-                game_context->UpdateSubresource(g_motion_cb.Get(), 0, nullptr, flip, 0, 0);
+                if (g_motion_cb_uploaded_flip != g_motion_flip)
+                {
+                    const float flip[4] = {g_motion_flip, 0.0f, 0.0f, 0.0f};
+                    game_context->UpdateSubresource(g_motion_cb.Get(), 0, nullptr, flip, 0, 0);
+                    g_motion_cb_uploaded_flip = g_motion_flip;
+                }
                 ID3D11Buffer *cbs[] = {g_motion_cb.Get()};
                 game_context->CSSetConstantBuffers(0, 1, cbs);
             }
@@ -2099,12 +2120,12 @@ static bool finish_gpu_shared()
 
 } // namespace
 
-
-
-
-
-
-
+// 进程退出标志的对外入口（g_process_exiting 在匿名命名空间内，此处仅转发）。
+// 由桥的 DllMain(DLL_PROCESS_DETACH, lpReserved != nullptr) 调用。
+void set_process_exiting()
+{
+    g_process_exiting.store(true, std::memory_order_release);
+}
 
 bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
 {
@@ -2536,11 +2557,34 @@ void shutdown()
     g_gpu_only_transport_available = false;
     g_queue.Reset();
     g_d12dev.Reset();
-    if (g_sdk_module != nullptr)
-        FreeLibrary(g_sdk_module);
+    // preload 缓存：**每个**候选句柄都要释放。旧实现只 FreeLibrary(g_sdk_module)，
+    // 而 g_sdk_module 只是 g_preloaded 里第一个命中项，其余候选（默认 4.1.1 + 402c
+    // 两个）的句柄永久泄漏。g_sdk_module 就是其中一个元素，故整表释放即可，
+    // 之后必须置空以免重复释放。
+    // 进程终止（DllMain detach 且 lpReserved != nullptr）时不能释放：已持有 loader lock。
+    if (!g_process_exiting.load(std::memory_order_acquire))
+    {
+        // 去重：同一 DLL 以不同路径被 LoadLibrary 两次会返回同一 HMODULE
+        // （引用计数 +1），按条目逐个 FreeLibrary 会重复释放。
+        std::vector<HMODULE> freed;
+        freed.reserve(g_preloaded.size());
+        for (const PreloadEntry &entry : g_preloaded)
+        {
+            if (entry.module == nullptr)
+                continue;
+            if (std::find(freed.begin(), freed.end(), entry.module) != freed.end())
+                continue;
+            freed.push_back(entry.module);
+            FreeLibrary(entry.module);
+        }
+    }
+    g_preloaded.clear();
     g_sdk_module = nullptr;
     g_runtime = {};
     g_sdk_version_id = 0;
+    // b0 缓存失效：缓冲已释放，重建后必须重新上传一次。
+    g_motion_cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();
+    g_motion_cb_uploaded_flip = std::numeric_limits<float>::quiet_NaN();
 }
 
 bool active()
@@ -2617,6 +2661,22 @@ void recover_device_removed_locked()
         slot = On12CommandSlot {};
     g_on12_command_slot_cursor = 0;
     g_on12_direct_dispatch_count.store(0, std::memory_order_relaxed);
+
+    // pending 帧状态必须一起清：它持有旧设备的 output_target 与游戏 immediate context
+    // （均为 AddRef 的 ComPtr）。旧实现只清纹理/队列，这两个引用留到下一次
+    // submit/complete 才可能被清，而那时 g_game_ctx4/g_shared_fence11 已是新设备，
+    // Wait 会对着不存在的 fence 走一遍并白等。设备已移除，pending 帧不可能再完成。
+    if (g_pending_ffx)
+    {
+        sdk234_step("recover: drop pending frame");
+        g_pending_ffx = false;
+        g_pending_v2 = 0;
+        g_pending_output_target.Reset();
+        g_pending_context.Reset();
+    }
+    // b0 缓存失效：g_motion_cb 随设备释放，重建后必须重新上传一次。
+    g_motion_cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();
+    g_motion_cb_uploaded_flip = std::numeric_limits<float>::quiet_NaN();
 }
 
 bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::uint64_t instance_key)

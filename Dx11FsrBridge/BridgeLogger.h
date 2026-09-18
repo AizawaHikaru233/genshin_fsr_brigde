@@ -101,6 +101,11 @@ bool enabled(Level level, std::string_view category);
 // 低频诊断：把当前生效的等级/分类配置回显到日志（启动时调用一次）。
 void log_effective_config();
 
+// 兼容模式：按行首前缀推断分类与等级（仅 [Log] compat_prefix=1 时的旧 log_line 路径）。
+// 未开启 compat 时不要调用——新代码一律用 LOG_*(分类, ...) 显式声明。
+bool compat_prefix_enabled();
+void write_compat_line(std::string_view line);
+
 // std::string 入口（旧调用点 / 回调适配）。level/category 显式给出，不做内容推断。
 void write(Level level, std::string_view category, std::string_view message);
 inline void write(Level level, std::string_view category, const std::string &message)
