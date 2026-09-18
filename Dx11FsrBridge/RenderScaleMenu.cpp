@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>   // std::hash（可写性缓存键的哈希器需要）
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -95,7 +96,36 @@ std::uintptr_t g_recent_object_snapshot_instance = 0;
 std::uint64_t g_recent_object_snapshot_tick = 0;
 std::mutex g_recent_object_snapshot_mutex;
 std::mutex g_writable_cache_mutex;
-std::unordered_map<std::uintptr_t, bool> g_writable_cache; // 实例字段可写性缓存（跨帧稳定；上限防实例重建残留）
+// 实例字段可写性缓存（跨帧稳定；上限防实例重建残留）。
+//
+// ⚠️ 缓存键必须**同时含地址与长度**（2026-09-19，审核报告）：
+// 可写性判定里 `result` 的最后一项是"length 是否落在该内存区域内"
+// （见 is_writable_address 末尾的区间检查），即结果**依赖 length**。
+// 旧实现只用地址作键 → 同一地址先以 length=4 查询得到 true 后，
+// 再以 length=0x400 查询会**直接命中缓存返回 true**，跳过区间检查 →
+// 跨区域写入风险（可能写到不可写页 → 崩溃）。
+// 当前唯一调用点固定传 sizeof(float)，故该缺陷尚未触发；但函数签名接受
+// 任意 length，必须让缓存与语义一致。
+struct WritableCacheKey
+{
+    std::uintptr_t address = 0;
+    std::size_t length = 0;
+    bool operator==(const WritableCacheKey &other) const
+    {
+        return address == other.address && length == other.length;
+    }
+};
+struct WritableCacheKeyHash
+{
+    std::size_t operator()(const WritableCacheKey &key) const
+    {
+        // 简单混合：地址与长度各自参与，避免 (addr,len) 与 (addr',len') 碰撞
+        std::size_t h = std::hash<std::uintptr_t> {}(key.address);
+        h ^= std::hash<std::size_t> {}(key.length) + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+std::unordered_map<WritableCacheKey, bool, WritableCacheKeyHash> g_writable_cache;
 
 bool is_executable_address(const void *address);
 bool read_float_value(const void *address, float &value);
@@ -350,6 +380,17 @@ std::int32_t label_index(const Il2CppStringSnapshot &snapshot)
     return -1;
 }
 
+// 构造 il2cpp String 的替身（托管堆外的裸内存，布局与 il2cpp 期望一致）。
+//
+// ⚠️ **这是有意的进程内泄漏**（2026-09-19，审核报告要求明确）：
+// 返回的 `memory` **从不 Free**。原因是该指针会被交给**游戏 il2cpp 运行时**当作
+// 合法 String 对象持有——我们无法得知运行时何时（或是否）还会读它，
+// 提前 VirtualFree 会造成 use-after-free（游戏侧读取已释放页 → 崩溃）。
+// 而游戏自己也不会释放它（它不是托管堆分配的对象）。
+//
+// 为什么可以接受：调用频次极低（仅在写入菜单文本/精度标签时），
+// 每次约 0x14 + 2*(len+1) 字节（几十字节），整个进程生命周期内累计量可忽略。
+// 若将来调用频次上升，需要改为"注册表登记 + 在确认安全时批量释放"的方案。
 void *make_il2cpp_string(void *template_string, const wchar_t *text)
 {
     if (template_string == nullptr || text == nullptr)
@@ -435,7 +476,7 @@ bool seed_selection_from_native_scale(void *instance)
 
 bool is_writable_address(const void *address, std::size_t length)
 {
-    const auto key = reinterpret_cast<std::uintptr_t>(address);
+    const WritableCacheKey key { reinterpret_cast<std::uintptr_t>(address), length };
     {
         std::lock_guard lock(g_writable_cache_mutex);
         const auto it = g_writable_cache.find(key);
