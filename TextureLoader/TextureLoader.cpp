@@ -428,7 +428,7 @@ static bool IsDynamic(ID3D11Resource *res)
     return SUCCEEDED(hr) && v != 0;
 }
 
-volatile long g_hook_ready = 0;
+std::atomic<long> g_hook_ready{0};   // 双检锁用；必须严格原子（旧为 volatile long，非原子读）
 volatile long g_stats_created = 0;   // 已哈希的纹理数
 volatile long g_stats_matched = 0;   // 命中的替换数
 volatile long g_stats_bound = 0;     // 替换 SRV 被绑定次数
@@ -545,8 +545,14 @@ ID3D11ShaderResourceView *CreateReplacementSRV(uint32_t hash,
         it->second.ready_fence = 0; // 只等待一次
         tex->AddRef(); // 锁外使用安全：防止后台加载线程/销毁同时释放
     }
-    if (!g_device)
+    if (!g_device) {
+        // ⚠️ 必须释放上面（锁内）为"锁外使用安全"而取的 AddRef：
+        // 旧实现此处直接 return，是唯一一条漏掉 Release 的返回路径 →
+        // 每次走到这里都泄漏一个替换纹理引用，导致替换缓存**永远无法被淘汰**
+        // （淘汰要求 refcount 归零，见 VramMonitorThread 的"绝不淘汰使用中"约束）。
+        tex->Release();
         return nullptr;
+    }
 
     // 渲染线程：等待 GDDS GPU 解压完成（fence 通常已 Signal——立即返回）
     if (gdds_fence != 0 && g_context != nullptr)
@@ -1107,7 +1113,7 @@ static bool InstallCreateDeviceHook();
 DWORD WINAPI BootstrapThread(LPVOID)
 {
     for (int i = 0; i < 4000; ++i) {
-        if (g_hook_ready)
+        if (g_hook_ready.load(std::memory_order_acquire))
             return 0;
         if (InstallCreateDeviceHook())
             return 0;
@@ -1661,10 +1667,10 @@ static void LogGpuInfo(ID3D11Device *device)
 
 static void AttachToDevice(ID3D11Device *device, ID3D11DeviceContext *context)
 {
-    if (g_hook_ready)
+    if (g_hook_ready.load(std::memory_order_acquire))
         return;
     std::lock_guard<std::mutex> lk(g_lock);
-    if (g_hook_ready)
+    if (g_hook_ready.load(std::memory_order_acquire))
         return;
     g_device = device;
     g_device->AddRef();
@@ -1672,7 +1678,7 @@ static void AttachToDevice(ID3D11Device *device, ID3D11DeviceContext *context)
     g_context->AddRef();
     HookDevice(device);
     HookContext(context);
-    InterlockedExchange(&g_hook_ready, 1);
+    g_hook_ready.store(1, std::memory_order_release);
     LogGpuInfo(device);
     // async_load 未显式设置时按 GPU 厂商自动选择：
     //   NVIDIA → 同步（驱动对后台线程建纹理有缺陷，实测 566.64 崩溃/卡死）
@@ -1910,7 +1916,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         std::wstring dir = slash ? std::wstring(path, slash + 1) : L"";
         ::tloader::log_init(dir);
         TL_LOG(L"TextureLoader init.");
-        g_observe_only = IniBool(dir, L"observe_only", true);
+        // ⚠️ 缺省值必须与发布 ini / README 一致（均为 0 = 真正替换）。
+        // 旧代码缺省 true（只观察不替换），而 TextureLoader.ini 与 README 都写
+        // `observe_only = 0`（默认真正替换）→ 只要用户的 ini 没有这一键（例如从旧版
+        // 升级、或用了精简模板），就会**静默退化为"完全不替换"**，且日志只打
+        // `[cfg ] observe_only=1`，用户很难意识到纹理根本没被替换。
+        g_observe_only = IniBool(dir, L"observe_only", false);
         TL_LOG(L"[cfg ] observe_only=%d", (int)g_observe_only);
 
         // 可调配置（供 gdds_interop/dds_loader/监控线程跨模块共享）
