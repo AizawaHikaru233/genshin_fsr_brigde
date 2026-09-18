@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -37,7 +38,9 @@ namespace
 {
 
 std::atomic_bool g_active { false };
-std::mutex g_mutex;
+// timed_mutex：shutdown() 必须带超时取锁 —— dispatch() 全程持此锁且中间会阻塞在
+// GPU fence 等待上，无限等待会让进程永久挂死在退出路径（见 shutdown() 注释）。
+std::timed_mutex g_mutex;
 std::wstring g_sdk_path;
 // 实际装载的 SDK 路径（与 g_sdk_path 区分——g_sdk_path 会被路由覆盖，
 // 而句柄可能来自 preload 的旧路径；装载路径不一致时必须释放重载，否则版本列表错配）。
@@ -2497,7 +2500,7 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
 
 bool init(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
 {
-    std::lock_guard lock(g_mutex);
+    std::lock_guard<std::timed_mutex> lock(g_mutex);
     return init_locked(game_device, sdk_dll_path);
 }
 
@@ -2506,7 +2509,24 @@ void shutdown()
     // 先置停机标志再取锁：这样正在等 g_mutex 的 dispatch() 拿到锁后会立刻退出，
     // 而不是继续使用即将被释放的 D3D12 资源。
     g_shutting_down.store(true, std::memory_order_release);
-    std::lock_guard lock(g_mutex);
+
+    // ⚠️ 必须带超时取锁，不能无限等 —— 这是"游戏窗口关了、进程不退出"的根因。
+    //
+    // dispatch() 是**全程持 g_mutex** 的，中间有 Wait(v_prev) / ctx4->Wait 等 GPU fence
+    // 阻塞等待。退出时渲染线程若正卡在这些等待里，它就持着 g_mutex 不放；
+    // g_shutting_down 只能拦住"还没进 dispatch"的线程，拦不住**已经在里面**的那个。
+    // 旧实现用 lock_guard 无限等待 → 进程永久挂死。
+    // 实测证据（2026-09-18，修复 shutdown_trace 的共享模式后首次拿到）：
+    //   [SHUTDOWN] final_shutdown_begin
+    //   （再无 final_shutdown_end）
+    //
+    // 拿不到锁就直接放弃释放：进程已在退出路径，句柄与设备资源交 OS 回收。
+    // 拿不到锁时**绝不能**继续往下走 —— 下面的 Reset() 会与仍在使用这些资源的
+    // 渲染线程并发，那是 use-after-free。
+    std::unique_lock<std::timed_mutex> lock(g_mutex, std::defer_lock);
+    if (!lock.try_lock_for(std::chrono::milliseconds(500)))
+        return;
+
     if (!g_active.exchange(false, std::memory_order_acq_rel))
         return;
     for (SdkContext &sc : g_sdk_ctxs)
@@ -2696,7 +2716,7 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
     // 只会白等，拿到锁之后用的还是已被 Reset 的 ComPtr。
     if (g_shutting_down.load(std::memory_order_acquire))
         return false;
-    std::lock_guard lock(g_mutex);
+    std::lock_guard<std::timed_mutex> lock(g_mutex);
     // 拿到锁后再判一次：等锁期间 shutdown() 可能已经开始。
     if (g_shutting_down.load(std::memory_order_acquire))
         return false;
@@ -2858,7 +2878,7 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
 
 void set_async_upscale(bool enable)
 {
-    std::lock_guard lock(g_mutex);
+    std::lock_guard<std::timed_mutex> lock(g_mutex);
     // 切换时若从异步切回同步且存在挂起，立即完成（避免 pending 泄漏）
     if (!enable && g_pending_ffx)
     {
@@ -2871,13 +2891,13 @@ void set_async_upscale(bool enable)
 
 bool async_upscale_enabled()
 {
-    std::lock_guard lock(g_mutex);
+    std::lock_guard<std::timed_mutex> lock(g_mutex);
     return g_async_upscale;
 }
 
 bool finish_pending()
 {
-    std::lock_guard lock(g_mutex);
+    std::lock_guard<std::timed_mutex> lock(g_mutex);
     return finish_gpu_shared();
 }
 
@@ -3037,7 +3057,7 @@ void adapter_luids(std::uint64_t &d11_luid, std::uint64_t &d12_luid)
 
 void interop_capabilities(bool &dx11on12, bool &gpu_only_transport)
 {
-    std::lock_guard lock(g_mutex);
+    std::lock_guard<std::timed_mutex> lock(g_mutex);
     dx11on12 = g_dx11on12_available;
     gpu_only_transport = g_gpu_only_transport_available;
 }
@@ -3064,7 +3084,7 @@ void preload(const wchar_t *path)
     HMODULE h = LoadLibraryW(path);
     if (h == nullptr)
         return;
-    std::lock_guard lock(g_mutex);
+    std::lock_guard<std::timed_mutex> lock(g_mutex);
     for (const PreloadEntry &e : g_preloaded)
         if (e.path == path)
             return;
@@ -3100,7 +3120,7 @@ ID3D11Texture2D *debug_color_texture()
 // 实际输入格式（桥日志诊断用）
 void input_formats(std::uint32_t &color, std::uint32_t &depth, std::uint32_t &motion, std::uint32_t &output)
 {
-    std::lock_guard lock(g_mutex);
+    std::lock_guard<std::timed_mutex> lock(g_mutex);
     color = static_cast<std::uint32_t>(g_input_color_fmt);
     depth = static_cast<std::uint32_t>(g_input_depth_fmt);
     motion = static_cast<std::uint32_t>(g_input_motion_fmt);
@@ -3110,7 +3130,7 @@ void input_formats(std::uint32_t &color, std::uint32_t &depth, std::uint32_t &mo
 // 诊断：最近一次 dispatch 的 reset 标志 + 上下文重建累计次数
 void debug_state(bool &last_reset, std::uint64_t &ctx_recreates)
 {
-    std::lock_guard lock(g_mutex);
+    std::lock_guard<std::timed_mutex> lock(g_mutex);
     last_reset = g_last_reset;
     ctx_recreates = g_ctx_recreates;
 }
