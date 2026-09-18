@@ -14,6 +14,7 @@
 [CmdletBinding()]
 param(
     [switch]$List,
+    [switch]$All,
     [string]$Use
 )
 
@@ -26,22 +27,34 @@ $routes = @(
 )
 
 # 已归档的候选版本（把需要对比的版本放这里）
-$candidates = [ordered]@{
-    'current' = $null   # 占位：当前部署的 DLL 自身
+$candidates = [ordered]@{}
+
+# 本地构建的 GitHub 基线（bc20442，翻译层 ON）——用于判定"最近改动"是否引入回归
+$baselineBuilt = 'D:\FSR-baseline\build\Dx11FsrBridge.dll'
+if (Test-Path -LiteralPath $baselineBuilt) {
+    $candidates['github-baseline'] = @{
+        Path  = $baselineBuilt
+        Sha   = (Get-FileHash $baselineBuilt -Algorithm SHA256).Hash.Substring(0, 8)
+        Size  = (Get-Item $baselineBuilt).Length
+        Time  = (Get-Item $baselineBuilt).LastWriteTime
+        Label = 'GitHub 基线 bc20442（翻译层 ON）'
+    }
 }
 
-# 从 Starward 路线的 .bak-* 备份里挑选候选（按时间倒序，取最近的几个）
+# 从 Starward 路线的 .bak-* 备份里挑选候选。
+# 始终枚举（-Use 也需要）；-All 列出全部（用于向前二分定位回归引入点）。
 $starward = $routes[0].Dir
+$take = if ($All -or [string]::IsNullOrWhiteSpace($Use)) { 9999 } else { 9999 }
 $bakIndex = 1
 if (Test-Path -LiteralPath $starward) {
     foreach ($bak in (Get-ChildItem -LiteralPath $starward -Filter 'Dx11FsrBridge.dll.bak-*' |
-                      Sort-Object LastWriteTime -Descending | Select-Object -First 5)) {
+                      Sort-Object LastWriteTime -Descending | Select-Object -First $take)) {
         $sha = (Get-FileHash $bak.FullName -Algorithm SHA256).Hash.Substring(0, 8)
         $candidates["$bakIndex"] = @{
-            Path = $bak.FullName
-            Sha  = $sha
-            Size = $bak.Length
-            Time = $bak.LastWriteTime
+            Path  = $bak.FullName
+            Sha   = $sha
+            Size  = $bak.Length
+            Time  = $bak.LastWriteTime
             Label = $bak.Name
         }
         $bakIndex++
@@ -58,11 +71,18 @@ if ($List -or [string]::IsNullOrWhiteSpace($Use)) {
         }
     }
     Write-Host ""
-    Write-Host "候选（备份）：" -ForegroundColor Cyan
+    Write-Host "候选：" -ForegroundColor Cyan
     foreach ($k in $candidates.Keys) {
-        if ($k -eq 'current') { continue }
         $c = $candidates[$k]
-        Write-Host ("  [{0}] sha={1}  {2} B  {3}" -f $k, $c.Sha, $c.Size, $c.Time)
+        $note = ''
+        switch ($c.Sha) {
+            '56E3EA7D' { $note = '  ← 会话前 main（53ca30f）' }
+            'E02F2A7F' { $note = '  ← 轮次 1' }
+            'AFA3A69C' { $note = '  ← 轮次 3' }
+            '9A20BE9E' { $note = '  ← 轮次 4' }
+        }
+        if ($k -eq 'github-baseline') { $note = '  ← ' + $c.Label }
+        Write-Host ("  [{0}] sha={1}  {2} B  {3}{4}" -f $k, $c.Sha, $c.Size, $c.Time, $note)
     }
     Write-Host ""
     Write-Host "切换： .\Toggle-BridgeDll.ps1 -Use 1" -ForegroundColor Yellow
