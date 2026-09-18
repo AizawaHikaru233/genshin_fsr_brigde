@@ -1,10 +1,26 @@
-name: Build Lite Package
+name: Build GitHub Release Package
+
+# 说明（2026-09-19 重写）：
+#   旧版围绕**已删除的 Lite 包概念**，且参数名与产物名全错，触发即失败：
+#     - 调用 -GithubLiteOnly，而 Build-OnlineInstaller.ps1 的参数只有 $GithubOnly
+#     - 上传 dist/原神解帧FSR插件包Lite_*.zip（脚本从不产出该名）
+#     - 发布 dist/github-release/GenshinFSRBridge.Lite_v*.zip（实际无 .Lite）
+#   现在对齐脚本实际行为：-GithubOnly 产出
+#     dist/github-release/GenshinFSRBridge_v<version>.zip
+#
+#   ⚠️ 关键前置：Dx11FsrBridge 的 CMake 配置需要 AMD FidelityFX SDK 头文件
+#   （Dx11FsrBridge/CMakeLists.txt 第 13-37 行，默认取
+#    OptiScaler-src/external/FidelityFX-SDK-v2/Kits/FidelityFX）。
+#   该 SDK 因许可（"binary form only" 再分发限制）**未 vendor 进本仓库**，
+#   且 OptiScaler-src/ 被 .gitignore → 全新检出没有它。
+#   故必须先克隆 OptiScaler 源码树并初始化 FidelityFX-SDK-v2 子模块，
+#   否则 CMake 会以 "FidelityFX ffx-api headers were not found" 直接失败。
 
 on:
   workflow_dispatch:
     inputs:
       publish_release:
-        description: Publish the generated Lite ZIP to GitHub Releases
+        description: Publish the generated ZIP to GitHub Releases
         required: true
         default: false
         type: boolean
@@ -27,21 +43,39 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Initialize MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Build FPS Unlock Lite package
+      # 取得 OptiScaler 源码树（提供 Dx11FsrBridge 需要的 FidelityFX SDK 头文件）。
+      # 只初始化 FidelityFX-SDK-v2 一个子模块：其余子模块（vulkan/spdlog/xess 等）
+      # 本构建不需要，全量递归会显著拖慢 CI。
+      #
+      # 注意：这里必须做**正常检出**（不能加 --no-checkout）——子模块更新依赖工作树。
+      # 用 --depth 1 控制体积。
+      - name: Fetch OptiScaler source tree (FidelityFX SDK headers)
         shell: pwsh
-        run: ./Build-OnlineInstaller.ps1 -Configuration Release -GithubLiteOnly
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = Join-Path $env:GITHUB_WORKSPACE 'OptiScaler-src'
+          git clone --depth 1 https://github.com/optiscaler/OptiScaler.git $dest
+          git -C $dest submodule update --init --depth 1 -- external/FidelityFX-SDK-v2
+          $kit = Join-Path $dest 'external\FidelityFX-SDK-v2\Kits\FidelityFX'
+          if (-not (Test-Path (Join-Path $kit 'api\include\ffx_api.h'))) {
+            throw "FidelityFX SDK headers missing under $kit"
+          }
+          if (-not (Test-Path (Join-Path $kit 'upscalers\include\ffx_upscale.h'))) {
+            throw "FidelityFX upscaler headers missing under $kit"
+          }
+          Write-Host "FidelityFX SDK headers ready: $kit"
 
-      - name: Upload FPS Unlock Lite package
+      # 不再使用 ilammy/msvc-dev-cmd：Build-OnlineInstaller.ps1 自身会通过 vswhere
+      # 定位 VS 并导入 vcvars64.bat（脚本第 58-76 行），双重初始化是冗余。
+      - name: Build GitHub release package
+        shell: pwsh
+        run: ./Build-OnlineInstaller.ps1 -Configuration Release -GithubOnly
+
+      - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GenshinFSRBridge-Lite-Packages
-          path: |
-            dist/原神解帧FSR插件包Lite_*.zip
+          name: GenshinFSRBridge-Package
+          path: dist/github-release/GenshinFSRBridge_v*.zip
           if-no-files-found: error
 
       - name: Validate release tag
@@ -58,4 +92,4 @@ jobs:
           generate_release_notes: false
           body: ${{ inputs.release_notes }}
           files: |
-            dist/github-release/GenshinFSRBridge.Lite_v*.zip
+            dist/github-release/GenshinFSRBridge_v*.zip
