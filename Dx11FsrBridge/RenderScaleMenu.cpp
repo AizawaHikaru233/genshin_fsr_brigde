@@ -807,12 +807,22 @@ DWORD WINAPI initialize_menu(void *)
 }
 }
 
-void initialize_render_scale_menu(HMODULE bridge_module, render_scale_menu_log_fn log_callback)
+void initialize_render_scale_menu(HMODULE bridge_module, render_scale_menu_log_fn log_callback, bool enabled)
 {
-    if (g_started.exchange(true, std::memory_order_acq_rel))
-        return;
     g_bridge_module = bridge_module;
     g_log_callback = log_callback;
+
+    // 总开关（ini [Dx11FsrBridge] RenderScaleMenu，默认 1）。关闭时不启动工作线程，
+    // 即不 hook 菜单文本 / 渲染命令构建 / 精度应用，也不扩展候选精度档位——
+    // 游戏回到原生精度档位。注意此处不置位 g_started，便于将来运行期重新启用。
+    if (!enabled)
+    {
+        log_line("disabled_by_ini (native render-scale list only)");
+        return;
+    }
+
+    if (g_started.exchange(true, std::memory_order_acq_rel))
+        return;
     if (const HANDLE thread = CreateThread(nullptr, 0, initialize_menu, nullptr, 0, nullptr))
         CloseHandle(thread);
     else

@@ -103,6 +103,10 @@ struct Config
 {
     bool enabled = true;
     bool enable_logging = false;
+    // 渲染精度 hook 总开关（ini [Dx11FsrBridge] RenderScaleMenu，默认 1=开启）。
+    // 关闭后：不启动渲染精度菜单模块（不 hook 菜单文本/渲染命令构建/精度应用，
+    // 也不扩展候选精度档位），游戏回到原生精度档位。用于 A/B 与故障隔离。
+    bool render_scale_menu = true;
     // 日志等级（LogLevel）：0=仅错误 1=核心状态（默认） 2=节流细节 3=全量（trace）
     // 已废弃（保留仅为兼容旧 ini / 旧代码读取）；实际过滤由 logging 决定。
     int log_level = 1;
@@ -240,7 +244,15 @@ struct Config
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     bool optiscaler_bridge_probe = false; // 遗留 OptiScaler 候选桥路径（frames.jsonl 记录，默认关）
 #endif
-    std::uint32_t ffx12_jitter_mode = 4; // 0=+norm*width-0.5, 1=+norm*width(符号反→整体抖), 2=raw, 3=-norm*width+0.5, 4=-norm*width(FSR4实测:符号正确), 5=零
+    // 抖动生成模式。**默认 3**（2026-09-18 由 4 改为 3）：
+    //   游戏 jitter 为 [0,1) 的 Halton 相位；FSR2 的 jitterOffset 期望**零中心**亚像素偏移。
+    //   模式 4 = -(norm×width)      → 值域 [-1,0]，**恒定带 -0.5px 偏置**、从不跨零；
+    //   模式 3 = -(norm×width)+0.5  → 值域 [-0.5,+0.5]，零中心（= v1.2.3 的公式）。
+    // 证据（2026-09-18 issue）：DLSS M/L（第二代 transformer）对重投影相位敏感，
+    //   模式 4 下累积朝错误方向 → 规则网格状黑线；改模式 3 即恢复正常。
+    //   其他上采样模型对半像素偏置较宽容，故长期未被发现 —— 但偏置是**普遍存在**的。
+    // 0=+norm*width-0.5, 1=+norm*width(符号反→整体抖), 2=raw, 3=-norm*width+0.5(默认), 4=-norm*width, 5=零
+    std::uint32_t ffx12_jitter_mode = 3;
     bool ffx12_depth_inverted = true; // 游戏深度逆方向（0=far）；FSR2 默认 0=near
     bool ffx12_decode_motion = true;  // 游戏 motion 为 R10G10B10A2 平方编码 → 解码 R16G16_FLOAT
     bool ffx12_hdr_input = true;      // 游戏 10-bit HDR 管线
@@ -3890,7 +3902,7 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"OptiScalerBridgeProbe", 0, config_path.c_str()) != 0;
 #endif
     g_config.ffx12_jitter_mode = static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12JitterMode", 4, config_path.c_str()));
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12JitterMode", 3, config_path.c_str()));
     g_config.ffx12_depth_inverted =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DepthInverted", 1, config_path.c_str()) != 0;
     g_config.ffx12_decode_motion =
@@ -4059,6 +4071,10 @@ void load_config()
         g_bridge_log_level = legacy; // 保留旧字段供兼容读取
     }
 
+    // 渲染精度 hook 总开关（**正式版必须在此读取**——非正式版分支另有一份同样的读取，
+    // 只写一边会让该开关在正式版静默失效；历史上 trace 键正是这样失效过）。
+    g_config.render_scale_menu =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"RenderScaleMenu", 1, config_path.c_str()) != 0;
 #endif
 #else
     g_config.enabled = GetPrivateProfileIntW(L"Dx11FsrBridge", L"Enabled", 1, config_path.c_str()) != 0;
@@ -4139,6 +4155,9 @@ void load_config()
         static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"TextureTraceDurationMs", 10000, config_path.c_str())));
     g_config.texture_trace_limit = std::max<std::uint32_t>(1u,
         static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"TextureTraceLimit", 128, config_path.c_str())));
+    // 渲染精度 hook 总开关（非正式版这一份与正式版分支保持一致）。
+    g_config.render_scale_menu =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"RenderScaleMenu", 1, config_path.c_str()) != 0;
     wchar_t trace_hash_buffer[64] {};
     GetPrivateProfileStringW(L"Dx11FsrBridge", L"TracePixelShaderHash", L"78057A29AF6C2D99", trace_hash_buffer, static_cast<DWORD>(std::size(trace_hash_buffer)), config_path.c_str());
     wchar_t *trace_hash_end = nullptr;
@@ -13417,7 +13436,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
         DisableThreadLibraryCalls(module);
         initialize_once();
         if (g_active)
-            initialize_render_scale_menu(module, &log_line);
+            initialize_render_scale_menu(module, &log_line, g_config.render_scale_menu);
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
