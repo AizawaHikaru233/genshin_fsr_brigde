@@ -99,6 +99,12 @@ bridge-sdk234-param-audit.md
 fsr2_sdk_params_enumeration.md
 reconcile-threeway-gap.md
 
+# 开发改动留痕（本地记录，不进仓库）
+# 记录每次改动的区域/原因/目标/结果，以时间线为准。
+# 规范：先写条目再动手；结果必须基于实测；失败与被证伪的结论必须留档。
+DEV-CHANGELOG.local.md
+*.local.md
+
 # 交接/计划/报告类文档（不进入仓库——本地保留）
 docs/
 交接文档*.md
