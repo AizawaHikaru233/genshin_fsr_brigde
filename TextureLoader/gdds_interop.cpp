@@ -104,8 +104,13 @@ void UnloadDstorageRuntime()
 }
 
 std::mutex g_mutex;
-bool g_initialized = false;
-bool g_init_failed = false; // 终态：初始化失败后不再重试（GDDS 不可用，不影响 DDS）
+// ⚠️ 这两个状态位必须用**原子**，不能靠 g_mutex 保护：
+// TextureLoader.cpp 的 EnqueueLoad() 在**渲染线程**上调用 Failed()（纹理创建钩子路径），
+// 而 g_mutex 会被异步加载线程在 LoadGddsTexture 内长期持有（含 DS 等待与 500ms 忙等，
+// 最坏数十秒）。若 Failed() 取该锁，渲染线程就会被堵住数十秒。
+// 这两个位只在 Initialize/Shutdown 里改（低频），用 atomic 读取是零成本的正确做法。
+std::atomic<bool> g_initialized{false};
+std::atomic<bool> g_init_failed{false}; // 终态：初始化失败后不再重试（GDDS 不可用，不影响 DDS）
 
 ID3D11Device *g_game_device = nullptr;
 
@@ -265,6 +270,12 @@ bool CreateReplacementTexture(const GddsInfo &info, ComPtr<ID3D11Texture2D> &d11
     if (FAILED(d11.As(&r1)))
         return false;
     HANDLE h = nullptr;
+    // 权限说明（审核报告曾建议收窄为最小权限）：此处保留 GENERIC_ALL 是**有意为之**。
+    // 该句柄只在同一进程内被紧接着的 OpenSharedHandle 消费，随即 CloseHandle，
+    // 不跨进程、不落盘，因此不构成权限放大面；而 D3D12 侧对 NT 共享纹理的实际
+    // 需求权限依驱动与资源用途而定，收窄到 D3D12_RESOURCE_STATE_* 对应位需要
+    // 实机验证每种用途——权限不足会让 OpenSharedHandle 直接失败，表现为
+    // "替换纹理全部创建失败"（静默退化），代价远高于收益。
     if (FAILED(r1->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &h)))
         return false;
     HRESULT hr = g_d12dev->OpenSharedHandle(h, IID_PPV_ARGS(&d12));
@@ -294,9 +305,9 @@ void SignalSharedFence()
 bool Initialize(ID3D11Device *game_device)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_initialized)
+    if (g_initialized.load(std::memory_order_acquire))
         return true;
-    if (g_init_failed)
+    if (g_init_failed.load(std::memory_order_acquire))
         return false; // 终态：之前失败过，不再重复初始化
     if (!game_device)
         return false;
@@ -310,14 +321,14 @@ bool Initialize(ID3D11Device *game_device)
             FAILED(dxgi_dev->GetAdapter(&adapter)))
         {
             debug_log("get adapter failed");
-            g_init_failed = true;
+            g_init_failed.store(true, std::memory_order_release);
             return false;
         }
         if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0,
                                      IID_PPV_ARGS(&g_d12dev))))
         {
             debug_log("D3D12CreateDevice failed");
-            g_init_failed = true;
+            g_init_failed.store(true, std::memory_order_release);
             return false;
         }
     }
@@ -327,13 +338,13 @@ bool Initialize(ID3D11Device *game_device)
         if (!LoadDstorageRuntime() || g_pfn_get_factory == nullptr)
         {
             debug_log("DStorageGetFactory unavailable (dstorage.dll not loaded)");
-            g_init_failed = true;
+            g_init_failed.store(true, std::memory_order_release);
             return false;
         }
         if (FAILED(g_pfn_get_factory(IID_PPV_ARGS(&g_ds_factory))))
         {
             debug_log("DStorageGetFactory failed (dstorage.dll missing?)");
-            g_init_failed = true;
+            g_init_failed.store(true, std::memory_order_release);
             return false;
         }
         DSTORAGE_QUEUE_DESC qd = {};
@@ -345,7 +356,7 @@ bool Initialize(ID3D11Device *game_device)
         if (FAILED(g_ds_factory->CreateQueue(&qd, IID_PPV_ARGS(&g_ds_queue))))
         {
             debug_log("CreateQueue failed");
-            g_init_failed = true;
+            g_init_failed.store(true, std::memory_order_release);
             return false;
         }
     }
@@ -356,7 +367,7 @@ bool Initialize(ID3D11Device *game_device)
                                          IID_PPV_ARGS(&g_shared_fence))))
         {
             debug_log("CreateFence shared failed");
-            g_init_failed = true;
+            g_init_failed.store(true, std::memory_order_release);
             return false;
         }
         HANDLE fh = nullptr;
@@ -364,7 +375,7 @@ bool Initialize(ID3D11Device *game_device)
                                                 GENERIC_ALL, nullptr, &fh)))
         {
             debug_log("fence CreateSharedHandle failed");
-            g_init_failed = true;
+            g_init_failed.store(true, std::memory_order_release);
             return false;
         }
         ComPtr<ID3D11Device5> d11v5;
@@ -373,7 +384,7 @@ bool Initialize(ID3D11Device *game_device)
         {
             CloseHandle(fh);
             debug_log("D3D11 OpenSharedFence failed");
-            g_init_failed = true;
+            g_init_failed.store(true, std::memory_order_release);
             return false;
         }
         CloseHandle(fh);
@@ -386,12 +397,12 @@ bool Initialize(ID3D11Device *game_device)
         if (FAILED(g_d12dev->CreateCommandQueue(&cqd, IID_PPV_ARGS(&g_signal_queue))))
         {
             debug_log("create signal queue failed");
-            g_init_failed = true;
+            g_init_failed.store(true, std::memory_order_release);
             return false;
         }
     }
 
-    g_initialized = true;
+    g_initialized.store(true, std::memory_order_release);
     debug_log("GDDS interop initialized (self D3D12 + DirectStorage)");
     return true;
 }
@@ -402,7 +413,7 @@ ID3D11Texture2D *LoadGddsTexture(const wchar_t *gdds_path, uint64_t *out_ready_f
     if (out_skipped)
         *out_skipped = false; // 默认非跳过；仅 max_texture_side 分支置 true
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_initialized || !g_ds_queue)
+    if (!g_initialized.load(std::memory_order_acquire) || !g_ds_queue)
         return nullptr;
 
     // 1. 读头 + 解析 GDDS（多子流：流数 @124，记录数组 @148）
@@ -589,7 +600,7 @@ void WaitOnRenderThread(ID3D11DeviceContext *immediate_ctx, uint64_t fence_value
 void Shutdown()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_initialized)
+    if (!g_initialized.load(std::memory_order_acquire))
         return;
     g_signal_queue.Reset();
     g_shared_fence11.Reset();
@@ -598,21 +609,23 @@ void Shutdown()
     g_ds_factory.Reset();
     g_d12dev.Reset();
     g_game_device = nullptr;
-    g_initialized = false;
+    g_initialized.store(false, std::memory_order_release);
     UnloadDstorageRuntime(); // 释放动态加载的 dstorage.dll
     debug_log("GDDS interop shutdown");
 }
 
+// ⚠️ 这两个查询**绝不能取 g_mutex**：Failed() 由 TextureLoader.cpp 的 EnqueueLoad()
+// 在**渲染线程**上调用，而 g_mutex 会被异步加载线程在 LoadGddsTexture 内长期持有
+// （含 DS 等待与 500ms 忙等，最坏数十秒）→ 渲染线程被堵住数十秒。
+// 两个状态位已是 atomic，直接读即可（零成本，无阻塞）。
 bool Active()
 {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    return g_initialized;
+    return g_initialized.load(std::memory_order_acquire);
 }
 
 bool Failed()
 {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    return g_init_failed;
+    return g_init_failed.load(std::memory_order_acquire);
 }
 
 // TextureLoaderFn 适配：统一加载器注册表入口。
