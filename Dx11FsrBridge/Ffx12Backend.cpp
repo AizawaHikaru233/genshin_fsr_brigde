@@ -248,6 +248,7 @@ ID3D11Texture2D *g_depth_src_last = nullptr;
 // D3D11 侧 motion 解码（金丝雀证实原 D3D12 decode pass 从不写 cvt）
 ComPtr<ID3D11ComputeShader> g_motion_decode_cs;   // D3D11 decode compute
 ComPtr<ID3D11ComputeShader> g_motion_decode_dz_cs; // ：静止死区变体
+ComPtr<ID3D11ComputeShader> g_motion_raw_cs;       // 不解码变体（Ffx12MotionDecode=0 时选用）
 bool g_motion_deadzone = false;                  // =true 用死区变体（微小 motion 归零）
 SharedTex g_tex_motion_cvt_share {};              // R16G16_FLOAT 共享解码输出（D3D12 直读给 FFX）
 ComPtr<ID3D11UnorderedAccessView> g_motion_cvt_share_uav;
@@ -260,6 +261,7 @@ ComPtr<ID3D11UnorderedAccessView> g_reactive_share_uav;
 // 运行期配置（桥 load_config 时设置；启动后固定）
 bool g_depth_inverted = true;   // 游戏深度逆方向（0=far）—— 2026-08-23 采样验证
 bool g_decode_motion = true;    // 游戏 motion 为 R10G10B10A2 平方编码
+std::uint32_t g_create_flags = 0; // 实际创建 flags（日志按真值输出，勿硬编码）
 float g_motion_flip = 1.0f;     // ：XeSS/DLSS 定向——motion 方向翻转（默认 +1 = FSR 方向）
 float g_depth_scale = 1.0f;     // ：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
 ComPtr<ID3D11Buffer> g_motion_cb;   // MotionParams 常数缓冲（b0: g_flip）
@@ -440,8 +442,16 @@ RWTexture2D<float> out_reactive : register(u1);
 void main(uint3 id : SV_DispatchThreadID)
 {
     float4 c = in_mv.Load(int3(id.xy, 0));
+    #if defined(FFX12_MOTION_RAW)
+    // 不解码变体：把通道按 R16G16 归一化运动矢量直接读出（只做方向翻转）。
+    // 用途：验证/绕开"游戏 motion 是 R10G10B10A2 signed-in-unorm 平方编码"这一前提。
+    // 历史缺陷：Ffx12MotionDecode 曾是**空开关**（g_decode_motion 除赋值外无任何读取点，
+    // 平方解码无条件执行），日志却打 mv_decode=1，看起来像在生效。
+    float2 mv = (c.rg * 2.0 - 1.0) * g_flip;
+    #else
     float2 d = c.rg - 0.498039;
     float2 mv = -sign(d) * (4.0 * d * d) * g_flip;
+    #endif
     #if defined(FFX12_MOTION_DEADZONE)
     // 静止死区——|mv| 低于阈值归零，让 FSR 进入静止锁定（lock），
     // 消除静止时残余 motion 驱动的时间累积网格（竖纹/云刺）。阈值 0.0005 UV ≈ 1px@1920。
@@ -1726,6 +1736,7 @@ bool create_context(SdkContext &sc)
                  // 仅当输入 motion 已包含投影 jitter 时启用抵消；否则该标志会对
                  // 未带 jitter 的矢量重复施加补偿，表现为静止画面细微抖动。
                  (g_motion_vectors_jittered ? FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION : 0u);
+    g_create_flags = desc.flags; // 供日志按真值输出（旧日志此处是硬编码字符串）
     const ffxReturnCode_t rc = g_runtime.create(
         &sc.ctx, reinterpret_cast<ffxCreateContextDescHeader *>(&desc), nullptr);
     if (rc != FFX_API_RETURN_OK || sc.ctx == nullptr)
@@ -1868,10 +1879,16 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
                 ID3D11Buffer *cbs[] = {g_motion_cb.Get()};
                 game_context->CSSetConstantBuffers(0, 1, cbs);
             }
-            game_context->CSSetShader(
-                g_motion_deadzone && g_motion_decode_dz_cs ? g_motion_decode_dz_cs.Get()
-                                                           : g_motion_decode_cs.Get(),
-                nullptr, 0);
+            // 变体选择（让 Ffx12MotionDecode 真正生效——此前它是空开关）：
+            //   decode_motion=false → raw 变体（不解码）；true 且 deadzone → dz 变体；否则 decode
+            ID3D11ComputeShader *motion_cs = nullptr;
+            if (!g_decode_motion && g_motion_raw_cs)
+                motion_cs = g_motion_raw_cs.Get();
+            else if (g_motion_deadzone && g_motion_decode_dz_cs)
+                motion_cs = g_motion_decode_dz_cs.Get();
+            else
+                motion_cs = g_motion_decode_cs.Get();
+            game_context->CSSetShader(motion_cs, nullptr, 0);
             ID3D11ShaderResourceView *srvs[] = { g_motion_src_srv.Get() };
             game_context->CSSetShaderResources(0, 1, srvs);
             // u0 = 解码 motion（R16G16），u1 = reactive（R8，motion B 通道）
@@ -2244,6 +2261,21 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
                              &g_motion_decode_dz_cs)))
                 setup_ok = false;
         }
+        // 不解码变体（Ffx12MotionDecode=0 时启用；让该开关真正生效）
+        if (setup_ok)
+        {
+            ComPtr<ID3DBlob> blob, err;
+            const D3D_SHADER_MACRO defs[] = {{"FFX12_MOTION_RAW", "1"}, {nullptr, nullptr}};
+            const HRESULT chr = D3DCompile(g_motion_decode_d11_hlsl, std::strlen(g_motion_decode_d11_hlsl),
+                                           nullptr, defs, nullptr, "main", "cs_5_0", 0, 0,
+                                           &blob, &err);
+            if (FAILED(chr) || !blob)
+                setup_ok = false;
+            else if (FAILED(g_d11dev->CreateComputeShader(
+                             blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+                             &g_motion_raw_cs)))
+                setup_ok = false;
+        }
         if (setup_ok)
         {
             // motion 解码 CS 常数缓冲（b0: g_flip——XeSS/DLSS 方向翻转）
@@ -2469,6 +2501,7 @@ void shutdown()
     g_depth_extract_cs.Reset();
     g_motion_decode_cs.Reset();
     g_motion_decode_dz_cs.Reset();
+    g_motion_raw_cs.Reset();
     g_shared_fence.Reset();
     g_shared_fence11.Reset();
     g_d11_5.Reset();
@@ -2567,6 +2600,7 @@ void recover_device_removed_locked()
     g_depth_extract_cs.Reset();
     g_motion_decode_cs.Reset();
     g_motion_decode_dz_cs.Reset();
+    g_motion_raw_cs.Reset();
     g_gpu_interop_ready = false;
     g_shared_fence_value = 0;
     g_d12dev.Reset();
@@ -2794,6 +2828,56 @@ void set_depth_inverted(bool inverted)
 void set_decode_motion(bool decode)
 {
     g_decode_motion = decode;
+}
+
+std::uint32_t create_flags()
+{
+    return g_create_flags;
+}
+
+bool pq_chain()
+{
+    return g_use_pq_chain;
+}
+
+bool decode_motion_wired()
+{
+    return g_motion_raw_cs != nullptr;
+}
+
+// flags 的可读解码。**为什么必须由后端提供**：FFX_UPSCALE_ENABLE_* 枚举在
+// ffx_upscale.h（后端私有 SDK 头）里，桥 TU 不引入它。
+// 存在的意义：日志曾把 flags 硬编码成 "hdr,deptinv,autoexp"，与运行时无关——
+// 出厂 ini（Ffx12Hdr=0/Ffx12NonLinear=0）下会让人误以为 HDR 已启用。
+const char *create_flags_text()
+{
+    static std::string text; // 单线程（dispatch 日志路径）使用，无需加锁
+    text.clear();
+    auto add = [](bool on, const char *name)
+    {
+        if (!on)
+            return;
+        if (!text.empty())
+            text += ",";
+        text += name;
+    };
+    add((g_create_flags & FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE) != 0, "hdr");
+    add((g_create_flags & FFX_UPSCALE_ENABLE_DEPTH_INVERTED) != 0, "deptinv");
+    add((g_create_flags & FFX_UPSCALE_ENABLE_AUTO_EXPOSURE) != 0, "autoexp");
+    add((g_create_flags & FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE) != 0, "nonlinear");
+    add((g_create_flags & FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION) != 0, "mvjitcancel");
+    add((g_create_flags & FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) != 0, "dispmv");
+    add((g_create_flags & FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION) != 0, "dynres");
+    if (text.empty())
+        text = "none";
+    return text.c_str();
+}
+
+const char *create_flags_hex()
+{
+    static char buffer[16] {};
+    std::snprintf(buffer, sizeof(buffer), "0x%X", static_cast<unsigned>(g_create_flags));
+    return buffer;
 }
 
 void set_motion_flip(float flip) // ：XeSS/DLSS 定向——motion 方向翻转（±1）

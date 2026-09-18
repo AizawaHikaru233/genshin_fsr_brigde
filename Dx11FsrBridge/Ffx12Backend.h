@@ -62,6 +62,24 @@ void set_hdr_input(bool hdr);
 // 自动曝光 + 非线性色彩空间（OptiScaler 实测 initFlags 含 AUTO_EXPOSURE|NON_LINEAR_COLORSPACE）。
 void set_auto_exposure(bool auto_exposure);
 void set_non_linear(bool non_linear);
+// 实际用于创建 FFX 上下文的 flags（FFX_UPSCALE_ENABLE_* 位组合）。
+// 存在的意义：日志此前把 flags **硬编码**成 "hdr,deptinv,autoexp" 字符串，与运行时
+// 实际值无关——出厂 ini（Ffx12Hdr=0 / Ffx12NonLinear=0）下会让人误以为 HDR 已启用。
+// 现在日志按这个真值逐位解码输出。
+std::uint32_t create_flags();
+// create_flags() 的可读解码（"hdr,deptinv,..."）与 "0xNNN" 十六进制串。
+// 放在后端 TU 内实现：FFX_UPSCALE_ENABLE_* 枚举只在后端的私有 SDK 头里可见，
+// 桥 TU 不应为此引入该头。
+const char *create_flags_text();
+const char *create_flags_hex();
+// 实际 PQ 链开关（true = 旧的 PqToLinear→FSR2→LinearToPq 链）。
+// 与 create_flags 同理：日志曾把链路硬编码成 "pq_decode->ffx_dispatch->pq_encode"，
+// 与运行时无关。现在按真值输出。
+bool pq_chain();
+// 该开关是否**真正接线**（存在对应的 CS 变体），供日志如实标注。
+// 背景：Ffx12MotionDecode 曾经是空开关（g_decode_motion 除赋值外无任何读取点），
+// 日志却只打 0/1，看起来像在生效。
+bool decode_motion_wired();
 // PQ 链开关：=true 时走 PqToLinear→FSR2→LinearToPq（旧链，线性输入会致自动曝光爆炸→白屏）；
 // =false（默认，复刻游戏原生 0x129 标志组合）时直喂 PQ 值 + HDR|NON_LINEAR|AUTO_EXPOSURE。
 void set_use_pq_chain(bool use_chain);

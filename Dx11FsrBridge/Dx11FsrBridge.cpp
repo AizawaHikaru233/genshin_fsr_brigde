@@ -10210,6 +10210,11 @@ bool try_fsr2_translation_draw(
                 sdk_in.reset = g_config.ffx12_force_reset || st->reset_next;
                 sdk_in.use_reactive_mask = g_config.fsr2_use_reactive_mask;
                 sdk_in.use_transparency_mask = g_config.fsr2_use_transparency_mask;
+                // RCAS 锐化：此前 `Fsr2SharpnessPercent` 只被读取、**从不使用**（与
+                // mv_decode / transparency / 硬编码 flags 同类的"配置存在但从未接线"死键）。
+                // 默认 0 ⇒ enable_sharpening=false，行为与现状一致；设 >0 才真正打开。
+                sdk_in.enable_sharpening = g_config.fsr2_sharpness_percent > 0;
+                sdk_in.sharpness = static_cast<float>(g_config.fsr2_sharpness_percent) / 100.0f;
                 // 接管空窗检测（2026-08-24 实证）：UI 全屏/场景切换由另一实例或原生接管，
                 // 距上次 dispatch 超 500ms（= 其他路径接管期）→ 恢复时强制 FSR2 reset，清历史残留。
                 {
@@ -10774,13 +10779,13 @@ bool try_fsr2_translation_draw(
                         HMODULE amdxc = GetModuleHandleW(L"amdxc64.dll");
                         LOG_DEBUG(blog::cat::upscale, "ffx12_path count=" + std::to_string(dcount) +
                             " version=" + ffx12::selected_version_name() +
-                            " chain=pq_decode->ffx_dispatch->pq_encode" +
+                            " chain=" + (ffx12::pq_chain() ? std::string("pq_decode->ffx_dispatch->pq_encode") : std::string("direct->ffx_dispatch")) +
                             " out=" + hex64(reinterpret_cast<std::uint64_t>(output_tex)) +
                             " render=" + std::to_string(sdk_in.render_w) + "x" +
                             std::to_string(sdk_in.render_h) +
                             " display=" + std::to_string(sdk_in.display_w) + "x" +
                             std::to_string(sdk_in.display_h) +
-                            " flags=hdr,deptinv,autoexp" +
+                            " flags=" + ffx12::create_flags_hex() + "(" + ffx12::create_flags_text() + ")" +
                             " amdxc64=" + (amdxc != nullptr ? std::string("loaded") : std::string("missing")) +
                             " sdk_msgs=" + (sdk_msgs.empty() ? std::string("none") : narrow(sdk_msgs)));
                     }
@@ -10903,11 +10908,13 @@ bool try_fsr2_translation_draw(
                             // （g_decode_motion 除赋值外无读取点，平方解码无条件执行），
                             // 日志只打 0/1，看起来像在生效。
                             " mv_decode=" + std::to_string(g_config.ffx12_decode_motion ? 1 : 0) +
+                            " mv_decode_wired=" + std::to_string(ffx12::decode_motion_wired() ? 1 : 0) +
                             " reactive=" + std::to_string(sdk_in.use_reactive_mask ? 1 : 0) +
                             // transparency 如实标注：桥取到了纹理、也赋值了开关，但后端**从未写进
                             // dispatch**（transparencyAndComposition 全项目 0 次出现），
                             // 且后端没有对应共享纹理 → 整条链未实现。
-                            " transparency=" + std::to_string(sdk_in.use_transparency_mask ? 1 : 0) +
+                            " transparency_cfg=" + std::to_string(sdk_in.use_transparency_mask ? 1 : 0) +
+                            " transparency_sent=0" +
                             " hdr=" + std::to_string(g_config.ffx12_hdr_input ? 1 : 0) +
                             " autoexp=" + std::to_string(g_config.ffx12_auto_exposure ? 1 : 0) +
                             " nonlin=" + std::to_string(g_config.ffx12_non_linear ? 1 : 0) +
