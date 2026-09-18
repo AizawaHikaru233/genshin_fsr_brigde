@@ -53,32 +53,41 @@ ID3D11DeviceContext *g_context = nullptr;
 // 不得直接 Release D3D11 对象——AMD 驱动 worker 可能在对象释放后仍引用
 // （快速切换角色时崩溃现场 amdxx64 + RIP=垃圾地址 = 驱动内 UAF）。统一入队，
 // 由渲染线程在 SetShaderResources hook 入口批量释放（与游戏提交串行）。
+//
+// ⚠️ 竞态修复：旧实现用 `g_pendingCount` 与队列**分离**维护——
+//   QueueRelease：{ 加锁 push_back } 解锁；然后 InterlockedIncrement(count)
+//   FlushPendingRelease：先读 count，为 0 就 return；否则锁内 swap、再 count=0
+// 中间那段"解锁之后、自增之前"的窗口里，Flush 可能：
+//   - 读到 count==0 直接返回（刚 push 的对象留在队列里，本次不释放，尚可等下次）
+//   - 更糟：读到非 0 → swap 拿到队列 → 把 count 置 0；此时并发的 QueueRelease
+//     已 push 完但**还没自增** → 该对象被 swap 走却没计入任何计数，而随后那次
+//     InterlockedIncrement 让 count 变成 1 而队列**实际为空** → 计数与队列永久失配，
+//     后续 Flush 反复进入却拿到空 batch，对象**永不释放**（泄漏）。
+//
+// 现在**移除独立计数器**，让队列本身成为唯一真相：判空与取走都在同一把锁内完成，
+// 计数与队列不可能失配。
 std::mutex g_pendingMutex;
 std::deque<IUnknown *> g_pendingRelease;
-volatile long g_pendingCount = 0;
 
 static void QueueRelease(IUnknown *obj)
 {
     if (!obj)
         return;
-    {
-        std::lock_guard<std::mutex> lk(g_pendingMutex);
-        g_pendingRelease.push_back(obj);
-    }
-    InterlockedIncrement(&g_pendingCount);
+    std::lock_guard<std::mutex> lk(g_pendingMutex);
+    g_pendingRelease.push_back(obj);
 }
 
-// 渲染线程调用：释放所有排队对象（仅当队列非空时锁一次）
+// 渲染线程调用：释放所有排队对象。判空与取走在同一锁内，无失配窗口。
 static void FlushPendingRelease()
 {
-    if (InterlockedCompareExchange(&g_pendingCount, 0, 0) == 0)
-        return;
     std::deque<IUnknown *> batch;
     {
         std::lock_guard<std::mutex> lk(g_pendingMutex);
+        if (g_pendingRelease.empty())
+            return;
         batch.swap(g_pendingRelease);
     }
-    InterlockedExchange(&g_pendingCount, 0);
+    // 锁外释放：Release 可能回调进 D3D/驱动，持锁会放大争用。
     for (IUnknown *obj : batch)
         obj->Release();
 }
@@ -205,6 +214,16 @@ std::mutex g_loadMutex;
 std::condition_variable g_loadCv[2];
 std::deque<AsyncLoadTask> g_loadQueue[2];
 std::unordered_set<uint32_t> g_inflight; // 已出队正在加载的 hash（防在途重复加载）
+
+// ---- 停机协作 ----------------------------------------------------------
+// ⚠️ 旧实现的两个后台线程（AsyncLoadThread / VramMonitorThread）**没有退出条件**，
+// 且 DLL_PROCESS_DETACH 既不停线程也不 DetourDetach —— 卸载时它们可能仍在
+// ExecuteLoadTask 里访问已释放的替换缓存（下面的 detach 会清空 g_replacements），
+// 属于 use-after-free。这里加显式停机信号 + 线程句柄，detach 时先停后清。
+std::atomic<bool> g_shutdownRequested{ false };
+HANDLE g_loadThread[2] = { nullptr, nullptr };
+HANDLE g_vramThread = nullptr;
+HANDLE g_bootstrapThread = nullptr;
 bool g_loadThreadRunning[2] = {false, false};
 
 // 前置声明（定义在 HookCreateTexture2D 之后，同步/异步共用）
@@ -892,6 +911,12 @@ static void STDMETHODCALLTYPE Hook_DS(ID3D11DeviceContext *t, UINT a, UINT b,
 static void STDMETHODCALLTYPE Hook_CS(ID3D11DeviceContext *t, UINT a, UINT b,
     ID3D11ShaderResourceView *const *c) { HookSetShaderResourcesCommon(t, a, b, c, g_real_ssr[5], 5); }
 
+// 六个阶段的钩子入口表。提为文件级，供 HookContext 安装与 UninstallHooks 卸载共用。
+// 旧实现把这张表放在 HookContext 函数内（局部数组），卸载时无从取得 →
+// 六个 SetShaderResources 钩子**无法 DetourDetach**，DLL 卸载后游戏仍会跳进
+// 已解除映射的 trampoline。
+static SetShaderResources_t const g_stage_hooks[6] = {Hook_PS, Hook_VS, Hook_GS, Hook_HS, Hook_DS, Hook_CS};
+
 // ---------------------------------------------------------------------------
 // Hook: UpdateSubresource — 标记动态纹理（创建后被更新的，动画/飘带模拟等）
 // ---------------------------------------------------------------------------
@@ -1052,14 +1077,13 @@ static void HookContext(ID3D11DeviceContext *context)
         (SetShaderResources_t)vtbl->DSSetShaderResources, // DS
         (SetShaderResources_t)vtbl->CSSetShaderResources, // CS
     };
-    SetShaderResources_t hooks[6] = {Hook_PS, Hook_VS, Hook_GS, Hook_HS, Hook_DS, Hook_CS};
     for (int i = 0; i < 6; i++)
         g_real_ssr[i] = funcs[i];
 
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     for (int i = 0; i < 6; i++)
-        DetourAttach(&(PVOID &)g_real_ssr[i], hooks[i]);
+        DetourAttach(&(PVOID &)g_real_ssr[i], g_stage_hooks[i]);
     // UpdateSubresource：标记动态纹理
     g_real_update_subresource = (UpdateSubresource_t)vtbl->UpdateSubresource;
     DetourAttach(&(PVOID &)g_real_update_subresource, HookUpdateSubresource);
@@ -1104,7 +1128,13 @@ DWORD WINAPI AsyncLoadThread(LPVOID param)
         AsyncLoadTask task;
         {
             std::unique_lock<std::mutex> lk(g_loadMutex);
-            g_loadCv[idx].wait(lk, [idx] { return !g_loadQueue[idx].empty(); });
+            // 停机信号也唤醒等待：否则线程会永远卡在 cv.wait 上，
+            // detach 时的 WaitForSingleObject 就会一直等到超时。
+            g_loadCv[idx].wait(lk, [idx] {
+                return !g_loadQueue[idx].empty() || g_shutdownRequested.load(std::memory_order_acquire);
+            });
+            if (g_loadQueue[idx].empty() && g_shutdownRequested.load(std::memory_order_acquire))
+                return 0;   // 队列已排空且要求停机 → 退出
             task = std::move(g_loadQueue[idx].front());
             g_loadQueue[idx].pop_front();
             g_inflight.insert(task.hash); // 在途标记：同 hash 新任务不再入队
@@ -1174,7 +1204,7 @@ DWORD WINAPI VramMonitorThread(LPVOID)
     Zone last_zone = Zone::Comfort;
     uint64_t last_record_cleanup = 0;
 
-    while (g_dxgi_adapter3) {
+    while (g_dxgi_adapter3 && !g_shutdownRequested.load(std::memory_order_acquire)) {
         // 状态化动态探针频率：按当前 zone 定频（压力越小探针越稀疏，低开销）
         DWORD sleep_ms = 5000;
         switch (last_zone) {
@@ -1659,13 +1689,15 @@ static void AttachToDevice(ID3D11Device *device, ID3D11DeviceContext *context)
     for (int i = 0; i < 2; i++) {
         if (!g_loadThreadRunning[i]) {
             g_loadThreadRunning[i] = true;
-            CreateThread(nullptr, 0, AsyncLoadThread, (LPVOID)(intptr_t)i, 0, nullptr);
+            // 保存句柄：detach 时需要等它们退出后才能释放替换缓存（见 DllMain）。
+            // 旧实现丢弃句柄 → 既无法等待退出，也无法 CloseHandle（句柄泄漏）。
+            g_loadThread[i] = CreateThread(nullptr, 0, AsyncLoadThread, (LPVOID)(intptr_t)i, 0, nullptr);
         }
     }
     // 启动显存监控线程（仅一次）
     if (!g_vramMonitorRunning) {
         InterlockedExchange(&g_vramMonitorRunning, 1);
-        CreateThread(nullptr, 0, VramMonitorThread, nullptr, 0, nullptr);
+        g_vramThread = CreateThread(nullptr, 0, VramMonitorThread, nullptr, 0, nullptr);
     }
     TL_LOG(L"[ok  ] attached: device=%p context=%p", device, context);
 }
@@ -1737,6 +1769,38 @@ static bool InstallCreateDeviceHook()
     LONG r = DetourTransactionCommit();
     TL_LOG(L"[ok  ] D3D11CreateDevice hook installed (commit=%d)", r);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// 卸载钩子（DLL_PROCESS_DETACH 时调用）
+//
+// ⚠️ 为什么必须做：Detours 的 DetourAttach 会把目标函数**改写**成跳转到我们的
+// trampoline，而 trampoline 位于本 DLL 的地址空间内。若 DLL 卸载时不 DetourDetach，
+// 游戏后续仍会跳进已解除映射的内存 → 立即崩溃。
+// 旧实现从不卸载，只在进程终结时才"侥幸"没出事（那时游戏也不再调用这些函数）。
+//
+// 顺序：必须在线程停掉**之后**调用——否则卸载瞬间仍有线程在钩子内执行。
+// 注意 D3D11CreateDevice 系列在 d3d11.dll 里（不在本模块），DetourDetach 会把
+// 原字节写回；失败也不致命（进程即将退出）。
+// ---------------------------------------------------------------------------
+static void UninstallHooks()
+{
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+    if (RealCreateTexture2D != nullptr)
+        DetourDetach(&(PVOID &)RealCreateTexture2D, HookCreateTexture2D);
+    for (int i = 0; i < 6; ++i) {
+        if (g_real_ssr[i] != nullptr)
+            DetourDetach(&(PVOID &)g_real_ssr[i], g_stage_hooks[i]);
+    }
+    if (g_real_update_subresource != nullptr)
+        DetourDetach(&(PVOID &)g_real_update_subresource, HookUpdateSubresource);
+    if (RealD3D11CreateDevice != nullptr)
+        DetourDetach(&(PVOID &)RealD3D11CreateDevice, HookD3D11CreateDevice);
+    if (RealD3D11CreateDeviceAndSwapChain != nullptr)
+        DetourDetach(&(PVOID &)RealD3D11CreateDeviceAndSwapChain, HookD3D11CreateDeviceAndSwapChain);
+    const LONG r = DetourTransactionCommit();
+    TL_LOG(L"[ok  ] hooks uninstalled (commit=%d)", r);
 }
 
 // ---------------------------------------------------------------------------
@@ -1902,11 +1966,42 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         // 提前加载，此时立即 hook 才能在游戏创建设备前截获。若 d3d11 尚未
         // 加载（极少数情况），退回后台线程等待。
         if (!InstallCreateDeviceHook()) {
-            CreateThread(nullptr, 0, BootstrapThread, nullptr, 0, nullptr);
+            g_bootstrapThread = CreateThread(nullptr, 0, BootstrapThread, nullptr, 0, nullptr);
         } else {
             TL_LOG(L"[ok  ] installed synchronously in DllMain");
         }
     } else if (reason == DLL_PROCESS_DETACH) {
+        // ⚠️ 顺序至关重要：**先停后台线程，再释放它们会访问的数据**。
+        // 旧实现直接释放 g_replacements，而 AsyncLoadThread 可能正在 ExecuteLoadTask
+        // 里写这张表 → use-after-free；VramMonitorThread 也可能正在淘汰条目。
+        // 线程也没有退出条件，会一直跑到进程终结。
+        g_shutdownRequested.store(true, std::memory_order_release);
+        {
+            // 唤醒两个加载线程（它们可能正卡在 cv.wait 上）
+            std::lock_guard<std::mutex> lk(g_loadMutex);
+            g_loadCv[0].notify_all();
+            g_loadCv[1].notify_all();
+        }
+        // 等待退出（有界：加载线程在任务边界检查停机信号，最多等一个任务时长）
+        HANDLE waits[3] = { g_loadThread[0], g_loadThread[1], g_vramThread };
+        for (HANDLE h : waits) {
+            if (h != nullptr)
+                WaitForSingleObject(h, 3000);
+        }
+        for (HANDLE &h : waits) {
+            if (h != nullptr) {
+                CloseHandle(h);
+                h = nullptr;
+            }
+        }
+        if (g_bootstrapThread != nullptr) {
+            WaitForSingleObject(g_bootstrapThread, 1000);
+            CloseHandle(g_bootstrapThread);
+            g_bootstrapThread = nullptr;
+        }
+        // 线程已停 → 现在释放钩子与缓存才是安全的。
+        // 旧实现从不 DetourDetach：DLL 卸载后游戏仍会跳进已释放的 trampoline。
+        UninstallHooks();
         ::tloader_gdds::Shutdown(); // 释放 GDDS 互操作（D3D12/DS 队列/共享 fence）
         // 进程退出：统一释放全局持久化的替换缓存（正常运行时不随原纹理销毁，
         // 退出时一次清空；进程卸载后驱动侧资源由系统回收，此处显式 Release）

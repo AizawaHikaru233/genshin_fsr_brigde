@@ -180,8 +180,14 @@ static void ComputePitch(DXGI_FORMAT fmt, UINT width, UINT height,
                          UINT *rowBytes, UINT *numRows)
 {
     if (DxgiFormatIsBc(fmt)) {
-        UINT blockW = (fmt >= DXGI_FORMAT_BC1_TYPELESS && fmt <= DXGI_FORMAT_BC1_UNORM_SRGB) ? 8 : 4;
-        UINT blockH = blockW;
+        // BC 格式的块尺寸**恒为 4×4 纹素**，只有"每块字节数"随格式变化
+        // （BC1/BC4 = 8 字节，BC2/BC3/BC5/BC6H/BC7 = 16 字节）。
+        // 旧实现对 BC1 系列取 blockW=blockH=8 —— 那是把"块字节数 8"错当成了
+        // "块边长 8"。后果（以 2048×2048 BC1 为例）：
+        //   hBlocks = 2048/8 = 256（应 512）→ sliceBytes 只有实际数据的一半，
+        //   纹理只上传一半数据；SysMemPitch 同样偏小一半 → 行错位、画面花屏。
+        const UINT blockW = 4;
+        const UINT blockH = 4;
         UINT blockBytes = 8;
         switch (fmt) {
             case DXGI_FORMAT_BC1_TYPELESS:
@@ -335,15 +341,23 @@ HRESULT LoadDdsTexture(ID3D11Device *device, const wchar_t *path, TextureLoadRes
             arraySize = 1;
         pixelData = (const uint8_t *)(dx10 + 1);
     } else if (hdr->ddspf.flags & DDPF_FOURCC) {
-        // Legacy FOURCC -> DXGI mapping for common BC formats
+        // Legacy FOURCC -> DXGI mapping for common BC formats.
+        //
+        // 修正（此前两处映射错误，会导致纹理花屏/错位）：
+        //   DXT3（显式 4 位 alpha）→ BC2，不是 BC3。BC3 是**插值** alpha，
+        //     按 BC3 解 BC2 数据会把 alpha 块当成插值端点 → alpha 全乱。
+        //   DXT5（插值 alpha）→ BC3，不是 BC5。BC5 是双通道法线图格式，
+        //     按 BC5 解 BC3 数据 → 颜色/法线全错。
+        // 正确的对应关系：DXT1→BC1；DXT2/DXT3→BC2；DXT4/DXT5→BC3。
         switch (hdr->ddspf.fourCC) {
-            case 0x31545844: format = DXGI_FORMAT_BC1_UNORM; break; // DXT1
-            case 0x32545844: format = DXGI_FORMAT_BC2_UNORM; break; // DXT2
-            case 0x33545844: format = DXGI_FORMAT_BC3_UNORM; break; // DXT3
-            case 0x35545844: format = DXGI_FORMAT_BC5_UNORM; break; // DXT5
-            case 0x55344342: format = DXGI_FORMAT_BC4_UNORM; break; // BC4U
-            case 0x55354342: format = DXGI_FORMAT_BC5_UNORM; break; // BC5U
-            case 0x44335232: format = DXGI_FORMAT_BC7_UNORM; break; // DX10 'D32R'
+            case 0x31545844: format = DXGI_FORMAT_BC1_UNORM; break; // 'DXT1'
+            case 0x32545844: format = DXGI_FORMAT_BC2_UNORM; break; // 'DXT2'（预乘 alpha）
+            case 0x33545844: format = DXGI_FORMAT_BC2_UNORM; break; // 'DXT3'（显式 alpha）
+            case 0x34545844: format = DXGI_FORMAT_BC3_UNORM; break; // 'DXT4'（预乘插值 alpha）
+            case 0x35545844: format = DXGI_FORMAT_BC3_UNORM; break; // 'DXT5'（插值 alpha）
+            case 0x55344342: format = DXGI_FORMAT_BC4_UNORM; break; // 'BC4U'
+            case 0x55354342: format = DXGI_FORMAT_BC5_UNORM; break; // 'BC5U'
+            case 0x44335232: format = DXGI_FORMAT_BC7_UNORM; break; // 'D32R'
             default:
                 _freea(buf);
                 return E_FAIL;
