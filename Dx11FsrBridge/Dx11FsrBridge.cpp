@@ -48,6 +48,8 @@ std::once_flag g_initialize_once;
 // 声明必须与定义**同为内部链接**（都在匿名命名空间里），否则 MSVC 会把
 // 匿名命名空间内的声明当成另一个实体 → LNK2001。
 DWORD WINAPI exit_watchdog_proc(LPVOID);
+// 停机追踪（定义见文件末尾；initialize 里创建看门狗时就要用）。
+void shutdown_trace(const char *step);
 constexpr std::size_t k_context_vtable_size = 128;
 constexpr std::size_t k_context4_vtable_size = 149;
 constexpr std::size_t k_device_vtable_size = 80;
@@ -13483,8 +13485,23 @@ void initialize()
 
     // 退出看门狗（诊断）：游戏主窗口消失后 dump 各线程栈，用于定位"进程残留"。
     // 这是**临时诊断设施**——问题定位后应移除（它会在退出阶段挂起线程回溯栈）。
-    if (const HANDLE watchdog = CreateThread(nullptr, 0, exit_watchdog_proc, nullptr, 0, nullptr))
-        CloseHandle(watchdog);
+    // 这里显式记录创建结果：上一版看门狗完全静默，无法区分"线程没起来"与
+    // "起来了但没触发"，只能靠这一行区分。
+    {
+        const HANDLE watchdog = CreateThread(nullptr, 0, exit_watchdog_proc, nullptr, 0, nullptr);
+        const DWORD create_error = watchdog == nullptr ? GetLastError() : 0;
+        shutdown_trace(watchdog != nullptr ? "exit_watchdog thread_created"
+                                           : "exit_watchdog thread_create_failed");
+        if (watchdog != nullptr)
+            CloseHandle(watchdog);
+        else
+        {
+            char buf[64] {};
+            std::snprintf(buf, sizeof(buf), "exit_watchdog create_error=%lu",
+                          static_cast<unsigned long>(create_error));
+            shutdown_trace(buf);
+        }
+    }
 }
 
 void initialize_once()
@@ -13514,17 +13531,25 @@ namespace
 // 可以安全做真正的释放。
 std::once_flag g_final_shutdown_once;
 
-// 停机追踪：**不经过 blog**，直接 fopen/fprintf/fclose 追加。
-// 原因：detach 里调过 blog::shutdown() 之后日志器已 g_active=false，
-// 后续的 LOG_* 会被静默丢弃——那样"卡在哪一步"就没有证据了。
-// 这个 sink 在 CRT 退出流程里同样可用（只用 CRT 文件 API，不碰 loader）。
+// 停机追踪：**不经过 blog**，直接写文件追加。
+//
+// ⚠️ 必须用 _wfsopen(_SH_DENYNO) 而不是 _wfopen_s：
+// _wfopen_s 走默认共享模式（独占），而日志器的 std::ofstream **在整个进程生命周期内
+// 一直持有该文件** → 每次调用都会以"文件被占用"静默失败。
+// 实测证据：PowerShell 以 FileShare.None 打开日志后，第二次独占打开必定抛异常；
+// 这正是"看门狗一行都没输出""[SHUTDOWN] 标记从未出现"的真正原因——
+// **标记不是没执行，是根本写不进去**，此前基于"标记缺失"的全部推论都无效。
+// _SH_DENYNO 允许共享，于是能与日志器并存。
+std::mutex g_shutdown_trace_mutex;
+
 void shutdown_trace(const char *step)
 {
     if (g_log_path.empty())
         return;
-    FILE *f = nullptr;
-    // 必须走宽字符重载：注入目录常含中文，窄串会被按系统 ACP(936) 解释成乱码 → 打不开。
-    if (_wfopen_s(&f, g_log_path.c_str(), L"a") != 0 || f == nullptr)
+    std::lock_guard<std::mutex> lock(g_shutdown_trace_mutex);
+    // 宽字符路径：注入目录常含中文，窄串会被按系统 ACP(936) 解释成乱码 → 打不开。
+    FILE *f = _wfsopen(g_log_path.c_str(), L"a", _SH_DENYNO);
+    if (f == nullptr)
         return;
     SYSTEMTIME st {};
     GetLocalTime(&st);
