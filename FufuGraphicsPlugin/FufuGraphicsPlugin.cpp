@@ -966,43 +966,59 @@ bool ensure_missing_component_configurations(const BootstrapConfig &config)
     if (!config.bridge_path.empty())
     {
         const std::filesystem::path bridge_ini = config.bridge_path.parent_path() / L"Dx11FsrBridge.ini";
-        if (!file_exists(bridge_ini) && !copy_file_replace(default_directory / L"Dx11FsrBridge.ini", bridge_ini))
+        // ⚠️ 2026-09-19（用户澄清设计意图）：配置**只在首次运行时写入**，
+        // 之后仅由用户手动重置（`ResetConfigurations`）才改动。
+        //
+        // 原实现的不对称：Bridge 侧的 `Ffx12AsyncUpscale` **每次启动都写**，
+        // 而 OptiScaler 侧只在首次写。这违背上述原则 ——
+        // 每次启动覆盖会让"用户手动改过的值"在下次启动被静默改回，
+        // 用户无法通过手改 ini 持久化自己的选择。
+        // 现统一为首次运行才写（与 OptiScaler 侧一致）。
+        //
+        // 首次运行 = ini 尚不存在（由模板复制而来）。此时才应用托管设置。
+        const bool bridge_ini_missing = !file_exists(bridge_ini);
+        if (bridge_ini_missing)
         {
-            write_log("config_initialize_failed component=bridge");
-            success = false;
-        }
-        // 托管设置：按 GPU 架构写 Ffx12AsyncUpscale 默认值。RDNA2（RX 6000 系）
-        // 在游戏 HDR 渲染下输出目标逐帧双缓冲交替，与异步交叠的单槽 pending
-        // 错位（黑屏与正常画面交替）→ 默认同步；其余显卡默认异步（性能优先）。
-        const DetectedFsr4Policy gpu = detect_fsr4_gpu_policy();
-        const char *async_value = gpu.rdna2 ? "0" : "1";
-        if (!set_ini_value_utf8(bridge_ini, "Dx11FsrBridge", "Ffx12AsyncUpscale", async_value))
-        {
-            write_log("config_initialize_failed component=bridge reason=async_upscale_write");
-            success = false;
-        }
-        else
-        {
-            write_log(std::string("bridge_async_upscale_managed gpu=") + wide_to_utf8(gpu.gpu_name) +
-                " rdna2=" + (gpu.rdna2 ? "1" : "0") + " value=" + async_value);
+            if (!copy_file_replace(default_directory / L"Dx11FsrBridge.ini", bridge_ini))
+            {
+                write_log("config_initialize_failed component=bridge reason=template_copy");
+                success = false;
+            }
+            else
+            {
+                // 托管设置：按 GPU 架构写 Ffx12AsyncUpscale 默认值。RDNA2（RX 6000 系）
+                // 在游戏 HDR 渲染下输出目标逐帧双缓冲交替，与异步交叠的单槽 pending
+                // 错位（黑屏与正常画面交替）→ 默认同步；其余显卡默认异步（性能优先）。
+                const DetectedFsr4Policy gpu = detect_fsr4_gpu_policy();
+                const char *async_value = gpu.rdna2 ? "0" : "1";
+                if (!set_ini_value_utf8(bridge_ini, "Dx11FsrBridge", "Ffx12AsyncUpscale", async_value))
+                {
+                    write_log("config_initialize_failed component=bridge reason=async_upscale_write");
+                    success = false;
+                }
+                else
+                {
+                    write_log(std::string("bridge_async_upscale_managed gpu=") + wide_to_utf8(gpu.gpu_name) +
+                        " rdna2=" + (gpu.rdna2 ? "1" : "0") + " value=" + async_value);
+                }
+            }
         }
     }
     if (!config.optiscaler_path.empty())
     {
         const std::filesystem::path optiscaler_directory = config.optiscaler_path.parent_path();
         const std::filesystem::path optiscaler_ini = optiscaler_directory / L"OptiScaler.ini";
-        // 托管项**每次都写**（2026-09-19 审核报告）。
+        // ⚠️ 2026-09-19（用户澄清设计意图）：配置**只在首次运行时写入**，
+        // 之后仅由用户手动重置（`ResetConfigurations`）才改动。
         //
-        // 原实现是 `if (!file_exists(optiscaler_ini)) { 复制模板 + 应用托管设置 }`
-        // —— 即"已存在就整块跳过"。后果：**已有 OptiScaler.ini 的安装永远不会收敛**
-        // 到当前托管项：`FSR4Policy.ini` 里的策略（Fsr4Update / UpscalerIndex /
-        // Fsr4ForceEnableInt8）、`Libraries/OptiDllPath`、`Log/*`、`FrameGen/*`
-        // 都只会在"首次安装"那一次写入；此后换显卡、改策略、挪插件目录都不会更新。
-        // 而 reset 路径（见下方 reset_configurations 分支）**始终**调用本函数
-        // —— 两条路径行为不一致，使问题只在"非 reset 的日常启动"下出现。
+        // 本处曾按审核报告改为"托管项每次都写"，但那是**误判**：
+        // 审核把"已有安装永不收敛"当作缺陷，而按设计意图，配置一旦写入
+        // 即归**用户所有** —— 每次启动覆盖会让用户手改的值被静默改回。
+        // 现回退为首次运行才写。
         //
-        // 现改为：模板仅在**缺失时**复制（避免覆盖用户自定义），但托管项**总是**应用。
-        // `apply_optiscaler_managed_settings` 内部是逐键 set，幂等，重复应用无副作用。
+        // 首次运行 = ini 尚不存在：复制模板 + 应用托管设置（GPU 相关策略）。
+        // 之后启动**完全不碰**该文件；需要重新收敛时用 `ResetConfigurations=1`
+        // 触发 `reset_all_configurations()`（它会重新应用托管设置）。
         if (!file_exists(optiscaler_ini))
         {
             if (!copy_file_replace(default_directory / L"OptiScaler.ini", optiscaler_ini))
@@ -1010,12 +1026,11 @@ bool ensure_missing_component_configurations(const BootstrapConfig &config)
                 write_log("config_initialize_failed component=optiscaler reason=template_copy");
                 success = false;
             }
-        }
-        if (file_exists(optiscaler_ini) &&
-            !apply_optiscaler_managed_settings(optiscaler_ini, optiscaler_directory))
-        {
-            write_log("config_initialize_failed component=optiscaler reason=managed_settings");
-            success = false;
+            else if (!apply_optiscaler_managed_settings(optiscaler_ini, optiscaler_directory))
+            {
+                write_log("config_initialize_failed component=optiscaler reason=managed_settings");
+                success = false;
+            }
         }
         const std::filesystem::path nvidia_directory =
             g_module_directory / L"payload" / L"NVIDIA" / L"DLSS";
@@ -1100,7 +1115,7 @@ bool reset_all_configurations(const BootstrapConfig &config)
         if (file_exists(optiscaler_ini) && !apply_optiscaler_managed_settings(
                 optiscaler_ini, optiscaler_directory))
         {
-            write_log("config_reset_failed component=optiscaler reason=dll_path_update");
+            write_log("config_reset_failed component=optiscaler reason=managed_settings");
             success = false;
         }
 
