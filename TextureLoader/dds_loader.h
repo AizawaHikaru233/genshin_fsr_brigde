@@ -49,9 +49,7 @@ const TextureLoaderEntry *SelectTextureLoader(const wchar_t *path,
 // CPU DDS 加载器（实现见 dds_loader.cpp）。
 HRESULT LoadDdsTexture(ID3D11Device *device, const wchar_t *path, TextureLoadResult *out);
 
-// True if a byte sequence at the start of a file is a DDS magic (0x20534444).
-static inline bool IsDdsMagic(const void *ptr)
-{
-    const unsigned char *p = (const unsigned char *)ptr;
-    return p[0] == 'D' && p[1] == 'D' && p[2] == 'S' && p[3] == ' ';
-}
+// 2026-09-19（审核报告）：删除死代码 `IsDdsMagic()`。
+// 全仓库搜索确认**无任何调用点**；而 `dds_loader.cpp` 自己用 `DDS_MAGIC`
+//（0x20534444，第 12 行）做同样的判断。留着它会形成"两个 DDS 魔数判断"
+// 的假象，实际只有一个在用。

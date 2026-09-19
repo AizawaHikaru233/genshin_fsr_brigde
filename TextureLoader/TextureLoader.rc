@@ -1,8 +1,10 @@
 #include <windows.h>
+// 版本号来自 CMake 生成的头（单一事实源 = CMakeLists 的 project(... VERSION ...)）。
+#include "Version.h"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     0,1,0,0
-PRODUCTVERSION  0,1,0,0
+FILEVERSION     TEXTURELOADER_VERSION_COMMA
+PRODUCTVERSION  TEXTURELOADER_VERSION_COMMA
 FILEFLAGSMASK   0x3fL
 #ifdef _DEBUG
 FILEFLAGS       0x1L
@@ -17,11 +19,17 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "FileDescription",  "TextureLoader d3d11 proxy (observe)"
-            VALUE "FileVersion",      "0.1.0"
+            // 2026-09-19（审核报告）修正两处不准确：
+            //   1) 原文 "d3d11 proxy (observe)" —— 那是早期形态。本模块现在是
+            //      **纹理/Mod 加载器**（hook D3D11 替换纹理），且 `observe_only`
+            //      缺省已改为 false（真正替换），"(observe)" 会误导。
+            //   2) `OriginalFilename` 原为 "d3d11.dll" —— 实际产物是
+            //      **TextureLoader.dll**（d3d11.dll 只是宿主注入时的加载名）。
+            VALUE "FileDescription",  "Texture/Mod Loader for Genshin Impact (D3D11 texture replacement)"
+            VALUE "FileVersion",      TEXTURELOADER_VERSION_DOTTED
             VALUE "ProductName",      "TextureLoader"
-            VALUE "ProductVersion",   "0.1.0"
-            VALUE "OriginalFilename", "d3d11.dll"
+            VALUE "ProductVersion",   TEXTURELOADER_VERSION_DOTTED
+            VALUE "OriginalFilename", "TextureLoader.dll"
         END
     END
     BLOCK "VarFileInfo"

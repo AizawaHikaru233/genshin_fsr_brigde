@@ -6,7 +6,10 @@
 
 namespace tloader
 {
-// 初始化日志：路径为 DLL 同目录 / TextureLoader.log。可在 DllMain 调用。
+// 记录日志目录（DLL 同目录 / TextureLoader.log）。**可在 DllMain 安全调用** ——
+// 它只保存路径，不做文件 I/O（2026-09-19 审核报告：原实现在此直接 fopen，
+// 而本函数由 DllMain 调用 → 在 loader lock 持有期间做文件 I/O，属已知死锁模式）。
+// 真正的 fopen 推迟到第一次 log_write，那时 DllMain 已返回。
 void log_init(const std::wstring &dll_dir);
 void log_shutdown();
 void log_write(const wchar_t *fmt, ...);

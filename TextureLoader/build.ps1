@@ -1,4 +1,11 @@
-# build.ps1 — 构建 TextureLoader.dll（自包含，不依赖仓库其他目录）
+# build.ps1 — 构建 TextureLoader.dll
+#
+# ⚠️ 2026-09-19（审核报告）：原先这里写"自包含，不依赖仓库其他目录"，**是错的**。
+# 本模块的 hook 依赖 Detours，而 Detours **只存在于 `Dx11FsrBridge/third_party/detours`**
+#（本目录内没有副本）。故构建**必须**在完整仓库检出中进行，或显式传
+# `-DDETOURS_ROOT=<...>`（见 CMakeLists 的 TEXTURELOADER_DETOURS_ROOT）。
+# CMake 配置阶段会显式校验该依赖并给出可操作的报错。
+#
 # 用法：powershell -ExecutionPolicy Bypass -File .\build.ps1 [-Configuration Release]
 # 前提：已安装 Visual Studio（含 C++ 桌面工作负载）与 CMake；脚本用 vswhere 自动定位 VS。
 param(
