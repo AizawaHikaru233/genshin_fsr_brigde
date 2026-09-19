@@ -16,11 +16,77 @@
 #include <string>
 #include <string_view>
 
-namespace
+// 日志级别（2026-09-19 审核报告：替换"按英文关键词过滤"）。
+//
+// **原实现的问题**：用 10 个英文关键词（failed / disabled / error …）决定一行是否落盘。
+//   - 误**丢**：成功与生命周期行不含这些词 → 全部被静默丢弃。结果是
+//     **插件正常工作时日志为空**，完全无法用它验证插件是否生效。
+//     例：`AntiPlayerMosaic loaded`、`patched PlayerPerspective with main-thread hook`、
+//     `main module ready after X ms`、`HideUID active: hidden N ui targets` 都不落盘。
+//   - 更根本：靠自然语言措辞决定日志去留，**任何一次文案改动都可能静默改变行为**。
+//
+// 说明：本文件的重复性输出**已经有原子守卫**（`g_hide_uid_logged_*` 的
+// `exchange(true)`、`g_hide_uid_next_tick` 的 CAS 退避），所以并不存在刷屏风险；
+// 关键词过滤纯属多余且有害。
+//
+// **现在**：显式级别。Release 下 INFO 常开（每条都是一次性、可验证的生命周期事实），
+// DEBUG 仅在非 release 构建输出。当前没有高频细节行需要 DEBUG，
+// 故只保留级别参数本身，不留未使用的 log_debug 包装（避免死代码）。
+//
+// ⚠️ 2026-09-19：枚举与 `log_line` 的声明移到**匿名命名空间之前** ——
+// `read_cached_signature` / `scan_unique_signature`（在命名空间内、`log_line` 定义之前）
+// 需要在签名模式解析失败时记日志，原先它们看不到 `log_line`。
+enum class LogLevel
 {
+    Info,
+    Debug
+};
+
+// `log_line` 的**定义**必须在匿名命名空间**之外**（2026-09-19）。
+//
+// 原因：`read_cached_signature` / `scan_unique_signature` 需要调用它，而这两个函数
+// 在匿名命名空间内、`log_line` 原定义之前。若只在命名空间外声明、在命名空间内定义，
+// 那是**两个不同的函数**（内部链接 vs 外部链接）→ 链接期 `LNK2019`。
+// 故把定义与它依赖的两个全局一起放在命名空间外（外部链接，声明与定义一致）。
 std::filesystem::path g_log_path;
 std::mutex g_log_mutex;
-std::uint8_t *g_main_base = nullptr;
+
+void log_line(const std::string &line, LogLevel level = LogLevel::Info)
+{
+#if defined(ANTIPLAYER_RELEASE_RUNTIME)
+    // Release：只保留 INFO。生命周期行必须可见 —— 否则无法验证插件是否生效。
+    if (level == LogLevel::Debug)
+        return;
+#else
+    (void)level;
+#endif
+    std::lock_guard lock(g_log_mutex);
+    std::ofstream out(g_log_path, std::ios::app);
+    SYSTEMTIME st {};
+    GetLocalTime(&st);
+    char prefix[64] {};
+    std::snprintf(prefix, sizeof(prefix), "%04u-%02u-%02u %02u:%02u:%02u.%03u ",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    out << prefix << line << "\n";
+}
+
+namespace
+{
+// "主模块已解析"门控（2026-09-19 审核报告）。
+//
+// 原名 `g_main_base`（`std::uint8_t *`），但**它存的值从未被读取** ——
+// 唯一的用途是 `if (g_main_base != nullptr)` 这一处非空判断
+//（扫描工作全部使用 `resolve_targets()` 内的局部 `base`）。
+// 即：用一个指针当布尔用，语义误导。
+//
+// 门控**必须保留**（不是死代码）：`hide_uid_from_main_thread` 是插进
+// `PlayerPerspective` 的 stub 回调，可能在签名解析完成前就被游戏主线程调用；
+// 而 `hide_uid_once()` 在所需签名未解析时会 `g_hide_uid_enabled.store(false)`
+// **永久禁用** HideUID。所以"未就绪时直接返回"是必要的保护。
+//
+// 跨线程：worker 线程写、游戏主线程读 → 用 `atomic_bool`（原为普通指针，
+// 属数据竞争）。
+std::atomic_bool g_main_module_resolved { false };
 void *g_player_perspective_stub = nullptr;
 std::uint8_t *g_hide_uid_find_string = nullptr;
 std::uint8_t *g_hide_uid_find_object = nullptr;
@@ -90,6 +156,15 @@ std::uint8_t *read_cached_signature(HMODULE module,
         (memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0)
         return nullptr;
     const auto pattern = pattern_scanner::parse_pattern(signature.text);
+    // 模式解析不完整 → 显式失败（2026-09-19 审核报告：原为静默截断）。
+    // 缓存路径也走这里：若签名被改坏，缓存命中也必须拒绝，否则会把
+    // "用错误模式算出的 RVA" 当成有效缓存。
+    if (!pattern.valid)
+    {
+        log_line(std::string(signature.name) + " pattern parse failed at offset=" +
+            std::to_string(pattern.error_offset) + " (signature text malformed)");
+        return nullptr;
+    }
     const auto region_end = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
     if (reinterpret_cast<std::uintptr_t>(address) > region_end ||
         !pattern_scanner::matches_at(address, region_end - reinterpret_cast<std::uintptr_t>(address), 0, pattern))
@@ -140,47 +215,6 @@ using find_object_fn = void *(__fastcall *)(void *);
 using object_active_fn = void(__fastcall *)(void *, bool);
 
 bool hide_uid_once();
-
-// 日志级别（2026-09-19 审核报告：替换"按英文关键词过滤"）。
-//
-// **原实现的问题**：用 10 个英文关键词（failed / disabled / error …）决定一行是否落盘。
-//   - 误**丢**：成功与生命周期行不含这些词 → 全部被静默丢弃。结果是
-//     **插件正常工作时日志为空**，完全无法用它验证插件是否生效。
-//     例：`AntiPlayerMosaic loaded`、`patched PlayerPerspective with main-thread hook`、
-//     `main module ready after X ms`、`HideUID active: hidden N ui targets` 都不落盘。
-//   - 更根本：靠自然语言措辞决定日志去留，**任何一次文案改动都可能静默改变行为**。
-//
-// 说明：本文件的重复性输出**已经有原子守卫**（`g_hide_uid_logged_*` 的
-// `exchange(true)`、`g_hide_uid_next_tick` 的 CAS 退避），所以并不存在刷屏风险；
-// 关键词过滤纯属多余且有害。
-//
-// **现在**：显式级别。Release 下 INFO 常开（每条都是一次性、可验证的生命周期事实），
-// DEBUG 仅在非 release 构建输出。当前没有高频细节行需要 DEBUG，
-// 故只保留级别参数本身，不留未使用的 log_debug 包装（避免死代码）。
-enum class LogLevel
-{
-    Info,
-    Debug
-};
-
-void log_line(const std::string &line, LogLevel level = LogLevel::Info)
-{
-#if defined(ANTIPLAYER_RELEASE_RUNTIME)
-    // Release：只保留 INFO。生命周期行必须可见 —— 否则无法验证插件是否生效。
-    if (level == LogLevel::Debug)
-        return;
-#else
-    (void)level;
-#endif
-    std::lock_guard lock(g_log_mutex);
-    std::ofstream out(g_log_path, std::ios::app);
-    SYSTEMTIME st {};
-    GetLocalTime(&st);
-    char prefix[64] {};
-    std::snprintf(prefix, sizeof(prefix), "%04u-%02u-%02u %02u:%02u:%02u.%03u ",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    out << prefix << line << "\n";
-}
 
 void reset_release_log()
 {
@@ -319,7 +353,7 @@ bool patch_rel32_jump(std::uint8_t *address, std::uintptr_t absolute_target)
 
 void hide_uid_from_main_thread()
 {
-    if (g_main_base != nullptr)
+    if (g_main_module_resolved.load(std::memory_order_acquire))
     {
         const ULONGLONG now = GetTickCount64();
         ULONGLONG next_allowed = g_hide_uid_next_tick.load(std::memory_order_relaxed);
@@ -471,6 +505,15 @@ std::uint8_t *scan_unique_signature(
         return nullptr;
 
     const auto pattern = pattern_scanner::parse_pattern(signature.text);
+    // 模式解析不完整 → 显式失败（2026-09-19 审核报告：原为静默截断）。
+    // 这条是主扫描路径：静默截断会产出"部分模式"→ 扫描不到 → 只表现为
+    // "签名未找到"，无法区分是"游戏版本变了"还是"签名文本被改坏"。
+    if (!pattern.valid)
+    {
+        log_line(std::string(signature.name) + " pattern parse failed at offset=" +
+            std::to_string(pattern.error_offset) + " (signature text malformed)");
+        return nullptr;
+    }
     const auto *sections = IMAGE_FIRST_SECTION(nt);
     std::array<std::uint8_t *, 2> matches {};
     std::size_t match_count = 0;
@@ -590,7 +633,9 @@ DWORD WINAPI worker_thread(void *parameter)
 
     auto *base = static_cast<std::uint8_t *>(module_info.lpBaseOfDll);
     const std::size_t size = static_cast<std::size_t>(module_info.SizeOfImage);
-    g_main_base = base;
+    // 置位门控（release）：此后 stub 回调允许执行 hide_uid_once。
+    // 注意置位点与旧实现一致 —— 都在**扫描签名之前**，语义不变。
+    g_main_module_resolved.store(true, std::memory_order_release);
 
     wchar_t executable_path[MAX_PATH] {};
     GetModuleFileNameW(main_module, executable_path, MAX_PATH);

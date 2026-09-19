@@ -55,6 +55,21 @@ struct Pattern
     std::vector<PatternByte> bytes;
     std::size_t anchor_offset = 0;
     std::size_t anchor_size = 0;
+    // 解析是否**完整**消费了输入（2026-09-19 审核报告）。
+    //
+    // 原先 `parse_pattern` 在两处直接 `break`（见下），**静默截断**：
+    //   - 末尾只剩一个十六进制字符（不完整字节）
+    //   - 遇到非十六进制字符
+    // 截断后返回的是"部分模式"，症状是**扫描不到**（而非报错），难以归因。
+    // 这个雷是真实存在的：`k_signatures` 的文本由**多个相邻字符串字面量拼接**而成
+    //（如 "… 85 D2 " "78 28 …"），一旦有人在拼接处漏掉空格，
+    // 就会出现 "D278" 之类的非法字节 → 静默截断。
+    //
+    // 注意：已核对**当前 5 个签名均完整解析**（60/64/64/97/96 字节），
+    // 故此标志目前恒为 true —— 它的价值是**防止将来改签名时静默出错**。
+    bool valid = true;
+    // 出错位置（valid==false 时有效），用于日志定位
+    std::size_t error_offset = 0;
 };
 
 inline Pattern parse_pattern(std::string_view text)
@@ -81,12 +96,22 @@ inline Pattern parse_pattern(std::string_view text)
             return -1;
         };
 
+        // 不完整字节（末尾只剩一个十六进制字符）→ 标记无效而不是静默截断
         if (i + 1 >= text.size())
+        {
+            pattern.valid = false;
+            pattern.error_offset = i;
             break;
+        }
         const int hi = hex_value(text[i]);
         const int lo = hex_value(text[i + 1]);
+        // 非十六进制字符（最常见成因：多行字面量拼接处漏了空格）→ 同样标记无效
         if (hi < 0 || lo < 0)
+        {
+            pattern.valid = false;
+            pattern.error_offset = i;
             break;
+        }
         pattern.bytes.push_back({ false, static_cast<std::uint8_t>((hi << 4) | lo) });
         i += 2;
     }
