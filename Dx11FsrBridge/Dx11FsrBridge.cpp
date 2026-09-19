@@ -11751,6 +11751,104 @@ bool fsr2_family_should_skip_draw(ID3D11DeviceContext *context)
         fsr2_family_takeover::should_skip_pre(hash, GetTickCount64(), g_config.fsr2_family_expire_ms);
 }
 
+// FSR2 合成族：draw / draw_indexed 共用的两段逻辑（2026-09-19 审核报告）
+//
+// **为什么抽出来**：这两段原本在 `hooked_draw_indexed` 与 `hooked_draw` 里
+// 各抄了一份，且**已经漂移**：
+//   - `hooked_draw_indexed` 有 family notify 诊断日志（前 16 次），
+//     `hooked_draw` **完全没有** → 走 draw 路径时这条诊断永远看不到。
+//   - family skip 块里 `hooked_draw` 多一段 `ffx12_probe` 的 PRE-pass cb0 探测。
+// 两处结构相同、行为不同，正是"复制粘贴样板"最容易积累隐藏差异的地方。
+// ---------------------------------------------------------------------------
+
+// family skip 命中时的收尾：`hooked_draw` 独有的 PRE-pass cb0 一次性探测。
+// 原样保留其触发条件（仅 ffx12_probe 且非 release 构建）。
+void probe_pre_pass_cb0_if_enabled(ID3D11DeviceContext *context)
+{
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    if (!g_config.ffx12_probe)
+        return;
+    static std::atomic_int pre_cb0_probe_round { 0 };
+    static std::atomic_bool pre_cb0_done { false };
+    const int pre_round = pre_cb0_probe_round.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (pre_cb0_done.load(std::memory_order_relaxed) || pre_round > 96)
+        return;
+    ID3D11Buffer *pre_cb = nullptr;
+    context->PSGetConstantBuffers(0, 1, &pre_cb);
+    if (pre_cb == nullptr)
+        return;
+    const std::uint64_t pre_key = reinterpret_cast<std::uint64_t>(pre_cb);
+    g_trace_ps_cb0_key.store(pre_key, std::memory_order_relaxed);
+    const auto pre_it = g_buffer_snapshots.find(pre_key);
+    if (pre_it != g_buffer_snapshots.end() && pre_it->second.size() > 496)
+    {
+        std::string probe = "ffx12_pre_cb0 size=" + std::to_string(pre_it->second.size());
+        const std::size_t floats = pre_it->second.size() / 4;
+        probe += " cb0=";
+        const auto *fb = reinterpret_cast<const float *>(pre_it->second.data());
+        for (std::size_t i = 0; i < floats; ++i)
+        {
+            probe += std::to_string(fb[i]);
+            if (i + 1 < floats)
+                probe += ",";
+        }
+        log_line(probe);
+        pre_cb0_done.store(true, std::memory_order_relaxed);
+    }
+    pre_cb->Release();
+#else
+    (void)context;
+#endif
+}
+
+// FSR2 合成族预处理 pass 跳过判定（仅当上一帧累积 pass 被桥成功替换且未超时）。
+// 返回 true 表示本次 draw 应被跳过。
+bool fsr2_family_skip_gate(ID3D11DeviceContext *context, UINT count, bool indexed)
+{
+#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
+    if (count != 3 || !fsr2_family_should_skip_draw(context))
+        return false;
+    static std::atomic_uint64_t family_skip_log_count { 0 };
+    const std::uint64_t log_count = family_skip_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (log_count == 1 || log_count % 1024 == 0)
+        LOG_DEBUG(blog::cat::upscale, "fsr2_family_skip_draw indexed=" + std::to_string(indexed ? 1 : 0) +
+            " total=" + std::to_string(fsr2_family_takeover::skipped_count()));
+    // draw 路径独有的 PRE-pass cb0 探测（原 hooked_draw 内的诊断块）
+    if (!indexed)
+        probe_pre_pass_cb0_if_enabled(context);
+    return true;
+#else
+    (void)context;
+    (void)count;
+    (void)indexed;
+    return false;
+#endif
+}
+
+// 把"本帧翻译层是否处理了该 draw"回报给合成族状态机，并输出前若干次诊断。
+// 注：原先只有 draw_indexed 路径写这条日志，draw 路径漏了 → 已统一。
+void note_family_notify(bool handled, const TargetUpscalerDrawInfo *target_draw_info)
+{
+#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
+    if (!g_config.fsr2_family_skip || target_draw_info == nullptr)
+        return;
+    static std::atomic_uint64_t family_notify_count { 0 };
+    const std::uint64_t notify_seq = family_notify_count.fetch_add(1, std::memory_order_relaxed);
+    if (notify_seq < 16)
+        LOG_DEBUG(blog::cat::upscale, "fsr2_family_notify handled=" + std::to_string(handled ? 1 : 0) +
+            " render=" + std::to_string(target_draw_info->render_width) + "x" +
+            std::to_string(target_draw_info->render_height) +
+            (il2cpp_callsite::active()
+                ? " il2cpp_render_calls=" + std::to_string(il2cpp_callsite::render_call_count())
+                : std::string()));
+    fsr2_family_takeover::notify_accumulate_result(handled, GetTickCount64());
+#else
+    (void)handled;
+    (void)target_draw_info;
+#endif
+}
+
+
 // ---------------------------------------------------------------------------
 // ⚠️ 已移除：绘制钩子内的每-draw 计时探针（原 Ffx12DrawProbe）
 //
@@ -11789,15 +11887,8 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
     poll_fsr2_transient_capture_hotkey();
 #endif
     // Phase 1：FSR2 合成族预处理 pass 跳过（仅当上一帧累积 pass 被桥成功替换且未超时）
-    if (index_count == 3 && fsr2_family_should_skip_draw(context))
-    {
-        static std::atomic_uint64_t family_skip_log_count { 0 };
-        const std::uint64_t log_count = family_skip_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (log_count == 1 || log_count % 1024 == 0)
-            LOG_DEBUG(blog::cat::upscale, "fsr2_family_skip_draw indexed=1 total=" +
-                std::to_string(fsr2_family_takeover::skipped_count()));
+    if (fsr2_family_skip_gate(context, index_count, true))
         return;
-    }
     const auto target_draw_info = inspect_target_upscaler_draw(context, index_count);
     if (target_draw_info && g_config.fsr2_translation_mode >= 3)
         observe_fsr2_dynamic_color_target(*target_draw_info);
@@ -11815,19 +11906,7 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
         {
             g_original_draw_indexed(context, index_count, start_index_location, base_vertex_location);
         });
-    if (g_config.fsr2_family_skip && target_draw_info)
-    {
-        static std::atomic_uint64_t family_notify_count { 0 };
-        const std::uint64_t notify_seq = family_notify_count.fetch_add(1, std::memory_order_relaxed);
-        if (notify_seq < 16)
-            LOG_DEBUG(blog::cat::upscale, "fsr2_family_notify handled=" + std::to_string(fsr2_translation_handled ? 1 : 0) +
-                " render=" + std::to_string(target_draw_info->render_width) + "x" +
-                std::to_string(target_draw_info->render_height) +
-                (il2cpp_callsite::active()
-                    ? " il2cpp_render_calls=" + std::to_string(il2cpp_callsite::render_call_count())
-                    : std::string()));
-        fsr2_family_takeover::notify_accumulate_result(fsr2_translation_handled, GetTickCount64());
-    }
+    note_family_notify(fsr2_translation_handled, target_draw_info ? &*target_draw_info : nullptr);
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     finish_fsr2_transient_capture_fallback();
 #endif
@@ -11873,6 +11952,7 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
 #endif
 }
 
+// ---------------------------------------------------------------------------
 void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_count, UINT start_vertex_location)
 {
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
@@ -11894,55 +11974,9 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     poll_fsr2_transient_capture_hotkey();
 #endif
-    // Phase 1：FSR2 合成族预处理 pass 跳过（同上）
-    if (vertex_count == 3 && fsr2_family_should_skip_draw(context))
-    {
-        {
-            static std::atomic_uint64_t family_skip_log_count { 0 };
-            const std::uint64_t log_count = family_skip_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (log_count == 1 || log_count % 1024 == 0)
-                LOG_DEBUG(blog::cat::upscale, "fsr2_family_skip_draw indexed=0 total=" +
-                    std::to_string(fsr2_family_takeover::skipped_count()));
-        }
-        // 一次性 PRE-pass cb0 探测（诊断用，Ffx12Probe=1 时启用；正式版不编译）
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-        if (g_config.ffx12_probe)
-        {
-            static std::atomic_int pre_cb0_probe_round { 0 };
-            static std::atomic_bool pre_cb0_done { false };
-            const int pre_round = pre_cb0_probe_round.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (!pre_cb0_done.load(std::memory_order_relaxed) && pre_round <= 96)
-            {
-                ID3D11Buffer *pre_cb = nullptr;
-                context->PSGetConstantBuffers(0, 1, &pre_cb);
-                if (pre_cb)
-                {
-                    const std::uint64_t pre_key = reinterpret_cast<std::uint64_t>(pre_cb);
-                    g_trace_ps_cb0_key.store(pre_key, std::memory_order_relaxed);
-                    const auto pre_it = g_buffer_snapshots.find(pre_key);
-                    if (pre_it != g_buffer_snapshots.end() && pre_it->second.size() > 496)
-                    {
-                        std::string probe = "ffx12_pre_cb0 size=" +
-                            std::to_string(pre_it->second.size());
-                        const std::size_t floats = pre_it->second.size() / 4;
-                        probe += " cb0=";
-                        const auto *fb = reinterpret_cast<const float *>(pre_it->second.data());
-                        for (std::size_t i = 0; i < floats; ++i)
-                        {
-                            probe += std::to_string(fb[i]);
-                            if (i + 1 < floats)
-                                probe += ",";
-                        }
-                        log_line(probe);
-                        pre_cb0_done.store(true, std::memory_order_relaxed);
-                    }
-                    pre_cb->Release();
-                }
-            }
-        }
-#endif
+    // Phase 1：FSR2 合成族预处理 pass 跳过（仅当上一帧累积 pass 被桥成功替换且未超时）
+    if (fsr2_family_skip_gate(context, vertex_count, false))
         return;
-    }
     const auto target_draw_info = inspect_target_upscaler_draw(context, vertex_count);
     if (target_draw_info && g_config.fsr2_translation_mode >= 3)
         observe_fsr2_dynamic_color_target(*target_draw_info);
@@ -11960,8 +11994,7 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
         {
             g_original_draw(context, vertex_count, start_vertex_location);
         });
-    if (g_config.fsr2_family_skip && target_draw_info)
-        fsr2_family_takeover::notify_accumulate_result(fsr2_translation_handled, GetTickCount64());
+    note_family_notify(fsr2_translation_handled, target_draw_info ? &*target_draw_info : nullptr);
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     finish_fsr2_transient_capture_fallback();
 #endif
