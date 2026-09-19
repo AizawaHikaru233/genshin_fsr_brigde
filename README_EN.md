@@ -62,7 +62,7 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 - Auto-matches the FSR series by GPU capability (FSR4/FSR3/FSR2); upscaling works on supported GPUs without external plugins.
 - Extends the in-game render-scale menu to `0.2–0.999`.
 - Writes runtime logs to `Dx11FsrBridge.log` beside the DLL by default for load and hook diagnostics.
-- **TextureLoader** (texture/Mod loader, **AMD only**): 3DMigoto-compatible `[TextureOverride]` Mod loading (DDS replacement + GDDS DirectStorage GPU decompression), loading from the package `Mods` directory by default. **This component has an unfixable texture-loading defect on NVIDIA GPUs** — see "GPU Support and NVIDIA Caveats" below.
+- **TextureLoader** (texture/Mod loader, **AMD only**): 3DMigoto-compatible `[TextureOverride]` Mod loading (DDS replacement + GDDS DirectStorage GPU decompression), loading from the package `Mods` directory by default. **Currently it supports pure texture mods only — model mods are not supported** (see "TextureLoader Scope" below). **This component has an unfixable texture-loading defect on NVIDIA GPUs** — see "GPU Support and NVIDIA Caveats" below.
 
 ## GPU Support and NVIDIA Caveats
 
@@ -98,12 +98,29 @@ Every distribution channel therefore behaves as follows:
 
 > AMD users are unaffected: interactive installation still asks whether to enable it (default No), and it can be toggled at any time from the plugin configuration screen.
 
+### TextureLoader Scope
+
+**TextureLoader currently supports only "pure texture" mods — model mods are not supported.**
+
+| Type | Supported | Notes |
+| --- | --- | --- |
+| **Pure texture replacement** (DDS / GDDS) | ✅ Yes | Matched via 3DMigoto-compatible `hash=`, replaces texture pixel content |
+| Model / mesh replacement (mesh, `.buf`, `.ib`) | ❌ Not yet | Requires hooking vertex/index buffers and draw calls; this component does not |
+| Skeleton / animation modification | ❌ Not yet | Same as above |
+| Material / shader replacement | ❌ Not yet | Requires hooking shader compilation or material constants |
+| `[CommandList*]` / `[Present]` draw-stage commands | ❌ Not yet | Draw-command replay is not implemented |
+
+The hashing algorithm is a verbatim port of 3DMigoto, so **pre-generated `hash=` values from mod authors can be reused as-is**; however, the **execution capability is far smaller than 3DMigoto's** — the latter is a complete draw-interception and command-replay framework, whereas this component implements only the single path of "replace pixels when a texture is created."
+
+> If a mod contains both textures and models, **the texture part takes effect and the model part does not** — it will look like "the texture changed but the shape did not". That is not a defect; it is the current scope.
+> See [`TextureLoader/README.md`](TextureLoader/README.md#支持范围) for the full description.
+
 ## Repository Layout
 
 - Repository root: FSR Bridge source, configuration, and build files.
 - `AntiPlayerMosaic/`: anti-aliasing blur removal, UID hiding, and underwater mosaic fix plugin.
 - `FufuGraphicsPlugin/`: FuFu Launcher bootstrap, configuration files, and install scripts.
-- `TextureLoader/`: 3DMigoto-compatible texture replacement / Mod loader (DDS + GDDS).
+- `TextureLoader/`: 3DMigoto-compatible texture replacement / Mod loader (DDS + GDDS, **pure texture mods only**).
 - `SharedResources/`: runtime resources and component archives shipped with the package.
   The Genshin-specific RenoDX HDR shader add-on and its redistribution authorization
   record are archived under `SharedResources/ReShade/runtime/reshade-shaders/`.

@@ -58,7 +58,7 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 - 按显卡能力自动匹配 FSR 系列（FSR4/FSR3/FSR2），支持显卡上无需外部插件即可超分。
 - 将游戏渲染精度菜单扩展为 `0.2–0.999`。
 - 运行时日志默认写入 DLL 同目录的 `Dx11FsrBridge.log`，用于排查加载与 Hook 状态。
-- **TextureLoader**（纹理/Mod 加载器，**仅推荐 A 卡**）：3DMigoto 兼容的 `[TextureOverride]` Mod 加载（DDS 替换 + GDDS DirectStorage GPU 解压），默认从插件包内 `Mods` 目录加载。**该组件在 NVIDIA 显卡上存在无法修复的纹理加载严重错误**，见下方「GPU 支持与 N 卡注意事项」。
+- **TextureLoader**（纹理/Mod 加载器，**仅推荐 A 卡**）：3DMigoto 兼容的 `[TextureOverride]` Mod 加载（DDS 替换 + GDDS DirectStorage GPU 解压），默认从插件包内 `Mods` 目录加载。**当前只支持纯纹理贴图类 Mod，不支持模型类 Mod**，见下方「TextureLoader 支持范围」。**该组件在 NVIDIA 显卡上存在无法修复的纹理加载严重错误**，见下方「GPU 支持与 N 卡注意事项」。
 
 ## GPU 支持与 N 卡注意事项
 
@@ -94,12 +94,32 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 
 > A 卡用户不受影响：交互式安装仍会询问是否启用（默认否），之后可在插件配置界面随时开关。
 
+### TextureLoader 支持范围
+
+**TextureLoader 当前只支持「纯纹理贴图类」Mod，不支持「模型类」Mod。**
+
+| 类型 | 支持 | 说明 |
+|---|---|---|
+| **纯纹理贴图**（DDS / GDDS） | ✅ 支持 | 以 3DMigoto 兼容 `hash=` 匹配，替换纹理像素内容 |
+| 模型 / 网格替换（mesh、`.buf`、`.ib`） | ❌ 暂不支持 | 需 hook 顶点/索引缓冲与绘制调用，本组件不介入 |
+| 骨骼 / 动画修改 | ❌ 暂不支持 | 同上 |
+| 材质 / 着色器替换 | ❌ 暂不支持 | 需 hook shader 编译或材质常量 |
+| `[CommandList*]` / `[Present]` 等绘制阶段指令 | ❌ 暂不支持 | 未实现绘制命令重放 |
+
+哈希算法逐字移植自 3DMigoto，所以 **mod 作者预生成的 `hash=` 可直接复用**；
+但**执行能力远小于 3DMigoto** —— 后者是完整的绘制拦截与命令重放框架，
+本组件只实现了"纹理创建时替换像素"这一条路径。
+
+> 若 Mod 同时包含贴图与模型，**贴图部分会生效、模型部分不会** ——
+> 表现为"贴图变了但外形没变"，这不是缺陷，是当前功能边界。
+> 完整说明见 [`TextureLoader/README.md`](TextureLoader/README.md#支持范围)。
+
 ## 仓库结构
 
 - 仓库根目录：FSR Bridge 源码、配置与构建文件。
 - `AntiPlayerMosaic/`：反虚化、隐藏 UID 与水下马赛克修复插件。
 - `FufuGraphicsPlugin/`：芙芙启动器的bootstrap、配置文件和安装脚本。
-- `TextureLoader/`：3DMigoto 兼容纹理替换 / Mod 加载器（DDS + GDDS）。
+- `TextureLoader/`：3DMigoto 兼容纹理替换 / Mod 加载器（DDS + GDDS，**仅纯纹理贴图类 Mod**）。
 - `SharedResources/`：随包分发的运行时资源与组件归档。原神专用 RenoDX HDR 滤镜
   Add-on 及其再分发授权记录归档于
   `SharedResources/ReShade/runtime/reshade-shaders/`。

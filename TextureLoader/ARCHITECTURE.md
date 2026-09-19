@@ -4,6 +4,10 @@
 > `[TextureOverride] hash=` + `[Resource] filename=` 映射，把运行时创建的纹理
 > 替换为 Mod 提供的 DDS / GDDS 贴图。设计为与已 hook 渲染链的插件共存
 > （ReShade、Dx11FsrBridge/FSR 等）。
+>
+> ⚠️ **功能边界**：只做**纹理像素替换**。**不支持模型 / 网格 / 骨骼 / 材质 /
+> 着色器类 Mod**（未实现绘制拦截与命令重放）。完整说明见
+> [`README.md` 的「支持范围」](README.md#支持范围)。
 
 | 项 | 值 |
 |---|---|
