@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$GamePath,
     [int]$FpsTarget = 0,
     [switch]$DisableBridge,
@@ -547,10 +547,39 @@ function Expand-ComponentPackage {
         return
     }
     if ($extension -eq '.7z') {
-        $tar = Get-Command tar.exe -ErrorAction SilentlyContinue
-        if ($null -eq $tar) { throw (Convert-InstallerText -Value '系统中没有 tar.exe，无法解压 7z；请手动解压后选择解压目录。') }
-        & $tar.Source -xf $PackagePath -C $Destination
-        if ($LASTEXITCODE -ne 0) { throw (Convert-InstallerText -Value "7z 解压失败，退出代码: $LASTEXITCODE") }
+        # 2026-09-19 修正（审核报告高严重度）：此前用 `tar.exe -xf` 解 7z。
+        # Windows 自带的是 libarchive 的 bsdtar，**通常不支持 7z** ——
+        # 手动选择 .7z 包时会解压失败（甚至可能"成功"退出但没解出内容，
+        # 表现为静默失败）。改用 7-Zip，与 tools\Update-UpstreamComponents.ps1
+        # 第 78-89 行的实现保持一致（同一套候选路径）。
+        $sz = Get-Command 7z.exe -ErrorAction SilentlyContinue
+        if (-not $sz) {
+            foreach ($candidate in @(
+                (Join-Path $root 'tools\7zip\7z.exe'),
+                (Join-Path (Split-Path -Parent $root) 'tools\7zip\7z.exe'),
+                "$env:LOCALAPPDATA\Programs\7-Zip\7z.exe",
+                'C:\Program Files\7-Zip\7z.exe',
+                'C:\Program Files (x86)\7-Zip\7z.exe'
+            )) {
+                if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+                    $sz = Get-Item -LiteralPath $candidate
+                    break
+                }
+            }
+        }
+        if (-not $sz) {
+            throw (Convert-InstallerText -Value '系统中没有 7z.exe，无法解压 7z；请安装 7-Zip，或手动解压后选择解压目录。')
+        }
+        $szPath = if ($sz -is [Management.Automation.CommandInfo]) { $sz.Source } else { $sz.FullName }
+        & $szPath x $PackagePath ("-o$Destination") -y | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw (Convert-InstallerText -Value "7z 解压失败，退出代码: $LASTEXITCODE（包: $PackagePath）")
+        }
+        # 额外校验：解压后目录不能为空 —— 防止"命令成功但没解出内容"的静默失败。
+        $extracted = Get-ChildItem -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        if ($null -eq $extracted -or $extracted.Count -eq 0) {
+            throw (Convert-InstallerText -Value "7z 报告成功但解压目录为空，包可能损坏: $PackagePath")
+        }
         return
     }
     throw (Convert-InstallerText -Value "不支持的压缩包格式: $extension")
