@@ -1,0 +1,29 @@
+// 由 CMake 生成 —— **不要直接编辑**（改动会被下次 configure 覆盖）。
+//
+// 单一版本源在 CMakeLists.txt 的 `project(AntiPlayerMosaic VERSION x.y.z)`。
+//
+// 为什么需要（2026-09-19 审核报告）：`.rc` 里的 FILEVERSION / FileVersion 等
+// 此前是**手写**的 `1,1,0,0` / `"1.1.0.0"`，与构建版本源无同步机制 ——
+// 改版本要记得同时改多处，漏一处就会出现"文件属性与实际版本不符"。
+// 现在 `.rc` 只 include 本文件，版本号改一处即可。
+#pragma once
+
+#define ANTIPLAYER_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define ANTIPLAYER_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define ANTIPLAYER_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define ANTIPLAYER_VERSION_TWEAK @PROJECT_VERSION_TWEAK@
+
+// 逗号分隔（供 VERSIONINFO 的 FILEVERSION / PRODUCTVERSION）
+#define ANTIPLAYER_VERSION_COMMA \
+    ANTIPLAYER_VERSION_MAJOR, ANTIPLAYER_VERSION_MINOR, \
+    ANTIPLAYER_VERSION_PATCH, ANTIPLAYER_VERSION_TWEAK
+
+// 点分字符串（供 VALUE "FileVersion" / "ProductVersion"）
+// 注意：这里用字符串化，让 `1.1.0.0` 由宏自动拼出，避免再写一遍字面量。
+#define ANTIPLAYER_STR2(x) #x
+#define ANTIPLAYER_STR(x) ANTIPLAYER_STR2(x)
+#define ANTIPLAYER_VERSION_DOTTED \
+    ANTIPLAYER_STR(ANTIPLAYER_VERSION_MAJOR) "." \
+    ANTIPLAYER_STR(ANTIPLAYER_VERSION_MINOR) "." \
+    ANTIPLAYER_STR(ANTIPLAYER_VERSION_PATCH) "." \
+    ANTIPLAYER_STR(ANTIPLAYER_VERSION_TWEAK)
