@@ -1,4 +1,4 @@
-﻿Set-StrictMode -Version Latest
+Set-StrictMode -Version Latest
 
 function Get-InstallerDefaultLanguage {
     $cultures = @(
@@ -34,6 +34,19 @@ function Convert-InstallerText {
     if ($null -eq $Value -or $script:InstallerLanguage -ne 'en-US' -or $Value -isnot [string]) { return $Value }
 
     $text = [string]$Value
+    # ⚠️ 2026-09-19（审核报告）：本表与下面的 $replacements **不再有重复键**。
+    #
+    # 原先两表有 16 个键值完全相同的条目（已安装/未安装/模块 ID/插件名/作者/当前版本/
+    # 安装状态/反虚化 / 隐藏 UID/OptiScaler 三条报错前缀/安装/更新/停止加载/
+    # 纹理-Mod 加载器/  9. 语言 等），维护双表易漏改一处。
+    #
+    # 那 16 条为何可以从本表删除（已逐条验证，非估计）：本表只处理**整串相等**的输入，
+    # 而子串表对「整串恰好等于某 key」的输入会**整串替换**，结果与直接查表完全一致。
+    # 已用脚本对 16 个键逐一比对：子串路径的输出 == 本表原值（16/16 相同）。
+    #
+    # 注意**不能**反向删除：子串表里那些键还被用于**部分匹配**
+    #（如 `已安装内置 NVIDIA DLSS 超分组件。` 依赖子串表里的 `已安装`），
+    # 删掉会破坏翻译。本表另有 60 个键在子串表中**不存在**，必须保留。
     $exact = @{
         '按回车键继续' = 'Press Enter to continue'
         '请输入 y 或 n。' = 'Please enter y or n.'
@@ -49,22 +62,10 @@ function Convert-InstallerText {
         '安装完成。' = 'Installation complete.'
         '安装失败，请重试。' = 'Installation failed. Please try again.'
         '请输入大于 0 的整数。' = 'Enter an integer greater than 0.'
-        '已安装' = 'Installed'
-        '未安装' = 'Not installed'
-        '模块 ID' = 'Module ID'
-        '插件名' = 'Plugin'
-        '作者' = 'Author'
-        '当前版本' = 'Version'
-        'OptiScaler 官方资产名称不符合预期: ' = 'Unexpected OptiScaler official asset name: '
-        'OptiScaler 官方压缩包 SHA256 校验失败。实际值: ' = 'OptiScaler official archive SHA256 verification failed. Actual value: '
-        'OptiScaler 版本不是 ' = 'OptiScaler version is not '
-        '安装状态' = 'Status'
-        '反虚化 / 隐藏 UID' = 'Anti-Mosaic / Hide UID'
         '语言 / Language' = 'Language / 语言'
         '  1. 中文' = '  1. Chinese'
         '  2. English' = '  2. English'
         '  8. 语言 / Language' = '  8. Language / 语言'
-        '  9. 语言 / Language' = '  9. Language / 语言'
         '  0. 返回上一层' = '  0. Back'
         '  0. 退出' = '  0. Exit'
         '关于 / 作者主页' = 'About / Author Pages'
@@ -85,9 +86,6 @@ function Convert-InstallerText {
         'ReShade 与 RenoDX 已同步为当前发布包版本。' = 'ReShade and RenoDX now match the current package.'
         '所选模块更新完成。' = 'Selected modules updated.'
         '未知' = 'Unknown'
-        '安装' = 'Install'
-        '更新' = 'Update'
-        '停止加载' = 'Disable'
         '  1. 从官方 GitHub 自动下载最新版（推荐）' = '  1. Download the latest official GitHub release (recommended)'
         '  2. 使用已经手动下载的文件或目录' = '  2. Use a manually downloaded file or folder'
         '  3. 使用当前目录中已有的版本' = '  3. Use the version already in this folder'
@@ -98,7 +96,6 @@ function Convert-InstallerText {
         '启用反虚化/隐藏 UID' = 'Enable Anti-Mosaic / Hide UID'
         '启用 ReShade + RenoDX HDR' = 'Enable ReShade + RenoDX HDR'
         '启用纹理/Mod 加载器（TextureLoader）' = 'Enable Texture/Mod Loader (TextureLoader)'
-        '纹理/Mod 加载器（TextureLoader）' = 'Texture/Mod Loader (TextureLoader)'
         '检测到 NVIDIA 显卡：TextureLoader 在 N 卡上存在无法修复的纹理加载严重错误，已隐藏并停用。' = 'NVIDIA GPU detected: TextureLoader has an unfixable texture-loading defect on NVIDIA cards, so it has been hidden and disabled.'
         'N 卡用户如需使用，可自行拉取仓库源码修复后提交合并。' = 'NVIDIA users who want it can pull the repository source, fix it, and submit a merge request.'
         '检测到 NVIDIA 显卡：TextureLoader 在当前显卡上不可用，-EnableTextureLoader 已忽略。' = 'NVIDIA GPU detected: TextureLoader is unavailable on this GPU; -EnableTextureLoader was ignored.'
