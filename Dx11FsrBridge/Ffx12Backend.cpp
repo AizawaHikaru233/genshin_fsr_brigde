@@ -434,7 +434,8 @@ void *g_up_motion_cvt_ptr = nullptr;
 UINT g_up_motion_cvt_pitch = 0;
 ComPtr<ID3D12DescriptorHeap> g_mv_heap;         // [SRV(motion源), UAV(cvt)]，shader-visible
 UINT g_mv_heap_inc = 0;
-ComPtr<ID3D12RootSignature> g_mv_rs;
+// 2026-09-19（审核报告）：删除 g_mv_rs —— 声明后从未创建或使用，
+// 仅在两行注释里被当作"布局参考"提及。该 heap 的实际布局在创建处（下方）明确指定。
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 bool g_motion_decode_test = false;
 #endif
@@ -446,12 +447,12 @@ ComPtr<ID3D12Resource> g_tex_color_linear;     // R16G16B16A16_FLOAT render 尺�
 ComPtr<ID3D12Resource> g_tex_output_linear;    // R16G16B16A16_FLOAT display 尺寸（FSR2 线性输出）
 ComPtr<ID3D12DescriptorHeap> g_pq_in_heap;     // [SRV(color源), UAV(color_linear)]
 ComPtr<ID3D12DescriptorHeap> g_pq_out_heap;    // [SRV(output_linear), UAV(输出共享)]
-ComPtr<ID3D12RootSignature> g_pq_rs;           // 通用 SRV+UAV 根签名
+// 2026-09-19（审核报告）：删除 g_pq_rs（声明后从未创建/使用）与 g_pq_encode_pso
+// （仅声明 + 在 shutdown 里 Reset，从未创建）。PQ 编解码已改为不使用独立根签名/PSO。
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 bool g_output_mark = false;                    // 输出标记开关（诊断）
 bool g_decode_test = false;                    // 解码常数注入测试（诊断：判断 pass 执行 vs SRV 读）
 #endif
-ComPtr<ID3D12PipelineState> g_pq_encode_pso;   // LinearToPq
 D3D12_RESOURCE_STATES g_color_linear_state = D3D12_RESOURCE_STATE_COMMON;
 D3D12_RESOURCE_STATES g_output_linear_state = D3D12_RESOURCE_STATE_COMMON;
 UINT g_pq_heap_inc = 0;
@@ -512,10 +513,11 @@ UINT g_rb_motion_own_pitch = 0;
 #endif
 
 // 标记目标纹理的 D3D12 侧（enc）状态跟踪。原版本标记 PSO/HLSL 已移除
-// （它们从未被创建，marker_pso_for_version 也无调用点），但**堆与状态跟踪仍在用**：
-// ensure_marker_heap_for 会为 enc 建 shader-visible 描述符堆并记录其状态。
+// （它们从未被创建，marker_pso_for_version 也无调用点），但**堆仍在用**：
+// ensure_marker_heap_for 会为 enc 建 shader-visible 描述符堆。
+// 2026-09-19（审核报告）：删除 g_marker_enc_state —— 只有赋值、**从未被读取**，
+// 是随 PSO/HLSL 一并移除后的残留状态跟踪。
 ComPtr<ID3D12DescriptorHeap> g_marker_heap;
-D3D12_RESOURCE_STATES g_marker_enc_state = D3D12_RESOURCE_STATE_COMMON;
 
 // 版本标记堆创建（起 CPU/On12/GPU-interop 共用；定义在
 // ensure_output_landing_resources 之后）。enc 为标记目标纹理的 D3D12 侧。
@@ -594,11 +596,48 @@ static void sdk_note(const wchar_t *fmt, ...)
 }
 
 // ---- 崩溃安全步进日志（fopen/fprintf/fclose 同步写；进程被看门狗/设备移除杀死也不丢）----
+
+// 本 DLL 所在目录（含尾部反斜杠）。
+//
+// ⚠️ 2026-09-19（审核报告）：步进日志此前用**相对路径** `"sdk234_steps.log"` ——
+// 落盘位置取决于进程当前工作目录（游戏启动方式不同则位置不同，甚至可能不可写），
+// 排查时找不到文件。改为与本 DLL 同目录的绝对路径（与主日志 `Dx11FsrBridge.log`
+// 的约定一致）。
+//
+// 注意必须用 GetModuleHandleExW(FROM_ADDRESS) 取**本 DLL** 的句柄：
+// GetModuleFileNameW(nullptr, ...) 返回的是**宿主 exe** 路径，不是本模块。
+static const std::wstring &sdk234_log_dir()
+{
+    static const std::wstring dir = []
+    {
+        HMODULE self = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&sdk234_log_dir), &self) == FALSE ||
+            self == nullptr)
+        {
+            return std::wstring {};
+        }
+        wchar_t path[MAX_PATH] {};
+        const DWORD length = GetModuleFileNameW(self, path, MAX_PATH);
+        if (length == 0 || length >= MAX_PATH)
+            return std::wstring {};
+        const std::wstring full(path, path + length);
+        const std::size_t slash = full.find_last_of(L"\\/");
+        return slash == std::wstring::npos ? std::wstring {} : full.substr(0, slash + 1);
+    }();
+    return dir;
+}
+
 static void sdk234_step(const char *step)
 {
 #if defined(FFX12_DEBUG_STEPS)
+    const std::wstring &dir = sdk234_log_dir();
+    if (dir.empty())
+        return; // 取不到模块目录则不写（避免又落到不可预测的位置）
+    const std::wstring full = dir + L"sdk234_steps.log";
     FILE *f = nullptr;
-    if (fopen_s(&f, "sdk234_steps.log", "a") == 0 && f)
+    if (_wfopen_s(&f, full.c_str(), L"a") == 0 && f)
     {
         SYSTEMTIME st {};
         GetLocalTime(&st);
@@ -614,8 +653,12 @@ static void sdk234_step(const char *step)
 static void sdk234_info(const char *fmt, ...)
 {
 #if defined(FFX12_DEBUG_STEPS)
+    const std::wstring &dir = sdk234_log_dir();
+    if (dir.empty())
+        return;
+    const std::wstring full = dir + L"sdk234_steps.log";
     FILE *f = nullptr;
-    if (fopen_s(&f, "sdk234_steps.log", "a") == 0 && f)
+    if (_wfopen_s(&f, full.c_str(), L"a") == 0 && f)
     {
         SYSTEMTIME st {};
         GetLocalTime(&st);
@@ -634,8 +677,16 @@ static void sdk234_info(const char *fmt, ...)
 
 static LONG WINAPI sdk234_exception_filter(EXCEPTION_POINTERS *ep)
 {
+    // 与 sdk234_step/sdk234_info 统一用模块目录绝对路径。
+    // 注意：异常处理器内不做可能抛异常/分配的操作 —— sdk234_log_dir() 返回的是
+    // 已初始化的静态 wstring（首次调用在正常路径完成），此处仅做拼接与 fopen。
+    // 该处理器只在 FFX12_DEBUG_STEPS 下被安装（见 SetUnhandledExceptionFilter 调用点）。
+    const std::wstring &dir = sdk234_log_dir();
+    if (dir.empty())
+        return EXCEPTION_CONTINUE_SEARCH;
+    const std::wstring full = dir + L"sdk234_steps.log";
     FILE *f = nullptr;
-    if (fopen_s(&f, "sdk234_steps.log", "a") == 0 && f)
+    if (_wfopen_s(&f, full.c_str(), L"a") == 0 && f)
     {
         const std::uint8_t *addr = static_cast<const std::uint8_t *>(ep->ExceptionRecord->ExceptionAddress);
         const std::uint8_t *base =
@@ -860,7 +911,6 @@ void release_pq_resources()
     g_canary_rb.Reset();
     g_canary_heap.Reset();
     g_marker_heap.Reset();
-    g_marker_enc_state = D3D12_RESOURCE_STATE_COMMON;
     g_canary_pitch = 0;
     g_canary_state = D3D12_RESOURCE_STATE_COMMON;
     {
@@ -1171,9 +1221,9 @@ bool ensure_output_landing_resources()
 }
 
 // 版本标记堆创建（起供 CPU / On12 / GPU-interop 三路径共用）。
-// heap 内按 g_mv_rs root signature 布局：[SRV(enc)@0, UAV(enc)@1]（t0=desc0/u0=desc1）。
-// 旧实现把 UAV 放 0、SRV 放 1 与 g_mv_rs 相反，u0 会绑定到 SRV 描述符 → 驱动层崩溃
-// （进场闪退根因；该标记路径此前从未被真实启用过）。
+// heap 内布局：[SRV(enc)@0, UAV(enc)@1]（t0=desc0/u0=desc1）。
+// 旧实现把 UAV 放 0、SRV 放 1（与上述布局相反），u0 会绑定到 SRV 描述符
+// → 驱动层崩溃（进场闪退根因；该标记路径此前从未被真实启用过）。
 // 调用方在画标记时把 UAV 覆盖为当前输出纹理。
 bool ensure_marker_heap_for(ID3D12Resource *enc)
 {
@@ -1203,7 +1253,6 @@ bool ensure_marker_heap_for(ID3D12Resource *enc)
     uav.Format = g_output_enc_format;
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     g_d12dev->CreateUnorderedAccessView(enc, nullptr, &uav, cpu1);
-    g_marker_enc_state = D3D12_RESOURCE_STATE_COMMON;
     return true;
 }
 
@@ -2463,9 +2512,6 @@ void shutdown()
     g_shared_fence_value = 0;
     g_gpu_interop_ready = false;
     g_active.store(false, std::memory_order_release);
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-#endif
-    g_pq_encode_pso.Reset();
     if (g_fence_event)
     {
         CloseHandle(g_fence_event);
@@ -2849,7 +2895,14 @@ bool decode_motion_wired()
 // 出厂 ini（Ffx12Hdr=0/Ffx12NonLinear=0）下会让人误以为 HDR 已启用。
 const char *create_flags_text()
 {
-    static std::string text; // 单线程（dispatch 日志路径）使用，无需加锁
+    // ⚠️ 必须 thread_local（2026-09-19，审核报告）：此前是普通 `static std::string`，
+    // 注释假设"单线程（dispatch 日志路径）使用"——但该假设**不成立**：
+    // 函数可能被渲染线程与其它线程同时调用，而 `clear()` + 逐段 `+=` 会让
+    // 另一线程读到**半构造**的字符串（撕裂读）。
+    // 改为 thread_local：每线程独立实例，零同步开销。
+    // 安全性：唯一调用点（Dx11FsrBridge.cpp:10796）把结果**立即拼进 std::string**
+    // （值拷贝），不保留指针，故每线程缓冲足够。
+    thread_local std::string text;
     text.clear();
     auto add = [](bool on, const char *name)
     {
@@ -2873,7 +2926,8 @@ const char *create_flags_text()
 
 const char *create_flags_hex()
 {
-    static char buffer[16] {};
+    // 同上：改 thread_local（原为普通 static char[16]，跨线程写同一缓冲有竞争）。
+    thread_local char buffer[16] {};
     std::snprintf(buffer, sizeof(buffer), "0x%X", static_cast<unsigned>(g_create_flags));
     return buffer;
 }
