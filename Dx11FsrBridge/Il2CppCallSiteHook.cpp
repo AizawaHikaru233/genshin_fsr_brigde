@@ -385,11 +385,28 @@ void shutdown()
     // 该地址即被登记；随后 `run_per_instance_test()` 期望 `known_instances` 返回 2 个，
     // 实际返回 3 个（多出前一次测试留下的失效栈地址）。此前该测试未接入 CMake，
     // 所以这个缺陷一直不可见。
+    //
+    // ⚠️ 2026-09-20（实机回归：游戏窗口已关但进程残留）：
+    // 本函数由 `DllMain(DLL_PROCESS_DETACH)` 调用（见 Dx11FsrBridge.cpp 的 DETACH 分支，
+    // 那里写着"只做 loader-lock 安全的事"）—— **在 loader lock 持有期间**。
+    // 而 `g_inst_mutex` 的写方是 `on_render_enter`，那是游戏**每次**
+    // `FFX_FSR2::Render` 都走的热点路径，持锁期间做参数快照。
+    // 若退出瞬间渲染线程正在锁内，DETACH 就会**永久阻塞** → loader lock 永不释放
+    // → 进程退不掉（窗口已关、进程残留）。
+    //
+    // 修法：**不阻塞**。`try_lock` 拿不到就放弃清理 —— 进程即将终止，
+    // 这张表的内存随进程回收，没有清理也不会有任何后果（它只在进程内使用）。
+    // 这与 `BridgeLogger::shutdown` 对 `g_file_mutex` 用 `try_lock_for` 是同一处理
+    //（那里的注释已经写明："阻塞等待就等于把主线程钉死在 loader lock 里"）。
     {
-        std::lock_guard lock(g_inst_mutex);
-        for (std::size_t i = 0; i < g_inst_count; ++i)
-            g_inst_params[i] = PerInstanceParams {};
-        g_inst_count = 0;
+        std::unique_lock<std::mutex> lock(g_inst_mutex, std::defer_lock);
+        if (lock.try_lock())
+        {
+            for (std::size_t i = 0; i < g_inst_count; ++i)
+                g_inst_params[i] = PerInstanceParams {};
+            g_inst_count = 0;
+        }
+        // 拿不到锁：直接返回。表内容由进程终止回收，不影响正确性。
     }
 }
 

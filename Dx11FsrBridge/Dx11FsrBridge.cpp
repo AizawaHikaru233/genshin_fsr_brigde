@@ -13259,9 +13259,17 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID reserved)
     else if (reason == DLL_PROCESS_DETACH)
     {
         // 这里**只做 loader-lock 安全的事**：
-        //   - il2cpp_callsite::shutdown()：只 VirtualProtect/VirtualFree，安全；
+        //   - il2cpp_callsite::shutdown()：VirtualProtect/VirtualFree + 清实例表
+        //     （后者用 `try_lock`，拿不到就放弃 —— 见其内部注释）；
         //   - blog::shutdown()：只 join 自己的写线程 + 关文件，不碰 loader，安全。
         // 真正的 D3D12/COM 释放交给 atexit 的 final_shutdown()。
+        //
+        // ⚠️ 2026-09-20（实机回归：窗口已关但进程残留）：本分支内的任何调用
+        // **都不得阻塞式取锁**。`il2cpp_callsite::shutdown()` 内部曾用 `lock_guard`
+        // 取 `g_inst_mutex`，而该锁的写方是游戏**每次 Render 都走**的
+        // `on_render_enter`；退出瞬间若渲染线程在锁内 → DETACH 永久阻塞
+        // → loader lock 不释放 → 进程退不掉。现已改为 `try_lock`。
+        // **新增调用前请先确认：该函数不取锁，或只用 try_lock。**
         //
         // 而渲染线程可能正持该锁卡在 GPU fence 等待上（dispatch 全程持锁）。
         if (reserved != nullptr)

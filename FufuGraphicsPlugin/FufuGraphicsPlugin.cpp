@@ -114,17 +114,39 @@ std::wstring lower(std::wstring value)
 //   2. `reset_log()` 用 CREATE_ALWAYS 截断文件后**无法使其失效** —— 缓存的句柄
 //      仍指向被截断后的旧文件对象，后续 write_log 追加的位置与预期不符。
 // 提到文件作用域后，`reset_log()` 可以先关闭再让 `write_log` 重新打开。
+//
+// ⚠️ 2026-09-19（实机回归：进程残留）：**句柄本身用原子量**，不要用 mutex 保护。
+// 前一次改动让 `DllMain(DLL_PROCESS_DETACH)` 调用一个**取 mutex** 的关闭函数 ——
+// 那是 Windows 上最经典的死锁模式之一：
+//   DllMain 在 DETACH 时持有 loader lock；若此时 worker 线程正持该 mutex 在写日志
+//   （或它随后要在 loader lock 下做任何事），两边互等 → **DETACH 永不返回**
+//   → 进程退不掉 → **残留**。
+// 当时注释只论证了"`CloseHandle` 不依赖 loader lock"，**漏了外层 mutex**。
+// 现在：句柄用 `std::atomic<HANDLE>` 交换（无锁），DETACH 路径不再取任何锁。
 std::mutex g_log_handle_mutex;
-HANDLE g_log_handle = INVALID_HANDLE_VALUE;
+std::atomic<HANDLE> g_log_handle { INVALID_HANDLE_VALUE };
 
+// 常规路径（非 DETACH）：可取锁，语义与 `write_log` 的句柄获取串行。
 void close_log_handle()
 {
     std::lock_guard lock(g_log_handle_mutex);
-    if (g_log_handle != INVALID_HANDLE_VALUE)
-    {
-        CloseHandle(g_log_handle);
-        g_log_handle = INVALID_HANDLE_VALUE;
-    }
+    HANDLE handle = g_log_handle.exchange(INVALID_HANDLE_VALUE, std::memory_order_acq_rel);
+    if (handle != INVALID_HANDLE_VALUE)
+        CloseHandle(handle);
+}
+
+// **DETACH 专用**：不取任何锁，只用原子交换取出句柄再关闭。
+//
+// 为什么必须单独有一个：`DllMain` 在 loader lock 下执行，取 mutex 会死锁（见上）。
+// 原子交换本身是用户态操作，`CloseHandle` 是内核调用，两者都不需要 loader lock。
+// 代价：若 worker 线程**恰好**在同一瞬间也持有旧句柄值并正在 `WriteFile`，
+// 那次写入可能失败 —— 这是可接受的（进程正在退出，丢最后一行日志无所谓），
+// 远优于进程残留。
+void close_log_handle_no_lock()
+{
+    HANDLE handle = g_log_handle.exchange(INVALID_HANDLE_VALUE, std::memory_order_acq_rel);
+    if (handle != INVALID_HANDLE_VALUE)
+        CloseHandle(handle);
 }
 
 void write_log(const std::string &message)
@@ -153,9 +175,10 @@ void write_log(const std::string &message)
     const std::string line = std::string(prefix) + message + "\r\n";
     {
         std::lock_guard handle_lock(g_log_handle_mutex);
-        if (g_log_handle == INVALID_HANDLE_VALUE)
+        HANDLE handle = g_log_handle.load(std::memory_order_acquire);
+        if (handle == INVALID_HANDLE_VALUE)
         {
-            g_log_handle = CreateFileW(
+            handle = CreateFileW(
                 g_log_path.c_str(),
                 FILE_APPEND_DATA,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -163,11 +186,12 @@ void write_log(const std::string &message)
                 OPEN_ALWAYS,
                 FILE_ATTRIBUTE_NORMAL,
                 nullptr);
-            if (g_log_handle == INVALID_HANDLE_VALUE)
+            if (handle == INVALID_HANDLE_VALUE)
                 return;
+            g_log_handle.store(handle, std::memory_order_release);
         }
         DWORD written = 0;
-        WriteFile(g_log_handle, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+        WriteFile(handle, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
     }
 }
 
@@ -1680,11 +1704,15 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
-        // 关闭日志文件句柄（2026-09-19 审核报告：该句柄原先永不关闭）。
-        // `CloseHandle` 只是内核调用、**不依赖 loader lock**，在 DETACH 下安全；
-        // 这里刻意**不做**任何文件 I/O（那才需要避免）。
-        // 注：DETACH 也会在进程正常退出时到达，故这是句柄的主要释放点。
-        close_log_handle();
+        // 关闭日志文件句柄（2026-09-19）。
+        //
+        // ⚠️ 必须用**无锁**版本：`DllMain` 在 DETACH 时持有 loader lock，
+        // 而前一版这里调用的是取 mutex 的 `close_log_handle()` ——
+        // 若 worker 线程此刻正持该 mutex 写日志，两边互等 → **DETACH 永不返回
+        // → 进程退不掉（实机回归：进程残留）**。
+        // `close_log_handle_no_lock()` 只做原子交换 + `CloseHandle`，
+        // 两者都不需要 loader lock。
+        close_log_handle_no_lock();
     }
     return TRUE;
 }
