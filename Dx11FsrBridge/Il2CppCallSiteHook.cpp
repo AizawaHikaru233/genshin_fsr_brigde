@@ -370,6 +370,27 @@ void shutdown()
         VirtualFree(g_projection_stub, 0, MEM_RELEASE);
         g_projection_stub = nullptr;
     }
+
+    // 清空 per-instance 表（2026-09-19：接入测试后实测发现的缺陷）。
+    //
+    // 为什么必须清：`g_inst_params[i].instance` 保存的是**游戏实例的裸指针**
+    // （FFX_FSR2 实例地址）。游戏重建实例后旧地址会失效；若表不清空，
+    // 这些**已失效的指针会残留到下一次 install()**：
+    //   - `known_instances()` 会把它们当作"仍在的实例"报出去
+    //     → 上层据此查 token/代次，拿到的是别的对象的陈旧数据
+    //   - `params_generation_for()` 命中陈旧槽位 → 返回过期代次
+    // 而实例地址可能被**复用**（栈/堆分配器），复用后就是"把新对象误判为旧实例"。
+    //
+    // 实测证据：`Il2CppCallSiteHookTest` 的 `run_test()` 用**栈上**实例调用一次后，
+    // 该地址即被登记；随后 `run_per_instance_test()` 期望 `known_instances` 返回 2 个，
+    // 实际返回 3 个（多出前一次测试留下的失效栈地址）。此前该测试未接入 CMake，
+    // 所以这个缺陷一直不可见。
+    {
+        std::lock_guard lock(g_inst_mutex);
+        for (std::size_t i = 0; i < g_inst_count; ++i)
+            g_inst_params[i] = PerInstanceParams {};
+        g_inst_count = 0;
+    }
 }
 
 bool active()

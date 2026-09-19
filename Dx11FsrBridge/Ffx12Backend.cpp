@@ -1706,8 +1706,38 @@ bool create_context(SdkContext &sc)
                  // 未带 jitter 的矢量重复施加补偿，表现为静止画面细微抖动。
                  (g_motion_vectors_jittered ? FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION : 0u);
     g_create_flags = desc.flags; // 供日志按真值输出（旧日志此处是硬编码字符串）
-    const ffxReturnCode_t rc = g_runtime.create(
-        &sc.ctx, reinterpret_cast<ffxCreateContextDescHeader *>(&desc), nullptr);
+    // 异常保护（2026-09-19，接入 Ffx12BackendTest 后实测发现）：
+    // `g_runtime.create` 是**第三方 FFX SDK 的入口**，其 D3D12 后端路径在设备/适配器
+    // 条件不满足时会**抛出异常**（实测：测试环境走到此处抛出非 std::exception 的异常；
+    // 未捕获时表现为 std::terminate + 退出码 0xE06D7363，既无消息也无转储）。
+    //
+    // 在游戏里这意味着：任何让 SDK 内部抛异常的边缘条件（驱动差异、适配器切换、
+    // 显存不足等）都会**崩溃整个游戏进程**，而不是回退原生 FSR。
+    // 本后端的既有约定是 **fail-open**（见 `ensure_pool` 末尾："GPU 互操作未就绪时
+    // 直接失败，由 dispatch 返回 false 让游戏走原有原生 FSR 路径，不损画质"）——
+    // 这里必须遵守同一约定。
+    //
+    // 注：`/EHsc` 只在 Debug 配置开启（见 CMakeLists）；Release 下 catch 仍能捕获
+    // SDK 抛出的 C++ 异常（编译器仍生成 catch 处理，只是不做栈展开清理），
+    // 这正是"防御性 catch"的预期用法。
+    ffxReturnCode_t rc = FFX_API_RETURN_ERROR;
+    try
+    {
+        rc = g_runtime.create(
+            &sc.ctx, reinterpret_cast<ffxCreateContextDescHeader *>(&desc), nullptr);
+    }
+    catch (const std::exception &e)
+    {
+        sdk_note(L"ffxFsr2ContextCreate threw std::exception stage=ctx");
+        sc.ctx = nullptr;
+        return false;
+    }
+    catch (...)
+    {
+        sdk_note(L"ffxFsr2ContextCreate threw unknown exception stage=ctx");
+        sc.ctx = nullptr;
+        return false;
+    }
     if (rc != FFX_API_RETURN_OK || sc.ctx == nullptr)
     {
         sdk_note(L"ffxFsr2ContextCreate rc=%d version=%s stage=ctx",

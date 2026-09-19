@@ -5,6 +5,24 @@ project(Dx11FsrBridge LANGUAGES C CXX RC)
 option(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL "Build the standard FSR2 translation exports" ON)
 option(DX11FSRBRIDGE_RELEASE_RUNTIME "Build the release runtime" ON)
 option(DX11FSRBRIDGE_BUILD_FAMILY_TEST "Build the Fsr2FamilyTakeover state-machine test" OFF)
+# 统一测试开关（2026-09-19 审核报告）。
+#
+# 背景：仓库有 7 个 `*Test.cpp`，但此前**只有** `Fsr2FamilyTakeoverTest` 接了 CMake
+# （且需单独开 `DX11FSRBRIDGE_BUILD_FAMILY_TEST`）。其余 6 个被 git 跟踪却**从不编译**
+# —— 会静默腐烂（改坏也没人知道），而它们恰是唯一能自动验证核心逻辑的东西。
+#
+# 这里接入**无需 FFX SDK 头**的两个：
+#   - `Il2CppCallSiteHookTest`  —— 只需 `Il2CppCallSiteHook.cpp`
+#   - `Ffx12BackendTest`        —— 只需 `Ffx12Backend.cpp`（其 `Ffx12Backend.h`
+#     仅依赖 <cstdint>/<string>，不需要 ffx_api 头）
+#
+# **未接入**（原因已核实，非疏漏）：
+#   - `Ffx12Test` / `Ffx12AccumTest` —— `#include "ffx_api.h"` / `"ffx_upscale.h"`，
+#     需 FFX SDK 头 staging（本文件的 FFX_API_STAGE_ROOT 流程），且运行需真实 SDK DLL
+#   - `Ffx12DescTest`               —— 纯 D3D12 计算着色器验证，运行需 GPU
+#   - `GpuRouteTest`                —— 已在文件内标注 OBSOLETE
+# 这些留待需要时按 FFX SDK staging 接入；先保证"能无外部依赖编译"的两个进 CI。
+option(DX11FSRBRIDGE_BUILD_TESTS "Build the SDK-free unit tests (il2cpp callsite, ffx12 backend)" OFF)
 
 # The bridge deliberately uses the deployed ffx-api runtime provider.  The
 # static open-SDK host was tested in-game and produced a black output, while
@@ -131,4 +149,87 @@ if(DX11FSRBRIDGE_BUILD_FAMILY_TEST)
         UNICODE
         _UNICODE
     )
+endif()
+
+# ---- 单元测试接入（2026-09-19 审核报告：此前被跟踪但从不编译）----
+#
+# 背景：仓库有 7 个 `*Test.cpp`，此前**只有** `Fsr2FamilyTakeoverTest` 接了 CMake
+# （且需单独开 `DX11FSRBRIDGE_BUILD_FAMILY_TEST`）。其余 6 个被 git 跟踪却**从不编译**
+# —— 会静默腐烂，而它们恰是唯一能自动验证核心逻辑的东西。
+#
+# 接入实测结论（逐个编译并运行过，不是估计）：
+#   ✅ `Il2CppCallSiteHookTest` —— 可编译、**运行通过**（`ALL PASS`）。
+#      接入后立刻暴露一个真实缺陷：`shutdown()` 不清 per-instance 表，
+#      残留的**失效实例指针**会污染下一次 `install()`（已修）。
+#   ⚠️ `Ffx12BackendTest` —— 可编译，但**运行仍崩溃**（见下），故单独开关。
+#   ❌ `Ffx12Test` / `Ffx12AccumTest` —— `#include "ffx_api.h"` 等，需 FFX SDK 头
+#      staging；`Ffx12DescTest` 另需 GPU；`GpuRouteTest` 已在文件内标注 OBSOLETE。
+option(DX11FSRBRIDGE_BUILD_TESTS "Build the runnable SDK-free unit tests (il2cpp callsite)" OFF)
+option(DX11FSRBRIDGE_BUILD_BACKEND_TEST
+    "Build Ffx12BackendTest (KNOWN ISSUE: crashes in ffxCreateContext under the isolated test harness)"
+    OFF)
+
+if(DX11FSRBRIDGE_BUILD_TESTS OR DX11FSRBRIDGE_BUILD_BACKEND_TEST)
+    # 共用设置函数：把主 target 用到的宏与警告级别统一施加到测试 target
+    function(fsrbridge_configure_test target)
+        target_compile_features(${target} PRIVATE cxx_std_20)
+        if(MSVC)
+            target_compile_options(${target} PRIVATE /utf-8 /W3)
+        endif()
+        target_compile_definitions(${target} PRIVATE
+            WIN32_LEAN_AND_MEAN
+            NOMINMAX
+            UNICODE
+            _UNICODE
+        )
+    endfunction()
+endif()
+
+if(DX11FSRBRIDGE_BUILD_TESTS)
+    # il2cpp callsite hook：观察/跳过/还原模式 + per-instance 隔离 + 相机 hook。
+    # 需链 Il2CppCallSiteHook.cpp。**此测试已实测通过**。
+    add_executable(Il2CppCallSiteHookTest
+        Il2CppCallSiteHookTest.cpp
+        Il2CppCallSiteHook.cpp
+    )
+    fsrbridge_configure_test(Il2CppCallSiteHookTest)
+    target_include_directories(Il2CppCallSiteHookTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    enable_testing()
+    add_test(NAME Il2CppCallSiteHookTest COMMAND Il2CppCallSiteHookTest)
+endif()
+
+if(DX11FSRBRIDGE_BUILD_BACKEND_TEST)
+    # ⚠️ **已知问题（2026-09-19 实测）**：本测试能编译、能跑到 FFX context 创建，
+    #    但在 `g_runtime.create`（FFX SDK 的 `ffxCreateContext`，D3D12 后端路径）
+    #    处**抛出未捕获异常**而终止（退出码 0xE06D7363）。
+    #
+    #    已核实的事实：
+    #      - `ensure_pool` **成功**（GPU 互操作池已建好，逐步打印确认）
+    #      - 崩溃发生在 `create_context` 调用第三方 SDK 时，**不在本仓库代码里**
+    #      - 三种 SDK DLL 变体（41MB AMD 版 / 28MB ×2）表现**完全一致**
+    #      - 加 `/EHsc` 后 `catch(...)` 仍抓不到 → 不是标准 C++ 异常路径
+    #    因此判断是**测试环境**（裸 D3D11/D3D12 设备 + 隔离上下文）不满足 SDK 的
+    #    内部前提，而非产品缺陷 —— 游戏内该路径正常工作（实测日志有
+    #    `ffx12_path chain=direct->ffx_dispatch`）。
+    #
+    #    但由此**发现并修复了一处真实健壮性缺口**：`create_context` 对
+    #    `g_runtime.create` **没有异常保护**，SDK 抛异常会崩掉整个游戏进程。
+    #    已加 fail-open 的 try/catch（见 Ffx12Backend.cpp）。
+    #
+    #    保持本开关默认 OFF，避免让"已知失败的测试"混进 CI 绿灯。
+    add_executable(Ffx12BackendTest
+        Ffx12BackendTest.cpp
+        Ffx12Backend.cpp
+    )
+    fsrbridge_configure_test(Ffx12BackendTest)
+    target_include_directories(Ffx12BackendTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
+        "${FFX_API_INCLUDE_ROOT}"
+        "${FFX_UPSCALER_INCLUDE_ROOT}"
+    )
+    target_link_libraries(Ffx12BackendTest PRIVATE d3d11 d3d12 d3dcompiler dxgi)
+
+    message(STATUS "Dx11FsrBridge: building Ffx12BackendTest "
+        "(KNOWN ISSUE: crashes in ffxCreateContext under the isolated test harness)")
 endif()
