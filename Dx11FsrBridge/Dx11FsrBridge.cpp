@@ -9646,6 +9646,68 @@ static std::size_t read_game_floats_seh(std::uint64_t ptr, float *out, std::size
     }
 }
 
+// sdk234 未接管原因的低频诊断（2026-09-19 审核报告：从 try_fsr2_translation_draw
+// 内抽出，该函数原约 1800 行）。
+//
+// **只读**：不修改任何状态机状态，只写自己的静态节流计数器 —— 因此可安全抽出，
+// 不会影响 dispatch/gate 语义。
+// 双入口第二次进入（同代次、刚派发过）不算异常，过滤掉。
+void log_sdk234_skip_reason(
+    const void *inst_state,
+    std::uint64_t match_inst,
+    std::uint64_t draw_out_ptr,
+    std::uint64_t sdk234_now,
+    std::uint64_t last_dispatch_tick,
+    std::uint32_t render_width,
+    std::uint32_t render_height)
+{
+    static std::atomic_uint64_t sdk234_skip_count { 0 };
+    static std::atomic_uint64_t sdk234_skip_next { 1 };
+    const bool second_entry_like =
+        inst_state != nullptr && last_dispatch_tick != 0 &&
+        sdk234_now - last_dispatch_tick <= 50;
+    if (second_entry_like)
+        return;
+
+    const std::uint64_t sc = sdk234_skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (sc != 1 && sc != sdk234_skip_next.load(std::memory_order_relaxed))
+        return;
+
+    sdk234_skip_next.store(sc * 8 + 1, std::memory_order_relaxed);
+    const std::string reason = match_inst == 0 ? "NO_TOKEN" : "GATE_STALE";
+    const std::uint64_t ago_ms =
+        inst_state != nullptr && last_dispatch_tick != 0 ? sdk234_now - last_dispatch_tick : 0;
+    // 已知实例代次/帧状态：判断"实例 Render 未被捕获"（:g 远离 glob）还是
+    // "代次在推进但 bridge 门控异常"（:g 接近 glob 却仍 gate_stale）。
+    std::string insts_state;
+    {
+        std::uint64_t insts[8] {};
+        std::size_t inst_n = 0;
+        il2cpp_callsite::known_instances(insts, 8, inst_n);
+        for (std::size_t i = 0; i < inst_n; ++i)
+        {
+            il2cpp_callsite::CapturedParams ip {};
+            std::uint64_t ig = 0;
+            il2cpp_callsite::last_params_for(insts[i], ip, ig);
+            if (i > 0)
+                insts_state += ",";
+            insts_state += hex64(insts[i] & 0xFFFFFFFFull) +
+                ":g" + std::to_string(ig) +
+                ":f" + std::to_string(ip.frame_index);
+        }
+    }
+    LOG_DEBUG(blog::cat::upscale, "ffx12_skip count=" + std::to_string(sc) +
+        " rc=" + reason +
+        " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
+        " out=" + hex64(draw_out_ptr) +
+        " sdk234_out=" + hex64(g_sdk234_output_ptr) +
+        " ago_ms=" + std::to_string(ago_ms) +
+        " render=" + std::to_string(render_width) + "x" +
+        std::to_string(render_height) +
+        " glob=" + std::to_string(il2cpp_callsite::params_generation()) +
+        " insts=" + insts_state);
+}
+
 template <typename DrawCall>
 bool try_fsr2_translation_draw(
     ID3D11DeviceContext *context,
@@ -11060,55 +11122,10 @@ bool try_fsr2_translation_draw(
             // 失败由 invalidate_direct_attempt 终结旧 token；函数末的 direct-only gate
             // 继续截断原生 accumulate draw，等待下一枚有效 token 以 reset 重建历史。
         }
-        // 诊断：sdk234 未接管原因（低频）。双入口第二次进入（同代次、刚派发过）不算异常，过滤。
-        {
-            static std::atomic_uint64_t sdk234_skip_count { 0 };
-            static std::atomic_uint64_t sdk234_skip_next { 1 };
-            const bool second_entry_like =
-                st != nullptr && st->last_dispatch_tick != 0 &&
-                sdk234_now - st->last_dispatch_tick <= 50;
-            if (!second_entry_like)
-            {
-                const std::uint64_t sc = sdk234_skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (sc == 1 || sc == sdk234_skip_next.load(std::memory_order_relaxed))
-                {
-                    sdk234_skip_next.store(sc * 8 + 1, std::memory_order_relaxed);
-                    const std::string reason = match_inst == 0 ? "NO_TOKEN" : "GATE_STALE";
-                    const std::uint64_t ago_ms =
-                        st != nullptr && st->last_dispatch_tick != 0
-                            ? sdk234_now - st->last_dispatch_tick : 0;
-                    // 已知实例代次/帧状态：判断"实例 Render 未被捕获"（:g 远离 glob）还是
-                    // "代次在推进但 bridge 门控异常"（:g 接近 glob 却仍 gate_stale）。
-                    std::string insts_state;
-                    {
-                        std::uint64_t insts[8] {};
-                        std::size_t inst_n = 0;
-                        il2cpp_callsite::known_instances(insts, 8, inst_n);
-                        for (std::size_t i = 0; i < inst_n; ++i)
-                        {
-                            il2cpp_callsite::CapturedParams ip {};
-                            std::uint64_t ig = 0;
-                            il2cpp_callsite::last_params_for(insts[i], ip, ig);
-                            if (i > 0)
-                                insts_state += ",";
-                            insts_state += hex64(insts[i] & 0xFFFFFFFFull) +
-                                ":g" + std::to_string(ig) +
-                                ":f" + std::to_string(ip.frame_index);
-                        }
-                    }
-                    LOG_DEBUG(blog::cat::upscale, "ffx12_skip count=" + std::to_string(sc) +
-                        " rc=" + reason +
-                        " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
-                        " out=" + hex64(draw_out_ptr) +
-                        " sdk234_out=" + hex64(g_sdk234_output_ptr) +
-                        " ago_ms=" + std::to_string(ago_ms) +
-                        " render=" + std::to_string(draw_info->render_width) + "x" +
-                        std::to_string(draw_info->render_height) +
-                        " glob=" + std::to_string(il2cpp_callsite::params_generation()) +
-                        " insts=" + insts_state);
-                }
-            }
-        }
+        // 诊断：sdk234 未接管原因（低频，只读，已抽为独立函数）
+        log_sdk234_skip_reason(st, match_inst, draw_out_ptr, sdk234_now,
+            st != nullptr ? st->last_dispatch_tick : 0,
+            draw_info->render_width, draw_info->render_height);
     }
 
     // Once a target FSR2 accumulate draw is identified, keep the native path
