@@ -116,15 +116,17 @@ texture_hash.cpp/.h    — 3DMigoto 兼容哈希（GPL-3.0 移植）
 mod_ini.cpp/.h         — [TextureOverride]/[Resource] ini 解析（自研，格式兼容）
 crc32c/crc32c.cpp      — 硬件 CRC-32C（zlib 许可）
 log.cpp/.h             — 日志
+TextureLoader.ini      — 配置（**唯一权威源**；打包与本地部署脚本均从本目录取用）
 third_party/dstorage/  — DirectStorage SDK（MIT + MS 条款，含 dstorage.h）
 NOTICE.md / LICENSE.GPL.txt / AUTHORS.txt — 许可证与溯源
 ```
 
-> 配置 `TextureLoader.ini` **不在本目录**：其唯一权威源位于
-> `SharedResources/TextureLoader/runtime/TextureLoader.ini`（与 `ReShade.ini` /
-> `OptiScaler.ini` 同模式 —— `SharedResources/*/runtime/` 是运行时资源的唯一源，
-> 源码目录不再保留副本）。打包与本地部署脚本均从该处取用。
-> 2026-09-19 前源码目录另有一份同名副本，因存在漂移风险（改源码那份不影响打包）
-> 已删除。
+> `TextureLoader.ini` 以**本目录为唯一权威源**，与 Bridge 的做法一致
+> （Bridge 的权威源是 `Dx11FsrBridge/Dx11FsrBridge.package.ini`，
+> `SharedResources/` 下不保留副本）。打包脚本
+> （`Build-OnlineInstaller.ps1` 的 `$tloaderConfig`，4 处 Copy-Item）与本地部署脚本
+> （`deploy-test.ps1`）都从本目录取用。
+> 2026-09-19：此前 `SharedResources/TextureLoader/runtime/` 另有一份同名副本，
+> 两份独立维护 → 漂移后改源码这份不影响打包（静默失效）；已删除该副本并统一到本目录。
 
 > 说明：开发期的测试工程与反汇编验证脚本已从仓库移除；验证结论沉淀于本文档 §5。

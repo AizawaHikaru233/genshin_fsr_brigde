@@ -27,7 +27,11 @@ $bridgeBuild = Join-Path $root 'build-package-bridge'
 $antiBuild = Join-Path $root 'build-package-antiplayermosaic'
 $tloaderSource = Join-Path $root 'TextureLoader'
 $tloaderBuild = Join-Path $root 'build-tloader-gdds'
-$tloaderRuntime = Join-Path $root 'SharedResources\TextureLoader\runtime'
+# TextureLoader.ini 的**唯一权威源**在组件源码目录（`TextureLoader\TextureLoader.ini`），
+# 与 Bridge 的做法一致（Bridge 的权威源是 `Dx11FsrBridge\Dx11FsrBridge.package.ini`，
+# 打包脚本第 256/324/454/487 行从那里取用，`SharedResources` 下**不保留副本**）。
+# 2026-09-19：原先 SharedResources 下另有一份同名副本，已删除并统一到源码目录。
+$tloaderConfig = Join-Path $tloaderSource 'TextureLoader.ini'
 $script:bridgeDll = $null
 $script:antiDll = $null
 $script:tloaderDll = $null
@@ -261,7 +265,7 @@ function Prepare-FpsStage {
     # license 集中目录只放"外部单模块"（OptiScaler/ReShade/FPSUnlocker），
     # 自有模块（Bridge/AntiPlayerMosaic/TextureLoader）与项目整体同为 GPL-3.0（根 LICENSE）。
     Copy-Item -LiteralPath $tloaderDll -Destination (Join-Path $stagePayloadTextureLoader 'TextureLoader.dll') -Force
-    Copy-Item -LiteralPath (Join-Path $tloaderRuntime 'TextureLoader.ini') -Destination (Join-Path $stagePayloadTextureLoader 'TextureLoader.ini') -Force
+    Copy-Item -LiteralPath ($tloaderConfig) -Destination (Join-Path $stagePayloadTextureLoader 'TextureLoader.ini') -Force
     foreach ($name in @('dstorage.dll', 'dstoragecore.dll')) {
         $source = Join-Path $tloaderBuild $name
         if (Test-Path -LiteralPath $source -PathType Leaf) {
@@ -324,7 +328,7 @@ function Prepare-FpsStage {
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $stageDefaults 'Dx11FsrBridge.ini') -Force
     Copy-Item -LiteralPath (Join-Path $optiRuntime 'OptiScaler.ini'), (Join-Path $optiRuntime 'OptiScaler-UpscalingFiles.json') -Destination $stageDefaults -Force
     Copy-Item -LiteralPath (Join-Path $reshadeRuntime 'ReShade.ini'), (Join-Path $reshadeRuntime 'ReShadePreset.ini') -Destination $stageDefaults -Force
-    Copy-Item -LiteralPath (Join-Path $tloaderRuntime 'TextureLoader.ini') -Destination (Join-Path $stageDefaults 'TextureLoader.ini') -Force
+    Copy-Item -LiteralPath ($tloaderConfig) -Destination (Join-Path $stageDefaults 'TextureLoader.ini') -Force
 
     # 外部组件 license 集中到独立 license 文件夹：只放"外部单模块"的 license
     # （OptiScaler/ReShade/FPSUnlocker）；模块内部依赖的 license 留在模块文件夹内
@@ -462,7 +466,7 @@ try {
     Remove-NonBundledReShadeEffects -ReShadeDirectory $reshade
     # TextureLoader（纹理/Mod 加载器）；许可收进模块内 licenses/ 子文件夹
     Copy-Item -LiteralPath $tloaderDll -Destination (Join-Path $textureLoader 'TextureLoader.dll') -Force
-    Copy-Item -LiteralPath (Join-Path $tloaderRuntime 'TextureLoader.ini') -Destination (Join-Path $textureLoader 'TextureLoader.ini') -Force
+    Copy-Item -LiteralPath ($tloaderConfig) -Destination (Join-Path $textureLoader 'TextureLoader.ini') -Force
     foreach ($name in @('dstorage.dll', 'dstoragecore.dll')) {
         $source = Join-Path $tloaderBuild $name
         if (Test-Path -LiteralPath $source -PathType Leaf) {
@@ -487,7 +491,7 @@ try {
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $defaults 'Dx11FsrBridge.ini') -Force
     Copy-Item -LiteralPath (Join-Path $optiRuntime 'OptiScaler.ini'), (Join-Path $optiRuntime 'OptiScaler-UpscalingFiles.json') -Destination $defaults -Force
     Copy-Item -LiteralPath (Join-Path $reshadeRuntime 'ReShade.ini'), (Join-Path $reshadeRuntime 'ReShadePreset.ini') -Destination $defaults -Force
-    Copy-Item -LiteralPath (Join-Path $tloaderRuntime 'TextureLoader.ini') -Destination (Join-Path $defaults 'TextureLoader.ini') -Force
+    Copy-Item -LiteralPath ($tloaderConfig) -Destination (Join-Path $defaults 'TextureLoader.ini') -Force
     Remove-Item -LiteralPath (Join-Path $reshade 'ReShade.ini'), (Join-Path $reshade 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
 
     # 外部组件 license 集中（同 FPS 包：只放外部单模块的 license）
@@ -551,13 +555,14 @@ if ($FetchUpstream) {
 
 Build-PackageComponents
 
-# TextureLoader.ini 的**唯一权威源**是 SharedResources\TextureLoader\runtime\（见下方 4 处
-# Copy-Item）。2026-09-19 已删除源码目录 `TextureLoader\TextureLoader.ini` 那份重复副本
-# —— 与 ReShade.ini / OptiScaler.ini 采用同一模式（`SharedResources/*/runtime/` 是唯一源，
-# 源码目录不留副本），因此不再需要双份一致性校验。
-# 这里只做存在性断言，避免"打包时才发现模板缺失"。
-if (-not (Test-Path -LiteralPath (Join-Path $root 'SharedResources\TextureLoader\runtime\TextureLoader.ini'))) {
-    throw '缺少 TextureLoader.ini 权威源：SharedResources\TextureLoader\runtime\TextureLoader.ini'
+# TextureLoader.ini 的**唯一权威源**在组件源码目录 `TextureLoader\TextureLoader.ini`
+# （见上方 $tloaderConfig 与 4 处 Copy-Item）—— 与 Bridge 的做法一致：
+# Bridge 的权威源是 `Dx11FsrBridge\Dx11FsrBridge.package.ini`，`SharedResources` 下不留副本。
+# 2026-09-19：原先 `SharedResources\TextureLoader\runtime\` 另有一份同名副本，已删除
+# 并统一到源码目录（此前两份独立维护 → 漂移后改源码那份不影响打包，属静默失效）。
+# 这里做存在性断言，避免"打包时才发现模板缺失"。
+if (-not (Test-Path -LiteralPath $tloaderConfig -PathType Leaf)) {
+    throw "缺少 TextureLoader.ini 权威源：$tloaderConfig"
 }
 
 # 上游版本一致性由 tools\Update-UpstreamComponents.ps1 保证（官方包 SHA-256 校验 + versions.json 记录 FileVersion）。

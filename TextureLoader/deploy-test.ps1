@@ -29,12 +29,12 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $BuildDir) { $BuildDir = Join-Path $root 'build' }
 
 $srcDll = Join-Path $BuildDir 'TextureLoader.dll'
-# ini 的**唯一权威源**在 SharedResources（与 ReShade.ini / OptiScaler.ini 同模式：
-# `SharedResources/*/runtime/` 是唯一源，源码目录不再保留副本）。
-# 2026-09-19：原先源码目录另有一份 `TextureLoader/TextureLoader.ini`，与权威源
-# 内容相同但独立维护 → 漂移后打包出去的仍是权威源，改源码那份会静默不生效。
-# 现已删除该副本（审核报告高严重度），本脚本改为直接读权威源。
-$srcIni = Join-Path (Split-Path -Parent $root) 'SharedResources\TextureLoader\runtime\TextureLoader.ini'
+# ini 的**唯一权威源**在本目录（组件源码目录），与 Bridge 的做法一致
+# （Bridge 的权威源是 `Dx11FsrBridge\Dx11FsrBridge.package.ini`，`SharedResources` 下不留副本）。
+# 2026-09-19：原先 `SharedResources\TextureLoader\runtime\` 另有一份同名副本，
+# 两份独立维护 → 漂移后打包出去的是副本，改源码这份会**静默不生效**。
+# 已删除该副本并把打包脚本一并改为从本目录取用，此处与打包脚本同源。
+$srcIni = Join-Path $root 'TextureLoader.ini'
 if (-not (Test-Path -LiteralPath $srcDll)) {
     throw "未找到 $srcDll —— 请先运行 build.ps1（产物为 build\TextureLoader.dll）"
 }
