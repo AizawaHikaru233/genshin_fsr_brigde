@@ -103,8 +103,10 @@ Every distribution channel therefore behaves as follows:
 - Repository root: FSR Bridge source, configuration, and build files.
 - `AntiPlayerMosaic/`: anti-aliasing blur removal, UID hiding, and underwater mosaic fix plugin.
 - `FufuGraphicsPlugin/`: FuFu Launcher bootstrap, configuration files, and install scripts.
-- `RenoDX-Genshin/`: Genshin-specific RenoDX HDR shader add-on.
 - `TextureLoader/`: 3DMigoto-compatible texture replacement / Mod loader (DDS + GDDS).
+- `SharedResources/`: runtime resources and component archives shipped with the package.
+  The Genshin-specific RenoDX HDR shader add-on and its redistribution authorization
+  record are archived under `SharedResources/ReShade/runtime/reshade-shaders/`.
 
 ## Usage
 

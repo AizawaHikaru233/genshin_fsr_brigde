@@ -99,8 +99,10 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 - 仓库根目录：FSR Bridge 源码、配置与构建文件。
 - `AntiPlayerMosaic/`：反虚化、隐藏 UID 与水下马赛克修复插件。
 - `FufuGraphicsPlugin/`：芙芙启动器的bootstrap、配置文件和安装脚本。
-- `RenoDX-Genshin/`：原神专用renodXHDR滤镜。
 - `TextureLoader/`：3DMigoto 兼容纹理替换 / Mod 加载器（DDS + GDDS）。
+- `SharedResources/`：随包分发的运行时资源与组件归档。原神专用 RenoDX HDR 滤镜
+  Add-on 及其再分发授权记录归档于
+  `SharedResources/ReShade/runtime/reshade-shaders/`。
 
 ## 使用方法
 
