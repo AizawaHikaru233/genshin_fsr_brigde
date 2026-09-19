@@ -51,7 +51,14 @@ struct BootstrapConfig
     std::wstring texture_loader_mod_path; // 自定义 Mod 加载路径（空 = DLL 同目录 Mods）
     std::wstring trigger_module = L"WINTRUST.dll";
     DWORD timeout_ms = 30000;
-    DWORD poll_interval_ms = 2;
+    // 轮询间隔（2026-09-19 审核报告）：原为 **2ms** —— 配合 30s 超时意味着最多
+    // **15000 次** `GetModuleHandleW` 轮询，纯烧 CPU。
+    //
+    // 而被等待的事件是"游戏加载 WINTRUST.dll"，属**毫秒级以上的模块加载**，
+    // 不是纳秒级状态变化：25ms 粒度下最坏只多等 25ms，对启动时序无可感影响，
+    // 却把轮询次数降到 1200 次（**约 1/12**）。
+    // 该值仍可由 config.ini 覆盖（见下方解析，范围 1..1000）。
+    DWORD poll_interval_ms = 25;
     bool reject_game_directory_proxies = true;
 };
 
@@ -183,11 +190,16 @@ void reset_log()
 
 std::filesystem::path module_path(const HMODULE module)
 {
-    wchar_t buffer[32768];
-    const DWORD length = GetModuleFileNameW(module, buffer, static_cast<DWORD>(std::size(buffer)));
-    if (length == 0 || length >= std::size(buffer))
+    // 动态缓冲（2026-09-19 审核报告）：原为 `wchar_t buffer[32768]`（**64KB 栈**）。
+    // `module_path` 在启动路径上被多次调用（`is_target_process`、`absolute_from`、
+    // 各路径解析），每次压 64KB 栈既浪费又逼近默认 1MB 栈上限。
+    // 用 `std::wstring` 按需分配，语义不变（仍按 length 构造，失败返回空路径）。
+    std::wstring buffer(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(module, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (length == 0 || length >= buffer.size())
         return {};
-    return std::filesystem::path(std::wstring(buffer, length));
+    buffer.resize(length);
+    return std::filesystem::path(buffer);
 }
 
 // 从**本模块自身的版本资源**读取版本串（2026-09-19 审核报告）。
@@ -236,18 +248,23 @@ std::string module_version_string(const HMODULE module)
 }
 
 bool file_exists(const std::filesystem::path &path)
-{    const DWORD attributes = GetFileAttributesW(path.c_str());
+{
+    const DWORD attributes = GetFileAttributesW(path.c_str());
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
 std::filesystem::path absolute_from(const std::filesystem::path &base, const std::filesystem::path &path)
 {
     const std::filesystem::path candidate = path.is_absolute() ? path : base / path;
-    wchar_t buffer[32768];
-    const DWORD length = GetFullPathNameW(candidate.c_str(), static_cast<DWORD>(std::size(buffer)), buffer, nullptr);
-    if (length == 0 || length >= std::size(buffer))
+    // 动态缓冲（2026-09-19 审核报告）：原为 `wchar_t buffer[32768]`（**64KB 栈**）。
+    // 语义不变：失败（含过长）时返回未规范化的 candidate，与旧行为一致。
+    std::wstring buffer(32768, L'\0');
+    const DWORD length = GetFullPathNameW(candidate.c_str(), static_cast<DWORD>(buffer.size()),
+                                          buffer.data(), nullptr);
+    if (length == 0 || length >= buffer.size())
         return candidate;
-    return std::filesystem::path(std::wstring(buffer, length));
+    buffer.resize(length);
+    return std::filesystem::path(buffer);
 }
 
 std::string trim_ascii(std::string value)
