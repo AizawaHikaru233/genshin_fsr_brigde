@@ -25,6 +25,19 @@ struct BootstrapConfig
 {
     bool enable_bridge = true;
     bool enable_optiscaler = true;
+    // ReShade 缺键时的默认值必须与**安装器的 GPU 策略**一致（2026-09-19 审核报告）。
+    //
+    // 三方原本不一致：
+    //   - Lua 安装器：**N 卡不写 config**（Install-FufuPlugin.lua 第 58-59 行），
+    //     非 N 卡写 `EnableReShade = is_nvidia and "0" or "1"`
+    //   - 包内 `config.ini` 模板：`EnableReShade = 0`（N 卡走这条）
+    //   - 本处缺键默认：**恒 `true`**
+    // 后果：N 卡用户若 config.ini 缺失/损坏，会落到"恒 true" → **开启本应关闭的
+    // ReShade**，与安装器策略相反。现改为与 Lua 完全对应的 GPU 判定。
+    //
+    // 初值仅占位；真正的缺键默认在读取配置处按 `has_nvidia_adapter()` 解析
+    //（见 enable_reshade 的读取分支）。`has_nvidia_adapter()` 定义在本文件后文，
+    // 但使用点在它之后，故可见。
     bool enable_reshade = true;
     // TextureLoader 为可选组件（opt-in）：config.ini 中**没有该键即视为关闭**。
     // 这与发布包一致（模板里 Value=0），而且现在是必需语义——模板 config.ini 已移除该项
@@ -153,9 +166,53 @@ std::filesystem::path module_path(const HMODULE module)
     return std::filesystem::path(std::wstring(buffer, length));
 }
 
-bool file_exists(const std::filesystem::path &path)
+// 从**本模块自身的版本资源**读取版本串（2026-09-19 审核报告）。
+//
+// 为什么需要：日志原硬编码 `version=2.0.0`，而 `.rc` 已是 `2.2.0.0`
+// （`config.ini` 与 Lua 也写 `2.2.0`）—— 版本号多处硬编码、日志与实际不符。
+// 现改为读自身的 `VS_VERSION_INFO`，使 **`.rc` 成为唯一事实源**：
+// 改 rc 后日志自动跟随，不会再出现"日志版本落后"。
+//
+// 取 `FileVersion` 字符串（如 "2.2.0.0"）；查询失败返回空串，调用方自行降级。
+std::string module_version_string(const HMODULE module)
 {
-    const DWORD attributes = GetFileAttributesW(path.c_str());
+    const std::filesystem::path path = module_path(module);
+    if (path.empty())
+        return {};
+
+    DWORD handle = 0;
+    const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &handle);
+    if (size == 0)
+        return {};
+
+    std::vector<std::uint8_t> buffer(size);
+    if (GetFileVersionInfoW(path.c_str(), handle, size, buffer.data()) == FALSE)
+        return {};
+
+    // 语言/代码页取自 rc 的 Translation（0x0804 = zh-CN，1200 与 0x04B0 同值）
+    static const wchar_t *k_queries[] = {
+        L"\\StringFileInfo\\080404B0\\FileVersion",
+        L"\\StringFileInfo\\040904B0\\FileVersion", // en-US 回退
+    };
+    for (const wchar_t *query : k_queries)
+    {
+        void *value = nullptr;
+        UINT length = 0;
+        if (VerQueryValueW(buffer.data(), query, &value, &length) != FALSE &&
+            value != nullptr && length > 0)
+        {
+            const auto *text = static_cast<const wchar_t *>(value);
+            // length 含结尾 NUL；用 wcsnlen 兼容两种情况
+            const std::size_t chars = wcsnlen(text, length);
+            if (chars > 0)
+                return wide_to_utf8(std::wstring_view(text, chars));
+        }
+    }
+    return {};
+}
+
+bool file_exists(const std::filesystem::path &path)
+{    const DWORD attributes = GetFileAttributesW(path.c_str());
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
@@ -1205,7 +1262,20 @@ BootstrapConfig load_config()
     if (const auto *value = find_fufu(L"EnableOptiScaler"))
         config.enable_optiscaler = parse_bool(*value, config.enable_optiscaler);
     if (const auto *value = find_fufu(L"EnableReShade"))
+    {
         config.enable_reshade = parse_bool(*value, config.enable_reshade);
+    }
+    else
+    {
+        // 键缺失时的默认值：与 Lua 安装器的 GPU 策略一致
+        //（`EnableReShade = is_nvidia and "0" or "1"`）。
+        // 原实现恒为 true，导致 N 卡用户在 config.ini 缺失/损坏时**开启本应关闭的
+        // ReShade**，与安装器策略相反（2026-09-19 审核报告）。
+        config.enable_reshade = !has_nvidia_adapter();
+        write_log("config_reshade_default_missing_key reshade=" +
+                  std::string(config.enable_reshade ? "1" : "0") +
+                  " reason=nvidia_policy");
+    }
     if (const auto *value = find_fufu(L"EnableTextureLoader"))
         config.enable_texture_loader = parse_bool(*value, config.enable_texture_loader);
     if (const auto *value = find_fufu(L"ResetConfigurations"))
@@ -1376,7 +1446,15 @@ DWORD WINAPI bootstrap_thread(void *)
     g_module_directory = self_path.parent_path();
     g_log_path = g_module_directory / L"FSR-Bridge-Plugin.log";
     reset_log();
-    write_log("plugin_loaded version=2.0.0 path=" + wide_to_utf8(self_path.wstring()));
+    // 版本从自身 `.rc` 资源读取（2026-09-19 审核报告）：原硬编码 `2.0.0`，
+    // 而 rc/config.ini/Lua 均为 `2.2.0` —— 日志版本与实际不符。
+    // 现 `.rc` 是唯一事实源；查询失败时写 "unknown" 而不是伪造一个版本号。
+    {
+        std::string version = module_version_string(g_module);
+        if (version.empty())
+            version = "unknown";
+        write_log("plugin_loaded version=" + version + " path=" + wide_to_utf8(self_path.wstring()));
+    }
 
     if (!is_target_process())
     {

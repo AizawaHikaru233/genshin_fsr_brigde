@@ -15,7 +15,10 @@ target_compile_definitions(FufuGraphicsPlugin PRIVATE
     NOMINMAX
 )
 target_compile_options(FufuGraphicsPlugin PRIVATE /utf-8)
-target_link_libraries(FufuGraphicsPlugin PRIVATE dxgi)
+# version：日志用 GetFileVersionInfoW/VerQueryValueW 读**自身 .rc 的版本资源**
+# （2026-09-19 审核报告：原硬编码 version=2.0.0，而 rc/config.ini/Lua 均为 2.2.0）。
+# 加它使 `.rc` 成为版本号的唯一事实源。
+target_link_libraries(FufuGraphicsPlugin PRIVATE dxgi version)
 set_property(TARGET FufuGraphicsPlugin PROPERTY
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set_target_properties(FufuGraphicsPlugin PROPERTIES OUTPUT_NAME "FSR-Bridge-Plugin")
