@@ -1,4 +1,4 @@
-# deploy-test.ps1 — 部署 TextureLoader.dll 到宿主插件路线（本地测试用）
+﻿# deploy-test.ps1 — 部署 TextureLoader.dll 到宿主插件路线（本地测试用）
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File .\deploy-test.ps1

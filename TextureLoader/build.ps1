@@ -1,4 +1,4 @@
-# build.ps1 — 构建 TextureLoader.dll
+﻿# build.ps1 — 构建 TextureLoader.dll
 #
 # ⚠️ 2026-09-19（审核报告）：原先这里写"自包含，不依赖仓库其他目录"，**是错的**。
 # 本模块的 hook 依赖 Detours，而 Detours **只存在于 `Dx11FsrBridge/third_party/detours`**

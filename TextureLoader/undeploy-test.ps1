@@ -1,4 +1,4 @@
-# undeploy-test.ps1 — 移除 TextureLoader 部署（两条宿主路线）
+﻿# undeploy-test.ps1 — 移除 TextureLoader 部署（两条宿主路线）
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File .\undeploy-test.ps1
