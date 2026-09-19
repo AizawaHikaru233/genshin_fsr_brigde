@@ -54,6 +54,21 @@ else
 end
 install.log("OptiScaler 运行目录: " .. opti_dir)
 
+-- OptiScaler 超分组件目录（2026-09-20）
+-- 上游有且仅有两种布局，两者都必须支持：
+--   平铺：payload\OptiScaler\{OptiScaler.dll, amd_fidelityfx_upscaler_dx12.dll, ...}
+--   嵌套：payload\OptiScaler\{OptiScaler.dll, OptiScaler.ini}
+--         payload\OptiScaler\OptiScaler\{amd_fidelityfx_upscaler_dx12.dll, ...}
+-- 主 DLL 与 ini 恒在根层；组件目录随布局变化。nvngx_dlss.dll 属"库"，
+-- OptiScaler 按 OptiDllPath（组件目录）解析 NvngxDlssPath=auto，故必须放进组件目录。
+local opti_component_dir = opti_root_dir
+if not install.file_exists(opti_root_dir .. "\\amd_fidelityfx_upscaler_dx12.dll") then
+    if install.file_exists(opti_root_dir .. "\\OptiScaler\\amd_fidelityfx_upscaler_dx12.dll") then
+        opti_component_dir = opti_root_dir .. "\\OptiScaler"
+    end
+end
+install.log("OptiScaler 组件目录: " .. opti_component_dir)
+
 install.set_progress(82, "正在写入插件配置")
 if is_nvidia then
     install.log("检测到 NVIDIA 显卡：跳过写入插件配置，TextureLoader 项由包内 config.ini 模板隐藏")
@@ -128,11 +143,11 @@ end
 local bundled_dlss = payload_dir .. "\\NVIDIA\\DLSS\\nvngx_dlss.dll"
 local bundled_dlss_license = payload_dir .. "\\NVIDIA\\DLSS\\nvngx_dlss.license.txt"
 if install_dlss_runtime and install.file_exists(bundled_dlss) then
-    install.copy_file(bundled_dlss, opti_dir .. "\\nvngx_dlss.dll")
+    install.copy_file(bundled_dlss, opti_component_dir .. "\\nvngx_dlss.dll")
     if install.file_exists(bundled_dlss_license) then
-        install.copy_file(bundled_dlss_license, opti_dir .. "\\nvngx_dlss.license.txt")
+        install.copy_file(bundled_dlss_license, opti_component_dir .. "\\nvngx_dlss.license.txt")
     end
-    install.log("已将 NVIDIA DLSS 组件复制到 OptiScaler 运行目录")
+    install.log("已将 NVIDIA DLSS 组件复制到 OptiScaler 组件目录")
 elseif not install_dlss_runtime then
     install.log("当前显卡不是已识别的 RTX，跳过 NVIDIA DLSS 组件复制")
 else

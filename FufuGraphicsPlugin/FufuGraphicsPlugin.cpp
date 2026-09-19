@@ -46,6 +46,11 @@ struct BootstrapConfig
     bool reset_configurations = false;
     std::filesystem::path bridge_path;
     std::filesystem::path optiscaler_path;
+    // OptiScaler 超分组件所在目录（2026-09-20）。
+    // 两种发行布局下不同：平铺 = optiscaler_path.parent_path()；
+    // 嵌套 = optiscaler_path.parent_path() / "OptiScaler"。
+    // 供 `[Libraries] OptiDllPath` 使用（OptiScaler 查找超分组件的唯一依据）。
+    std::filesystem::path optiscaler_component_directory;
     std::filesystem::path reshade_path;
     std::filesystem::path texture_loader_path;
     std::wstring texture_loader_mod_path; // 自定义 Mod 加载路径（空 = DLL 同目录 Mods）
@@ -918,7 +923,8 @@ bool has_nvidia_rtx_adapter()
 
 bool apply_optiscaler_managed_settings(
     const std::filesystem::path &ini_path,
-    const std::filesystem::path &optiscaler_directory)
+    const std::filesystem::path &optiscaler_directory,
+    const std::filesystem::path &optiscaler_component_directory)
 {
     const std::filesystem::path policy_path = g_module_directory / L"FSR4Policy.ini";
     std::string fsr4_update = read_policy_value(policy_path, L"Fsr4Update", L"auto");
@@ -963,7 +969,11 @@ bool apply_optiscaler_managed_settings(
         // FSR4 uses the verified non-linear input path on every GPU.
         // This setting is inert for DLSS/XeSS and other backends.
         { "FSR", "FsrNonLinearColorSpace", "true" },
-        { "Libraries", "OptiDllPath", wide_to_utf8(optiscaler_directory.wstring()) },
+        // ⚠️ 2026-09-20：必须是**超分组件实际所在目录**，不是 ini 所在目录。
+        // 嵌套布局下组件在 `OptiScaler\` 子目录；若写根层，OptiScaler 会
+        // 注入成功却找不到任何超分后端（"接管了却无法启用"），且退出时
+        // DETACH 卡死 → 游戏进程残留。见 BootstrapConfig 该字段的说明。
+        { "Libraries", "OptiDllPath", wide_to_utf8(optiscaler_component_directory.wstring()) },
         { "Log", "LogToFile", "true" },
         { "Log", "LogLevel", "2" },
         // LogFileName 保持 OptiScaler 默认（不覆写路径）
@@ -1050,7 +1060,8 @@ bool ensure_missing_component_configurations(const BootstrapConfig &config)
                 write_log("config_initialize_failed component=optiscaler reason=template_copy");
                 success = false;
             }
-            else if (!apply_optiscaler_managed_settings(optiscaler_ini, optiscaler_directory))
+            else if (!apply_optiscaler_managed_settings(
+                         optiscaler_ini, optiscaler_directory, config.optiscaler_component_directory))
             {
                 write_log("config_initialize_failed component=optiscaler reason=managed_settings");
                 success = false;
@@ -1058,7 +1069,11 @@ bool ensure_missing_component_configurations(const BootstrapConfig &config)
         }
         const std::filesystem::path nvidia_directory =
             g_module_directory / L"payload" / L"NVIDIA" / L"DLSS";
-        const std::filesystem::path dlss_destination = optiscaler_directory / L"nvngx_dlss.dll";
+        // nvngx_dlss.dll 是"库"而非 OptiScaler 自身配置：OptiScaler 按
+        // `OptiDllPath`（组件目录）解析 `NvngxDlssPath = auto`，故必须放进
+        // **组件目录**（嵌套布局下是子目录），放根层会导致 N 卡找不到 DLSS。
+        const std::filesystem::path dlss_destination =
+            config.optiscaler_component_directory / L"nvngx_dlss.dll";
         // 先做文件级短路，命中缺失且包内含组件时才枚举 GPU（避免每次启动 DXGI 枚举）。
         if (!file_exists(dlss_destination) &&
             file_exists(nvidia_directory / L"nvngx_dlss.dll") &&
@@ -1068,7 +1083,7 @@ bool ensure_missing_component_configurations(const BootstrapConfig &config)
             if (file_exists(nvidia_directory / L"nvngx_dlss.license.txt"))
                 copy_file_replace(
                     nvidia_directory / L"nvngx_dlss.license.txt",
-                    optiscaler_directory / L"nvngx_dlss.license.txt");
+                    config.optiscaler_component_directory / L"nvngx_dlss.license.txt");
         }
     }
     if (!config.texture_loader_path.empty())
@@ -1137,7 +1152,7 @@ bool reset_all_configurations(const BootstrapConfig &config)
         const std::filesystem::path optiscaler_ini = optiscaler_directory / L"OptiScaler.ini";
         reset_file(default_directory / L"OptiScaler.ini", optiscaler_ini, "optiscaler");
         if (file_exists(optiscaler_ini) && !apply_optiscaler_managed_settings(
-                optiscaler_ini, optiscaler_directory))
+                optiscaler_ini, optiscaler_directory, config.optiscaler_component_directory))
         {
             write_log("config_reset_failed component=optiscaler reason=managed_settings");
             success = false;
@@ -1429,6 +1444,32 @@ BootstrapConfig load_config()
             L"..\\payload\\OptiScaler\\OptiScaler.dll",
             L"..\\payload\\OptiScaler\\OptiScaler\\OptiScaler.dll",
         });
+    }
+    // OptiScaler 超分组件目录（2026-09-20）
+    //
+    // 上游 OptiScaler 有**且仅有两种**发行布局，两者都必须支持：
+    //   平铺：payload\OptiScaler\{OptiScaler.dll, amd_fidelityfx_upscaler_dx12.dll, ...}
+    //   嵌套：payload\OptiScaler\{OptiScaler.dll, OptiScaler.ini}
+    //         payload\OptiScaler\OptiScaler\{amd_fidelityfx_upscaler_dx12.dll, ...}
+    //
+    // `[Libraries] OptiDllPath` 是 OptiScaler 查找超分组件的**唯一依据**。
+    // 主 DLL 与 ini 恒在根层（OptiScaler 从自身所在目录读 ini），但组件目录随
+    // 布局变化。若把嵌套布局当平铺（写根层），OptiScaler 会**注入成功却找不到
+    // 任何超分后端** —— 实机表现："接管了超分但无法启用"，且退出时其
+    // DETACH 卡死导致**游戏进程残留**（窗口已关、进程可见）。
+    //
+    // 判定标志物：amd_fidelityfx_upscaler_dx12.dll（FSR 超分主组件，两种布局下
+    // 都必须存在），与安装脚本 Configure.ps1 / Installer.ps1 的判定保持一致。
+    if (!config.optiscaler_path.empty())
+    {
+        const std::filesystem::path opti_root = config.optiscaler_path.parent_path();
+        const std::filesystem::path nested = opti_root / L"OptiScaler";
+        if (file_exists(opti_root / L"amd_fidelityfx_upscaler_dx12.dll"))
+            config.optiscaler_component_directory = opti_root;       // 平铺
+        else if (file_exists(nested / L"amd_fidelityfx_upscaler_dx12.dll"))
+            config.optiscaler_component_directory = nested;          // 嵌套
+        else
+            config.optiscaler_component_directory = opti_root;       // 未装/缺失：按平铺，后续报错
     }
     if (config.reshade_path.empty())
     {

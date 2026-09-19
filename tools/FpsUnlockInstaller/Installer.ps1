@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$GamePath,
     [switch]$NoShortcut,
     [switch]$ResumeUpdateAll,
@@ -23,8 +23,40 @@ $errorLogPath = Join-Path $root '.last-install-error.log'
 $unlockerPath = Join-Path $root 'unlockfps_nc.exe'
 $payloadDirectory = Join-Path $root 'payload'
 $optiRootDirectory = Join-Path $payloadDirectory 'OptiScaler'
+
+# ---------------------------------------------------------------------------
+# OptiScaler 布局检测（2026-09-20）—— 与 Configure.ps1 的 Get-OptiScalerLayout 同源
+#
+# 上游 OptiScaler 有**且仅有两种**发行布局，两者都必须支持：
+#   平铺：payload\OptiScaler\{OptiScaler.dll, amd_fidelityfx_upscaler_dx12.dll, libxess.dll, ...}
+#   嵌套：payload\OptiScaler\{OptiScaler.dll, OptiScaler.ini}
+#         payload\OptiScaler\OptiScaler\{amd_fidelityfx_upscaler_dx12.dll, libxess.dll, ...}
+#
+# 为什么 Installer 也要判：`[Libraries] OptiDllPath` 是 OptiScaler 查找超分
+# 组件的唯一依据。Repair-RuntimePaths 会重写该键（"修复路径"），若仍按
+# 根层写，就会把 Configure.ps1 正确写入的组件目录**改回错的值**，
+# 造成"注入成功但找不到超分后端"→ 退出时 DETACH 卡死 → 进程残留。
+#
+# 判定标志物：amd_fidelityfx_upscaler_dx12.dll（FSR 超分主组件，两种布局下都必须存在）。
+# ---------------------------------------------------------------------------
+function Get-OptiScalerComponentDirectory {
+    param([string]$Root)
+    if (Test-Path -LiteralPath (Join-Path $Root 'amd_fidelityfx_upscaler_dx12.dll') -PathType Leaf) {
+        return $Root
+    }
+    $nested = Join-Path $Root 'OptiScaler'
+    if (Test-Path -LiteralPath (Join-Path $nested 'amd_fidelityfx_upscaler_dx12.dll') -PathType Leaf) {
+        return $nested
+    }
+    # 未安装 / 组件缺失：按平铺返回，由调用方的 Assert 报错
+    return $Root
+}
+
 $optiDirectory = $optiRootDirectory
+# 主 DLL 与 ini 恒在根层（OptiScaler 从自身所在目录读 ini）
 $optiPath = Join-Path $optiDirectory 'OptiScaler.dll'
+# 超分组件所在目录（两种布局不同）—— 写 OptiDllPath / 放 DLSS 用这个
+$optiComponentDirectory = Get-OptiScalerComponentDirectory -Root $optiRootDirectory
 $bridgePath = Join-Path $payloadDirectory 'Bridge\Dx11FsrBridge.dll'
 $antiBlurPath = Join-Path $payloadDirectory 'AntiPlayerMosaic\AntiPlayerMosaic.dll'
 $reShadePath = Join-Path $payloadDirectory 'ReShade\ReShade64.dll'
@@ -300,8 +332,14 @@ function Repair-RuntimePaths {
             }
             Copy-Item -LiteralPath $optiTemplate -Destination $optiIni -Force
         }
+        # ⚠️ 2026-09-20：OptiDllPath 必须指向**超分组件所在目录**，不是 ini 所在目录。
+        # 嵌套布局下组件在 OptiScaler\ 子目录；写根层会让 OptiScaler
+        # "注入成功但找不到任何超分后端"，且退出时 DETACH 卡死 → 进程残留。
+        # 这里用 Get-OptiScalerComponentDirectory 判定，避免把 Configure.ps1
+        # 正确写入的值改回错的。
+        $optiComponentDirectory = Get-OptiScalerComponentDirectory -Root $optiRootDirectory
         Set-IniPathValue -Path $optiIni -Section 'Libraries' -Key 'OptiDllPath' `
-            -Value ([IO.Path]::GetFullPath($optiDirectory).TrimEnd('\')) | Out-Null
+            -Value ([IO.Path]::GetFullPath($optiComponentDirectory).TrimEnd('\')) | Out-Null
         foreach ($libraryKey in @(
             'NvngxDlssPath',
             'FfxDx12Path',

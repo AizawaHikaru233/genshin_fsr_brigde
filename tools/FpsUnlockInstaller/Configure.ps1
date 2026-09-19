@@ -42,7 +42,82 @@ $root = if ([IO.Path]::GetFileName($scriptDirectory) -ieq 'scripts') {
 $payload = Join-Path $root 'payload'
 $bridgeDir = Join-Path $payload 'Bridge'
 $optiRootDir = Join-Path $payload 'OptiScaler'
+
+# ---------------------------------------------------------------------------
+# OptiScaler 布局检测（2026-09-20）
+#
+# 上游 OptiScaler 有**且仅有两种**发行布局，两者都必须支持：
+#
+#   平铺（flat，旧版 / v0.9.4）：
+#     payload\OptiScaler\
+#       OptiScaler.dll, OptiScaler.ini, amd_fidelityfx_upscaler_dx12.dll,
+#       libxess.dll, D3D12_Optiscaler\D3D12Core.dll, Licenses\...
+#       → 主 DLL 与所有超分/帧生成组件**同级**
+#
+#   嵌套（nested，新版）：
+#     payload\OptiScaler\
+#       OptiScaler.dll, OptiScaler.ini, setup_windows.bat, Licenses\
+#       OptiScaler\                      ← 组件都在这一层
+#         amd_fidelityfx_upscaler_dx12.dll, libxess.dll, Streamline\, D3D12_OptiScaler\...
+#       → 主 DLL 在**根层**，组件在 **OptiScaler\ 子目录**
+#
+# 为什么必须检测而不能写死：OptiScaler.ini 的 `[Libraries] OptiDllPath`
+# 是它查找超分组件的**唯一依据**。若该键指向的目录里没有组件（把嵌套布局
+# 当成平铺 → 指向根层），OptiScaler 会**注入成功但找不到任何超分后端**，
+# 表现为"接管了超分却无法启用"，且退出时其 DETACH 卡死导致**进程残留**。
+#
+# 判定依据：`amd_fidelityfx_upscaler_dx12.dll`（FSR 超分主组件）所在目录。
+# 它是两种布局下都必须存在的文件（Configure.ps1 末尾也 Assert 它），
+# 因此是可靠的布局标志物。
+# ---------------------------------------------------------------------------
+function Get-OptiScalerLayout {
+    param([string]$Root)
+    # 返回 @{ Kind='flat'|'nested'|'empty'; ComponentDir=<路径>; MainDll=<路径> }
+    $flatMain = Join-Path $Root 'OptiScaler.dll'
+    $flatMarker = Join-Path $Root 'amd_fidelityfx_upscaler_dx12.dll'
+    $nestedRoot = Join-Path $Root 'OptiScaler'
+    $nestedMain = Join-Path $nestedRoot 'OptiScaler.dll'
+    $nestedMarker = Join-Path $nestedRoot 'amd_fidelityfx_upscaler_dx12.dll'
+
+    if (Test-Path -LiteralPath $flatMarker -PathType Leaf) {
+        # 平铺优先：标志物在根层即判平铺（此时根层同时有主 DLL）
+        return [pscustomobject]@{ Kind = 'flat'; ComponentDir = $Root; MainDll = $flatMain }
+    }
+    if (Test-Path -LiteralPath $nestedMarker -PathType Leaf) {
+        # 嵌套：组件在子目录。主 DLL 在根层（新版发行包如此）；
+        # 若根层没有主 DLL 而子目录有，也按子目录取主 DLL（容错）。
+        $main = if (Test-Path -LiteralPath $flatMain -PathType Leaf) { $flatMain } else { $nestedMain }
+        return [pscustomobject]@{ Kind = 'nested'; ComponentDir = $nestedRoot; MainDll = $main }
+    }
+    # 都没有：尚未安装（或组件缺失）。此时按平铺处理，由后续 Assert 报错。
+    return [pscustomobject]@{ Kind = 'empty'; ComponentDir = $Root; MainDll = $flatMain }
+}
+
+# $optiDir 语义（本次改动后统一）：
+#   - **配置文件所在目录**（OptiScaler.dll / OptiScaler.ini / fakenvapi.ini / nvngx_dlss.dll）
+#     —— 两种布局下都在**根层**，因为 OptiScaler 从自身所在目录读 ini。
+#   - **不是**超分组件的查找目录；组件目录见 $optiComponentDir。
+# 这样拆分后，所有 `Join-Path $optiDir <ini/配置类文件>` 的既有代码语义不变，
+# 只有 `OptiDllPath` 与组件断言改用 $optiComponentDir。
 $optiDir = $optiRootDir
+
+# 由布局派生的路径，必须可刷新：
+# `Install-OptiScaler` 会按**源包**的布局重装，可能把平铺换成嵌套（或反之），
+# 此时加载期算出的 $optiComponentDir 就过期了 —— 后续的 DLSS 落位、
+# `OptiDllPath` 写入、末尾依赖断言都会指向错目录（正是本次要修的那类缺陷）。
+# 故统一收进一个函数，安装后再调一次。
+function Update-OptiScalerDerivedPaths {
+    $script:OptiScalerLayout = Get-OptiScalerLayout -Root $optiRootDir
+    $script:optiComponentDir = $script:OptiScalerLayout.ComponentDir
+    $script:fakeNvapiIni = Join-Path $script:optiComponentDir 'fakenvapi.ini'
+    $script:fakeNvapiDefaultIni = Join-Path $script:optiComponentDir 'fakenvapi.default.ini'
+    # nvngx_dlss.dll 是"库"而非 OptiScaler 自身配置：它由 ini 的
+    # `[Libraries] NvngxDlssPath = auto` 解析，而 auto 相对 **OptiDllPath**（组件目录）。
+    # 故必须放进组件目录，放根层会导致 N 卡上 OptiScaler 找不到 DLSS。
+    $script:installedDlss = Join-Path $script:optiComponentDir 'nvngx_dlss.dll'
+}
+Update-OptiScalerDerivedPaths
+$optiComponentDir = $script:optiComponentDir
 $reshadeDir = Join-Path $payload 'ReShade'
 $bridgeDll = Join-Path $bridgeDir 'Dx11FsrBridge.dll'
 $optiDll = Join-Path $optiDir 'OptiScaler.dll'
@@ -67,10 +142,10 @@ $optiFallbackTemplate = Join-Path $optiTemplateDir 'OptiScaler.ini'
 $optiUpscalingManifest = Join-Path $optiTemplateDir 'OptiScaler-UpscalingFiles.json'
 $reshadeIniTemplate = Join-Path $reShadeTemplateDir 'ReShade.ini'
 $reshadePresetTemplate = Join-Path $reShadeTemplateDir 'ReShadePreset.ini'
-$fakeNvapiIni = Join-Path $optiDir 'fakenvapi.ini'
-$fakeNvapiDefaultIni = Join-Path $optiDir 'fakenvapi.default.ini'
+$fakeNvapiIni = $script:fakeNvapiIni
+$fakeNvapiDefaultIni = $script:fakeNvapiDefaultIni
 $bundledDlss = Join-Path $payload 'NVIDIA\DLSS\nvngx_dlss.dll'
-$installedDlss = Join-Path $optiDir 'nvngx_dlss.dll'
+$installedDlss = $script:installedDlss
 $antiBlurDll = Join-Path $payload 'AntiPlayerMosaic\AntiPlayerMosaic.dll'
 $textureLoaderDll = Join-Path $payload 'TextureLoader\TextureLoader.dll'
 $reshadeDll = Join-Path $reshadeDir 'ReShade64.dll'
@@ -431,12 +506,16 @@ function Set-OptiScalerManagedSettings {
     #   - FSR4 策略（Fsr4Update/UpscalerIndex/Fsr4ForceEnableInt8/FsrNonLinearColorSpace）
     #   - Spoofing.Dxgi=false（原神无 DLSS 场景——A 卡不伪装成 N 卡，防副作用）
     #   - Libraries.OptiDllPath 绝对路径
+    #     ⚠️ 2026-09-20：必须是**超分组件实际所在目录**，不是 ini 所在目录。
+    #     嵌套布局下组件在 `OptiScaler\` 子目录；若这里仍写根层，OptiScaler
+    #     会注入成功但找不到任何超分后端（"接管了却无法启用"），且退出时
+    #     DETACH 卡死 → 进程残留。见文件头 Get-OptiScalerLayout 的说明。
     #   - Log：LogToFile=true / LogLevel=2（LogFileName 保持 OptiScaler 默认，不覆写路径）
     #   - FrameGen 版型（非帧生成版强制关闭）
     # Upscalers/Inputs/Plugins 等其余设置由 default_config 模板自足，脚本不覆写。
     Set-Fsr4GpuPolicy -Path $Path | Out-Null
     Set-IniValue -Path $Path -Section 'Spoofing' -Key 'Dxgi' -Value 'false'
-    Set-IniValue -Path $Path -Section 'Libraries' -Key 'OptiDllPath' -Value ([IO.Path]::GetFullPath($optiDir).TrimEnd('\'))
+    Set-IniValue -Path $Path -Section 'Libraries' -Key 'OptiDllPath' -Value ([IO.Path]::GetFullPath($optiComponentDir).TrimEnd('\'))
     Set-IniValue -Path $Path -Section 'Log' -Key 'LogToFile' -Value 'true'
     Set-IniValue -Path $Path -Section 'Log' -Key 'LogLevel' -Value '2'
     # LogFileName 保持 OptiScaler 默认（不覆写路径）
@@ -484,14 +563,16 @@ function Install-NvidiaDlssIfNeeded {
     $gpuNames = @($rtxControllers | ForEach-Object { [string]$_.Name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     $gpuLabel = if ($gpuNames.Count -gt 0) { $gpuNames -join ' / ' } else { 'NVIDIA RTX GPU' }
     Write-Host "检测到 $gpuLabel，正在补齐 DLSS 超分组件..." -ForegroundColor Cyan
-    New-Item -ItemType Directory -Force -Path $optiDir | Out-Null
+    # DLSS 属"库"而非 OptiScaler 自身配置：OptiScaler 按 `OptiDllPath`（组件目录）
+    # 解析 `NvngxDlssPath = auto`，故必须放进组件目录（嵌套布局下是子目录）。
+    New-Item -ItemType Directory -Force -Path $optiComponentDir | Out-Null
 
     if (Test-Path -LiteralPath $bundledDlss -PathType Leaf) {
         Assert-NvidiaSignedFile -Path $bundledDlss
         Copy-Item -LiteralPath $bundledDlss -Destination $installedDlss -Force
         $bundledLicense = Join-Path (Split-Path -Parent $bundledDlss) 'nvngx_dlss.license.txt'
         if (Test-Path -LiteralPath $bundledLicense -PathType Leaf) {
-            Copy-Item -LiteralPath $bundledLicense -Destination (Join-Path $optiDir 'nvngx_dlss.license.txt') -Force
+            Copy-Item -LiteralPath $bundledLicense -Destination (Join-Path $optiComponentDir 'nvngx_dlss.license.txt') -Force
         }
         Write-Host '已安装内置 NVIDIA DLSS 超分组件。' -ForegroundColor Green
         return
@@ -529,7 +610,7 @@ function Install-NvidiaDlssIfNeeded {
         Copy-Item -LiteralPath $sourceDll.FullName -Destination $installedDlss -Force
         $sourceLicense = Get-ChildItem -LiteralPath $expanded -Recurse -File -Filter 'nvngx_dlss.license.txt' | Select-Object -First 1
         if ($null -ne $sourceLicense) {
-            Copy-Item -LiteralPath $sourceLicense.FullName -Destination (Join-Path $optiDir 'nvngx_dlss.license.txt') -Force
+            Copy-Item -LiteralPath $sourceLicense.FullName -Destination (Join-Path $optiComponentDir 'nvngx_dlss.license.txt') -Force
         }
         Write-Host '已从 NVIDIA 官方来源安装 DLSS 超分组件。' -ForegroundColor Green
     }
@@ -645,20 +726,33 @@ function Get-OptiScalerUpscalingManifest {
 }
 
 function Copy-CuratedOptiScaler {
-    param([string]$SourceDirectory, [string]$Destination)
+    param([string]$SourceDirectory, [string]$RootDirectory, [string]$ComponentDirectory)
+    # 目标分两层，对应 OptiScaler 的两种发行布局：
+    #   $RootDirectory      = payload\OptiScaler        —— 主 DLL、ini、Licenses 所在
+    #   $ComponentDirectory = 超分/帧生成组件所在目录
+    #                         平铺布局 = $RootDirectory 自身
+    #                         嵌套布局 = $RootDirectory\OptiScaler
+    #
+    # 为什么主 DLL 必须单独处理：清单里 `OptiScaler.dll` 与其他组件同列，但
+    # **主 DLL 永远在根层**（OptiScaler 从自身所在目录读 ini，且宿主按根层路径
+    # 加载它）。只有其余组件随布局变化。清单的相对路径（如
+    # `D3D12_Optiscaler\D3D12Core.dll`）在两种布局下都相对**组件目录**解析。
     $manifest = Get-OptiScalerUpscalingManifest
-    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    New-Item -ItemType Directory -Force -Path $RootDirectory | Out-Null
+    New-Item -ItemType Directory -Force -Path $ComponentDirectory | Out-Null
     foreach ($relativePath in @($manifest.RuntimeFiles)) {
-        $sourcePath = Join-Path $SourceDirectory ([string]$relativePath)
+        $relative = [string]$relativePath
+        $sourcePath = Join-Path $SourceDirectory $relative
         Assert-File -Path $sourcePath
-        $destinationPath = Join-Path $Destination ([string]$relativePath)
+        $destinationRoot = if ($relative -ieq 'OptiScaler.dll') { $RootDirectory } else { $ComponentDirectory }
+        $destinationPath = Join-Path $destinationRoot $relative
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destinationPath) | Out-Null
         Copy-Item -LiteralPath $sourcePath -Destination $destinationPath -Force
     }
     foreach ($licenseName in @($manifest.LicenseFiles)) {
         $sourcePath = Join-Path $SourceDirectory ("Licenses\" + [string]$licenseName)
         if (Test-Path -LiteralPath $sourcePath -PathType Leaf) {
-            $licenseDirectory = Join-Path $Destination 'Licenses'
+            $licenseDirectory = Join-Path $RootDirectory 'Licenses'
             New-Item -ItemType Directory -Force -Path $licenseDirectory | Out-Null
             Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $licenseDirectory ([string]$licenseName)) -Force
         }
@@ -666,7 +760,7 @@ function Copy-CuratedOptiScaler {
     foreach ($licenseName in @($manifest.OptionalLicenseFiles)) {
         $sourcePath = Join-Path $SourceDirectory ("Licenses\" + [string]$licenseName)
         if (Test-Path -LiteralPath $sourcePath -PathType Leaf) {
-            $licenseDirectory = Join-Path $Destination 'Licenses'
+            $licenseDirectory = Join-Path $RootDirectory 'Licenses'
             New-Item -ItemType Directory -Force -Path $licenseDirectory | Out-Null
             Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $licenseDirectory ([string]$licenseName)) -Force
         }
@@ -791,9 +885,42 @@ function Install-OptiScaler {
             Write-Warning (Convert-InstallerText -Value "OptiScaler 版本 $($mainDll.VersionInfo.FileVersion) 与预置 $optiFileVersion 不同，继续安装（必要组件存在即可）")
         }
         $sourceDirectory = $mainDll.Directory.FullName
-        if (-not (Test-Path -LiteralPath (Join-Path $sourceDirectory 'amd_fidelityfx_upscaler_dx12.dll') -PathType Leaf)) {
-            throw (Convert-InstallerText -Value 'OptiScaler 包不完整：缺少 amd_fidelityfx_upscaler_dx12.dll。')
+        # ⚠️ 2026-09-20：源包的组件目录**未必**等于主 DLL 所在目录。
+        # 新版 OptiScaler 发行包是嵌套布局：主 DLL 在包根，组件在 `OptiScaler\` 子目录。
+        # 旧代码硬取 `$mainDll.Directory` 当组件目录 → 断言 amd_fidelityfx_upscaler_dx12.dll
+        # 失败（抛"包不完整"），或（在只按根层拷贝的路径上）装出一个**组件缺失**的安装。
+        # 这里用与目标端相同的标志物判定源布局。
+        $sourceLayout = Get-OptiScalerLayout -Root $expanded
+        if ($sourceLayout.Kind -eq 'empty') {
+            # 标志物不在 $expanded 根层，也不在 $expanded\OptiScaler。
+            # 兼容"解压后多一层外壳目录"的包：从主 DLL 位置向上找标志物。
+            $probe = $sourceDirectory
+            $found = $null
+            while (-not [string]::IsNullOrWhiteSpace($probe)) {
+                if (Test-Path -LiteralPath (Join-Path $probe 'amd_fidelityfx_upscaler_dx12.dll') -PathType Leaf) { $found = $probe; break }
+                $parent = Split-Path -Parent $probe
+                if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $probe) { break }
+                $probe = $parent
+            }
+            if ($null -eq $found) {
+                throw (Convert-InstallerText -Value 'OptiScaler 包不完整：缺少 amd_fidelityfx_upscaler_dx12.dll。')
+            }
+            $sourceComponentDirectory = $found
         }
+        else {
+            $sourceComponentDirectory = $sourceLayout.ComponentDir
+        }
+        # 组件目录与主 DLL 目录是否同一层 —— 决定目标端采用哪种布局。
+        # 判定源布局而非写死：用户可能手动替换成另一种布局（本项目实际如此）。
+        $targetIsNested = -not [string]::Equals(
+            [IO.Path]::GetFullPath($sourceComponentDirectory),
+            [IO.Path]::GetFullPath($sourceDirectory),
+            [StringComparison]::OrdinalIgnoreCase)
+        $targetRootDirectory = $optiRootDir
+        $targetComponentDirectory = if ($targetIsNested) { Join-Path $optiRootDir 'OptiScaler' } else { $optiRootDir }
+        Write-Host ("OptiScaler 布局: {0}（组件目录 {1}）" -f
+            $(if ($targetIsNested) { '嵌套 OptiScaler\ 子目录' } else { '平铺（组件与主 DLL 同级）' }),
+            $targetComponentDirectory) -ForegroundColor DarkGray
         $componentDefaultIni = Join-Path $sourceDirectory 'OptiScaler.default.ini'
         $componentIni = Join-Path $sourceDirectory 'OptiScaler.ini'
         # 优先使用包内 default_config 的官方模板；只有开发包未携带模板时，
@@ -822,16 +949,23 @@ function Install-OptiScaler {
             Copy-Item -LiteralPath $fakeNvapiIni -Destination $preservedFakeNvapiConfig -Force
         }
         Get-OptiScalerUpscalingManifest | Out-Null
+        # 保留用户已有的 DLSS 组件。注意它们可能在**两种位置**：
+        #   - 组件目录（正确位置，OptiScaler 按 OptiDllPath 解析）
+        #   - 根层（历史安装遗留；旧脚本写错过位置）
+        # 两处都扫，统一恢复到组件目录。
         $preservedNvidiaDirectory = Join-Path $temporaryDirectory 'preserved-nvidia'
-        foreach ($fileName in @('nvngx_dlss.dll', 'nvngx_dlssg.dll', 'nvngx_dlssd.dll', 'nvngx_dlss.license.txt')) {
-            $existingFile = Join-Path $optiDir $fileName
-            if (Test-Path -LiteralPath $existingFile -PathType Leaf) {
-                New-Item -ItemType Directory -Force -Path $preservedNvidiaDirectory | Out-Null
-                Copy-Item -LiteralPath $existingFile -Destination (Join-Path $preservedNvidiaDirectory $fileName) -Force
+        foreach ($scanDirectory in @($optiComponentDir, $optiRootDir) | Select-Object -Unique) {
+            foreach ($fileName in @('nvngx_dlss.dll', 'nvngx_dlssg.dll', 'nvngx_dlssd.dll', 'nvngx_dlss.license.txt')) {
+                $existingFile = Join-Path $scanDirectory $fileName
+                if (Test-Path -LiteralPath $existingFile -PathType Leaf) {
+                    New-Item -ItemType Directory -Force -Path $preservedNvidiaDirectory | Out-Null
+                    Copy-Item -LiteralPath $existingFile -Destination (Join-Path $preservedNvidiaDirectory $fileName) -Force
+                }
             }
         }
-        if (Test-Path -LiteralPath $optiDir) { Remove-Item -LiteralPath $optiDir -Recurse -Force }
-        Copy-CuratedOptiScaler -SourceDirectory $sourceDirectory -Destination $optiDir
+        if (Test-Path -LiteralPath $optiRootDir) { Remove-Item -LiteralPath $optiRootDir -Recurse -Force }
+        Copy-CuratedOptiScaler -SourceDirectory $sourceComponentDirectory `
+            -RootDirectory $targetRootDirectory -ComponentDirectory $targetComponentDirectory
         Copy-Item -LiteralPath $stagedConfigTemplate -Destination $optiDefaultIni -Force
         if (Test-Path -LiteralPath $preservedUserConfig -PathType Leaf) {
             Copy-Item -LiteralPath $preservedUserConfig -Destination $optiIni -Force
@@ -846,8 +980,10 @@ function Install-OptiScaler {
             Copy-Item -LiteralPath $fakeNvapiIni -Destination $fakeNvapiDefaultIni -Force
         }
         if (Test-Path -LiteralPath $preservedNvidiaDirectory -PathType Container) {
+            # 恢复到**组件目录**（正确位置）；根层遗留不再回写。
+            New-Item -ItemType Directory -Force -Path $targetComponentDirectory | Out-Null
             foreach ($preservedFile in @(Get-ChildItem -LiteralPath $preservedNvidiaDirectory -File)) {
-                $destination = Join-Path $optiDir $preservedFile.Name
+                $destination = Join-Path $targetComponentDirectory $preservedFile.Name
                 if (-not (Test-Path -LiteralPath $destination -PathType Leaf)) {
                     Copy-Item -LiteralPath $preservedFile.FullName -Destination $destination -Force
                 }
@@ -1404,22 +1540,30 @@ if ($bridgeEnabled) {
 if (-not $DisableOptiScaler) {
     $optiMode = Select-SourceMode -Label 'OptiScaler' -RequestedMode $OptiScalerSource -ExistingAvailable (Test-Path -LiteralPath $optiDll -PathType Leaf)
     Install-OptiScaler -Mode $optiMode -ManualPath $OptiScalerPackagePath -PreserveExistingConfig:$PreserveExistingConfigs
+    # ⚠️ 必须刷新：Install-OptiScaler 按**源包布局**重装，可能改变布局
+    # （平铺 ↔ 嵌套）。若不刷新，下面的 DLSS 落位、末尾依赖断言仍按
+    # 安装前的旧目录，会指向错位置。
+    Update-OptiScalerDerivedPaths
+    $optiComponentDir = $script:optiComponentDir
+    $installedDlss = $script:installedDlss
+    $fakeNvapiIni = $script:fakeNvapiIni
     try {
         Install-NvidiaDlssIfNeeded
     }
     catch {
         # DLSS 为可选组件（仅 NVIDIA RTX 需要）：失败不影响主流程，说明原因与临时办法后继续。
-        Write-Warning (Convert-InstallerText -Value "NVIDIA DLSS 组件安装失败（可选，不影响其他组件）：$($_.Exception.Message)。临时办法：A 卡无需安装 DLSS；N 卡可稍后在「安装模块」或「更新模块」中重试，或从 NVIDIA Streamline 官方发布页手动下载 nvngx_dlss.dll 放入 $optiDir")
+        Write-Warning (Convert-InstallerText -Value "NVIDIA DLSS 组件安装失败（可选，不影响其他组件）：$($_.Exception.Message)。临时办法：A 卡无需安装 DLSS；N 卡可稍后在「安装模块」或「更新模块」中重试，或从 NVIDIA Streamline 官方发布页手动下载 nvngx_dlss.dll 放入 $optiComponentDir")
     }
     Assert-File -Path $bridgeDll
+    # 依赖断言按**组件目录**（两种布局下组件所在位置），不是 ini 所在的根层。
     $ffxMainCandidates = @(
-        (Join-Path $optiDir 'amd_fidelityfx_dx12.dll'),
-        (Join-Path $optiDir 'amd_fidelityfx_loader_dx12.dll')
+        (Join-Path $optiComponentDir 'amd_fidelityfx_dx12.dll'),
+        (Join-Path $optiComponentDir 'amd_fidelityfx_loader_dx12.dll')
     )
     if (-not ($ffxMainCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })) {
-        throw (Convert-InstallerText -Value "OptiScaler 依赖不完整：请将完整发行包解压到 $optiDir")
+        throw (Convert-InstallerText -Value "OptiScaler 依赖不完整：请将完整发行包解压到 $optiRootDir")
     }
-    Assert-File -Path (Join-Path $optiDir 'amd_fidelityfx_upscaler_dx12.dll')
+    Assert-File -Path (Join-Path $optiComponentDir 'amd_fidelityfx_upscaler_dx12.dll')
 }
 if (-not $DisableAntiBlur) {
     Assert-File -Path $antiBlurDll
