@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release', 'RelWithDebInfo', 'MinSizeRel')]
     [string]$Configuration = 'Release',
@@ -550,6 +550,28 @@ if ($FetchUpstream) {
 }
 
 Build-PackageComponents
+
+# 打包前置校验（2026-09-19，审核报告高严重度）：TextureLoader.ini 双份防漂移。
+# 打包流水线用的是 SharedResources\TextureLoader\runtime\TextureLoader.ini（**权威源**，
+# 见下方 4 处 Copy-Item）；而 TextureLoader\TextureLoader.ini 是开发者就近编辑的另一份。
+# 两份若漂移，**打包出去的是权威源** → 改源码那份会静默不生效。
+# 这里显式校验并**以失败终止**，让问题在打包时暴露而不是上线后才发现。
+& {
+    $authIni = Join-Path $root 'SharedResources\TextureLoader\runtime\TextureLoader.ini'
+    $derIni  = Join-Path $root 'TextureLoader\TextureLoader.ini'
+    if ((Test-Path -LiteralPath $authIni) -and (Test-Path -LiteralPath $derIni)) {
+        $hA = (Get-FileHash -LiteralPath $authIni -Algorithm SHA256).Hash
+        $hD = (Get-FileHash -LiteralPath $derIni -Algorithm SHA256).Hash
+        if ($hA -ne $hD) {
+            throw ("TextureLoader.ini 两份内容不一致（打包会用权威源，改源码那份不会生效）。`n" +
+                   "  权威源: $authIni`n    sha=$($hA.Substring(0,16))`n" +
+                   "  源码份: $derIni`n    sha=$($hD.Substring(0,16))`n" +
+                   "  修复: pwsh -File .\TextureLoader\Sync-TextureLoaderIni.ps1 -Apply")
+        }
+        Write-Host 'TextureLoader.ini 双份一致性校验通过。' -ForegroundColor Green
+    }
+}
+
 # 上游版本一致性由 tools\Update-UpstreamComponents.ps1 保证（官方包 SHA-256 校验 + versions.json 记录 FileVersion）。
 $version = Get-BridgeVersion
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
