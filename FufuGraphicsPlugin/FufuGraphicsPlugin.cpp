@@ -101,6 +101,25 @@ std::wstring lower(std::wstring value)
     return value;
 }
 
+// 日志文件句柄（2026-09-19 审核报告：原先它是 `write_log` 内的**函数局部 static**，
+// 导致两个真实缺陷）：
+//   1. **永不关闭** —— 进程生命周期内一直持有该文件句柄；
+//   2. `reset_log()` 用 CREATE_ALWAYS 截断文件后**无法使其失效** —— 缓存的句柄
+//      仍指向被截断后的旧文件对象，后续 write_log 追加的位置与预期不符。
+// 提到文件作用域后，`reset_log()` 可以先关闭再让 `write_log` 重新打开。
+std::mutex g_log_handle_mutex;
+HANDLE g_log_handle = INVALID_HANDLE_VALUE;
+
+void close_log_handle()
+{
+    std::lock_guard lock(g_log_handle_mutex);
+    if (g_log_handle != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(g_log_handle);
+        g_log_handle = INVALID_HANDLE_VALUE;
+    }
+}
+
 void write_log(const std::string &message)
 {
     std::lock_guard lock(g_log_mutex);
@@ -125,26 +144,31 @@ void write_log(const std::string &message)
         GetCurrentThreadId());
 
     const std::string line = std::string(prefix) + message + "\r\n";
-    static HANDLE cached_handle = INVALID_HANDLE_VALUE;
-    if (cached_handle == INVALID_HANDLE_VALUE)
     {
-        cached_handle = CreateFileW(
-            g_log_path.c_str(),
-            FILE_APPEND_DATA,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr,
-            OPEN_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr);
-        if (cached_handle == INVALID_HANDLE_VALUE)
-            return;
+        std::lock_guard handle_lock(g_log_handle_mutex);
+        if (g_log_handle == INVALID_HANDLE_VALUE)
+        {
+            g_log_handle = CreateFileW(
+                g_log_path.c_str(),
+                FILE_APPEND_DATA,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+            if (g_log_handle == INVALID_HANDLE_VALUE)
+                return;
+        }
+        DWORD written = 0;
+        WriteFile(g_log_handle, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
     }
-    DWORD written = 0;
-    WriteFile(cached_handle, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
 }
 
 void reset_log()
 {
+    // 先关掉缓存句柄（2026-09-19）：否则下面的 CREATE_ALWAYS 截断之后，
+    // write_log 仍会往**旧句柄**追加，日志位置与预期不符。
+    close_log_handle();
     HANDLE file = CreateFileW(
         g_log_path.c_str(),
         GENERIC_WRITE,
@@ -937,14 +961,31 @@ bool ensure_missing_component_configurations(const BootstrapConfig &config)
     {
         const std::filesystem::path optiscaler_directory = config.optiscaler_path.parent_path();
         const std::filesystem::path optiscaler_ini = optiscaler_directory / L"OptiScaler.ini";
+        // 托管项**每次都写**（2026-09-19 审核报告）。
+        //
+        // 原实现是 `if (!file_exists(optiscaler_ini)) { 复制模板 + 应用托管设置 }`
+        // —— 即"已存在就整块跳过"。后果：**已有 OptiScaler.ini 的安装永远不会收敛**
+        // 到当前托管项：`FSR4Policy.ini` 里的策略（Fsr4Update / UpscalerIndex /
+        // Fsr4ForceEnableInt8）、`Libraries/OptiDllPath`、`Log/*`、`FrameGen/*`
+        // 都只会在"首次安装"那一次写入；此后换显卡、改策略、挪插件目录都不会更新。
+        // 而 reset 路径（见下方 reset_configurations 分支）**始终**调用本函数
+        // —— 两条路径行为不一致，使问题只在"非 reset 的日常启动"下出现。
+        //
+        // 现改为：模板仅在**缺失时**复制（避免覆盖用户自定义），但托管项**总是**应用。
+        // `apply_optiscaler_managed_settings` 内部是逐键 set，幂等，重复应用无副作用。
         if (!file_exists(optiscaler_ini))
         {
-            if (!copy_file_replace(default_directory / L"OptiScaler.ini", optiscaler_ini) ||
-                !apply_optiscaler_managed_settings(optiscaler_ini, optiscaler_directory))
+            if (!copy_file_replace(default_directory / L"OptiScaler.ini", optiscaler_ini))
             {
-                write_log("config_initialize_failed component=optiscaler");
+                write_log("config_initialize_failed component=optiscaler reason=template_copy");
                 success = false;
             }
+        }
+        if (file_exists(optiscaler_ini) &&
+            !apply_optiscaler_managed_settings(optiscaler_ini, optiscaler_directory))
+        {
+            write_log("config_initialize_failed component=optiscaler reason=managed_settings");
+            success = false;
         }
         const std::filesystem::path nvidia_directory =
             g_module_directory / L"payload" / L"NVIDIA" / L"DLSS";
@@ -1594,6 +1635,14 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
         HANDLE thread = CreateThread(nullptr, 0, bootstrap_thread, nullptr, 0, nullptr);
         if (thread != nullptr)
             CloseHandle(thread);
+    }
+    else if (reason == DLL_PROCESS_DETACH)
+    {
+        // 关闭日志文件句柄（2026-09-19 审核报告：该句柄原先永不关闭）。
+        // `CloseHandle` 只是内核调用、**不依赖 loader lock**，在 DETACH 下安全；
+        // 这里刻意**不做**任何文件 I/O（那才需要避免）。
+        // 注：DETACH 也会在进程正常退出时到达，故这是句柄的主要释放点。
+        close_log_handle();
     }
     return TRUE;
 }
