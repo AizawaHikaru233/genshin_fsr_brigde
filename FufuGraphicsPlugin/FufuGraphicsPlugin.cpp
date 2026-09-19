@@ -1129,35 +1129,53 @@ bool reset_all_configurations(const BootstrapConfig &config)
     return success;
 }
 
-std::unordered_map<std::wstring, std::wstring> read_paths_file(const std::filesystem::path &path)
+// 读取 UTF-8 文本文件为宽字符串（2026-09-19 审核报告：消除 read_paths_file 与
+// read_fufu_settings 约 30 行的完全重复）。
+//
+// 两者此前各自抄了一份：CreateFileW → GetFileSizeEx（含 1MB 上限）→ ReadFile →
+// 剥 UTF-8 BOM → utf8_to_wide。**只有解析逻辑不同**（一个读 `key=value`，
+// 另一个读 `[section]` 下的 `value=`）。现共用本函数，解析各留各的。
+//
+// 返回 false 表示"文件不可读/过大/读失败"—— 调用方返回空表即可（与旧行为一致：
+// 旧实现在这些分支都是 `return values;`）。
+bool read_utf8_text_file(const std::filesystem::path &path, std::wstring &out_text)
 {
-    std::unordered_map<std::wstring, std::wstring> values;
+    out_text.clear();
     HANDLE file = CreateFileW(
         path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE)
-        return values;
+        return false;
 
     LARGE_INTEGER size {};
     if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > 1024 * 1024)
     {
         CloseHandle(file);
-        return values;
+        return false;
     }
     std::string bytes(static_cast<std::size_t>(size.QuadPart), '\0');
     DWORD read = 0;
     const BOOL read_ok = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr);
     CloseHandle(file);
     if (!read_ok)
-        return values;
+        return false;
     bytes.resize(read);
     if (bytes.size() >= 3 && static_cast<unsigned char>(bytes[0]) == 0xEF &&
         static_cast<unsigned char>(bytes[1]) == 0xBB && static_cast<unsigned char>(bytes[2]) == 0xBF)
     {
         bytes.erase(0, 3);
     }
+    out_text = utf8_to_wide(bytes);
+    return true;
+}
 
-    std::wstring text = utf8_to_wide(bytes);
+std::unordered_map<std::wstring, std::wstring> read_paths_file(const std::filesystem::path &path)
+{
+    std::unordered_map<std::wstring, std::wstring> values;
+    std::wstring text;
+    if (!read_utf8_text_file(path, text))
+        return values;
+
     std::size_t position = 0;
     while (position <= text.size())
     {
@@ -1184,32 +1202,11 @@ std::unordered_map<std::wstring, std::wstring> read_paths_file(const std::filesy
 std::unordered_map<std::wstring, std::wstring> read_fufu_settings(const std::filesystem::path &path)
 {
     std::unordered_map<std::wstring, std::wstring> values;
-    HANDLE file = CreateFileW(
-        path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE)
+    std::wstring text;
+    // 读取部分与 read_paths_file 共用（见 read_utf8_text_file 的说明）
+    if (!read_utf8_text_file(path, text))
         return values;
 
-    LARGE_INTEGER size {};
-    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > 1024 * 1024)
-    {
-        CloseHandle(file);
-        return values;
-    }
-    std::string bytes(static_cast<std::size_t>(size.QuadPart), '\0');
-    DWORD read = 0;
-    const BOOL read_ok = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr);
-    CloseHandle(file);
-    if (!read_ok)
-        return values;
-    bytes.resize(read);
-    if (bytes.size() >= 3 && static_cast<unsigned char>(bytes[0]) == 0xEF &&
-        static_cast<unsigned char>(bytes[1]) == 0xBB && static_cast<unsigned char>(bytes[2]) == 0xBF)
-    {
-        bytes.erase(0, 3);
-    }
-
-    const std::wstring text = utf8_to_wide(bytes);
     std::wstring section;
     std::size_t position = 0;
     while (position <= text.size())
