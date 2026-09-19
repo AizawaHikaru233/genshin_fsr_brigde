@@ -41,4 +41,12 @@ if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
 if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
 
 $dll = Join-Path $buildDir "TextureLoader.dll"
-Write-Host "OK -> $dll"
+# 2026-09-19（审核报告）：显式校验产物存在。此前只打印路径不检查，
+# 产物缺失时脚本仍"成功"退出（调用方以为可以部署，实际 deploy 才报错）。
+if (-not (Test-Path -LiteralPath $dll)) {
+    throw "构建报告成功但未找到产物: $dll"
+}
+$item = Get-Item -LiteralPath $dll
+Write-Host ("OK -> {0}  {1} B  sha={2}" -f $dll, $item.Length,
+    (Get-FileHash $dll -Algorithm SHA256).Hash.Substring(0, 8))
+Write-Host '下一步：.\deploy-test.ps1（部署到宿主插件路线；产物即此 TextureLoader.dll）'
