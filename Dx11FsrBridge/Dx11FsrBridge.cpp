@@ -9708,6 +9708,247 @@ void log_sdk234_skip_reason(
         " insts=" + insts_state);
 }
 
+// 一次性原生参数探测（诊断用，Ffx12Probe=1 时启用；正式版不编译）。
+//
+// 2026-09-19（审核报告）：从 try_fsr2_translation_draw 内抽出（该函数原约 1800 行）。
+// **纯诊断**：已逐项核实对 g_sdk234_output_ptr / g_sdk234_output_tick / st-> / g_config.
+// 的写入均为 **0 处** —— 只写自己的静态节流计数器与 dump 文件，不影响 dispatch 语义。
+// 整个函数体在 !RELEASE_RUNTIME 下才编译，故对发布版是**编译期无操作**。
+//
+// 外部依赖仅 5 个：context、call_params，以及 color/depth/motion 三张纹理（用于记录格式）。
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+void probe_native_params_once(
+    ID3D11DeviceContext *context,
+    const il2cpp_callsite::CapturedParams &call_params,
+    ID3D11Texture2D *color_tex,
+    ID3D11Texture2D *depth_tex,
+    ID3D11Texture2D *motion_tex)
+{
+    if (g_config.ffx12_probe)
+    {
+    static std::atomic_uint32_t sdk234_probe_round { 0 };
+    static std::atomic_bool sdk234_cb0_done { false };
+    const std::uint32_t probe_round = sdk234_probe_round.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool probe_full = probe_round == 1;
+    const bool probe_cb0 = !sdk234_cb0_done.load(std::memory_order_relaxed) && probe_round <= 32;
+    if (probe_full || probe_cb0)
+    {
+        std::string probe;
+        if (probe_full)
+            probe = "ffx12_probe";
+        else
+            probe = "ffx12_probe_cb0";
+        if (probe_full)
+        {
+            ID3D11PixelShader *ps = nullptr;
+            context->PSGetShader(&ps, nullptr, nullptr);
+            if (ps)
+            {
+                const ShaderInfo si = lookup_pixel_shader_info(ps);
+                probe += " ps_hash=" + hex64(si.hash);
+                ps->Release();
+            }
+            ID3D11ShaderResourceView *psrvs[8] = {};
+            context->PSGetShaderResources(0, 8, psrvs);
+            for (int i = 0; i < 8; ++i)
+            {
+                if (!psrvs[i])
+                    continue;
+                ID3D11Resource *res = nullptr;
+                psrvs[i]->GetResource(&res);
+                if (res)
+                {
+                    ID3D11Texture2D *tex = nullptr;
+                    if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D),
+                                                      reinterpret_cast<void **>(&tex))))
+                    {
+                        D3D11_TEXTURE2D_DESC td {};
+                        tex->GetDesc(&td);
+                        probe += " s" + std::to_string(i) + "=" + std::to_string(td.Format) + "x" +
+                            std::to_string(td.Width) + "x" + std::to_string(td.Height);
+                        tex->Release();
+                    }
+                    res->Release();
+                }
+                psrvs[i]->Release();
+            }
+            ID3D11RenderTargetView *prtvs[4] = {};
+            ID3D11DepthStencilView *pdsv = nullptr;
+            context->OMGetRenderTargets(4, prtvs, &pdsv);
+            for (int i = 0; i < 4; ++i)
+            {
+                if (!prtvs[i])
+                    continue;
+                ID3D11Resource *res = nullptr;
+                prtvs[i]->GetResource(&res);
+                if (res)
+                {
+                    ID3D11Texture2D *tex = nullptr;
+                    if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D),
+                                                      reinterpret_cast<void **>(&tex))))
+                    {
+                        D3D11_TEXTURE2D_DESC td {};
+                        tex->GetDesc(&td);
+                        probe += " r" + std::to_string(i) + "=" + std::to_string(td.Format) + "x" +
+                            std::to_string(td.Width) + "x" + std::to_string(td.Height);
+                        tex->Release();
+                    }
+                    res->Release();
+                }
+                prtvs[i]->Release();
+            }
+            if (pdsv)
+                pdsv->Release();
+        }
+        std::uint8_t cb0[512] {};
+        std::size_t cb0_size = 0;
+        {
+            ID3D11Buffer *bound_cb = nullptr;
+            context->PSGetConstantBuffers(0, 1, &bound_cb);
+            if (bound_cb)
+            {
+                const std::uint64_t cb_key = reinterpret_cast<std::uint64_t>(bound_cb);
+                g_trace_ps_cb0_key.store(cb_key, std::memory_order_relaxed);
+                const auto snap_it = g_buffer_snapshots.find(cb_key);
+                if (snap_it != g_buffer_snapshots.end())
+                {
+                    cb0_size = snap_it->second.size();
+                    std::memcpy(cb0, snap_it->second.data(),
+                                cb0_size < sizeof(cb0) ? cb0_size : sizeof(cb0));
+                }
+                bound_cb->Release();
+            }
+        }
+        probe += " cb0_size=" + std::to_string(cb0_size);
+        if (cb0_size > 0)
+        {
+            sdk234_cb0_done.store(true, std::memory_order_relaxed);
+            probe += " cb0=";
+            const std::size_t floats = cb0_size / 4;
+            for (std::size_t i = 0; i < floats; ++i)
+            {
+                probe += std::to_string(reinterpret_cast<const float *>(cb0)[i]);
+                if (i + 1 < floats)
+                    probe += ",";
+            }
+        }
+        log_line(probe);
+    }
+    // ---- 输入内容采样（前 3 轮 + 每 64 轮；motion 3×3 网格 + mvmax） ----
+    if (probe_round <= 3 || probe_round % 64 == 0)
+    {
+        std::string samples = "ffx12_samples round=" + std::to_string(probe_round);
+        append_tex_samples(samples, "color", color_tex, context);
+        append_tex_samples(samples, "depth", depth_tex, context);
+        append_tex_samples(samples, "motion", motion_tex, context, true, true);
+        bool last_reset = false;
+        std::uint64_t ctx_recreates = 0;
+        ffx12::debug_state(last_reset, ctx_recreates);
+        samples += " reset=" + std::to_string(last_reset ? 1 : 0) +
+            " recreates=" + std::to_string(ctx_recreates);
+        log_line(samples);
+    }
+    // ---- cb0 逐帧跟踪（前 32 轮）：jitter/frame/instance 与 cb0 tail 的对应 ----
+    if (probe_round <= 32)
+    {
+        std::string track = "ffx12_cb0_track round=" + std::to_string(probe_round) +
+            " inst=" + hex64(call_params.instance & 0xFFFFFFFFull) +
+            " frame=" + std::to_string(call_params.frame_index) +
+            " jit_norm=" + std::to_string(call_params.jitter_x) + "," +
+            std::to_string(call_params.jitter_y);
+        ID3D11Buffer *bound_cb = nullptr;
+        context->PSGetConstantBuffers(0, 1, &bound_cb);
+        if (bound_cb)
+        {
+            const std::uint64_t cb_key = reinterpret_cast<std::uint64_t>(bound_cb);
+            g_trace_ps_cb0_key.store(cb_key, std::memory_order_relaxed);
+            const auto snap_it = g_buffer_snapshots.find(cb_key);
+            if (snap_it != g_buffer_snapshots.end() && snap_it->second.size() >= 464)
+            {
+                const float *f = reinterpret_cast<const float *>(snap_it->second.data());
+                track += " cb0_96_115=";
+                for (int i = 96; i < 116; ++i)
+                {
+                    track += std::to_string(f[i]);
+                    if (i < 115)
+                        track += ",";
+                }
+            }
+            else
+            {
+                track += " cb0_snap_missing";
+            }
+            bound_cb->Release();
+        }
+        log_line(track);
+    }
+    // ---- 一次性实例/上下文内存 dump（前 2 轮；找原生 near/far/fov/exposure 等参数） ----
+    if (probe_round <= 2)
+    {
+        std::string mem = "ffx12_mem_dump round=" + std::to_string(probe_round);
+        append_mem_dump(mem, "inst", call_params.instance, 32);
+        append_mem_u64(mem, "inst_ptr", call_params.instance, 32);
+        append_mem_dump(mem, "ctx", call_params.context, 16);
+        append_mem_u64(mem, "ctx_ptr", call_params.context, 32);
+        log_line(mem);
+        // 原生参数全量转储（日志截断放不下；第 1 轮写文件，供离线分析 fov/near/far）：
+        // 实例前 8KB + 上下文前 4KB + cb0 全量（496B）
+        if (probe_round == 1)
+        {
+            FILE *f = nullptr;
+            if (fopen_s(&f, "sdk234_native_dump.bin", "wb") == 0 && f)
+            {
+                if (call_params.instance)
+                    fwrite(reinterpret_cast<const void *>(call_params.instance), 1, 8192, f);
+                if (call_params.context)
+                    fwrite(reinterpret_cast<const void *>(call_params.context), 1, 4096, f);
+                // cb0 全量（含实例字段的 render/display/jitter 段）：快照钩子可能缺失，
+                // 用 staging 直读兜底（CopyResource + Map）
+                {
+                    ID3D11Buffer *bound_cb = nullptr;
+                    context->PSGetConstantBuffers(0, 1, &bound_cb);
+                    if (bound_cb)
+                    {
+                        D3D11_BUFFER_DESC bd {};
+                        bound_cb->GetDesc(&bd);
+                        const UINT cb_size = bd.ByteWidth > 4096 ? 4096 : bd.ByteWidth;
+                        D3D11_BUFFER_DESC sd {};
+                        sd.ByteWidth = cb_size;
+                        sd.Usage = D3D11_USAGE_STAGING;
+                        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                        ID3D11Buffer *staging_cb = nullptr;
+                        ID3D11Device *dev = nullptr;
+                        context->GetDevice(&dev);
+                        if (dev &&
+                            SUCCEEDED(dev->CreateBuffer(&sd, nullptr, &staging_cb)) &&
+                            staging_cb != nullptr)
+                        {
+                            context->CopyResource(staging_cb, bound_cb);
+                            context->Flush();
+                            D3D11_MAPPED_SUBRESOURCE m {};
+                            if (SUCCEEDED(context->Map(staging_cb, 0,
+                                                       D3D11_MAP_READ, 0, &m)) &&
+                                m.pData)
+                            {
+                                fwrite(m.pData, 1, cb_size, f);
+                                context->Unmap(staging_cb, 0);
+                            }
+                            staging_cb->Release();
+                        }
+                        if (dev)
+                            dev->Release();
+                        bound_cb->Release();
+                    }
+                }
+                fclose(f);
+                LOG_DEBUG(blog::cat::upscale, "ffx12_native_dump written=sdk234_native_dump.bin");
+            }
+        }
+    }
+    } // if (g_config.ffx12_probe)
+}
+#endif // !DX11FSRBRIDGE_RELEASE_RUNTIME
+
 template <typename DrawCall>
 bool try_fsr2_translation_draw(
     ID3D11DeviceContext *context,
@@ -10568,230 +10809,10 @@ bool try_fsr2_translation_draw(
                     st->last_frame_tick = GetTickCount64();
                 }
 
-                // ---- 一次性原生参数探测（诊断用，Ffx12Probe=1 时启用；正式版不编译）----
+                // 一次性原生参数探测（诊断用）—— 已抽为独立函数，见上方
+                // probe_native_params_once；纯诊断、不改状态。
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-                if (g_config.ffx12_probe)
-                {
-                static std::atomic_uint32_t sdk234_probe_round { 0 };
-                static std::atomic_bool sdk234_cb0_done { false };
-                const std::uint32_t probe_round = sdk234_probe_round.fetch_add(1, std::memory_order_relaxed) + 1;
-                const bool probe_full = probe_round == 1;
-                const bool probe_cb0 = !sdk234_cb0_done.load(std::memory_order_relaxed) && probe_round <= 32;
-                if (probe_full || probe_cb0)
-                {
-                    std::string probe;
-                    if (probe_full)
-                        probe = "ffx12_probe";
-                    else
-                        probe = "ffx12_probe_cb0";
-                    if (probe_full)
-                    {
-                        ID3D11PixelShader *ps = nullptr;
-                        context->PSGetShader(&ps, nullptr, nullptr);
-                        if (ps)
-                        {
-                            const ShaderInfo si = lookup_pixel_shader_info(ps);
-                            probe += " ps_hash=" + hex64(si.hash);
-                            ps->Release();
-                        }
-                        ID3D11ShaderResourceView *psrvs[8] = {};
-                        context->PSGetShaderResources(0, 8, psrvs);
-                        for (int i = 0; i < 8; ++i)
-                        {
-                            if (!psrvs[i])
-                                continue;
-                            ID3D11Resource *res = nullptr;
-                            psrvs[i]->GetResource(&res);
-                            if (res)
-                            {
-                                ID3D11Texture2D *tex = nullptr;
-                                if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D),
-                                                                  reinterpret_cast<void **>(&tex))))
-                                {
-                                    D3D11_TEXTURE2D_DESC td {};
-                                    tex->GetDesc(&td);
-                                    probe += " s" + std::to_string(i) + "=" + std::to_string(td.Format) + "x" +
-                                        std::to_string(td.Width) + "x" + std::to_string(td.Height);
-                                    tex->Release();
-                                }
-                                res->Release();
-                            }
-                            psrvs[i]->Release();
-                        }
-                        ID3D11RenderTargetView *prtvs[4] = {};
-                        ID3D11DepthStencilView *pdsv = nullptr;
-                        context->OMGetRenderTargets(4, prtvs, &pdsv);
-                        for (int i = 0; i < 4; ++i)
-                        {
-                            if (!prtvs[i])
-                                continue;
-                            ID3D11Resource *res = nullptr;
-                            prtvs[i]->GetResource(&res);
-                            if (res)
-                            {
-                                ID3D11Texture2D *tex = nullptr;
-                                if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D),
-                                                                  reinterpret_cast<void **>(&tex))))
-                                {
-                                    D3D11_TEXTURE2D_DESC td {};
-                                    tex->GetDesc(&td);
-                                    probe += " r" + std::to_string(i) + "=" + std::to_string(td.Format) + "x" +
-                                        std::to_string(td.Width) + "x" + std::to_string(td.Height);
-                                    tex->Release();
-                                }
-                                res->Release();
-                            }
-                            prtvs[i]->Release();
-                        }
-                        if (pdsv)
-                            pdsv->Release();
-                    }
-                    std::uint8_t cb0[512] {};
-                    std::size_t cb0_size = 0;
-                    {
-                        ID3D11Buffer *bound_cb = nullptr;
-                        context->PSGetConstantBuffers(0, 1, &bound_cb);
-                        if (bound_cb)
-                        {
-                            const std::uint64_t cb_key = reinterpret_cast<std::uint64_t>(bound_cb);
-                            g_trace_ps_cb0_key.store(cb_key, std::memory_order_relaxed);
-                            const auto snap_it = g_buffer_snapshots.find(cb_key);
-                            if (snap_it != g_buffer_snapshots.end())
-                            {
-                                cb0_size = snap_it->second.size();
-                                std::memcpy(cb0, snap_it->second.data(),
-                                            cb0_size < sizeof(cb0) ? cb0_size : sizeof(cb0));
-                            }
-                            bound_cb->Release();
-                        }
-                    }
-                    probe += " cb0_size=" + std::to_string(cb0_size);
-                    if (cb0_size > 0)
-                    {
-                        sdk234_cb0_done.store(true, std::memory_order_relaxed);
-                        probe += " cb0=";
-                        const std::size_t floats = cb0_size / 4;
-                        for (std::size_t i = 0; i < floats; ++i)
-                        {
-                            probe += std::to_string(reinterpret_cast<const float *>(cb0)[i]);
-                            if (i + 1 < floats)
-                                probe += ",";
-                        }
-                    }
-                    log_line(probe);
-                }
-                // ---- 输入内容采样（前 3 轮 + 每 64 轮；motion 3×3 网格 + mvmax） ----
-                if (probe_round <= 3 || probe_round % 64 == 0)
-                {
-                    std::string samples = "ffx12_samples round=" + std::to_string(probe_round);
-                    append_tex_samples(samples, "color", color_tex, context);
-                    append_tex_samples(samples, "depth", depth_tex, context);
-                    append_tex_samples(samples, "motion", motion_tex, context, true, true);
-                    bool last_reset = false;
-                    std::uint64_t ctx_recreates = 0;
-                    ffx12::debug_state(last_reset, ctx_recreates);
-                    samples += " reset=" + std::to_string(last_reset ? 1 : 0) +
-                        " recreates=" + std::to_string(ctx_recreates);
-                    log_line(samples);
-                }
-                // ---- cb0 逐帧跟踪（前 32 轮）：jitter/frame/instance 与 cb0 tail 的对应 ----
-                if (probe_round <= 32)
-                {
-                    std::string track = "ffx12_cb0_track round=" + std::to_string(probe_round) +
-                        " inst=" + hex64(call_params.instance & 0xFFFFFFFFull) +
-                        " frame=" + std::to_string(call_params.frame_index) +
-                        " jit_norm=" + std::to_string(call_params.jitter_x) + "," +
-                        std::to_string(call_params.jitter_y);
-                    ID3D11Buffer *bound_cb = nullptr;
-                    context->PSGetConstantBuffers(0, 1, &bound_cb);
-                    if (bound_cb)
-                    {
-                        const std::uint64_t cb_key = reinterpret_cast<std::uint64_t>(bound_cb);
-                        g_trace_ps_cb0_key.store(cb_key, std::memory_order_relaxed);
-                        const auto snap_it = g_buffer_snapshots.find(cb_key);
-                        if (snap_it != g_buffer_snapshots.end() && snap_it->second.size() >= 464)
-                        {
-                            const float *f = reinterpret_cast<const float *>(snap_it->second.data());
-                            track += " cb0_96_115=";
-                            for (int i = 96; i < 116; ++i)
-                            {
-                                track += std::to_string(f[i]);
-                                if (i < 115)
-                                    track += ",";
-                            }
-                        }
-                        else
-                        {
-                            track += " cb0_snap_missing";
-                        }
-                        bound_cb->Release();
-                    }
-                    log_line(track);
-                }
-                // ---- 一次性实例/上下文内存 dump（前 2 轮；找原生 near/far/fov/exposure 等参数） ----
-                if (probe_round <= 2)
-                {
-                    std::string mem = "ffx12_mem_dump round=" + std::to_string(probe_round);
-                    append_mem_dump(mem, "inst", call_params.instance, 32);
-                    append_mem_u64(mem, "inst_ptr", call_params.instance, 32);
-                    append_mem_dump(mem, "ctx", call_params.context, 16);
-                    append_mem_u64(mem, "ctx_ptr", call_params.context, 32);
-                    log_line(mem);
-                    // 原生参数全量转储（日志截断放不下；第 1 轮写文件，供离线分析 fov/near/far）：
-                    // 实例前 8KB + 上下文前 4KB + cb0 全量（496B）
-                    if (probe_round == 1)
-                    {
-                        FILE *f = nullptr;
-                        if (fopen_s(&f, "sdk234_native_dump.bin", "wb") == 0 && f)
-                        {
-                            if (call_params.instance)
-                                fwrite(reinterpret_cast<const void *>(call_params.instance), 1, 8192, f);
-                            if (call_params.context)
-                                fwrite(reinterpret_cast<const void *>(call_params.context), 1, 4096, f);
-                            // cb0 全量（含实例字段的 render/display/jitter 段）：快照钩子可能缺失，
-                            // 用 staging 直读兜底（CopyResource + Map）
-                            {
-                                ID3D11Buffer *bound_cb = nullptr;
-                                context->PSGetConstantBuffers(0, 1, &bound_cb);
-                                if (bound_cb)
-                                {
-                                    D3D11_BUFFER_DESC bd {};
-                                    bound_cb->GetDesc(&bd);
-                                    const UINT cb_size = bd.ByteWidth > 4096 ? 4096 : bd.ByteWidth;
-                                    D3D11_BUFFER_DESC sd {};
-                                    sd.ByteWidth = cb_size;
-                                    sd.Usage = D3D11_USAGE_STAGING;
-                                    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                                    ID3D11Buffer *staging_cb = nullptr;
-                                    ID3D11Device *dev = nullptr;
-                                    context->GetDevice(&dev);
-                                    if (dev &&
-                                        SUCCEEDED(dev->CreateBuffer(&sd, nullptr, &staging_cb)) &&
-                                        staging_cb != nullptr)
-                                    {
-                                        context->CopyResource(staging_cb, bound_cb);
-                                        context->Flush();
-                                        D3D11_MAPPED_SUBRESOURCE m {};
-                                        if (SUCCEEDED(context->Map(staging_cb, 0,
-                                                                   D3D11_MAP_READ, 0, &m)) &&
-                                            m.pData)
-                                        {
-                                            fwrite(m.pData, 1, cb_size, f);
-                                            context->Unmap(staging_cb, 0);
-                                        }
-                                        staging_cb->Release();
-                                    }
-                                    if (dev)
-                                        dev->Release();
-                                    bound_cb->Release();
-                                }
-                            }
-                            fclose(f);
-                            LOG_DEBUG(blog::cat::upscale, "ffx12_native_dump written=sdk234_native_dump.bin");
-                        }
-                    }
-                }
-                } // if (g_config.ffx12_probe)
+                probe_native_params_once(context, call_params, color_tex, depth_tex, motion_tex);
 #endif // !DX11FSRBRIDGE_RELEASE_RUNTIME
 
                 if (ffx12::dispatch(sdk_in, context, call_params.instance))
