@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(FufuGraphicsPlugin LANGUAGES CXX RC)
+# 版本号**单一事实源**（2026-09-19 审核报告）。
+# 改版本只改这里；`.rc` 通过下面生成的头读取，不再手写。
+project(FufuGraphicsPlugin VERSION 2.2.0.0 LANGUAGES CXX RC)
+
+# 生成版本头供 .rc 使用（生成到构建目录，避免污染源码树）。
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/Version.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/Version.h"
+    @ONLY)
 
 add_library(FufuGraphicsPlugin SHARED
     FufuGraphicsPlugin.cpp
@@ -8,6 +16,11 @@ add_library(FufuGraphicsPlugin SHARED
 )
 
 target_compile_features(FufuGraphicsPlugin PRIVATE cxx_std_20)
+# .rc 里 `#include "Version.h"` 需要能找到生成的头（RC 编译器也吃 include 目录）。
+target_include_directories(FufuGraphicsPlugin PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+# 生成头变化时重编 .rc，否则改版本号不会反映到产物。
+set_source_files_properties(FufuGraphicsPlugin.rc PROPERTIES
+    OBJECT_DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/Version.h")
 target_compile_definitions(FufuGraphicsPlugin PRIVATE
     UNICODE
     _UNICODE

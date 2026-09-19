@@ -1,0 +1,30 @@
+// 由 CMake 生成 —— **不要直接编辑**（改动会被下次 configure 覆盖）。
+//
+// 单一版本源在 CMakeLists.txt 的 `project(FufuGraphicsPlugin VERSION x.y.z)`。
+//
+// 为什么需要（2026-09-19 审核报告）：`.rc` 里的 FILEVERSION / FileVersion 等
+// 此前是**手写**的 `2,2,0,0` / `"2.2.0.0"`，与构建版本源无同步机制 ——
+// 改版本要记得同时改多处，漏一处就会出现"文件属性与实际版本不符"
+//（历史上已出现过：插件日志写 `version=2.0.0` 而 `.rc` 是 `2.2.0.0`）。
+// 现在 `.rc` 只 include 本文件，版本号改一处即可。
+#pragma once
+
+#define FUFU_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define FUFU_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define FUFU_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define FUFU_VERSION_TWEAK @PROJECT_VERSION_TWEAK@
+
+// 逗号分隔（供 VERSIONINFO 的 FILEVERSION / PRODUCTVERSION）
+#define FUFU_VERSION_COMMA \
+    FUFU_VERSION_MAJOR, FUFU_VERSION_MINOR, \
+    FUFU_VERSION_PATCH, FUFU_VERSION_TWEAK
+
+// 点分字符串（供 VALUE "FileVersion" / "ProductVersion"）
+// 用字符串化让 `2.2.0.0` 由宏自动拼出，避免再写一遍字面量。
+#define FUFU_STR2(x) #x
+#define FUFU_STR(x) FUFU_STR2(x)
+#define FUFU_VERSION_DOTTED \
+    FUFU_STR(FUFU_VERSION_MAJOR) "." \
+    FUFU_STR(FUFU_VERSION_MINOR) "." \
+    FUFU_STR(FUFU_VERSION_PATCH) "." \
+    FUFU_STR(FUFU_VERSION_TWEAK)

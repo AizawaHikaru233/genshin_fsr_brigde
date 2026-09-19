@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(Dx11FsrBridge LANGUAGES C CXX RC)
+# 版本号**单一事实源**（2026-09-19 审核报告）。
+# 改版本只改这里；`.rc` 通过下面生成的头读取，不再手写。
+project(Dx11FsrBridge VERSION 2.2.0.0 LANGUAGES C CXX RC)
+
+# 生成版本头供 .rc 使用（生成到构建目录，避免污染源码树）。
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/Version.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/Version.h"
+    @ONLY)
 
 option(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL "Build the standard FSR2 translation exports" ON)
 option(DX11FSRBRIDGE_RELEASE_RUNTIME "Build the release runtime" ON)
@@ -125,7 +133,12 @@ target_include_directories(Dx11FsrBridge PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
     "${FFX_API_INCLUDE_ROOT}"
     "${FFX_UPSCALER_INCLUDE_ROOT}"
+    # .rc 里 `#include "Version.h"` 需要能找到生成的头（RC 编译器也吃 include 目录）
+    "${CMAKE_CURRENT_BINARY_DIR}"
 )
+# 生成头变化时重编 .rc，否则改版本号不会反映到产物。
+set_source_files_properties(Dx11FsrBridge.rc PROPERTIES
+    OBJECT_DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/Version.h")
 target_link_libraries(Dx11FsrBridge PRIVATE
     d3d11
     d3d12
