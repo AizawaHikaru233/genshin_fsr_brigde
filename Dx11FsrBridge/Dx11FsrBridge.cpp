@@ -1240,7 +1240,7 @@ static void append_mem_u64(std::string &out, const char *tag, std::uint64_t addr
             continue;
         if (out.size() > 0 && out.back() != '=' && out.back() != ' ')
             out += ",";
-        out += std::to_string(i) + "=0x" + hex64(v);
+        out += std::to_string(i) + "=" + hex64(v);
     }
 }
 
@@ -10852,13 +10852,13 @@ bool try_fsr2_translation_draw(
                         LOG_DEBUG(blog::cat::upscale, "ffx12_out_samples count=" + std::to_string(dcount) +
                             " enc_valid=" + std::to_string(os_valid ? 1 : 0) +
                             " dims=" + std::to_string(os_w) + "x" + std::to_string(os_h) +
-                            " enc_p0=0x" + hex64(os_raw[0]) + " p1=0x" + hex64(os_raw[1]) +
-                            " p2=0x" + hex64(os_raw[2]) + " p3=0x" + hex64(os_raw[3]) +
-                            " p4=0x" + hex64(os_raw[4]) +
-                            " canary=0x" + hex64(cs.canary) +
-                            " co=0x" + hex64(cs.color_own) +
+                            " enc_p0=" + hex64(os_raw[0]) + " p1=" + hex64(os_raw[1]) +
+                            " p2=" + hex64(os_raw[2]) + " p3=" + hex64(os_raw[3]) +
+                            " p4=" + hex64(os_raw[4]) +
+                            " canary=" + hex64(cs.canary) +
+                            " co=" + hex64(cs.color_own) +
                             " dz=" + std::to_string(cs.depth_own) +
-                            " mo=0x" + hex64(cs.motion_own) +
+                            " mo=" + hex64(cs.motion_own) +
                             " mv_cvt=" + std::to_string(cs.motion_cvt[0]) + "," +
                             std::to_string(cs.motion_cvt[1]) +
                             " cl=" + std::to_string(cs.color_linear[0]) + "," +
@@ -10881,7 +10881,7 @@ bool try_fsr2_translation_draw(
                             float ctx_f[128] {};
                             const std::size_t ctx_n =
                                 read_game_floats_seh(call_params.context, ctx_f, 128);
-                            std::string ctx_line = "ffx12_context ptr=0x" +
+                            std::string ctx_line = "ffx12_context ptr=" +
                                 hex64(call_params.context) + " n=" + std::to_string(ctx_n);
                             for (std::size_t ci = 0; ci < ctx_n; ++ci)
                                 ctx_line += " " + std::to_string(ctx_f[ci]);
@@ -12383,7 +12383,7 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
             effective_desc = &effective_texture_desc;
             LOG_INFO(blog::cat::core, std::string("native_ldr_final_target_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM") +
                 " size=" + std::to_string(desc->Width) + "x" + std::to_string(desc->Height) +
-                " bind=0x" + hex64(desc->BindFlags));
+                " bind=" + hex64(desc->BindFlags));
         }
     }
 
@@ -13379,9 +13379,9 @@ void initialize()
             hook_cfg.render_rva = detected_render;
             hook_cfg.update_cmd_buffer_rva = detected_ucb;
             hook_cfg.camera_rva = detected_camera;
-            LOG_INFO(blog::cat::hook, "fsr2_il2cpp_rva_feature_match render=0x" + hex64(detected_render) +
-                " ucb=0x" + hex64(detected_ucb) +
-                " camera=0x" + hex64(detected_camera));
+            LOG_INFO(blog::cat::hook, "fsr2_il2cpp_rva_feature_match render=" + hex64(detected_render) +
+                " ucb=" + hex64(detected_ucb) +
+                " camera=" + hex64(detected_camera));
         }
         LOG_DEBUG(blog::cat::upscale, "ffx12_camera_config probe=" +
             std::to_string(g_config.ffx12_probe_camera ? 1 : 0) +
@@ -13402,7 +13402,7 @@ void initialize()
                 " render_va=" + hex64(exe_base + hook_cfg.render_rva));
         else
         {
-            LOG_ERROR(blog::cat::hook, "fsr2_il2cpp_hook_failed render_rva=0x" + hex64(hook_cfg.render_rva) +
+            LOG_ERROR(blog::cat::hook, "fsr2_il2cpp_hook_failed render_rva=" + hex64(hook_cfg.render_rva) +
                 " skip=" + std::to_string(g_config.fsr2_il2cpp_skip_render ? 1 : 0) +
                 " fallback=draw_family_skip");
             // RVA 自动识别诊断：扫描 render/ucb 序言配对候选（国际服/版本更新偏移对齐）
