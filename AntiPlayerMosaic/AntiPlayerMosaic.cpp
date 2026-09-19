@@ -141,28 +141,36 @@ using object_active_fn = void(__fastcall *)(void *, bool);
 
 bool hide_uid_once();
 
-void log_line(const std::string &line)
+// 日志级别（2026-09-19 审核报告：替换"按英文关键词过滤"）。
+//
+// **原实现的问题**：用 10 个英文关键词（failed / disabled / error …）决定一行是否落盘。
+//   - 误**丢**：成功与生命周期行不含这些词 → 全部被静默丢弃。结果是
+//     **插件正常工作时日志为空**，完全无法用它验证插件是否生效。
+//     例：`AntiPlayerMosaic loaded`、`patched PlayerPerspective with main-thread hook`、
+//     `main module ready after X ms`、`HideUID active: hidden N ui targets` 都不落盘。
+//   - 更根本：靠自然语言措辞决定日志去留，**任何一次文案改动都可能静默改变行为**。
+//
+// 说明：本文件的重复性输出**已经有原子守卫**（`g_hide_uid_logged_*` 的
+// `exchange(true)`、`g_hide_uid_next_tick` 的 CAS 退避），所以并不存在刷屏风险；
+// 关键词过滤纯属多余且有害。
+//
+// **现在**：显式级别。Release 下 INFO 常开（每条都是一次性、可验证的生命周期事实），
+// DEBUG 仅在非 release 构建输出。当前没有高频细节行需要 DEBUG，
+// 故只保留级别参数本身，不留未使用的 log_debug 包装（避免死代码）。
+enum class LogLevel
+{
+    Info,
+    Debug
+};
+
+void log_line(const std::string &line, LogLevel level = LogLevel::Info)
 {
 #if defined(ANTIPLAYER_RELEASE_RUNTIME)
-    std::string lowered = line;
-    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char value)
-        { return static_cast<char>(std::tolower(value)); });
-    static constexpr std::array<std::string_view, 10> error_terms {
-        "failed",
-        "failure",
-        "disabled",
-        "unresolved",
-        "unavailable",
-        "mismatch",
-        "exception",
-        "invalid",
-        "allocation",
-        "error",
-    };
-    const bool is_error = std::any_of(error_terms.begin(), error_terms.end(), [&](std::string_view term)
-        { return lowered.find(term) != std::string::npos; });
-    if (!is_error)
+    // Release：只保留 INFO。生命周期行必须可见 —— 否则无法验证插件是否生效。
+    if (level == LogLevel::Debug)
         return;
+#else
+    (void)level;
 #endif
     std::lock_guard lock(g_log_mutex);
     std::ofstream out(g_log_path, std::ios::app);
