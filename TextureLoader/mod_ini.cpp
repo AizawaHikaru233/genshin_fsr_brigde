@@ -116,6 +116,26 @@ void ParseOneFile(const std::wstring &path,
         uint32_t hash = 0;
         bool have_hash = false;
         std::wstring this_res;
+        // 提交当前 override 段（抽出共用，2026-09-19 审核报告）：
+        // 此前"遇到新段头"与"文件末尾"两处**各抄了一份**，且其中一份含
+        // if/else 两分支体完全相同的死条件。统一到本 lambda。
+        auto flush_override = [&]() {
+            if (!have_hash || this_res.empty())
+                return;
+            auto it = resources.find(Normalize(this_res));
+            if (it == resources.end() || it->second.empty())
+                return;
+            TextureOverrideEntry e;
+            e.hash = hash;
+            e.ini_file = path;
+            e.ini_dir = dir;
+            e.ini_section = section;
+            // 相对 ini 目录解析；无分隔符时同样拼在 ini 目录下
+            //（原实现此处有 if/else 但两分支体相同，属死条件，已合并）
+            e.dds_path = std::wstring(dir) + L"\\" + it->second;
+            // Simple dedup: later files win
+            map[hash] = e;
+        };
         size_t pos = 0;
         while (pos < wdata.size()) {
             size_t eol = wdata.find(L'\n', pos);
@@ -126,25 +146,7 @@ void ParseOneFile(const std::wstring &path,
                 continue;
             if (line[0] == L'[') {
                 // Flush previous override section
-                if (have_hash && !this_res.empty()) {
-                    auto it = resources.find(Normalize(this_res));
-                    if (it != resources.end() && !it->second.empty()) {
-                        TextureOverrideEntry e;
-                        e.hash = hash;
-                        e.ini_file = path;
-                        e.ini_dir = dir;
-                        e.ini_section = section;
-                        std::wstring dds = Normalize(it->second);
-                        // Resolve relative to ini dir
-                        if (dds.find(L'/') != std::wstring::npos || dds.find(L'\\') != std::wstring::npos) {
-                            e.dds_path = std::wstring(dir) + L"\\" + it->second;
-                        } else {
-                            e.dds_path = std::wstring(dir) + L"\\" + it->second;
-                        }
-                        // Simple dedup: later files win
-                        map[hash] = e;
-                    }
-                }
+                flush_override();
                 size_t end = line.find(L']');
                 if (end != std::wstring::npos)
                     section = Trim(line.substr(1, end - 1));
@@ -158,25 +160,16 @@ void ParseOneFile(const std::wstring &path,
                 continue;
             std::wstring key = Trim(line.substr(0, eq));
             std::wstring val = Trim(line.substr(eq + 1));
-            if (key == L"hash") {
+            // 大小写不敏感（2026-09-19 审核报告）：3DMigoto 生态里
+            // `Hash=` / `This=` 等写法常见，原实现只认全小写 → 这类 mod 会**漏解析**。
+            if (_wcsicmp(key.c_str(), L"hash") == 0) {
                 have_hash = ParseHash(val, &hash);
-            } else if (key == L"this") {
+            } else if (_wcsicmp(key.c_str(), L"this") == 0) {
                 this_res = val;
             }
         }
         // Flush last
-        if (have_hash && !this_res.empty()) {
-            auto it = resources.find(Normalize(this_res));
-            if (it != resources.end() && !it->second.empty()) {
-                TextureOverrideEntry e;
-                e.hash = hash;
-                e.ini_file = path;
-                e.ini_dir = dir;
-                e.ini_section = section;
-                e.dds_path = std::wstring(dir) + L"\\" + it->second;
-                map[hash] = e;
-            }
-        }
+        flush_override();
     }
 }
 
@@ -190,11 +183,15 @@ void CollectInis(const std::wstring &dir, std::vector<std::wstring> &out)
         return;
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            // 跳过 . / .. 与 DISABLED（3DMigoto 约定：整目录改名以禁用）。
+            // ⚠️ 2026-09-19（审核报告）：原实现还多了一句
+            //   `if (sub.rfind(L"DISABLED") == npos) CollectInis(sub, out);`
+            // —— 它搜的是**整条路径**，若任一父目录名含 "DISABLED"
+            //（例如根目录叫 `D:\MyDISABLEDMods\`），会**误跳过整个子树**。
+            // 段名判断已由上面的 wcscmp 完成，故删除该冗余且过宽的检查。
             if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0 &&
-                wcscmp(fd.cFileName, L"DISABLED") != 0) {
-                std::wstring sub = dir + L"\\" + fd.cFileName;
-                if (sub.rfind(L"DISABLED") == std::wstring::npos)
-                    CollectInis(sub, out);
+                _wcsicmp(fd.cFileName, L"DISABLED") != 0) {
+                CollectInis(dir + L"\\" + fd.cFileName, out);
             }
         } else {
             std::wstring name = fd.cFileName;
@@ -212,6 +209,11 @@ void CollectInis(const std::wstring &dir, std::vector<std::wstring> &out)
 size_t LoadModInis(const std::wstring &root_dir,
                    std::unordered_map<uint32_t, TextureOverrideEntry> &out_map)
 {
+    // 显式清空（2026-09-19 审核报告）：此前依赖调用方传入空 map；若复用同一个 map
+    // 再次调用，旧条目会残留 —— 且下方 `map[hash] = e` 是"后写覆盖"，
+    // 叠加 FindFirstFile 的**未排序**枚举顺序，结果**不确定**。
+    // 这里明确契约：本函数从零开始填充 out_map。
+    out_map.clear();
     std::vector<std::wstring> files;
     CollectInis(root_dir, files);
     for (const auto &f : files)

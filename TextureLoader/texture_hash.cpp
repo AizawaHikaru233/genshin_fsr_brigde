@@ -300,13 +300,22 @@ static uint32_t hash_tex2d_data(uint32_t hash, const void *data, size_t length,
                                 const D3D11_TEXTURE2D_DESC *pDesc, bool zero_padding,
                                 bool skip_padding, UINT mapped_row_pitch)
 {
-    size_t row_pitch, slice_pitch, row_count;
+    // 显式初始化（2026-09-19 审核报告）：GetSurfaceInfo 在**不支持的格式**
+    // （BitsPerPixel==0）或 planar 格式奇数高度时返回 E_INVALIDARG 并**提前 return，
+    // 不写任何输出参数** —— 此前忽略返回值，导致下面的 row_pitch/row_count
+    // 用**未初始化**的栈值参与寻址与循环控制（未定义行为，可能越界读）。
+    size_t row_pitch = 0, slice_pitch = 0, row_count = 0;
 
     if (!zero_padding && !skip_padding)
         return crc32c_hw(hash, data, length);
 
-    GetSurfaceInfo(pDesc->Width, pDesc->Height, pDesc->Format,
-                   &slice_pitch, &row_pitch, &row_count);
+    const HRESULT si = GetSurfaceInfo(pDesc->Width, pDesc->Height, pDesc->Format,
+                                      &slice_pitch, &row_pitch, &row_count);
+    if (FAILED(si) || row_pitch == 0 || row_count == 0) {
+        // 无法得知行布局 → 无法做逐行 padding 处理，退化为整块 CRC。
+        // 比"用未初始化值寻址"安全，且对调用方仍是确定的结果。
+        return crc32c_hw(hash, data, length);
+    }
 
     const uint8_t *sptr = static_cast<const uint8_t *>(data);
     size_t msize = min(row_pitch, (size_t)mapped_row_pitch);
@@ -343,7 +352,12 @@ uint32_t CalcTexture2DDataHash(const D3D11_TEXTURE2D_DESC *pDesc,
         return 0;
 
     // texture_hash_version == 0 (GIMI default): 3DMigoto v1.2.1-compatible.
-    length_v12 = pDesc->Width * pDesc->Height * pDesc->ArraySize;
+    // ⚠️ 2026-09-19（审核报告）：原为 `pDesc->Width * pDesc->Height * pDesc->ArraySize`，
+    // 三个 UINT 相乘在 **32 位**下计算后才赋给 size_t —— 大纹理（如 8192×8192×2）
+    // 会**回绕**成一个很小的值，使下方 `length_v12 <= length` 判断走错分支、
+    // 并让整块 CRC 只覆盖回绕后的长度。改为先提升到 size_t 再乘（64 位）。
+    length_v12 = static_cast<size_t>(pDesc->Width) * static_cast<size_t>(pDesc->Height) *
+                 static_cast<size_t>(pDesc->ArraySize);
     length = Texture2DLength(pDesc, &pInitialData[0], 0);
 
     if (length_v12 <= length) {
@@ -352,8 +366,8 @@ uint32_t CalcTexture2DDataHash(const D3D11_TEXTURE2D_DESC *pDesc,
                                pDesc, false, false, pInitialData[0].SysMemPitch);
     }
 
-    // v1.2.11+ path: hash first subresource only, skipping row padding
-    length = Texture2DLength(pDesc, &pInitialData[0], 0);
+    // v1.2.11+ path: hash first subresource only, skipping row padding.
+    // （原实现在此处**又算了一次** Texture2DLength，结果与上面完全相同 —— 已复用。）
     return hash_tex2d_data(hash, pInitialData[0].pSysMem, length,
                            pDesc, false, true, pInitialData[0].SysMemPitch);
 }
