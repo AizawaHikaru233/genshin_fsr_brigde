@@ -4202,6 +4202,37 @@ bool process_matches()
 
 bool read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo &out_info); // 定义见下（cached 版本在其后调用）
 
+// 从 ID3D11Resource 填充"资源级"字段（2026-09-19 审核报告：消除两套实现的重复）。
+//
+// `read_resource_info`（视图入口）与 `read_resource_info_from_resource`（资源入口）
+// 此前各写了一份 Texture2D 的 GetDesc + 字段填充，后者是前者的**真子集**：
+//   - 共有：resource_key / width / height / format
+//   - 仅视图版：bind_flags / misc_flags / view_format
+// 抽成本函数后两边共用同一段填充逻辑，避免将来只改一处导致字段不一致。
+bool fill_resource_info_from_texture2d(ID3D11Resource *resource, ResourceInfo &out_info)
+{
+    D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    resource->GetType(&dimension);
+    if (dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+        return false;
+
+    ID3D11Texture2D *texture = nullptr;
+    if (FAILED(resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&texture))) ||
+        texture == nullptr)
+        return false;
+
+    D3D11_TEXTURE2D_DESC desc {};
+    texture->GetDesc(&desc);
+    out_info.resource_key = reinterpret_cast<std::uint64_t>(resource);
+    out_info.width = desc.Width;
+    out_info.height = desc.Height;
+    out_info.format = desc.Format;
+    out_info.bind_flags = desc.BindFlags;
+    out_info.misc_flags = desc.MiscFlags;
+    texture->Release();
+    return true;
+}
+
 bool read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo &out_info)
 {
     out_info = {};
@@ -4213,49 +4244,33 @@ bool read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo &out
     if (resource == nullptr)
         return false;
 
-    D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
-    resource->GetType(&dimension);
-    if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+    if (!fill_resource_info_from_texture2d(resource, out_info))
     {
-        ID3D11Texture2D *texture = nullptr;
-        if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&texture))) && texture != nullptr)
-        {
-            D3D11_TEXTURE2D_DESC desc {};
-            texture->GetDesc(&desc);
-            out_info.resource_key = reinterpret_cast<std::uint64_t>(resource);
-            out_info.width = desc.Width;
-            out_info.height = desc.Height;
-            out_info.format = desc.Format;
-            out_info.bind_flags = desc.BindFlags;
-            out_info.misc_flags = desc.MiscFlags;
-
-            ID3D11ShaderResourceView *srv = nullptr;
-            if (SUCCEEDED(view->QueryInterface(__uuidof(ID3D11ShaderResourceView), reinterpret_cast<void **>(&srv))) && srv != nullptr)
-            {
-                D3D11_SHADER_RESOURCE_VIEW_DESC view_desc {};
-                srv->GetDesc(&view_desc);
-                out_info.view_format = view_desc.Format;
-                srv->Release();
-            }
-            else
-            {
-                ID3D11RenderTargetView *rtv = nullptr;
-                if (SUCCEEDED(view->QueryInterface(__uuidof(ID3D11RenderTargetView), reinterpret_cast<void **>(&rtv))) && rtv != nullptr)
-                {
-                    D3D11_RENDER_TARGET_VIEW_DESC view_desc {};
-                    rtv->GetDesc(&view_desc);
-                    out_info.view_format = view_desc.Format;
-                    rtv->Release();
-                }
-            }
-            texture->Release();
-            resource->Release();
-            return true;
-        }
+        resource->Release();
+        return false;
     }
 
+    ID3D11ShaderResourceView *srv = nullptr;
+    if (SUCCEEDED(view->QueryInterface(__uuidof(ID3D11ShaderResourceView), reinterpret_cast<void **>(&srv))) && srv != nullptr)
+    {
+        D3D11_SHADER_RESOURCE_VIEW_DESC view_desc {};
+        srv->GetDesc(&view_desc);
+        out_info.view_format = view_desc.Format;
+        srv->Release();
+    }
+    else
+    {
+        ID3D11RenderTargetView *rtv = nullptr;
+        if (SUCCEEDED(view->QueryInterface(__uuidof(ID3D11RenderTargetView), reinterpret_cast<void **>(&rtv))) && rtv != nullptr)
+        {
+            D3D11_RENDER_TARGET_VIEW_DESC view_desc {};
+            rtv->GetDesc(&view_desc);
+            out_info.view_format = view_desc.Format;
+            rtv->Release();
+        }
+    }
     resource->Release();
-    return false;
+    return true;
 }
 
 bool read_resource_info_from_resource(ID3D11Resource *resource, const wchar_t *kind, ResourceInfo &out_info)
@@ -4263,24 +4278,9 @@ bool read_resource_info_from_resource(ID3D11Resource *resource, const wchar_t *k
     out_info = {};
     if (resource == nullptr)
         return false;
-
-    D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
-    resource->GetType(&dimension);
-    if (dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
-        return false;
-
-    ID3D11Texture2D *texture = nullptr;
-    if (FAILED(resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&texture))) || texture == nullptr)
-        return false;
-
-    D3D11_TEXTURE2D_DESC desc {};
-    texture->GetDesc(&desc);
-    out_info.resource_key = reinterpret_cast<std::uint64_t>(resource);
-    out_info.width = desc.Width;
-    out_info.height = desc.Height;
-    out_info.format = desc.Format;
-    texture->Release();
-    return true;
+    // 注意：本函数**有意**只填资源级字段，不填 view_format（调用方给的是资源而非视图）。
+    // 共享助手会顺带填 bind_flags/misc_flags —— 对本函数的调用方是无害的增量信息。
+    return fill_resource_info_from_texture2d(resource, out_info);
 }
 
 // SEH 保护读取：渲染线程 draw 时视图可能被游戏释放（竞态）——无效视图
