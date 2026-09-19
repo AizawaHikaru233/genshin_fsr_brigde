@@ -65,11 +65,21 @@ if(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
 endif()
 
 if(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    # Debug 配置（--config Debug）不定义正式版过滤宏：log_line 全量输出（排查日志等级提升）。
-    # Release 保持白名单精简（error_terms + basic_terms）。
+    # Debug 配置（--config Debug）**不**定义正式版过滤宏 → 日志全量输出。
+    # Release 定义 DX11FSRBRIDGE_RELEASE_RUNTIME=1 → 由 BridgeLogger 按**显式等级**裁剪。
+    #
+    # ⚠️ 2026-09-19（审核报告）修正过时注释：此处原写"Release 保持白名单精简
+    # （error_terms + basic_terms）"——那是**旧日志方案**的描述，已不适用：
+    #   - 新 BridgeLogger 用显式 `LOG_DEBUG/INFO/WARN/ERROR` + 每分类等级，
+    #     不再按消息内容猜等级（见 BridgeLogger.h 的设计目标说明）。
+    #   - `basic_terms` 在白名单里已不存在；`error_terms` 仅保留给
+    #     **兼容路径** `level_from_prefix`（BridgeLogger.cpp:253），
+    #     新代码不再经过它。
+    #
+    # 另：此处原还定义了 `DX11FSRBRIDGE_DEBUG_RUNTIME=1`（Debug 配置），
+    # 但全仓库**无任何代码引用**该宏（已核实），属死定义，已删除。
     target_compile_definitions(Dx11FsrBridge PRIVATE
         $<$<NOT:$<CONFIG:Debug>>:DX11FSRBRIDGE_RELEASE_RUNTIME=1>
-        $<$<CONFIG:Debug>:DX11FSRBRIDGE_DEBUG_RUNTIME=1>
     )
 endif()
 
@@ -80,8 +90,6 @@ if(MSVC)
     # 无 /EHsc 时异常直接 terminate（fail-fast），与旧版 762KB 行为一致）。
     target_compile_options(Dx11FsrBridge PRIVATE /utf-8 $<$<CONFIG:Debug>:/EHsc>)
     if(DX11FSRBRIDGE_RELEASE_RUNTIME)
-        
-        
         # 链接映射文件（模块大小分析用；仅构建产物，不部署）
         target_compile_options(Dx11FsrBridge PRIVATE $<$<CONFIG:Release>:/GL>)
         target_link_options(Dx11FsrBridge PRIVATE $<$<CONFIG:Release>:/LTCG>)
