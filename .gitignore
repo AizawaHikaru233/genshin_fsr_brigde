@@ -38,6 +38,16 @@ SharedResources/ReShade/runtime/reshade-shaders/Shaders/
 SharedResources/ReShade/runtime/reshade-shaders/Textures/
 SharedResources/OptiScaler/runtime/
 
+# ReShade 二进制**不入库**（2026-09-19）：
+#   官方指引 "Do NOT share the binaries"，且该文件 5.6 MB。
+#   本地/国内完整包在打包时由 tools\Update-UpstreamComponents.ps1 的 Update-ReShade
+#   从 reshade.me 官方渠道下载并解出（Build-OnlineInstaller.ps1 的 -FetchUpstream）；
+#   GitHub 合规包**不内置**，由安装器在用户机器上从官方下载
+#   （Configure.ps1 第 1367 行按 payload 内是否存在自动选择 Existing / Auto）。
+#   与 SharedResources/OptiScaler/runtime/OptiScaler.dll 同一处理方式。
+SharedResources/ReShade/runtime/ReShade64.dll
+SharedResources/ReShade/runtime/ReShade32.dll
+
 # Local research trees and diagnostic artifacts are not release sources
 experiments/
 external/

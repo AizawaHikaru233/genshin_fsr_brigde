@@ -127,6 +127,17 @@ First refresh the upstream component baseline (only needed when component versio
 powershell -ExecutionPolicy Bypass -File .\tools\Update-UpstreamComponents.ps1 -WorkspaceRoot .
 ```
 
+> **The ReShade binary is not stored in this repository** (since 2026-09-19):
+> `ReShade64.dll` is not committed. ReShade's official guidance is "Do NOT share the
+> binaries", so the script above downloads the official Add-on setup from reshade.me
+> **at packaging time** and extracts the DLL into `SharedResources\ReShade\runtime\`
+> (`Update-ReShade`, which also writes the version baseline to `upstream-versions.json`).
+> Local/domestic Full packages bundle that DLL; the **GitHub-compliant package does not** —
+> its installer fetches ReShade on the user's machine (`Configure.ps1` picks `Existing`
+> or `Auto` based on whether the payload already contains it). A **local Full package
+> therefore requires running the command above before packaging**, otherwise it will ship
+> without the ReShade runtime.
+
 Then build all release packages:
 
 ```powershell
