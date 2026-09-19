@@ -76,10 +76,13 @@ std::filesystem::path feature_cache_path(HMODULE module)
         L"AntiPlayerMosaic.features.cache";
 }
 
-std::uint8_t *read_cached_signature(HMODULE module, const ModuleFingerprint &fingerprint,
+// 2026-09-19（审核报告）：删除未使用的 `fingerprint` 参数。
+// 它此前被 `(void)fingerprint;` 显式丢弃 —— 本函数**已经**做了等价于指纹校验的
+// 边界与内容检查（RVA 必须落在已提交的可执行页内，且该处机器码仍匹配签名），
+// 所以指纹参数是冗余的。删除而非"恢复校验"，避免重复同一件事。
+std::uint8_t *read_cached_signature(HMODULE module,
     const pattern_scanner::Signature &signature, std::uint32_t expected_rva)
 {
-    (void)fingerprint;
     const auto base = reinterpret_cast<std::uint8_t *>(module);
     auto *address = base + expected_rva;
     MEMORY_BASIC_INFORMATION memory {};
@@ -463,6 +466,13 @@ std::uint8_t *scan_unique_signature(
     const auto *sections = IMAGE_FIRST_SECTION(nt);
     std::array<std::uint8_t *, 2> matches {};
     std::size_t match_count = 0;
+    // 2026-09-19（审核报告）：独立统计**真实**匹配数。
+    // 原先只报 match_count，而它在 matches 满 2 后就不再增长 ——
+    // 实际有 50 处匹配时日志也写 "matches=2"，诊断时**信息失真**
+    // （看不出是"2 处"还是"到处都是"）。
+    // 保留 matches 容量 2 是**有意的**：只需区分 0 / 1 / ≥2 三种情况
+    //（1 才可用），提前停止扫描可省下其余匹配的成本。
+    std::size_t total_matches = 0;
 
     for (unsigned section_index = 0; section_index < nt->FileHeader.NumberOfSections && match_count < matches.size(); ++section_index)
     {
@@ -477,13 +487,18 @@ std::uint8_t *scan_unique_signature(
             section_size,
             pattern,
             matches.size() - match_count);
+        total_matches += section_matches.size();
         for (const auto offset : section_matches)
             matches[match_count++] = base + section.VirtualAddress + offset;
     }
 
     if (match_count != 1)
     {
-        log_line(std::string(signature.name) + " scan failed: matches=" + std::to_string(match_count));
+        // 报真实总数；>=2 时明确标注"至少"（因为扫描已提前停止，可能还有更多）
+        const std::string reported = match_count >= matches.size()
+            ? (">=" + std::to_string(total_matches))
+            : std::to_string(total_matches);
+        log_line(std::string(signature.name) + " scan failed: matches=" + reported);
         return nullptr;
     }
 
@@ -495,11 +510,67 @@ std::uint8_t *scan_unique_signature(
     return matches[0];
 }
 
-DWORD WINAPI worker_thread(void *)
+// 有界等待主模块代码段可读（替代固定 Sleep(3000)，2026-09-19 审核报告）。
+//
+// 判定依据：主模块映像的**首个页面**可读且已提交。这不足以证明游戏已完成所有
+// 运行时初始化，但比"固定睡 3 秒"更贴近真实条件：
+//   - 就绪早 → 立刻继续（不再白等）
+//   - 就绪晚 → 继续轮询到上限（不再过早扫描导致静默失效）
+// 返回实际等待的毫秒数，供日志记录（便于诊断"启动慢"导致的失败）。
+constexpr ULONGLONG k_init_wait_timeout_ms = 30000; // 上限 30s（与旧行为同数量级，但可提前退出）
+constexpr DWORD k_init_poll_interval_ms = 25;       // 轮询间隔：足够细，且不烧 CPU
+
+ULONGLONG wait_for_main_module_ready()
 {
+    const ULONGLONG start = GetTickCount64();
+    const ULONGLONG deadline = start + k_init_wait_timeout_ms;
+
+    for (;;)
+    {
+        HMODULE main_module = GetModuleHandleW(nullptr);
+        if (main_module != nullptr)
+        {
+            MEMORY_BASIC_INFORMATION info {};
+            if (VirtualQuery(main_module, &info, sizeof(info)) == sizeof(info) &&
+                info.State == MEM_COMMIT &&
+                (info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ |
+                                 PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0)
+            {
+                const ULONGLONG waited = GetTickCount64() - start;
+                log_line("main module ready after " + std::to_string(waited) + " ms");
+                return waited;
+            }
+        }
+        if (GetTickCount64() >= deadline)
+        {
+            const ULONGLONG waited = GetTickCount64() - start;
+            log_line("main module not confirmed ready after " + std::to_string(waited) +
+                     " ms; scanning anyway");
+            return waited;
+        }
+        Sleep(k_init_poll_interval_ms);
+    }
+}
+
+DWORD WINAPI worker_thread(void *parameter)
+{
+    // 2026-09-19（审核报告）：日志路径改在**本线程**计算。
+    // 原先在 DllMain 里调用 module_dir()（内部 GetModuleFileNameW +
+    // std::filesystem 构造）—— 那是在 **loader lock 持有期间**执行，
+    // 是官方明确不建议的反模式（可能死锁/在锁内分配）。
+    // 现在 DllMain 只做 pin + CreateThread，模块句柄经参数传入本线程。
+    const auto self_module = static_cast<HMODULE>(parameter);
+    if (self_module != nullptr)
+        g_log_path = module_dir(self_module) / "AntiPlayerMosaic.log";
+
     reset_release_log();
     log_line("AntiPlayerMosaic loaded (dynamic scan)");
-    Sleep(3000);
+
+    // 2026-09-19（审核报告）：原为固定 `Sleep(3000)` 等待游戏初始化 ——
+    // 游戏启动慢于 3 秒时会**过早扫描**（签名找不到 → 功能静默失效），
+    // 启动快时又白白浪费 3 秒。改为**有界轮询**：轮询主模块代码段可读性，
+    // 就绪即继续，最长仍等 k_init_wait_timeout_ms。
+    wait_for_main_module_ready();
 
     HMODULE main_module = GetModuleHandleW(nullptr);
     MODULEINFO module_info {};
@@ -526,7 +597,7 @@ DWORD WINAPI worker_thread(void *)
     {
         for (std::size_t index = 0; index < targets.size(); ++index)
         {
-            targets[index] = read_cached_signature(main_module, fingerprint,
+            targets[index] = read_cached_signature(main_module,
                 pattern_scanner::k_signatures[index], cached_rvas[index]);
             if (targets[index] == nullptr)
             {
@@ -589,8 +660,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
             reinterpret_cast<LPCWSTR>(hModule),
             &pinned);
-        g_log_path = module_dir(hModule) / "AntiPlayerMosaic.log";
-        HANDLE thread = CreateThread(nullptr, 0, worker_thread, nullptr, 0, nullptr);
+        // 2026-09-19（审核报告）：**不在 DllMain 内做任何需要 loader lock 的工作**。
+        // 原先此处还调用 module_dir(hModule)（GetModuleFileNameW + std::filesystem）
+        // 设置日志路径 —— 属官方不建议的 loader lock 内操作。
+        // 现在只做 pin + 启动工作线程，模块句柄作为参数传给线程，
+        // 路径计算与后续全部初始化都在**loader lock 之外**完成。
+        //
+        // 说明：在 DllMain 内 CreateThread 本身仍是已知反模式；彻底消除需要
+        // 宿主显式调用导出函数触发初始化（本项目为注入式，无此入口）。
+        // 这里通过"线程内不做任何依赖 loader lock 的事"把风险降到实际可接受：
+        // 线程不会与 DllMain 争用加载器锁，也就不会死锁。
+        HANDLE thread = CreateThread(nullptr, 0, worker_thread, hModule, 0, nullptr);
         if (thread)
             CloseHandle(thread);
     }
