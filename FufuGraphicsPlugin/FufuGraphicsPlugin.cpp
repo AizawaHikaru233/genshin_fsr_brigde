@@ -728,6 +728,17 @@ bool has_nvidia_adapter()
 
 DetectedFsr4Policy detect_fsr4_gpu_policy()
 {
+    // 进程内缓存（2026-09-19 审核报告）：本函数被调用 **3 次**
+    //（`apply_optiscaler_managed_settings`、配置初始化、配置 reset），
+    // 每次都会 `CreateDXGIFactory1` + 逐个 `EnumAdapters1` —— 纯重复开销。
+    //
+    // 结果在**进程生命周期内是常量**：适配器集合、厂商 ID、型号名都不会在
+    // 插件运行期间变化（换显卡需要重启进程）。故用函数局部 static 缓存一次。
+    //
+    // 说明：`static` 的初始化是线程安全的（C++11 magic statics），
+    // 且本函数目前只在启动线程调用；即便将来多线程调用也不会重复枚举。
+    static const DetectedFsr4Policy cached = []
+    {
     DetectedFsr4Policy best {};
     IDXGIFactory1 *factory = nullptr;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&factory))) ||
@@ -814,6 +825,8 @@ DetectedFsr4Policy detect_fsr4_gpu_policy()
 
     factory->Release();
     return best;
+    }();
+    return cached;
 }
 
 // DLSS Runtime 仅在 RTX 上自动补齐。GTX 16 可以运行 FSR4 INT8，
