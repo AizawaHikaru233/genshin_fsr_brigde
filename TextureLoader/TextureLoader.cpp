@@ -124,6 +124,12 @@ std::atomic<ID3D11Resource *> g_activeArr[kMaxActiveResources] = {};
 std::atomic<long> g_activeCount{0}; // 存活条目数（写方持锁更新；读方 acquire 读）
 std::mutex g_activeMutex;           // 写互斥（低频）；读方不取锁
 
+// 满员丢弃计数（2026-09-22，审核报告）：原实现在写满时**静默 return** ——
+// 一旦真的写满，新资源再也无法登记，替换会**静默失效而日志毫无痕迹**。
+// 这是最难查的一类故障，必须留下证据。
+std::atomic<long> g_activeOverflow{0};
+std::atomic<long> g_repSrvOverflow{0};
+
 static void ActiveAdd(ID3D11Resource *res)
 {
     if (!res)
@@ -131,7 +137,14 @@ static void ActiveAdd(ID3D11Resource *res)
     std::lock_guard<std::mutex> lk(g_activeMutex);
     long n = g_activeCount.load(std::memory_order_relaxed);
     if (n >= kMaxActiveResources)
-        return; // 满：放弃（实际存活数远小于 4096，正常不会触发）
+    {
+        // 满：计数 + 限流告警（首次与每 1024 次）—— 见 g_activeOverflow 的说明
+        const long dropped = ++g_activeOverflow;
+        if (dropped == 1 || (dropped % 1024) == 0)
+            TL_LOG(L"[warn] activeArr full (%d) — replacement silently misses; dropped=%ld",
+                   kMaxActiveResources, dropped);
+        return;
+    }
     g_activeArr[n].store(res, std::memory_order_release); // 先写槽位
     g_activeCount.store(n + 1, std::memory_order_release); // 后发布 count
 }
@@ -180,7 +193,14 @@ static void RepSrvAdd(ID3D11ShaderResourceView *srv)
     std::lock_guard<std::mutex> lk(g_repSrvMutex);
     long n = g_repSrvCount.load(std::memory_order_relaxed);
     if (n >= kMaxReplacementSrvs)
+    {
+        // 满：计数 + 限流告警（同 ActiveAdd —— 静默丢弃会让替换无声失效）
+        const long dropped = ++g_repSrvOverflow;
+        if (dropped == 1 || (dropped % 1024) == 0)
+            TL_LOG(L"[warn] repSrvArr full (%d) — bound-SRV fast path degrades; dropped=%ld",
+                   kMaxReplacementSrvs, dropped);
         return;
+    }
     g_repSrvArr[n].store(srv, std::memory_order_release);
     g_repSrvCount.store(n + 1, std::memory_order_release);
 }
@@ -251,6 +271,20 @@ static const TextureLoaderEntry g_loaders[] = {
     {nullptr, LoadDdsTexture}, // 默认兜底：未注册扩展名走 CPU DDS
 };
 
+// ⚠️ 2026-09-22（审核报告）：判断"是不是 GDDS 加载器"必须按**加载器函数**，
+// 不能按 `&g_loaders[0]` 下标。
+//
+// 原实现两处都用下标 0 认 GDDS。一旦调整注册表顺序、或在 GDDS 之前插入
+// 新加载器，判定就会**静默错位** —— 把 DDS 当成 GDDS（于是 DDS 被
+// `gdds_enabled=0`/`Failed()` 误拦，替换整体失效），或反之（GDDS 任务
+// 投进 DDS 队列）。两种都很难从日志看出来。
+// 按函数指针判定与顺序无关：默认兜底项用的也是 LoadDdsTexture，所以
+// `load == LoadGddsTextureEntry` 唯一标识 GDDS。
+static bool IsGddsLoader(const TextureLoaderEntry *entry)
+{
+    return entry != nullptr && entry->load == ::tloader_gdds::LoadGddsTextureEntry;
+}
+
 // 入队：选定加载器并按类型投递到对应队列
 static void EnqueueLoad(uint32_t hash, std::wstring path)
 {
@@ -264,7 +298,9 @@ static void EnqueueLoad(uint32_t hash, std::wstring path)
     // GDDS 失败终态隔离：DirectStorage 不可用时 GDDS 任务不再入队，
     // 避免队列堆积与 [fail] 刷屏——DDS 路径完全不受影响。
     // gdds_enabled=0：配置禁用 GDDS（N 卡驱动缺陷规避等场景），.gdds 直接跳过。
-    if (lt.loader == &g_loaders[0] &&
+    // 2026-09-22（审核报告）：改用 IsGddsLoader 判定，不再依赖注册表下标。
+    const bool is_gdds = IsGddsLoader(lt.loader);
+    if (is_gdds &&
         (!::tloader::g_gdds_enabled || ::tloader_gdds::Failed()))
         return;
     // 同步模式（async_load=0）：渲染线程直接执行加载——与 3DMigoto/旧版一致，
@@ -273,7 +309,7 @@ static void EnqueueLoad(uint32_t hash, std::wstring path)
         ExecuteLoadTask(lt);
         return;
     }
-    int q = (lt.loader == &g_loaders[0]) ? 0 : 1; // 0=GDDS 1=DDS
+    int q = is_gdds ? 0 : 1; // 0=GDDS 1=DDS
     {
         std::lock_guard<std::mutex> lk(g_loadMutex);
         // 去重（含在途）：同 hash 已在队列（未消费）或正在加载（已出队）时
@@ -444,10 +480,13 @@ static bool IsDynamic(ID3D11Resource *res)
 }
 
 std::atomic<long> g_hook_ready{0};   // 双检锁用；必须严格原子（旧为 volatile long，非原子读）
-volatile long g_stats_created = 0;   // 已哈希的纹理数
-volatile long g_stats_matched = 0;   // 命中的替换数
+volatile long g_stats_created = 0;   // 已哈希的纹理数（**所有**带初始数据的纹理）
+volatile long g_stats_matched = 0;   // 命中的替换数（g_stats_created 的子集）
 volatile long g_stats_bound = 0;     // 替换 SRV 被绑定次数
 volatile bool g_observe_only = true; // 1=只记录匹配，0=真正替换
+// ⚠️ 2026-09-22（审核报告）：`g_stats_created` 原在 matched 分支内自增，
+// 与 `g_stats_matched` **恒等** —— 是日志说谎（"created" 从未反映哈希量）。
+// 已移到哈希之后、判定之前。`created - matched` = 哈希了但未命中。
 
 // ---------------------------------------------------------------------------
 // 原始函数指针
@@ -670,6 +709,22 @@ ID3D11ShaderResourceView *CreateReplacementSRV(uint32_t hash,
 // 重入保护：LoadDdsTexture 创建替换纹理时直接转发，不再进入哈希/替换逻辑
 static thread_local bool t_in_create_texture = false;
 
+// ⚠️ 2026-09-22（审核报告）：重入标志必须用 RAII 管理。
+//
+// 原实现是手工 `t_in_create_texture = true;` / `= false;` 夹住 loader->load()。
+// 只要 load() 以**异常**离开（其内部用到 std::vector/std::wstring 等会分配的
+// 类型），那句 `= false` 就永不执行 → 该线程**永久**停留在重入态 →
+// 此后该线程创建的**所有**纹理都直接转发、绕过哈希与替换 →
+// **mod 整体静默失效，且日志里没有任何异常痕迹**。
+// RAII 保证任何离开路径（return / throw）都会复位。
+struct CreateTextureReentryGuard
+{
+    CreateTextureReentryGuard() { t_in_create_texture = true; }
+    ~CreateTextureReentryGuard() { t_in_create_texture = false; }
+    CreateTextureReentryGuard(const CreateTextureReentryGuard &) = delete;
+    CreateTextureReentryGuard &operator=(const CreateTextureReentryGuard &) = delete;
+};
+
 static HRESULT STDMETHODCALLTYPE HookCreateTexture2D(
     ID3D11Device *This,
     const D3D11_TEXTURE2D_DESC *pDesc,
@@ -689,11 +744,18 @@ static HRESULT STDMETHODCALLTYPE HookCreateTexture2D(
     if (pInitialData && pInitialData->pSysMem) {
         uint32_t data_hash = CalcTexture2DDataHash(pDesc, pInitialData);
         uint32_t hash = CalcTexture2DDescHash(data_hash, pDesc);
+        // ⚠️ 2026-09-22（审核报告）：`g_stats_created` 必须在这里自增。
+        //
+        // 原实现把它放在下面的 `if (matched && ov)` 分支**内**，紧邻
+        // `g_stats_matched` —— 于是两个计数**恒等**，`[stat]` 行里的
+        // "created" 从来没有反映过实际哈希量（是**日志说谎**，不是冗余）。
+        // 移到判定之前，让它真正表示"已哈希的纹理数"，
+        // 从而 `created - matched` 就是"哈希了但没命中"的数量。
+        InterlockedIncrement(&g_stats_created);
         const TextureOverrideEntry *ov = nullptr;
         bool matched = FindOverride(g_overrides, hash, &ov);
 
         if (matched && ov) {
-            InterlockedIncrement(&g_stats_created);
             {
                 std::lock_guard<std::mutex> lk(g_lock);
                 SetResourceHash(*ppTexture2D, hash);
@@ -757,9 +819,13 @@ static void ExecuteLoadTask(const AsyncLoadTask &task)
             return; // 已加载或条目已移除
     }
     TextureLoadResult res;
-    t_in_create_texture = true; // 防止加载内部重入（建纹理）
-    HRESULT lhr = task.loader->load(dev, task.path.c_str(), &res);
-    t_in_create_texture = false;
+    HRESULT lhr;
+    {
+        // 2026-09-22（审核报告）：原为手工置位/复位，load() 抛异常会让该线程
+        // 永久处于重入态 → 之后所有纹理创建都绕过替换（静默失效）。改 RAII。
+        CreateTextureReentryGuard reentry_guard; // 防止加载内部重入（建纹理）
+        lhr = task.loader->load(dev, task.path.c_str(), &res);
+    }
     if (SUCCEEDED(lhr) && res.texture) {
         std::lock_guard<std::mutex> lk(g_lock);
         auto it = g_replacements.find(task.hash);
@@ -902,6 +968,15 @@ static void STDMETHODCALLTYPE HookSetShaderResourcesCommon(
                 if (rep) {
                     views[i] = rep;
                     InterlockedIncrement(&g_stats_bound);
+                    // 2026-09-22（审核报告）：`stageIdx` 形参与 `g_stage_name[]`
+                    // 此前都是**死代码**（形参从未使用、名字表从未被引用）。
+                    // 这里把它们用于**等级 2** 的绑定诊断 —— 默认 log_level=1
+                    // 不产生任何输出，只有排查时才打开，因此不影响热路径成本。
+                    // 价值：能回答"替换是在哪个着色器阶段生效的"。
+                    const wchar_t *stage = (stageIdx >= 0 && stageIdx < 6)
+                        ? g_stage_name[stageIdx] : L"?";
+                    TL_LOG_IF(2, L"[bind] stage=%ls slot=%u hash=0x%08X -> replacement SRV",
+                              stage, StartSlot + i, hash);
                 }
             }
         }
@@ -1947,12 +2022,20 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         // 避免渲染线程被磁盘 IO/纹理创建阻塞导致 GPU 空转），N 卡在
         // AttachToDevice（已知 GPU 厂商）时自动切同步规避驱动缺陷。
         {
+            // ⚠️ 2026-09-22（审核报告）：改用 IniBool，与其它布尔键语义一致。
+            //
+            // 原实现是 `(av == L"1") ? 1 : 0` —— **只认字面量 "1"**。于是
+            // `async_load = true` / `= yes` / `= on` 全部被当成 **0（同步）**，
+            // 与 `IniBool` 的语义（以及同文件其它布尔键）不一致；
+            // 而 async_load 直接决定纹理在哪个线程创建（N 卡驱动规避的关键开关），
+            // 静默走错分支代价很大。
+            // 注意 `IniBool` 需要键存在与否的区分，故仍用 GetIniValue 判空。
             std::wstring av = GetIniValue(dir, L"async_load");
             if (av.empty()) {
                 ::tloader::g_async_load = 1; // 默认异步
                 ::tloader::g_async_load_explicit = 0;
             } else {
-                ::tloader::g_async_load = (av == L"1") ? 1 : 0;
+                ::tloader::g_async_load = IniBool(dir, L"async_load", true) ? 1 : 0;
                 ::tloader::g_async_load_explicit = 1;
             }
         }
