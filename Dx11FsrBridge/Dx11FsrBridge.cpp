@@ -4847,6 +4847,39 @@ std::size_t section_end_rva(const IMAGE_SECTION_HEADER *section)
            std::max<std::size_t>(section->Misc.VirtualSize, section->SizeOfRawData);
 }
 
+// 记录一次 IAT 写失败（2026-09-22）。
+//
+// 为什么需要：实测到 `VirtualProtect` 返回 TRUE、`VirtualQuery` 也报告页面可写，
+// 但对同一地址的写仍然 ACCESS_VIOLATION。机制静态分析无法定论，所以先把
+// **现场**记下来（模块名 + VirtualQuery 的真实字段），下次复现即可定案。
+// 只记前若干次，避免刷屏。
+void log_iat_write_fault(HMODULE module, const void *slot, std::size_t index)
+{
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 8)
+        return;
+
+    char module_name[MAX_PATH] = {};
+    GetModuleFileNameA(module, module_name, static_cast<DWORD>(std::size(module_name)));
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    const SIZE_T got = VirtualQuery(slot, &mbi, sizeof(mbi));
+    const bool valid = got == sizeof(mbi);
+
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+        "iat_write_fault module=%s index=%zu addr=%p vq=%zu state=0x%lX protect=0x%lX alloc=0x%lX type=0x%lX",
+        module_name[0] != '\0' ? module_name : "?",
+        index,
+        slot,
+        static_cast<std::size_t>(got),
+        static_cast<unsigned long>(valid ? mbi.State : 0),
+        static_cast<unsigned long>(valid ? mbi.Protect : 0),
+        static_cast<unsigned long>(valid ? mbi.AllocationProtect : 0),
+        static_cast<unsigned long>(valid ? mbi.Type : 0));
+    log_line(buf);
+}
+
 bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *function_name, void *replacement, void **original)
 {
     const auto *base = reinterpret_cast<const std::uint8_t *>(module);
@@ -4976,10 +5009,35 @@ bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *fun
                 return true;
             }
 
+            // ⚠️ 2026-09-22：写操作**单独**用 __try 包住，与 hook_iat 的外层
+            // `__try` 分开。两点原因：
+            //   1) 失败只影响**这一条槽位**，不会让整个模块的 5 个钩子全部放弃；
+            //   2) 可以在写失败后**还原保护位并继续**，而不是把异常抛给外层。
+            //
+            // 写失败**不会造成内存损坏** —— 违例本身就证明写入没有落地。
+            // 记录现场供定案（见 log_iat_write_fault）。
+            bool write_ok = false;
+            __try
+            {
+                iat[thunk_index].u1.Function = reinterpret_cast<ULONGLONG>(replacement);
+                write_ok = true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                write_ok = false;
+            }
+            VirtualProtect(&iat[thunk_index].u1.Function, sizeof(std::uintptr_t), old_protect, &old_protect);
+
+            if (!write_ok)
+            {
+                g_iat_patch_skipped.fetch_add(1, std::memory_order_relaxed);
+                log_iat_write_fault(module, &iat[thunk_index].u1.Function, thunk_index);
+                continue;
+            }
+
+            // 只有**真正写入成功**才登记原始函数指针。
             if (original != nullptr && *original == nullptr)
                 *original = current;
-            iat[thunk_index].u1.Function = reinterpret_cast<ULONGLONG>(replacement);
-            VirtualProtect(&iat[thunk_index].u1.Function, sizeof(std::uintptr_t), old_protect, &old_protect);
             return true;
         }
     }
