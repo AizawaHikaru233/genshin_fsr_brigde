@@ -768,6 +768,9 @@ std::atomic_uint64_t g_color_source_sequence = 0;
 std::mutex g_hook_scan_mutex;
 std::string g_last_create_hook_scan;
 std::string g_last_loader_hook_scan;
+// 上次打印 `patch_skipped` 时的值（2026-09-22）。该计数不受
+// `log_loader_activity` 门槛约束，靠这个比较"只在变化时打印"来防刷屏。
+std::size_t g_last_iat_patch_skipped = 0;
 std::string g_last_hdr_environment_hook_scan;
 std::atomic_uint32_t g_hdr_environment_probe_call_count = 0;
 std::atomic_bool g_hdr_environment_probe_suppressed_logged = false;
@@ -5456,7 +5459,15 @@ void install_loader_hooks_for_loaded_modules()
         // 2026-09-22：把"被跳过的 IAT 补丁"暴露出来。非 0 说明有模块
         // 因不可写/异常而未打上钩子 —— 此前完全不可见。
         " patch_skipped=" + std::to_string(g_iat_patch_skipped.load(std::memory_order_relaxed));
+    // ⚠️ 2026-09-22：`patch_skipped` 必须**无条件可见**。
+    //
+    // 原先这条汇总挂在 `g_config.log_loader_activity` 上，而它**默认 false**
+    // （见该字段定义处）—— 于是新加的计数在默认配置下永远不打印，等于没加。
+    // 现在：汇总内容变化仍按原门槛（受 log_loader_activity 控制，避免刷屏），
+    // 但**计数一旦变化就打印** —— 因为它代表"有钩子没打上"，属于必须知道的事。
+    const std::size_t patch_skipped = g_iat_patch_skipped.load(std::memory_order_relaxed);
     bool summary_changed = false;
+    bool skipped_changed = false;
     {
         std::lock_guard lock(g_hook_scan_mutex);
         if (summary != g_last_loader_hook_scan)
@@ -5464,8 +5475,13 @@ void install_loader_hooks_for_loaded_modules()
             g_last_loader_hook_scan = summary;
             summary_changed = true;
         }
+        if (patch_skipped != g_last_iat_patch_skipped)
+        {
+            g_last_iat_patch_skipped = patch_skipped;
+            skipped_changed = true;
+        }
     }
-    if (summary_changed && g_config.log_loader_activity)
+    if ((summary_changed && g_config.log_loader_activity) || skipped_changed)
         log_line(summary);
 }
 
