@@ -4867,16 +4867,22 @@ std::size_t section_end_rva(const IMAGE_SECTION_HEADER *section)
            std::max<std::size_t>(section->Misc.VirtualSize, section->SizeOfRawData);
 }
 
-// 记录一次 IAT 写失败（2026-09-22）。
+// 记录一次 IAT 补丁跳过（2026-09-22 建，2026-09-23 扩）。
 //
 // 为什么需要：实测到 `VirtualProtect` 返回 TRUE、`VirtualQuery` 也报告页面可写，
-// 但对同一地址的写仍然 ACCESS_VIOLATION。机制静态分析无法定论，所以先把
-// **现场**记下来（模块名 + VirtualQuery 的真实字段），下次复现即可定案。
+// 但对同一地址的写仍然 ACCESS_VIOLATION。机制在用户态无法定论，
+// 所以把**现场**记下来（模块名 + VirtualQuery 的真实字段 + 错误码）。
+//
+// ⚠️ 2026-09-23：**两条跳过路径都要记**。此前只有"写失败"会记，
+// 而"写前被守卫拦下"（`not_writable`）只计数不记模块名 ——
+// 于是看到 `not_writable=10` 时**无法知道跳过了哪些模块**，
+// 也就无法判断是否丢掉了我们真正需要的钩子（例如会加载 d3d11 的那个模块）。
+// 这是"静默失败"的另一种形态，必须一并消除。
 // 只记前若干次，避免刷屏。
-void log_iat_write_fault(HMODULE module, const void *slot, std::size_t index, DWORD last_error)
+void log_iat_skip(const char *reason, HMODULE module, const void *slot, std::size_t index, DWORD detail)
 {
     static std::atomic<int> logged{0};
-    if (logged.fetch_add(1, std::memory_order_relaxed) >= 8)
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 16)
         return;
 
     char module_name[MAX_PATH] = {};
@@ -4888,7 +4894,8 @@ void log_iat_write_fault(HMODULE module, const void *slot, std::size_t index, DW
 
     char buf[512];
     std::snprintf(buf, sizeof(buf),
-        "iat_write_fault module=%s index=%zu addr=%p vq=%zu state=0x%lX protect=0x%lX alloc=0x%lX type=0x%lX lasterr=%lu",
+        "iat_skip reason=%s module=%s index=%zu addr=%p vq=%zu state=0x%lX protect=0x%lX alloc=0x%lX type=0x%lX detail=%lu",
+        reason,
         module_name[0] != '\0' ? module_name : "?",
         index,
         slot,
@@ -4897,7 +4904,7 @@ void log_iat_write_fault(HMODULE module, const void *slot, std::size_t index, DW
         static_cast<unsigned long>(valid ? mbi.Protect : 0),
         static_cast<unsigned long>(valid ? mbi.AllocationProtect : 0),
         static_cast<unsigned long>(valid ? mbi.Type : 0),
-        static_cast<unsigned long>(last_error));
+        static_cast<unsigned long>(detail));
     log_line(buf);
 }
 
@@ -5020,6 +5027,10 @@ bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *fun
             {
                 VirtualProtect(&iat[thunk_index].u1.Function, sizeof(std::uintptr_t), old_protect, &old_protect);
                 g_iat_skip_not_writable.fetch_add(1, std::memory_order_relaxed);
+                // 2026-09-23：这条路径同样要记模块名 —— 只计数的话，
+                // 看到 not_writable=N 时无法判断跳过了哪些模块、是否丢了关键钩子。
+                log_iat_skip("not_writable", module, &iat[thunk_index].u1.Function, thunk_index,
+                             static_cast<DWORD>(mbi.Protect));
                 continue;
             }
 
@@ -5080,7 +5091,7 @@ bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *fun
             if (!write_ok)
             {
                 g_iat_skip_write_fault.fetch_add(1, std::memory_order_relaxed);
-                log_iat_write_fault(module, &iat[thunk_index].u1.Function, thunk_index, write_error);
+                log_iat_skip("write_fault", module, &iat[thunk_index].u1.Function, thunk_index, write_error);
                 continue;
             }
 
