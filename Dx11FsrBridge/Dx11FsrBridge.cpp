@@ -4807,6 +4807,46 @@ std::optional<OptiScalerBridgePacket> build_dispatch_candidate(UINT group_x, UIN
 }
 #endif // OptiScaler 候选桥探测
 
+// IAT 打补丁过程中被跳过的次数（2026-09-22）。
+//
+// 为什么需要这个计数：原实现遇到任何异常都只是静默 `return false`，
+// 于是"有多少模块没能打上钩子"完全不可见 —— 这次实机崩溃能定位，
+// 靠的还是 TextureLoader 的 VEH 恰好记录了栈，纯属侥幸。
+// 计数会并入 `iat_scan` 汇总行，让失败变得可观测。
+std::atomic<std::size_t> g_iat_patch_skipped{0};
+
+// 取包含 rva 的节（有效范围取 VirtualSize 与 SizeOfRawData 的较大者）。
+// 找不到返回 nullptr。
+//
+// 为什么需要（2026-09-22 实机崩溃）：原实现只用 `SizeOfImage` 给 thunk 遍历
+// 做上界，而 IAT（.idata）通常只占几百字节~几 KB。上界过宽意味着
+// `thunk_index` 可以越出真实 IAT 节、落进后续节，然后对那里执行写操作。
+const IMAGE_SECTION_HEADER *find_section_for_rva(const IMAGE_NT_HEADERS *nt, std::size_t rva)
+{
+    // 节表紧跟可选头：Signature(4) + FileHeader(20) + SizeOfOptionalHeader。
+    // 用 SizeOfOptionalHeader 而不是 sizeof(IMAGE_OPTIONAL_HEADER64)，
+    // 这样即便遇到可选头长度异常的模块也能算对节表起点。
+    const auto *section = reinterpret_cast<const IMAGE_SECTION_HEADER *>(
+        reinterpret_cast<const std::uint8_t *>(nt) + 4 + sizeof(IMAGE_FILE_HEADER) +
+        nt->FileHeader.SizeOfOptionalHeader);
+    const std::size_t count = nt->FileHeader.NumberOfSections;
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        const std::size_t start = section[i].VirtualAddress;
+        const std::size_t size = std::max<std::size_t>(section[i].Misc.VirtualSize,
+                                                       section[i].SizeOfRawData);
+        if (size != 0 && rva >= start && rva < start + size)
+            return &section[i];
+    }
+    return nullptr;
+}
+
+std::size_t section_end_rva(const IMAGE_SECTION_HEADER *section)
+{
+    return static_cast<std::size_t>(section->VirtualAddress) +
+           std::max<std::size_t>(section->Misc.VirtualSize, section->SizeOfRawData);
+}
+
 bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *function_name, void *replacement, void **original)
 {
     const auto *base = reinterpret_cast<const std::uint8_t *>(module);
@@ -4817,6 +4857,23 @@ bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *fun
     const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE)
         return false;
+
+    // ⚠️ 2026-09-22（实机崩溃）：必须确认是 **64 位** PE 才能继续。
+    //
+    // 本函数用 `IMAGE_NT_HEADERS`（= 64 位布局）解析，而
+    // `enumerate_process_modules()` 用的是
+    // `TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32` —— 在 **64 位进程**里
+    // `TH32CS_SNAPMODULE32` 会把 **32 位模块也列进来**（MSDN 明载）。
+    //
+    // 32 位 PE 被按 64 位布局解析时：
+    //   - `SizeOfImage` 偏移恰好相同（+56）→ `image_size` 是对的，所以
+    //     下面的 `>= image_size` 检查**不会**拦住它；
+    //   - 但 **`DataDirectory` 偏移不同**（32 位 @96 / 64 位 @112）→
+    //     读到的其实是 32 位模块的 `DataDirectory[3]`（EXCEPTION，即 `.pdata`）。
+    // 结果是**把异常表当成导入表遍历**，进而对任意 RVA 执行写操作。
+    if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return false;
+
     const std::size_t image_size = nt->OptionalHeader.SizeOfImage;
     const std::size_t nt_offset = static_cast<std::size_t>(dos->e_lfanew);
     if (image_size < sizeof(IMAGE_DOS_HEADER) || nt_offset > image_size - sizeof(IMAGE_NT_HEADERS))
@@ -4838,16 +4895,38 @@ bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *fun
         if (_stricmp(name, import_name) != 0)
             continue;
 
+        // 定位 IAT 与查找表各自所在的节（2026-09-22）。
+        // 原来只判断 `offset < image_size`（整个镜像），现在要求两者都
+        // 落在**真实存在的节**内 —— 这是把遍历限制在节内的前提。
+        const DWORD lookup_rva = current_descriptor.OriginalFirstThunk != 0
+            ? current_descriptor.OriginalFirstThunk
+            : current_descriptor.FirstThunk;
+        const IMAGE_SECTION_HEADER *lookup_section = find_section_for_rva(nt, lookup_rva);
+        const IMAGE_SECTION_HEADER *iat_section = find_section_for_rva(nt, current_descriptor.FirstThunk);
+        if (lookup_section == nullptr || iat_section == nullptr)
+            continue;
+
         auto *lookup = reinterpret_cast<IMAGE_THUNK_DATA *>(
-            const_cast<std::uint8_t *>(base) + (current_descriptor.OriginalFirstThunk != 0 ? current_descriptor.OriginalFirstThunk : current_descriptor.FirstThunk));
+            const_cast<std::uint8_t *>(base) + lookup_rva);
         auto *iat = reinterpret_cast<IMAGE_THUNK_DATA *>(const_cast<std::uint8_t *>(base) + current_descriptor.FirstThunk);
         const std::size_t lookup_offset = reinterpret_cast<const std::uint8_t *>(lookup) - base;
         const std::size_t iat_offset = reinterpret_cast<const std::uint8_t *>(iat) - base;
         if (lookup_offset >= image_size || iat_offset >= image_size)
             continue;
+
+        // ⚠️ 2026-09-22（实机崩溃）：遍历上界必须是**节内**，不是整个镜像。
+        //
+        // 原实现用 `(image_size - offset) / 8`。IAT 只占几百字节~几 KB，
+        // 而 image_size 是数 MB —— 于是当查找表比 IAT 长（畸形/加壳模块，
+        // 或上面那类被误判的 32 位模块）时，`iat[thunk_index]` 会越出
+        // 真实 IAT 节，落到后续节上，然后在那里执行写操作。
+        const std::size_t lookup_section_end = section_end_rva(lookup_section);
+        const std::size_t iat_section_end = section_end_rva(iat_section);
+        if (lookup_offset >= lookup_section_end || iat_offset >= iat_section_end)
+            continue;
         const std::size_t thunk_count = std::min(
-            (image_size - lookup_offset) / sizeof(IMAGE_THUNK_DATA),
-            (image_size - iat_offset) / sizeof(IMAGE_THUNK_DATA));
+            (lookup_section_end - lookup_offset) / sizeof(IMAGE_THUNK_DATA),
+            (iat_section_end - iat_offset) / sizeof(IMAGE_THUNK_DATA));
         for (std::size_t thunk_index = 0; thunk_index < thunk_count && lookup[thunk_index].u1.AddressOfData != 0; ++thunk_index)
         {
             if (IMAGE_SNAP_BY_ORDINAL(lookup[thunk_index].u1.Ordinal))
@@ -4863,6 +4942,32 @@ bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *fun
             DWORD old_protect = 0;
             if (!VirtualProtect(&iat[thunk_index].u1.Function, sizeof(std::uintptr_t), PAGE_READWRITE, &old_protect))
                 return false;
+
+            // ⚠️ 2026-09-22（实机崩溃）：**不能只信 VirtualProtect 的返回值**。
+            //
+            // 实测（AMD RX 9070 XT / Win11 26H1，附后反汇编与寄存器）：
+            //   - 对同一地址的**读**成功（`mov rcx,[rbx]`，取到 KERNEL32!LoadLibraryExW）
+            //   - `VirtualProtect` 返回 **TRUE**（`test eax,eax / je` 未跳转）
+            //   - 紧随其后的**写**仍然 ACCESS_VIOLATION
+            //     → `hook_iat_unchecked+0x219` = `mov [rbx],r8`
+            // 即"报成功但实际没放开写权限"。
+            //
+            // 这里用 `VirtualQuery` 复核**真实**保护位；不可写就还原并跳过。
+            // 为什么必须跳过而不是硬写：崩溃虽被 `hook_iat` 的 `__try/__except`
+            // 接住（所以非致命），但**若目标页恰好可写，就会静默把钩子指针
+            // 写进无关内存** —— 那比崩溃更难查。
+            MEMORY_BASIC_INFORMATION mbi{};
+            const DWORD protect = (VirtualQuery(&iat[thunk_index].u1.Function, &mbi, sizeof(mbi)) == sizeof(mbi))
+                ? (mbi.Protect & 0xFF)
+                : 0;
+            const bool writable = protect == PAGE_READWRITE || protect == PAGE_WRITECOPY ||
+                                  protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
+            if (!writable || (mbi.Protect & PAGE_GUARD) != 0)
+            {
+                VirtualProtect(&iat[thunk_index].u1.Function, sizeof(std::uintptr_t), old_protect, &old_protect);
+                g_iat_patch_skipped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
 
             void *current = reinterpret_cast<void *>(iat[thunk_index].u1.Function);
             if (current == replacement)
@@ -4900,6 +5005,10 @@ bool hook_iat(HMODULE module, const char *import_name, const char *function_name
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
+        // 2026-09-22：计数而不是静默吞掉。原实现只 `return false`，
+        // 于是"哪些模块因异常被跳过"完全不可见（实机崩溃能定位纯属侥幸
+        // —— 是 TextureLoader 的 VEH 恰好记了栈）。计数并入 iat_scan 汇总行。
+        g_iat_patch_skipped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 }
@@ -5285,7 +5394,10 @@ void install_loader_hooks_for_loaded_modules()
         " loadlibraryw=" + std::to_string(load_library_w_hooks) +
         " loadlibraryexa=" + std::to_string(load_library_ex_a_hooks) +
         " loadlibraryexw=" + std::to_string(load_library_ex_w_hooks) +
-        " getprocaddress=" + std::to_string(get_proc_address_hooks);
+        " getprocaddress=" + std::to_string(get_proc_address_hooks) +
+        // 2026-09-22：把"被跳过的 IAT 补丁"暴露出来。非 0 说明有模块
+        // 因不可写/异常而未打上钩子 —— 此前完全不可见。
+        " patch_skipped=" + std::to_string(g_iat_patch_skipped.load(std::memory_order_relaxed));
     bool summary_changed = false;
     {
         std::lock_guard lock(g_hook_scan_mutex);
