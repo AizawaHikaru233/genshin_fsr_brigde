@@ -4816,7 +4816,24 @@ std::optional<OptiScalerBridgePacket> build_dispatch_candidate(UINT group_x, UIN
 // 于是"有多少模块没能打上钩子"完全不可见 —— 这次实机崩溃能定位，
 // 靠的还是 TextureLoader 的 VEH 恰好记录了栈，纯属侥幸。
 // 计数会并入 `iat_scan` 汇总行，让失败变得可观测。
-std::atomic<std::size_t> g_iat_patch_skipped{0};
+//
+// ⚠️ 2026-09-22（第二次实机）：必须**按原因拆分**。实测到
+// `patch_skipped=1` 而 `iat_write_fault` 未打印 —— 说明那一次是
+// "写之前就被守卫拦下"，不是"写失败"。合成一个计数无法区分这两种
+// 截然不同的情况，也就无法定案。故拆成三个：
+//   not_writable —— `VirtualProtect` 后 `VirtualQuery` 仍报不可写（写前拦下）
+//   write_fault  —— 写动作本身触发 ACCESS_VIOLATION（`__try` 内接住）
+//   exception    —— 其它异常冒泡到 `hook_iat` 外层 `__except`
+std::atomic<std::size_t> g_iat_skip_not_writable{0};
+std::atomic<std::size_t> g_iat_skip_write_fault{0};
+std::atomic<std::size_t> g_iat_skip_exception{0};
+
+std::size_t iat_skip_total()
+{
+    return g_iat_skip_not_writable.load(std::memory_order_relaxed) +
+           g_iat_skip_write_fault.load(std::memory_order_relaxed) +
+           g_iat_skip_exception.load(std::memory_order_relaxed);
+}
 
 // 取包含 rva 的节（有效范围取 VirtualSize 与 SizeOfRawData 的较大者）。
 // 找不到返回 nullptr。
@@ -5001,7 +5018,7 @@ bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *fun
             if (!writable || (mbi.Protect & PAGE_GUARD) != 0)
             {
                 VirtualProtect(&iat[thunk_index].u1.Function, sizeof(std::uintptr_t), old_protect, &old_protect);
-                g_iat_patch_skipped.fetch_add(1, std::memory_order_relaxed);
+                g_iat_skip_not_writable.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
 
@@ -5033,7 +5050,7 @@ bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *fun
 
             if (!write_ok)
             {
-                g_iat_patch_skipped.fetch_add(1, std::memory_order_relaxed);
+                g_iat_skip_write_fault.fetch_add(1, std::memory_order_relaxed);
                 log_iat_write_fault(module, &iat[thunk_index].u1.Function, thunk_index);
                 continue;
             }
@@ -5069,7 +5086,7 @@ bool hook_iat(HMODULE module, const char *import_name, const char *function_name
         // 2026-09-22：计数而不是静默吞掉。原实现只 `return false`，
         // 于是"哪些模块因异常被跳过"完全不可见（实机崩溃能定位纯属侥幸
         // —— 是 TextureLoader 的 VEH 恰好记了栈）。计数并入 iat_scan 汇总行。
-        g_iat_patch_skipped.fetch_add(1, std::memory_order_relaxed);
+        g_iat_skip_exception.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 }
@@ -5456,16 +5473,20 @@ void install_loader_hooks_for_loaded_modules()
         " loadlibraryexa=" + std::to_string(load_library_ex_a_hooks) +
         " loadlibraryexw=" + std::to_string(load_library_ex_w_hooks) +
         " getprocaddress=" + std::to_string(get_proc_address_hooks) +
-        // 2026-09-22：把"被跳过的 IAT 补丁"暴露出来。非 0 说明有模块
-        // 因不可写/异常而未打上钩子 —— 此前完全不可见。
-        " patch_skipped=" + std::to_string(g_iat_patch_skipped.load(std::memory_order_relaxed));
+        // 2026-09-22：把"被跳过的 IAT 补丁"按**原因**暴露出来。此前合成一个
+        // 计数无法区分"写前被守卫拦下"与"写失败" —— 而这两者指向完全不同的
+        // 结论（前者说明守卫有效，后者说明存在保护位被并发改回之类的竞态）。
+        " patch_skipped=" + std::to_string(iat_skip_total()) +
+        " (not_writable=" + std::to_string(g_iat_skip_not_writable.load(std::memory_order_relaxed)) +
+        " write_fault=" + std::to_string(g_iat_skip_write_fault.load(std::memory_order_relaxed)) +
+        " exception=" + std::to_string(g_iat_skip_exception.load(std::memory_order_relaxed)) + ")";
     // ⚠️ 2026-09-22：`patch_skipped` 必须**无条件可见**。
     //
     // 原先这条汇总挂在 `g_config.log_loader_activity` 上，而它**默认 false**
     // （见该字段定义处）—— 于是新加的计数在默认配置下永远不打印，等于没加。
     // 现在：汇总内容变化仍按原门槛（受 log_loader_activity 控制，避免刷屏），
     // 但**计数一旦变化就打印** —— 因为它代表"有钩子没打上"，属于必须知道的事。
-    const std::size_t patch_skipped = g_iat_patch_skipped.load(std::memory_order_relaxed);
+    const std::size_t patch_skipped = iat_skip_total();
     bool summary_changed = false;
     bool skipped_changed = false;
     {
