@@ -4873,7 +4873,7 @@ std::size_t section_end_rva(const IMAGE_SECTION_HEADER *section)
 // 但对同一地址的写仍然 ACCESS_VIOLATION。机制静态分析无法定论，所以先把
 // **现场**记下来（模块名 + VirtualQuery 的真实字段），下次复现即可定案。
 // 只记前若干次，避免刷屏。
-void log_iat_write_fault(HMODULE module, const void *slot, std::size_t index)
+void log_iat_write_fault(HMODULE module, const void *slot, std::size_t index, DWORD last_error)
 {
     static std::atomic<int> logged{0};
     if (logged.fetch_add(1, std::memory_order_relaxed) >= 8)
@@ -4888,7 +4888,7 @@ void log_iat_write_fault(HMODULE module, const void *slot, std::size_t index)
 
     char buf[512];
     std::snprintf(buf, sizeof(buf),
-        "iat_write_fault module=%s index=%zu addr=%p vq=%zu state=0x%lX protect=0x%lX alloc=0x%lX type=0x%lX",
+        "iat_write_fault module=%s index=%zu addr=%p vq=%zu state=0x%lX protect=0x%lX alloc=0x%lX type=0x%lX lasterr=%lu",
         module_name[0] != '\0' ? module_name : "?",
         index,
         slot,
@@ -4896,7 +4896,8 @@ void log_iat_write_fault(HMODULE module, const void *slot, std::size_t index)
         static_cast<unsigned long>(valid ? mbi.State : 0),
         static_cast<unsigned long>(valid ? mbi.Protect : 0),
         static_cast<unsigned long>(valid ? mbi.AllocationProtect : 0),
-        static_cast<unsigned long>(valid ? mbi.Type : 0));
+        static_cast<unsigned long>(valid ? mbi.Type : 0),
+        static_cast<unsigned long>(last_error));
     log_line(buf);
 }
 
@@ -5029,29 +5030,57 @@ bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *fun
                 return true;
             }
 
-            // ⚠️ 2026-09-22：写操作**单独**用 __try 包住，与 hook_iat 的外层
-            // `__try` 分开。两点原因：
-            //   1) 失败只影响**这一条槽位**，不会让整个模块的 5 个钩子全部放弃；
-            //   2) 可以在写失败后**还原保护位并继续**，而不是把异常抛给外层。
+            // ⚠️ 2026-09-23：改用 `WriteProcessMemory`，**不再直接赋值**。
             //
-            // 写失败**不会造成内存损坏** —— 违例本身就证明写入没有落地。
-            // 记录现场供定案（见 log_iat_write_fault）。
+            // 实机证据（`iat_write_fault` 诊断行，Bridge `E0979019`）：
+            //   module=amd_fidelityfx_framegeneration_dx12.dll index=39
+            //   addr=0x7FFF9A56E138
+            //   state=0x1000 (MEM_COMMIT) protect=0x4 (PAGE_READWRITE)
+            //   alloc=0x80 (PAGE_EXECUTE_WRITECOPY) type=0x1000000 (MEM_IMAGE)
+            // 交叉核对 PE 头：该 DLL 的 IAT RVA = 0x10E000，`.rdata` 也从
+            // 0x10E000 开始 → index 39 落在 0x10E000+39*8 = **0x10E138**，
+            // 与故障地址完全吻合（真实 IAT 项，不是算错地址）。
+            //
+            // 结论：**页面已提交、是模块映像、用户态查询显示 PAGE_READWRITE**，
+            // 而直接赋值仍然 ACCESS_VIOLATION。也就是说拒绝发生在用户态看不到的
+            // 层（内核组件 / 节属性），靠 `VirtualProtect` + `VirtualQuery`
+            // **无法预判** —— 前两版据此设计的守卫再严密也拦不住。
+            //
+            // `WriteProcessMemory` 走 `NtWriteVirtualMemory`：拷贝由内核完成，
+            // 失败时**返回错误码而不是抛异常**。于是：
+            //   - 能写就写（行为不变）
+            //   - 不能写就干净地失败 → **不再产生 first-chance 异常**
+            //     → TextureLoader 的 VEH 不再记录 → 日志里那条"崩溃"消失
+            // 本函数只在打钩子时跑一次（非热路径），用一次系统调用换掉一次
+            // 异常派发是划算的。
+            //
+            // 为什么不加"失败则退回直接赋值"的兜底：直接赋值正是会违例的那条路，
+            // 兜底只会把异常重新引回来；且若 `WriteProcessMemory` 在
+            // MEM_COMMIT + PAGE_READWRITE 的自身进程页上都失败，直接赋值更无可能成功。
+            const ULONGLONG new_value = reinterpret_cast<ULONGLONG>(replacement);
             bool write_ok = false;
+            DWORD write_error = 0;
             __try
             {
-                iat[thunk_index].u1.Function = reinterpret_cast<ULONGLONG>(replacement);
-                write_ok = true;
+                // __try 仅作最后一道防线（API 本身不应抛异常）；
+                // 真正的"不抛异常"保障来自 WriteProcessMemory 的错误码语义。
+                write_ok = WriteProcessMemory(GetCurrentProcess(),
+                                              &iat[thunk_index].u1.Function,
+                                              &new_value, sizeof(new_value), nullptr) != FALSE;
+                if (!write_ok)
+                    write_error = GetLastError(); // 必须在此刻取，还原保护位会覆盖它
             }
             __except (EXCEPTION_EXECUTE_HANDLER)
             {
                 write_ok = false;
+                write_error = GetExceptionCode();
             }
             VirtualProtect(&iat[thunk_index].u1.Function, sizeof(std::uintptr_t), old_protect, &old_protect);
 
             if (!write_ok)
             {
                 g_iat_skip_write_fault.fetch_add(1, std::memory_order_relaxed);
-                log_iat_write_fault(module, &iat[thunk_index].u1.Function, thunk_index);
+                log_iat_write_fault(module, &iat[thunk_index].u1.Function, thunk_index, write_error);
                 continue;
             }
 
