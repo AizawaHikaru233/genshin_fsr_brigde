@@ -2112,6 +2112,24 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         // 旧实现从不 DetourDetach：DLL 卸载后游戏仍会跳进已释放的 trampoline。
         UninstallHooks();
         ::tloader_gdds::Shutdown(); // 释放 GDDS 互操作（D3D12/DS 队列/共享 fence）
+        // ⚠️ 2026-09-23：退出时打印统计汇总 —— 必须在下面释放缓存**之前**，
+        // 否则 cache_entries/cache_MB 全是 0。
+        //
+        // 为什么现在才加：`g_stats_created/matched/bound` 三个计数**一直被自增
+        // 但从未被任何地方读取**（write-only 死存储）。于是上一批
+        // "修正 g_stats_created 语义（原来与 matched 恒等）" 的改动
+        // **没有任何可观测效果，也无法验收**。把汇总打出来，三个计数才有意义：
+        //   hashed  = 带初始数据、被哈希过的纹理数
+        //   matched = 其中命中 mod 覆盖的
+        //   bound   = 替换 SRV 实际被绑定的次数
+        //   hashed - matched = 哈希了但没命中（判断 mod 覆盖范围的关键量）
+        {
+            std::lock_guard<std::mutex> lk(g_lock);
+            TL_LOG(L"[stat] hashed=%ld matched=%ld bound=%ld cache_entries=%u cache_MB=%u",
+                   g_stats_created, g_stats_matched, g_stats_bound,
+                   (unsigned)g_replacements.size(),
+                   (unsigned)(g_cacheBytesTotal.load(std::memory_order_relaxed) / (1024ull * 1024ull)));
+        }
         // 进程退出：统一释放全局持久化的替换缓存（正常运行时不随原纹理销毁，
         // 退出时一次清空；进程卸载后驱动侧资源由系统回收，此处显式 Release）
         {
