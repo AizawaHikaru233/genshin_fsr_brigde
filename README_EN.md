@@ -127,12 +127,71 @@ The hashing algorithm is a verbatim port of 3DMigoto, so **pre-generated `hash=`
 
 ## Usage
 
-Download an archive from [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases), extract it, and run `一键配置.bat`, then follow the prompts to install. For the English interface, run `GenshinFSRBridgeTools.bat`. You can also switch between Chinese and English at any time from the installer main menu; the selection is saved automatically. GitHub release packages include FPS Unlocker and OptiScaler; the installer downloads the [NVIDIA DLSS upscaling component (`nvngx_dlss.dll`)](https://github.com/NVIDIA-RTX/Streamline/releases) and ReShade from their official upstream sources at install time. Local distributions must complete the required components on their own.
-In-game `FSR2` anti-aliasing must be enabled, and the render scale must be below `1`.
+> ⚠️ This package is **Windows-only**. There is no Linux compatibility: the installer relies on Windows
+> batch files and PowerShell, so it cannot run under Wine / Proton (it closes immediately when launched).
+> Linux users should follow **Linux install / Windows manual install** below.
 
-`Dx11FsrBridge.dll` independently hooks Genshin Impact's FSR2 calls and forwards them to the AMD FFX12 SDK, providing FSR4/FSR3/FSR2 upscaling directly on supported GPUs without any external plugin. [OptiScaler](https://github.com/optiscaler/OptiScaler) can optionally be connected to extend the upscaler types (DLSS, XeSS, FSR4 INT8, etc.). The package configures component loading in the default order, so manual ordering is normally not required; `AntiPlayerMosaic.dll` is an optional anti-mosaic/UID-hiding plugin.
+### Windows: one-click script install
 
-When OptiScaler and ReShade are used, their runtime configurations are located in their respective component directories. OptiScaler DLL and log paths, as well as ReShade shader, texture, preset, and screenshot paths, use relative paths. This prevents third-party configuration-saving logic from incorrectly transcoding installation paths that contain Chinese characters. Only the game-directory `[INSTALL] BasePath`, which locates the external ReShade directory, must use a dynamically generated absolute path when installed across directories or drives.
+1. Download the **latest** package from [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases)
+   and extract it to a directory **without Chinese characters or illegal characters**.
+2. Run the installer script (pick by interface language; both are functionally identical):
+
+   | Interface language | File name |
+   |---|---|
+   | Chinese | `一键配置.bat` |
+   | English | `GenshinFSRBridgeTools.bat` |
+
+   You can also switch between Chinese and English at any time from the installer main menu; the selection is saved automatically.
+3. Enter the **frame rate you want to unlock** and **which plugins to install**:
+
+   - **Replacing the upscaler only** → install at least **Bridge**
+   - **DLSS or XeSS needed** → also install **OptiScaler**
+
+> **In-game settings (required)**: enable `FSR2` anti-aliasing and set the render scale **below `1`**.
+
+GitHub release packages include FPS Unlocker and OptiScaler; the installer downloads the
+[NVIDIA DLSS upscaling component (`nvngx_dlss.dll`)](https://github.com/NVIDIA-RTX/Streamline/releases) and ReShade
+from their official upstream sources at install time. Local distributions must complete the required components on their own.
+
+### Linux install / Windows manual install
+
+1. Download the **latest** package from [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases)
+   and extract it to a directory **without Chinese characters or illegal characters**.
+2. Find a launcher that can **inject DLLs into Genshin Impact under Linux + Wine/Proton**.
+   (On Windows, using another launcher with DLL-injection support follows the same procedure.)
+3. Install the components:
+
+   - **Replacing the upscaler only** → install at least **Bridge**
+   - **DLSS or XeSS needed** → also install **OptiScaler**
+
+**Injection order**: **Bridge must load before OptiScaler**. Other plugins have no strict requirement.
+
+When injecting OptiScaler manually, either approach is recommended:
+
+- Point **`OptiDllPath`** in the **`[Libraries]`** section of `OptiScaler.ini` at the **directory containing `OptiScaler.dll`**; or
+- Copy the **entire file set** into the game's main-executable directory the way OptiScaler officially recommends, then specify the DLL to inject.
+
+The main executable differs by release:
+
+| Release | Main executable |
+|---|---|
+| China (CN) | `YuanShen.exe` |
+| Global | `GenshinImpact.exe` |
+
+### Components and paths
+
+`Dx11FsrBridge.dll` independently hooks Genshin Impact's FSR2 calls and forwards them to the AMD FFX12 SDK, providing
+FSR4/FSR3/FSR2 upscaling directly on supported GPUs **without any external plugin**.
+[OptiScaler](https://github.com/optiscaler/OptiScaler) can optionally be connected to extend the upscaler types
+(DLSS, XeSS, FSR4 INT8, etc.). The package configures component loading in the default order, so manual ordering is
+normally not required; `AntiPlayerMosaic.dll` is an optional anti-mosaic / UID-hiding plugin.
+
+When OptiScaler and ReShade are used, their runtime configurations are located in their respective component
+directories. OptiScaler DLL and log paths, as well as ReShade shader, texture, preset, and screenshot paths, use
+**relative paths**. This prevents third-party configuration-saving logic from incorrectly transcoding installation
+paths that contain Chinese characters. Only the game-directory `[INSTALL] BasePath`, which locates the external
+ReShade directory, must use a dynamically generated absolute path when installed across directories or drives.
 
 ## Build
 

@@ -126,12 +126,68 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 
 ## 使用方法
 
-从 [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases) 下载压缩包，解压后运行 `一键配置.bat` 并根据提示安装。英语界面可运行 `GenshinFSRBridgeTools.bat`；也可在安装器主菜单中随时切换中文或 English，选择会自动保存。GitHub 发布包内置 FPS Unlocker 与 OptiScaler，安装脚本会在运行时从官方上游获取 [NVIDIA DLSS 超分组件（`nvngx_dlss.dll`）](https://github.com/NVIDIA-RTX/Streamline/releases) 与 ReShade；本地分发包需要自行补齐相应组件。
-游戏内必须启用 `FSR2` 抗锯齿，渲染精度需低于 `1`。
+> ⚠️ 本插件包**仅面向 Windows**，未做 Linux 兼容：安装脚本依赖 Windows 批处理与 PowerShell，
+> 在 Wine / Proton 下无法运行（双击后立即退出）。Linux 用户请走下方的
+> **Linux 安装 / Windows 手动安装**流程。
 
-`Dx11FsrBridge.dll` 独立 hook 原神的 FSR2 调用并转接到 AMD FFX12 SDK，在支持的显卡上直接实现 FSR4/FSR3/FSR2 超分，无需 OptiScaler 等外部插件。可选接入 [OptiScaler](https://github.com/optiscaler/OptiScaler) 扩展超分类型（DLSS、XeSS、FSR4 INT8 等）。安装包已按默认顺序配置好组件加载，通常无需手动指定；`AntiPlayerMosaic.dll` 为可选的反虚化/UID 隐藏插件。
+### Windows 脚本一键安装
 
-若接入 OptiScaler 和 ReShade，它们的运行配置位于各自组件目录。OptiScaler 的 DLL 与日志路径、ReShade 的着色器、纹理、Preset 和截图路径均使用相对路径，避免安装目录含中文时被第三方配置保存逻辑错误转码。只有游戏目录中用于定位外置 ReShade 目录的 `[INSTALL] BasePath` 在跨目录或跨盘安装时必须使用动态生成的绝对路径。
+1. 从 [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases) 下载**最新版本**的插件包，
+   解压到**不含中文或非法字符**的目录。
+2. 运行安装脚本（按界面语言选择，两者功能相同）：
+
+   | 界面语言 | 文件名 |
+   |---|---|
+   | 中文 | `一键配置.bat` |
+   | English | `GenshinFSRBridgeTools.bat` |
+
+   也可在安装器主菜单中随时切换中文 / English，选择会自动保存。
+3. 按提示填写**需要解锁的帧率**与**要安装的插件**：
+
+   - **只需替换超分模型** → 至少安装 **Bridge**
+   - **需要 DLSS 或 XeSS** → 还需安装 **OptiScaler**
+
+> **游戏内设置（必须）**：启用 `FSR2` 抗锯齿，且渲染精度需**低于 `1`**。
+
+GitHub 发布包内置 FPS Unlocker 与 OptiScaler；安装脚本会在运行时从官方上游获取
+[NVIDIA DLSS 超分组件（`nvngx_dlss.dll`）](https://github.com/NVIDIA-RTX/Streamline/releases) 与 ReShade。
+本地分发包需要自行补齐相应组件。
+
+### Linux 安装 / Windows 手动安装
+
+1. 从 [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases) 下载**最新版本**的插件包，
+   解压到**不含中文或非法字符**的目录。
+2. 找一个**支持在 Linux + Wine/Proton 环境下给原神注入 DLL** 的启动器。
+   （Windows 上改用其它支持 DLL 注入的启动器时，同样参考本流程。）
+3. 安装组件：
+
+   - **只需替换超分模型** → 至少安装 **Bridge**
+   - **需要 DLSS 或 XeSS** → 还需安装 **OptiScaler**
+
+**注入顺序**：**Bridge 必须先于 OptiScaler**；其他插件没有严格要求。
+
+手动注入 OptiScaler 时，推荐二选一：
+
+- 把 `OptiScaler.ini` 中 **`[Libraries]`** 段的 **`OptiDllPath`** 改为 **`OptiScaler.dll` 所在目录**；或
+- 按 OptiScaler 官方推荐方式，把**整套文件**复制到游戏主程序所在目录，再指定注入 DLL。
+
+游戏主程序按发行版区分：
+
+| 发行版 | 主程序 |
+|---|---|
+| 国服 | `YuanShen.exe` |
+| 国际服 | `GenshinImpact.exe` |
+
+### 组件说明与路径
+
+`Dx11FsrBridge.dll` 独立 hook 原神的 FSR2 调用并转接到 AMD FFX12 SDK，在支持的显卡上直接实现
+FSR4/FSR3/FSR2 超分，**无需 OptiScaler 等外部插件**。可选接入
+[OptiScaler](https://github.com/optiscaler/OptiScaler) 扩展超分类型（DLSS、XeSS、FSR4 INT8 等）。
+安装包已按默认顺序配置好组件加载，通常无需手动指定；`AntiPlayerMosaic.dll` 为可选的反虚化 / UID 隐藏插件。
+
+接入 OptiScaler 与 ReShade 后，它们的运行配置位于各自组件目录。OptiScaler 的 DLL 与日志路径、
+ReShade 的着色器 / 纹理 / Preset / 截图路径均使用**相对路径**，避免安装目录含中文时被第三方配置保存逻辑错误转码。
+只有游戏目录中用于定位外置 ReShade 目录的 `[INSTALL] BasePath` 在跨目录或跨盘安装时必须使用动态生成的绝对路径。
 
 ## 构建
 
