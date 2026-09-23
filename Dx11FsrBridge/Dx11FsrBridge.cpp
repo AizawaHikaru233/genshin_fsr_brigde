@@ -3771,8 +3771,11 @@ void load_config()
 {
     const std::filesystem::path config_path = g_module_dir / L"Dx11FsrBridge.ini";
     g_config.enabled = GetPrivateProfileIntW(L"Dx11FsrBridge", L"Enabled", 1, config_path.c_str()) != 0;
-    g_config.enable_logging = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableLogging", 1, config_path.c_str()) != 0;
-    g_logging_enabled.store(g_config.enable_logging, std::memory_order_relaxed);
+    // ⚠️ 2026-09-23（用户要求）：**不再读旧键 `EnableLogging`**。
+    // 日志开关改由 `[Log] level` 派生（`level=off` 即关闭），见下方 [Log] 段。
+    // 这里只给**保守初值**：在 [Log] 段解析完成前保持开启，避免早期日志被丢。
+    g_config.enable_logging = true;
+    g_logging_enabled.store(true, std::memory_order_relaxed);
     g_config.dlssg_dxgi_workaround =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"DlssgDxgiWorkaround", -1, config_path.c_str());
     g_config.hdr_swapchain_spoof =
@@ -4090,26 +4093,57 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FailClosed", 0, config_path.c_str()) != 0;
     // -----------------------------------------------------------------------
     // 日志配置。新方案：显式等级 + 分类过滤（[Log] 段），不做内容推断。
-    // 旧键 LogLevel=0..3 / Ffx12FullLogging 仍然兼容（映射到新等级），
-    // 但 [Log] 段优先——它支持按子系统单独放开（例如只把 probe 调到 debug）。
+    // `[Log] level` 是**唯一权威**（缺省 info）；旧键 LogLevel / Ffx12FullLogging /
+    // EnableLogging **已被停用**（只检测存在性并提示迁移），理由见下方块内注释。
     // -----------------------------------------------------------------------
     {
-        const int legacy = std::clamp(static_cast<int>(
-            GetPrivateProfileIntW(L"Dx11FsrBridge", L"LogLevel", 1, config_path.c_str())), 0, 3);
-        // 旧的 0..3 → 新 Level：0=仅错误 1=核心(INFO) 2=节流细节(DEBUG) 3=全量(TRACE)
-        static constexpr blog::Level k_legacy_map[4] {
-            blog::Level::Error, blog::Level::Info, blog::Level::Debug, blog::Level::Trace
-        };
-        g_config.logging.level = k_legacy_map[legacy];
-        if (GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FullLogging", 0, config_path.c_str()) != 0)
-            g_config.logging.level = blog::Level::Trace;
-
+        // ⚠️ 2026-09-23（用户要求）：**默认等级固定为 info**，且旧键不再改变等级。
+        //
+        // 背景：旧版发布包 ini 里带 `Ffx12FullLogging`（直到 `0322fa4` 才移除），
+        // 它原来会**无条件**把等级抬到 TRACE，且执行顺序在 `LogLevel` 之后 ——
+        // 于是"旧 ini + 没有 [Log] 段"的部署（如用户的 Linux 环境）会**静默变成 TRACE**，
+        // 用户既不知道原因、也没有显式设过 trace。
+        //
+        // 现在：`[Log] level` 是**唯一权威**，缺省 `info`。
+        // 三个旧键（LogLevel / Ffx12FullLogging / EnableLogging）只**检测存在性**，
+        // 不再影响任何行为；存在时记一条 WARN 提示迁移 —— 避免"设置了却无效"的困惑。
         wchar_t level_text[32] {};
-        GetPrivateProfileStringW(L"Log", L"level", L"", level_text,
+        GetPrivateProfileStringW(L"Log", L"level", L"info", level_text,
                                  static_cast<DWORD>(std::size(level_text)), config_path.c_str());
         blog::Level parsed {};
-        if (level_text[0] != L'\0' && blog::parse_level(narrow(level_text).c_str(), parsed))
-            g_config.logging.level = parsed;
+        if (!blog::parse_level(narrow(level_text).c_str(), parsed))
+        {
+            // 解析失败也回落 info（而非 TRACE）—— 与"默认 info"一致
+            parsed = blog::Level::Info;
+            g_config.logging.pending_warnings.push_back(
+                std::string("log_level_unparsed value=") + narrow(level_text) + " fallback=info");
+        }
+        g_config.logging.level = parsed;
+
+        // 日志开关由等级派生：`level=off` 即关闭（替代旧键 `EnableLogging`）
+        g_config.enable_logging = (parsed != blog::Level::Off);
+        g_logging_enabled.store(g_config.enable_logging, std::memory_order_relaxed);
+
+        // 旧键：只检测存在性，用于提示迁移
+        {
+            std::string legacy_keys;
+            for (const wchar_t *key : {L"LogLevel", L"Ffx12FullLogging", L"EnableLogging"})
+            {
+                wchar_t legacy_buf[32] {};
+                GetPrivateProfileStringW(L"Dx11FsrBridge", key, L"", legacy_buf,
+                                         static_cast<DWORD>(std::size(legacy_buf)), config_path.c_str());
+                if (legacy_buf[0] != L'\0')
+                {
+                    if (!legacy_keys.empty())
+                        legacy_keys += ",";
+                    legacy_keys += narrow(key);
+                }
+            }
+            if (!legacy_keys.empty())
+                g_config.logging.pending_warnings.push_back(
+                    "legacy_log_keys_ignored keys=" + legacy_keys +
+                    " migrate_to=[Log] level (default info) / to_file");
+        }
 
         g_config.logging.to_debugger =
             GetPrivateProfileIntW(L"Log", L"to_debugger", 0, config_path.c_str()) != 0;
@@ -4161,7 +4195,11 @@ void load_config()
                 std::to_string(std::size(section)) + " parsed=" +
                 std::to_string(g_config.logging.categories.size()));
         }
-        g_bridge_log_level = legacy; // 保留旧字段供兼容读取
+        // 旧字段（已无任何读取点）：按**新等级**回填，避免留下过期值。
+        g_bridge_log_level =
+            (parsed == blog::Level::Trace) ? 3 :
+            (parsed == blog::Level::Debug) ? 2 :
+            (parsed == blog::Level::Off || parsed == blog::Level::Error) ? 0 : 1;
     }
 
     // 渲染精度 hook 总开关（**正式版必须在此读取**——非正式版分支另有一份同样的读取，
