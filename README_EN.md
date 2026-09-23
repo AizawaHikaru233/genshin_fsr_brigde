@@ -169,7 +169,19 @@ from their official upstream sources at install time. Local distributions must c
 
 When injecting OptiScaler manually, either approach is recommended:
 
-- Point **`OptiDllPath`** in the **`[Libraries]`** section of `OptiScaler.ini` at the **directory containing `OptiScaler.dll`**; or
+- Point **`OptiDllPath`** in the **`[Libraries]`** section of `OptiScaler.ini` at the **directory holding the upscaling
+  components** — that is, the directory containing `amd_fidelityfx_upscaler_dx12.dll`. It is **not necessarily** the
+  directory containing `OptiScaler.dll`:
+
+  | OptiScaler version | Layout | What to set `OptiDllPath` to |
+  |---|---|---|
+  | 0.9.x | Flat: components sit next to `OptiScaler.dll` | the directory containing `OptiScaler.dll` |
+  | 0.10 nightly | Nested: components live in an `OptiScaler\` subdirectory | that `OptiScaler\` subdirectory |
+
+  > Note that `OptiScaler.dll` and `OptiScaler.ini` sit at the **root level in both layouts** (OptiScaler reads its
+  > ini from its own directory), so do **not** simply use the ini's directory as `OptiDllPath`. Getting it wrong makes
+  > OptiScaler inject successfully yet find no upscaling backend at all ("takes over but cannot enable"), and it may
+  > also hang in DETACH on exit, leaving the process behind.
 - Copy the **entire file set** into the game's main-executable directory the way OptiScaler officially recommends, then specify the DLL to inject.
 
 The main executable differs by release:

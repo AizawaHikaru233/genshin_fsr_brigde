@@ -168,7 +168,17 @@ GitHub 发布包内置 FPS Unlocker 与 OptiScaler；安装脚本会在运行时
 
 手动注入 OptiScaler 时，推荐二选一：
 
-- 把 `OptiScaler.ini` 中 **`[Libraries]`** 段的 **`OptiDllPath`** 改为 **`OptiScaler.dll` 所在目录**；或
+- 把 `OptiScaler.ini` 中 **`[Libraries]`** 段的 **`OptiDllPath`** 改为**超分组件所在目录**
+  —— 即含 `amd_fidelityfx_upscaler_dx12.dll` 的那个目录。它**不一定**是 `OptiScaler.dll` 所在目录：
+
+  | OptiScaler 版本 | 布局 | `OptiDllPath` 应填 |
+  |---|---|---|
+  | 0.9.x | 平铺：组件与 `OptiScaler.dll` 同层 | `OptiScaler.dll` 所在目录 |
+  | 0.10 每夜版 | 嵌套：组件在 `OptiScaler\` 子目录 | 该 `OptiScaler\` 子目录 |
+
+  > 注意 `OptiScaler.dll` 与 `OptiScaler.ini` **两种布局下都在根层**（OptiScaler 从自身所在目录读 ini），
+  > 所以**不要**直接把 ini 所在目录当作 `OptiDllPath`。填错会导致 OptiScaler 注入成功
+  > 却找不到任何超分后端（"接管了却无法启用"），退出时还可能 DETACH 卡死、进程残留。
 - 按 OptiScaler 官方推荐方式，把**整套文件**复制到游戏主程序所在目录，再指定注入 DLL。
 
 游戏主程序按发行版区分：
