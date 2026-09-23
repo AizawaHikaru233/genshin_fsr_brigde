@@ -1553,13 +1553,40 @@ DWORD WINAPI VramMonitorThread(LPVOID)
 // 轻量配置读取：DLL 同目录 TextureLoader.ini（key = value，支持 ; 注释）
 // ---------------------------------------------------------------------------
 
-static std::wstring GetIniValue(const std::wstring &dir, const std::wstring &key)
+// ⚠️ 2026-09-23（审核报告）：ini **只读一次**，不再每个键都把整个文件重读一遍。
+//
+// 原实现每次 `GetIniValue` 都走 `CreateFileW` + 整文件 `ReadFile` + UTF-8 转码
+// + 逐行解析。而 `DllMain` 的初始化块里有 **8 次**读取
+// （observe_only / log_level / max_texture_side / gdds_enabled /
+//  async_load ×2 / vram_threshold / mods_dir）
+// ⇒ 同一份 73 行的 ini 被完整读入并解析 8 遍。
+//
+// 关键点不只是浪费 I/O：这些调用**全部发生在 loader lock 持有期间**（DllMain），
+// 属于已知的死锁模式（与已修的 `log_init` 内 fopen 同性质）——
+// 该窗口应尽量缩短。8 次文件打开/读取/关闭收窄为 1 次。
+//
+// 语义**原样保留**：同名键取**最后一次**出现（"后出现覆盖先前"）、
+// `;` 行内注释截断、键与值的首尾空白裁剪、UTF-8 失败时退回按字节扩展。
+struct IniCache
 {
-    std::wstring path = dir + L"TextureLoader.ini";
+    std::mutex mutex;
+    bool loaded = false;
+    std::wstring source; // 已解析的文件路径；dir 变化时重载
+    std::unordered_map<std::wstring, std::wstring> values;
+};
+IniCache g_ini_cache;
+
+// 调用方必须已持有 g_ini_cache.mutex。
+static void reload_ini_locked(const std::wstring &path)
+{
+    g_ini_cache.values.clear();
+    g_ini_cache.source = path;
+    g_ini_cache.loaded = true;
+
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE)
-        return L"";
+        return;
     std::string data;
     char buf[4096];
     DWORD got = 0;
@@ -1578,7 +1605,6 @@ static std::wstring GetIniValue(const std::wstring &dir, const std::wstring &key
     }
 
     size_t pos = 0;
-    std::wstring matched;
     while (pos < wdata.size()) {
         size_t eol = wdata.find(L'\n', pos);
         if (eol == std::wstring::npos)
@@ -1600,10 +1626,18 @@ static std::wstring GetIniValue(const std::wstring &dir, const std::wstring &key
         while (!v.empty() && (v.back() == L' ' || v.back() == L'\t')) v.pop_back();
         // 自研无 section 行解析：同名键允许出现多次（如外部工具追加 [General] 段），
         // 取最后一个匹配——后出现的键覆盖先前的空值/旧值。
-        if (k == key)
-            matched = v;
+        g_ini_cache.values[k] = v;
     }
-    return matched;
+}
+
+static std::wstring GetIniValue(const std::wstring &dir, const std::wstring &key)
+{
+    const std::wstring path = dir + L"TextureLoader.ini";
+    std::lock_guard<std::mutex> lk(g_ini_cache.mutex);
+    if (!g_ini_cache.loaded || g_ini_cache.source != path)
+        reload_ini_locked(path);
+    auto it = g_ini_cache.values.find(key);
+    return it == g_ini_cache.values.end() ? std::wstring() : it->second;
 }
 
 static bool IniBool(const std::wstring &dir, const std::wstring &key, bool def)
