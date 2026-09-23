@@ -168,6 +168,16 @@ void log_write(const wchar_t *fmt, ...)
     fwprintf(g_file, L"%04d-%02d-%02d %02d:%02d:%02d.%03d  %s\n",
              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
              buf);
+    // ⚠️ 2026-09-23（审核报告「每行 fflush 且持全锁」）—— **评估后刻意保留**：
+    //
+    // 每行 fflush 换到的是**崩溃尾完整性**：进程异常终止时，最后几行已在盘上。
+    // 本项目**多次依赖**这一点定位问题（VEH 记录的崩溃现场、IAT 写违例的诊断行
+    // 都出现在日志末尾）。改成缓冲/定期 flush 会让这些行在崩溃时丢失 ——
+    // 而那正是最需要它们的时候。
+    //
+    // 成本实测可忽略：常规详细度下一次会话仅数百行日志，
+    // 即数百次 WriteFile，摊到数十分钟里不构成竞争。
+    // 代价是"高详细度（level 2）下持锁时间随行数线性增长" —— 已知且接受。
     fflush(g_file);
 }
 } // namespace tloader

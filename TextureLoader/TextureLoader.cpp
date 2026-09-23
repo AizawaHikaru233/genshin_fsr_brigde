@@ -413,7 +413,26 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return ++ref; }
     ULONG STDMETHODCALLTYPE Release() override
     {
-        ULONG r = --ref;
+        // ⚠️ 2026-09-23（审核报告）：下溢防护。
+        //
+        // `ref` 初值为 0，本对象能否正确触发**完全依赖** `SetPrivateDataInterface`
+        // 按 COM 约定 AddRef。若它没有 AddRef（或 D3D 内部多调一次 Release），
+        // 原来的 `--ref` 会**回绕到 ULONG_MAX**，`r == 0` 永不成立
+        // ⇒ tracker 永不触发 ⇒ `g_replacements[hash].refcount` 永不递减
+        // ⇒ 该条目**永不可淘汰**（静默显存泄漏，且现象与"缓存策略正常"无法区分）。
+        //
+        // 改用 CAS：归零后再 Release 只返回 0，既不下溢也不重复触发。
+        ULONG prev = ref.load(std::memory_order_relaxed);
+        for (;;)
+        {
+            if (prev == 0)
+                return 0; // 已归零：不再下溢，也不再触发
+            if (ref.compare_exchange_weak(prev, prev - 1,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_relaxed))
+                break;
+        }
+        const ULONG r = prev - 1;
         if (r == 0) {
             // 原纹理销毁：替换缓存引用计数 -1。
             // 缓存全局持久化（与 3DMigoto CustomResource 同策略）：原纹理销毁
@@ -1050,6 +1069,45 @@ static void STDMETHODCALLTYPE HookUpdateSubresource(
 }
 
 // ---------------------------------------------------------------------------
+// Hook: CopyResource — 与 UpdateSubresource 同理标记动态纹理
+// ---------------------------------------------------------------------------
+//
+// ⚠️ 2026-09-23（审核报告）：原实现**只** hook 了 `UpdateSubresource`，
+// 于是"创建时带初始数据（被我们哈希并替换）、之后由游戏用 `CopyResource`
+// 覆写内容"的纹理不会被标记为动态 ⇒ 替换纹理**过期**（画面与游戏状态不一致），
+// 且这种不一致只在特定角色/特效上出现，很难归因。
+//
+// 为什么**不**同时 hook `Map`/`Unmap`：纹理经 `Map` 更新要求
+// `D3D11_USAGE_DYNAMIC`/`STAGING`，而 `HookCreateTexture2D` 只对**带初始数据**
+// 的纹理算哈希 —— 这类纹理极少同时满足；反观 `Map`/`Unmap` 是**极热路径**
+// （每帧大量常量缓冲/顶点缓冲都走它），为覆盖罕见情形而给它加一次线性扫描不划算。
+// 该限制在此显式记录（审核报告给出的"补 hook 或文档明确限制"两条路，此处各取一半）。
+
+typedef void(STDMETHODCALLTYPE *CopyResource_t)(ID3D11DeviceContext *,
+    ID3D11Resource *, ID3D11Resource *);
+CopyResource_t g_real_copy_resource = nullptr;
+
+static void STDMETHODCALLTYPE HookCopyResource(
+    ID3D11DeviceContext *This,
+    ID3D11Resource *pDstResource,
+    ID3D11Resource *pSrcResource)
+{
+    // 与 HookUpdateSubresource 同构：先无锁判空（替换未启用时零开销），
+    // 命中活跃替换资源才进锁查 hash、标记动态并移出活跃数组。
+    if (pDstResource && g_activeCount != 0) {
+        if (ActiveContains(pDstResource)) {
+            uint32_t h = 0;
+            std::lock_guard<std::mutex> lk(g_lock);
+            if (GetResourceHash(pDstResource, &h)) {
+                MarkDynamic(pDstResource);
+                ActiveRemove(pDstResource);
+            }
+        }
+    }
+    g_real_copy_resource(This, pDstResource, pSrcResource);
+}
+
+// ---------------------------------------------------------------------------
 // vtable hook 安装
 // ---------------------------------------------------------------------------
 // 槽位号一律不硬编码：通过下面的镜像 vtable 结构体按成员名取函数指针，
@@ -1183,10 +1241,14 @@ static void HookContext(ID3D11DeviceContext *context)
     // UpdateSubresource：标记动态纹理
     g_real_update_subresource = (UpdateSubresource_t)vtbl->UpdateSubresource;
     DetourAttach(&(PVOID &)g_real_update_subresource, HookUpdateSubresource);
+    // CopyResource：同上（2026-09-23 补，见 HookCopyResource 的说明）
+    g_real_copy_resource = (CopyResource_t)vtbl->CopyResource;
+    DetourAttach(&(PVOID &)g_real_copy_resource, HookCopyResource);
     DetourTransactionCommit();
     for (int i = 0; i < 6; i++)
         TL_LOG(L"[ok  ] hooked %ls.SetShaderResources @ %p", g_stage_name[i], g_real_ssr[i]);
     TL_LOG(L"[ok  ] hooked UpdateSubresource @ %p", g_real_update_subresource);
+    TL_LOG(L"[ok  ] hooked CopyResource @ %p", g_real_copy_resource);
 }
 
 // ---------------------------------------------------------------------------
@@ -1925,6 +1987,10 @@ static void UninstallHooks()
     }
     if (g_real_update_subresource != nullptr)
         DetourDetach(&(PVOID &)g_real_update_subresource, HookUpdateSubresource);
+    // ⚠️ 新增钩子必须在此同步摘除：漏摘会让 DLL 卸载后游戏仍跳进已释放的
+    // trampoline（`c9bb8df` 修过的正是这类缺陷）。
+    if (g_real_copy_resource != nullptr)
+        DetourDetach(&(PVOID &)g_real_copy_resource, HookCopyResource);
     if (RealD3D11CreateDevice != nullptr)
         DetourDetach(&(PVOID &)RealD3D11CreateDevice, HookD3D11CreateDevice);
     if (RealD3D11CreateDeviceAndSwapChain != nullptr)
