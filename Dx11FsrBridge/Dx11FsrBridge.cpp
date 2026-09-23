@@ -13440,13 +13440,18 @@ void initialize()
             append_code_bytes(camera_target, exe_base + hook_cfg.camera_rva, 16);
             LOG_INFO(blog::cat::probe, camera_target);
         }
-        if (il2cpp_callsite::install(exe_base, hook_cfg))
+        const char *install_reason = nullptr;
+        if (il2cpp_callsite::install(exe_base, hook_cfg, &install_reason))
             LOG_INFO(blog::cat::hook, "fsr2_il2cpp_hook_installed mode=" +
                 (g_config.fsr2_il2cpp_skip_render ? std::string("skip") : std::string("observe")) +
                 " render_va=" + hex64(exe_base + hook_cfg.render_rva));
         else
         {
+            // ⚠️ 2026-09-23（审核项）：如实带上**失败原因**。此前只有"失败了"，
+            // 分不清 RVA 为 0（配置）/ 序言不匹配（游戏更新）/ 分配失败（资源）——
+            // 三者处置完全不同，缺了这句就只能靠猜。
             LOG_ERROR(blog::cat::hook, "fsr2_il2cpp_hook_failed render_rva=" + hex64(hook_cfg.render_rva) +
+                " reason=" + (install_reason != nullptr ? std::string(install_reason) : std::string("unknown")) +
                 " skip=" + std::to_string(g_config.fsr2_il2cpp_skip_render ? 1 : 0) +
                 " fallback=draw_family_skip");
             // RVA 自动识别诊断：扫描 render/ucb 序言配对候选（国际服/版本更新偏移对齐）
@@ -13457,7 +13462,7 @@ void initialize()
                 std::ostringstream cand_log;
                 cand_log << "fsr2_il2cpp_rva_candidates count=" << candidates.size() << " rvas=";
                 for (const std::uint32_t rva : candidates)
-                    cand_log << "0x" << hex64(rva) << " ";
+                    cand_log << hex64(rva) << " "; // hex64 已含 0x 前缀，勿再加
                 LOG_INFO(blog::cat::probe, cand_log.str());
             }
         }

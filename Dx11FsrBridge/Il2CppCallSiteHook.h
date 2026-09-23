@@ -46,8 +46,21 @@ struct RenderToken
 };
 
 // 安装钩子。失败时原代码未改动（调用方应回退到 draw 层家族跳过）。
-bool install(std::uint64_t exe_base, const Config &cfg);
-// 还原原字节并释放 stub（DLL_PROCESS_DETACH 调用）。
+//
+// ⚠️ 2026-09-23（审核项）：**失败原因通过 `out_reason` 如实报出**。
+// 此前 6 条失败路径一律静默 `return false`，调用点只知道"失败了"，
+// **分不清是 RVA 为 0、序言不匹配（游戏更新）还是 VirtualAlloc 失败** ——
+// 而这三者的处置完全不同（前者是配置问题、中者是版本问题、后者是资源问题）。
+//
+// 为什么不用日志：本 TU **刻意不依赖 BridgeLogger**（测试目标只编译本 cpp，
+// 引入日志会破坏其链接）。记录由调用点负责，本模块只负责**如实报告原因**。
+// 取值：`bad_rva` / `render_prologue_mismatch` / `ucb_relation_mismatch` /
+//       `ucb_prologue_mismatch` / `protect_failed` / `alloc_failed`
+bool install(std::uint64_t exe_base, const Config &cfg, const char **out_reason = nullptr);
+// 还原原字节（DLL_PROCESS_DETACH 调用）。
+//
+// ⚠️ 2026-09-23：**不再释放 stub**（详见实现处注释：还原只能阻止"新的"跳入，
+// 无法排除已有线程正执行在 stub 内；stub 仅 64 字节，泄漏远优于崩溃）。
 void shutdown();
 bool active();
 // observe/skip 模式下 stub 累计的 Render 调用次数。

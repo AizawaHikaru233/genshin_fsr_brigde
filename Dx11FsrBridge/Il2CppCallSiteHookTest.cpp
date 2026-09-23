@@ -231,13 +231,80 @@ void run_per_instance_test()
     CHECK(!il2cpp_callsite::active(), "per-instance: inactive after shutdown");
 }
 
+// 2026-09-23（审核项）新增：验证两条新行为。
+// 此前 install 失败只返回 false（调用点无法区分原因），shutdown 盲目还原
+// （会把别人的补丁抹掉）—— 两者都需要测试守住。
+void run_install_reason_test()
+{
+    const std::uint64_t exe_base = reinterpret_cast<std::uint64_t>(g_base);
+    il2cpp_callsite::Config cfg;
+    cfg.update_cmd_buffer_rva = 0x2000 - 0x70;
+
+    // 1) RVA 为 0
+    cfg.render_rva = 0;
+    const char *reason = nullptr;
+    CHECK(!il2cpp_callsite::install(exe_base, cfg, &reason), "reason: rva=0 fails");
+    CHECK(reason != nullptr && std::strcmp(reason, "bad_rva") == 0, "reason: rva=0 reports bad_rva");
+
+    // 2) 序言不匹配（模拟游戏更新后 RVA 偏移）
+    cfg.render_rva = 0x2000 + 0x80;
+    reason = nullptr;
+    CHECK(!il2cpp_callsite::install(exe_base, cfg, &reason), "reason: bad prologue fails");
+    CHECK(reason != nullptr && std::strcmp(reason, "render_prologue_mismatch") == 0,
+          "reason: bad prologue reports render_prologue_mismatch");
+
+    // 3) ucb 关系不匹配（ucb 不在 render 之前）
+    cfg.render_rva = 0x2000;
+    cfg.update_cmd_buffer_rva = 0x2000 + 0x10;
+    reason = nullptr;
+    CHECK(!il2cpp_callsite::install(exe_base, cfg, &reason), "reason: bad ucb relation fails");
+    CHECK(reason != nullptr && std::strcmp(reason, "ucb_relation_mismatch") == 0,
+          "reason: bad ucb relation reports ucb_relation_mismatch");
+
+    // 不传 out_reason 时行为不变（旧调用点兼容）
+    CHECK(!il2cpp_callsite::install(exe_base, cfg), "reason: null out_reason still fails cleanly");
+    il2cpp_callsite::shutdown();
+}
+
+void run_shutdown_skip_when_overwritten_test()
+{
+    const std::uint64_t exe_base = reinterpret_cast<std::uint64_t>(g_base);
+    il2cpp_callsite::Config cfg;
+    cfg.render_rva = 0x2000;
+    cfg.update_cmd_buffer_rva = 0x2000 - 0x70;
+    CHECK(il2cpp_callsite::install(exe_base, cfg), "overwritten: install returns true");
+
+    // 模拟"另一个插件在我们的跳转之上又写了补丁"：
+    // 直接改写目标前 12 字节为一段可识别的标记。
+    std::uint8_t foreign[sizeof(k_render_head)];
+    for (std::size_t i = 0; i < sizeof(foreign); ++i)
+        foreign[i] = static_cast<std::uint8_t>(0xA0 + i);
+    DWORD old_protect = 0;
+    CHECK(VirtualProtect(g_render, sizeof(foreign), PAGE_EXECUTE_READWRITE, &old_protect) != 0,
+          "overwritten: unprotect");
+    std::memcpy(g_render, foreign, sizeof(foreign));
+    VirtualProtect(g_render, sizeof(foreign), old_protect, &old_protect);
+
+    il2cpp_callsite::shutdown();
+
+    // 关键断言：**不得**把对方的补丁还原成我们的 g_saved
+    CHECK(std::memcmp(g_render, foreign, sizeof(foreign)) == 0,
+          "overwritten: shutdown does NOT clobber a foreign patch");
+    CHECK(!il2cpp_callsite::active(), "overwritten: inactive after shutdown");
+
+    // 复位，避免影响后续用例
+    std::memcpy(g_render, k_render_head, sizeof(k_render_head));
+}
+
 int main()
 {
     std::printf("Il2CppCallSiteHookTest\n");
     setup_pages();
     run_verify_failure();
+    run_install_reason_test();
     run_test(false); // observe
     run_test(true);  // skip
+    run_shutdown_skip_when_overwritten_test();
     run_per_instance_test();
     run_camera_hook_test();
     VirtualFree(g_base, 0, MEM_RELEASE);

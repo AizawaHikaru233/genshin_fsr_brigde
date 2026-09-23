@@ -265,28 +265,58 @@ std::vector<std::uint32_t> scan_render_candidates(std::uint64_t exe_base,
     return candidates;
 }
 
-bool install(std::uint64_t exe_base, const Config &cfg)
+// 失败路径统一出口（2026-09-23，审核项）：
+// 记录原因供调用点如实上报，并保证 `false` 的语义不变。
+// 本 TU 不依赖 BridgeLogger（测试目标只编译本 cpp），故只写 out 参数、不记日志。
+namespace
 {
+bool fail_install(const char *reason, const char **out_reason)
+{
+    if (out_reason != nullptr)
+        *out_reason = reason;
+    return false;
+}
+
+// 构造写入目标的绝对跳转：`48 B8 <stub u64> FF E0`，余下用 `0x90` 填充。
+//
+// ⚠️ 三处 install（render / camera / projection）与 shutdown 的校验**必须共用本函数**。
+// 若两边的构造方式漂移，shutdown 的"校验后还原"会**永远判定不匹配** →
+// 静默跳过还原 → 原字节留在被 patch 状态，比不校验更糟。
+void build_jmp_patch(std::uint8_t *patch, std::size_t len, const std::uint8_t *stub)
+{
+    std::memset(patch, 0x90, len);
+    patch[0] = 0x48;
+    patch[1] = 0xB8;
+    write_u64(patch + 2, reinterpret_cast<std::uint64_t>(stub));
+    patch[10] = 0xFF;
+    patch[11] = 0xE0;
+}
+} // namespace
+
+bool install(std::uint64_t exe_base, const Config &cfg, const char **out_reason)
+{
+    if (out_reason != nullptr)
+        *out_reason = nullptr;
     if (g_active.load(std::memory_order_relaxed))
         return true;
     if (exe_base == 0 || cfg.render_rva == 0)
-        return false;
+        return fail_install("bad_rva", out_reason);
 
     std::uint8_t *render = reinterpret_cast<std::uint8_t *>(exe_base + cfg.render_rva);
     std::uint8_t *ucb = reinterpret_cast<std::uint8_t *>(exe_base + cfg.update_cmd_buffer_rva);
 
     // 序言验证（RVA 或版本不匹配时安全放弃）
     if (std::memcmp(render, k_render_head, sizeof(k_render_head)) != 0)
-        return false;
+        return fail_install("render_prologue_mismatch", out_reason);
     if (ucb >= render || render - ucb != static_cast<std::ptrdiff_t>(cfg.render_rva - cfg.update_cmd_buffer_rva))
-        return false;
+        return fail_install("ucb_relation_mismatch", out_reason);
     if (std::memcmp(ucb, k_ucb_head, sizeof(k_ucb_head)) != 0)
-        return false;
+        return fail_install("ucb_prologue_mismatch", out_reason);
 
     // 保存原字节
     DWORD old_protect = 0;
     if (!VirtualProtect(render, k_patch_len, PAGE_EXECUTE_READWRITE, &old_protect))
-        return false;
+        return fail_install("protect_failed", out_reason);
     std::memcpy(g_saved, render, k_patch_len);
 
     // 分配可执行 stub
@@ -295,17 +325,13 @@ bool install(std::uint64_t exe_base, const Config &cfg)
     if (g_stub == nullptr)
     {
         VirtualProtect(render, k_patch_len, old_protect, &old_protect);
-        return false;
+        return fail_install("alloc_failed", out_reason);
     }
     build_stub(cfg.skip_render, render, g_stub);
 
     // 写 12 字节绝对跳转: 48 B8 <stub> FF E0
     std::uint8_t patch[k_patch_len] {};
-    patch[0] = 0x48;
-    patch[1] = 0xB8;
-    write_u64(patch + 2, reinterpret_cast<std::uint64_t>(g_stub));
-    patch[10] = 0xFF;
-    patch[11] = 0xE0;
+    build_jmp_patch(patch, k_patch_len, g_stub);
     std::memcpy(render, patch, k_patch_len);
     VirtualProtect(render, k_patch_len, old_protect, &old_protect);
     FlushInstructionCache(GetCurrentProcess(), render, k_patch_len);
@@ -322,54 +348,65 @@ void shutdown()
     const bool projection_active = g_projection_active.exchange(false, std::memory_order_acq_rel);
     if (!render_active && !camera_active && !projection_active)
         return;
+
+    // ---------------------------------------------------------------------
+    // ⚠️ 2026-09-23（审核项）：**校验后还原**，不再盲目 `memcpy(g_saved)`。
+    //
+    // 为什么：若期间有别的插件在我们的跳转**之上**又写了补丁（典型：OptiScaler
+    // 也 hook 同一个函数），盲目还原会**把对方的补丁抹掉** —— 对方的钩子静默失效，
+    // 且表现为"用了本桥之后另一个插件就不工作了"，极难归因。
+    // 现在：只有当前字节**仍是我们写入的那条 jmp** 时才还原；否则跳过。
+    //
+    // 注：跳过还原意味着原字节留在被 patch 状态 —— 但那正是**对方的**补丁，
+    // 保持现状才是正确行为（谁最后写谁负责）。
+    // ---------------------------------------------------------------------
+    const auto restore_if_ours = [](std::uint8_t *target, std::size_t len,
+                                    const std::uint8_t *stub, const std::uint8_t *saved) -> bool
+    {
+        if (target == nullptr)
+            return false;
+        std::uint8_t expected[k_camera_patch_len] {}; // 三者中最大
+        build_jmp_patch(expected, len, stub);
+        if (std::memcmp(target, expected, len) != 0)
+            return false; // 已被他人改写 → 不动
+        DWORD old_protect = 0;
+        if (!VirtualProtect(target, len, PAGE_EXECUTE_READWRITE, &old_protect))
+            return false;
+        std::memcpy(target, saved, len);
+        VirtualProtect(target, len, old_protect, &old_protect);
+        FlushInstructionCache(GetCurrentProcess(), target, len);
+        return true;
+    };
+
     if (render_active && g_render != nullptr)
     {
-        DWORD old_protect = 0;
-        if (VirtualProtect(g_render, k_patch_len, PAGE_EXECUTE_READWRITE, &old_protect))
-        {
-            std::memcpy(g_render, g_saved, k_patch_len);
-            VirtualProtect(g_render, k_patch_len, old_protect, &old_protect);
-            FlushInstructionCache(GetCurrentProcess(), g_render, k_patch_len);
-        }
+        restore_if_ours(g_render, k_patch_len, g_stub, g_saved);
         g_render = nullptr;
-    }
-    if (render_active && g_stub != nullptr)
-    {
-        VirtualFree(g_stub, 0, MEM_RELEASE);
-        g_stub = nullptr;
     }
     if (camera_active && g_camera_render != nullptr)
     {
-        DWORD old_protect = 0;
-        if (VirtualProtect(g_camera_render, k_camera_patch_len, PAGE_EXECUTE_READWRITE, &old_protect))
-        {
-            std::memcpy(g_camera_render, g_camera_saved, k_camera_patch_len);
-            VirtualProtect(g_camera_render, k_camera_patch_len, old_protect, &old_protect);
-            FlushInstructionCache(GetCurrentProcess(), g_camera_render, k_camera_patch_len);
-        }
+        restore_if_ours(g_camera_render, k_camera_patch_len, g_camera_stub, g_camera_saved);
         g_camera_render = nullptr;
-    }
-    if (camera_active && g_camera_stub != nullptr)
-    {
-        VirtualFree(g_camera_stub, 0, MEM_RELEASE);
-        g_camera_stub = nullptr;
     }
     if (projection_active && g_projection_setter != nullptr)
     {
-        DWORD old_protect = 0;
-        if (VirtualProtect(g_projection_setter, k_projection_patch_len, PAGE_EXECUTE_READWRITE, &old_protect))
-        {
-            std::memcpy(g_projection_setter, g_projection_saved, k_projection_patch_len);
-            VirtualProtect(g_projection_setter, k_projection_patch_len, old_protect, &old_protect);
-            FlushInstructionCache(GetCurrentProcess(), g_projection_setter, k_projection_patch_len);
-        }
+        restore_if_ours(g_projection_setter, k_projection_patch_len, g_projection_stub, g_projection_saved);
         g_projection_setter = nullptr;
     }
-    if (projection_active && g_projection_stub != nullptr)
-    {
-        VirtualFree(g_projection_stub, 0, MEM_RELEASE);
-        g_projection_stub = nullptr;
-    }
+
+    // ---------------------------------------------------------------------
+    // ⚠️ 2026-09-23（审核项）：**刻意不 `VirtualFree` 三个 stub**。
+    //
+    // 原实现无条件释放。但还原原字节只能阻止**新的**跳入，**无法排除此刻已有线程
+    // 正执行在 stub 内** —— `FreeLibrary` 并不终止其他线程（只有 `TerminateProcess` 会），
+    // 于是那些线程会跳进已解除映射的内存 → **崩溃**。
+    //
+    // stub 各仅 64/… 字节，**泄漏它们远优于崩溃**；这里把指针置空，
+    // 故不存在重复释放，重新 install 也会重新分配。
+    // ---------------------------------------------------------------------
+    g_stub = nullptr;
+    g_camera_stub = nullptr;
+    g_projection_stub = nullptr;
 
     // 清空 per-instance 表（2026-09-19：接入测试后实测发现的缺陷）。
     //
@@ -665,13 +702,7 @@ bool install_camera(std::uint64_t exe_base, const Config &cfg)
     build_camera_stub(target, g_camera_stub);
 
     std::uint8_t patch[k_camera_patch_len] {};
-    patch[0] = 0x48;
-    patch[1] = 0xB8;
-    write_u64(patch + 2, reinterpret_cast<std::uint64_t>(g_camera_stub));
-    patch[10] = 0xFF;
-    patch[11] = 0xE0;
-    patch[12] = 0x90;
-    patch[13] = 0x90;
+    build_jmp_patch(patch, k_camera_patch_len, g_camera_stub);
     std::memcpy(target, patch, k_camera_patch_len);
     VirtualProtect(target, k_camera_patch_len, old_protect, &old_protect);
     FlushInstructionCache(GetCurrentProcess(), target, k_camera_patch_len);
@@ -746,11 +777,7 @@ bool install_projection_setter(std::uint64_t exe_base, const Config &cfg)
     }
     build_projection_stub(target, g_projection_stub);
     std::uint8_t patch[k_projection_patch_len] {};
-    patch[0] = 0x48; patch[1] = 0xB8;
-    write_u64(patch + 2, reinterpret_cast<std::uint64_t>(g_projection_stub));
-    patch[10] = 0xFF; patch[11] = 0xE0;
-    for (std::size_t i = 12; i < k_projection_patch_len; ++i)
-        patch[i] = 0x90;
+    build_jmp_patch(patch, k_projection_patch_len, g_projection_stub);
     std::memcpy(target, patch, k_projection_patch_len);
     VirtualProtect(target, k_projection_patch_len, old_protect, &old_protect);
     FlushInstructionCache(GetCurrentProcess(), target, k_projection_patch_len);
