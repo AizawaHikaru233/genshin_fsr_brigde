@@ -117,9 +117,13 @@ struct Config
         bool to_file = true;
         bool to_debugger = false;
         bool truncate_on_start = true;
-        // 兼容模式（**默认关**）：未迁移的旧 log_line 行按消息前缀归类。
-        // 打开后才有"按内容猜分类/等级"的行为——那是旧方案的遗留。新代码一律经
-        // LOG_* 宏显式声明；未迁移的 log_line 落到 core/INFO，**不会再被静默丢弃**。
+        // 兼容模式（**默认关**）：把 `log_line()` 回调传来的裸字符串按消息前缀归类。
+        //
+        // ⚠️ 2026-09-23（`[待办 1]` ①）：本文件 **28 处调用点已全部迁移**到 `LOG_*` 宏，
+        // 因此本开关**现在只服务一条路径** —— `initialize_render_scale_menu` 的回调
+        // （`RenderScaleMenu.cpp` 只有 `void(const std::string&)` 这一种回调形态，
+        // 携带不了分类）。**要移除本开关，须先改回调签名并迁移该模块的 18 处调用。**
+        // 关掉时这些行统一落 `core/INFO`，**不会被静默丢弃**。
         bool compat_prefix_categories = false;
         std::uint32_t max_file_kb = 16384;
         std::uint32_t rotate_keep = 2;
@@ -1470,7 +1474,7 @@ void toggle_recording_mode(int mode)
     }
 #endif
 
-    log_line(std::string(started ? "mode_recording_started " : "mode_recording_stopped ") +
+    LOG_INFO(blog::cat::core, std::string(started ? "mode_recording_started " : "mode_recording_stopped ") +
         "mode=" + narrow(calibrated_mode_name(mode)) + " features=" + std::to_string(sample_size));
     set_osd_text(L"Dx11FsrBridge OSD\n" + status);
 }
@@ -3244,7 +3248,7 @@ void log_interesting_dispatch_details(UINT group_x, UINT group_y, UINT group_z)
         std::string text = message.str();
         if (text.starts_with(prefix))
             text.insert(prefix.size(), " phase=" + std::to_string(phase));
-        log_line(text);
+        LOG_INFO(blog::cat::core, text);
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         update_osd_from_dispatch(phase, group_x, group_y, group_z);
 #endif
@@ -3266,10 +3270,16 @@ void log_line(const std::string &line)
 {
     if (!g_logging_enabled.load(std::memory_order_relaxed))
         return;
-    // 未迁移的调用点默认统一走 core/INFO：**不会被静默丢弃**。
-    // 旧方案在词表未命中时按 level 3 处理并被 LogLevel=2 丢弃——这正是
-    // "探针在跑却零输出"的根因。
-    // [Log] compat_prefix=1 时改走前缀归类路径（hdr_/fsr2_/dlssg_ 等进对应分类）。
+    // ⚠️ 2026-09-23（`[待办 1]` ①）：本文件的 **28 处调用点已全部迁移**到 `LOG_*` 宏
+    // （分类按内容显式声明，等级一律保持 INFO —— 改等级会让诊断行在默认阈值下消失）。
+    // 因此这里**不再是**"未迁移调用点"的兜底入口，而是**唯一剩下的一个用途**：
+    //   `initialize_render_scale_menu(module, &log_line, …)` 把它作为**回调**传给
+    //   RenderScaleMenu —— 该模块只有 `void(const std::string&)` 这一种回调形态，
+    //   携带不了分类，故仍走本函数。
+    //
+    // `[Log] compat_prefix=1` 时改走前缀归类路径（hdr_/fsr2_/render_scale_menu 等进对应分类），
+    // 就是为这条回调路径服务的。**要移除 `compat_prefix`，必须先改回调签名**
+    // （带上 Level/Category）并迁移 `RenderScaleMenu.cpp` 的 18 处调用 —— 属独立一批。
     if (blog::compat_prefix_enabled())
     {
         blog::write_compat_line(line);
@@ -4943,7 +4953,7 @@ void log_iat_skip(const char *reason, HMODULE module, const void *slot, std::siz
         static_cast<unsigned long>(valid ? mbi.AllocationProtect : 0),
         static_cast<unsigned long>(valid ? mbi.Type : 0),
         static_cast<unsigned long>(detail));
-    log_line(buf);
+    LOG_INFO(blog::cat::core, buf);
 }
 
 bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *function_name, void *replacement, void **original)
@@ -5353,7 +5363,7 @@ void install_hdr_environment_probe_for_loaded_modules()
         }
     }
     if (summary_changed)
-        log_line(summary);
+        LOG_INFO(blog::cat::hdr, summary);
 }
 
 HRESULT STDMETHODCALLTYPE hooked_output_get_desc1(IDXGIOutput6 *output, DXGI_OUTPUT_DESC1 *desc)
@@ -5396,7 +5406,7 @@ HRESULT STDMETHODCALLTYPE hooked_output_get_desc1(IDXGIOutput6 *output, DXGI_OUT
     {
         out << " response=unavailable";
     }
-    log_line(out.str());
+    LOG_INFO(blog::cat::hdr, out.str());
     return result;
 }
 
@@ -5495,7 +5505,7 @@ void install_create_hooks_for_loaded_modules()
     }
     if (summary_changed)
     {
-        log_line(summary);
+        LOG_INFO(blog::cat::core, summary);
         if (swapchain_hooks == 0 && device_hooks == 0)
         {
             LOG_WARN(blog::cat::core, "warning no d3d11 create import hooks found; possible reasons: already-created device, GetProcAddress path, or module loaded later");
@@ -5581,7 +5591,7 @@ void install_loader_hooks_for_loaded_modules()
         }
     }
     if ((summary_changed && g_config.log_loader_activity) || skipped_changed)
-        log_line(summary);
+        LOG_INFO(blog::cat::core, summary);
 }
 
 bool clone_and_patch_vtable(void *instance, std::size_t method_count, const std::vector<std::pair<std::size_t, void *>> &patches)
@@ -6047,7 +6057,7 @@ void flush_final_scene_probe(std::uint64_t frame_index)
         for (std::uint32_t index = 0; index < frame.tail_candidate_count; ++index)
             append_candidate("tail", index, frame.tail_candidates[index]);
     }
-    log_line(out.str());
+    LOG_INFO(blog::cat::probe, out.str());
 }
 
 void record_final_scene_probe_draw(UINT element_count, bool indexed)
@@ -6620,7 +6630,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target0
                 " hr=" + std::to_string(static_cast<long>(result));
             if (errors != nullptr && errors->GetBufferPointer() != nullptr)
                 message += " error=" + std::string(static_cast<const char *>(errors->GetBufferPointer()), errors->GetBufferSize());
-            log_line(message);
+            LOG_ERROR(blog::cat::hdr, message);
             if (errors != nullptr)
                 errors->Release();
             if (bytecode != nullptr)
@@ -7314,7 +7324,7 @@ HRESULT STDMETHODCALLTYPE hooked_set_hdr_metadata(
     const bool should_log = spoof;
 #endif
     if (should_log)
-        log_line(message.str());
+        LOG_INFO(blog::cat::hdr, message.str());
     return spoof ? S_OK : physical_hr;
 }
 
@@ -8125,7 +8135,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
                     if (diag_srvs[i] != nullptr)
                         diag_srvs[i]->Release();
                 }
-                log_line(diag.str());
+                LOG_INFO(blog::cat::upscale, diag.str());
             }
         }
     }
@@ -8239,7 +8249,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
                          << " vp=" << (viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Width) : 0)
                          << "x" << (viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Height) : 0)
                          << " cb0=" << constant_buffer_description.ByteWidth;
-                    log_line(diag.str());
+                    LOG_INFO(blog::cat::upscale, diag.str());
                 }
             }
             return std::nullopt;
@@ -10117,7 +10127,7 @@ void probe_native_params_once(
                     probe += ",";
             }
         }
-        log_line(probe);
+        LOG_INFO(blog::cat::probe, probe);
     }
     // ---- 输入内容采样（前 3 轮 + 每 64 轮；motion 3×3 网格 + mvmax） ----
     if (probe_round <= 3 || probe_round % 64 == 0)
@@ -10131,7 +10141,7 @@ void probe_native_params_once(
         ffx12::debug_state(last_reset, ctx_recreates);
         samples += " reset=" + std::to_string(last_reset ? 1 : 0) +
             " recreates=" + std::to_string(ctx_recreates);
-        log_line(samples);
+        LOG_INFO(blog::cat::upscale, samples);
     }
     // ---- cb0 逐帧跟踪（前 32 轮）：jitter/frame/instance 与 cb0 tail 的对应 ----
     if (probe_round <= 32)
@@ -10165,7 +10175,7 @@ void probe_native_params_once(
             }
             bound_cb->Release();
         }
-        log_line(track);
+        LOG_INFO(blog::cat::upscale, track);
     }
     // ---- 一次性实例/上下文内存 dump（前 2 轮；找原生 near/far/fov/exposure 等参数） ----
     if (probe_round <= 2)
@@ -10175,7 +10185,7 @@ void probe_native_params_once(
         append_mem_u64(mem, "inst_ptr", call_params.instance, 32);
         append_mem_dump(mem, "ctx", call_params.context, 16);
         append_mem_u64(mem, "ctx_ptr", call_params.context, 32);
-        log_line(mem);
+        LOG_INFO(blog::cat::probe, mem);
         // 原生参数全量转储（日志截断放不下；第 1 轮写文件，供离线分析 fov/near/far）：
         // 实例前 8KB + 上下文前 4KB + cb0 全量（496B）
         if (probe_round == 1)
@@ -11253,7 +11263,7 @@ bool try_fsr2_translation_draw(
                                 hex64(call_params.context) + " n=" + std::to_string(ctx_n);
                             for (std::size_t ci = 0; ci < ctx_n; ++ci)
                                 ctx_line += " " + std::to_string(ctx_f[ci]);
-                            log_line(ctx_line);
+                            LOG_INFO(blog::cat::upscale, ctx_line);
                         }
                     }
                     if (dcount <= 8 || dcount % 1024 == 0)
@@ -11318,7 +11328,7 @@ bool try_fsr2_translation_draw(
                                 std::to_string(camera_count);
                             for (std::size_t i = 0; i < camera_count; ++i)
                                 camera_line += " " + std::to_string(camera_values[i]);
-                            log_line(camera_line);
+                            LOG_INFO(blog::cat::upscale, camera_line);
                         }
                         if (g_config.ffx12_projection_hook)
                         {
@@ -11333,7 +11343,7 @@ bool try_fsr2_translation_draw(
                                 hex64(projection_camera) + " n=" + std::to_string(projection_count);
                             for (std::size_t i = 0; i < projection_count; ++i)
                                 projection_line += " " + std::to_string(projection[i]);
-                            log_line(projection_line);
+                            LOG_INFO(blog::cat::upscale, projection_line);
                         }
                     }
                     fsr2_family_takeover::notify_accumulate_result(true, GetTickCount64());
@@ -11500,7 +11510,7 @@ SpatialOutput main(float4 position : SV_Position)
         std::string message = "pixel_shader_replacement_compile_failed hr=" + std::to_string(static_cast<long>(hr));
         if (errors != nullptr && errors->GetBufferPointer() != nullptr)
             message += " error=" + std::string(static_cast<const char *>(errors->GetBufferPointer()), errors->GetBufferSize());
-        log_line(message);
+        LOG_ERROR(blog::cat::core, message);
         if (errors != nullptr)
             errors->Release();
         if (bytecode != nullptr)
@@ -11793,7 +11803,7 @@ void probe_pre_pass_cb0_if_enabled(ID3D11DeviceContext *context)
             if (i + 1 < floats)
                 probe += ",";
         }
-        log_line(probe);
+        LOG_INFO(blog::cat::upscale, probe);
         pre_cb0_done.store(true, std::memory_order_relaxed);
     }
     pre_cb->Release();
@@ -12447,7 +12457,7 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
                     out << ',';
                 out << hex64(reinterpret_cast<std::uintptr_t>(frames[frame_index]));
             }
-            log_line(out.str());
+            LOG_INFO(blog::cat::hook, out.str());
         }
     }
 #endif
@@ -12797,7 +12807,7 @@ void set_output_size(UINT width, UINT height, const char *source)
     }
 
     if (changed)
-        log_line(std::string(source) + " output_size=" + std::to_string(width) + "x" + std::to_string(height));
+        LOG_INFO(blog::cat::core, std::string(source) + " output_size=" + std::to_string(width) + "x" + std::to_string(height));
 }
 
 void install_factory_hooks(IDXGIFactory *factory)
@@ -13051,7 +13061,7 @@ HRESULT STDMETHODCALLTYPE hooked_factory2_create_swap_chain_for_hwnd(IDXGIFactor
 void on_module_activity(const char *source, HMODULE module)
 {
     if (module != nullptr && is_d3d11_module(module))
-        log_line(std::string(source) + " loaded d3d11.dll");
+        LOG_INFO(blog::cat::core, std::string(source) + " loaded d3d11.dll");
 
     install_create_hooks_for_loaded_modules();
     install_loader_hooks_for_loaded_modules();
@@ -13121,7 +13131,7 @@ LONG WINAPI hooked_display_config_get_device_info(DISPLAYCONFIG_DEVICE_INFO_HEAD
     if (result != ERROR_SUCCESS || request->size < sizeof(DISPLAYCONFIG_DEVICE_INFO_HEADER) + sizeof(std::uint32_t))
     {
         out << " response=unavailable size=" << request->size;
-        log_line(out.str());
+        LOG_INFO(blog::cat::hdr, out.str());
         return result;
     }
 
@@ -13141,7 +13151,7 @@ LONG WINAPI hooked_display_config_get_device_info(DISPLAYCONFIG_DEVICE_INFO_HEAD
             << " hdr_supported=" << ((value & (1u << 4)) != 0 ? 1 : 0)
             << " hdr_user_enabled=" << ((value & (1u << 5)) != 0 ? 1 : 0);
     }
-    log_line(out.str());
+    LOG_INFO(blog::cat::hdr, out.str());
     return result;
 }
 
@@ -13428,7 +13438,7 @@ void initialize()
             std::string camera_target = "ffx12_camera_target rva=" +
                 hex64(hook_cfg.camera_rva) + " va=" + hex64(exe_base + hook_cfg.camera_rva);
             append_code_bytes(camera_target, exe_base + hook_cfg.camera_rva, 16);
-            log_line(camera_target);
+            LOG_INFO(blog::cat::probe, camera_target);
         }
         if (il2cpp_callsite::install(exe_base, hook_cfg))
             LOG_INFO(blog::cat::hook, "fsr2_il2cpp_hook_installed mode=" +
@@ -13448,7 +13458,7 @@ void initialize()
                 cand_log << "fsr2_il2cpp_rva_candidates count=" << candidates.size() << " rvas=";
                 for (const std::uint32_t rva : candidates)
                     cand_log << "0x" << hex64(rva) << " ";
-                log_line(cand_log.str());
+                LOG_INFO(blog::cat::probe, cand_log.str());
             }
         }
         if (g_config.ffx12_camera_hook)
