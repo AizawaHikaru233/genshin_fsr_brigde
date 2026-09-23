@@ -1942,6 +1942,17 @@ static void UninstallHooks()
 
 static LONG WINAPI CrashHandler(PEXCEPTION_POINTERS ep)
 {
+    // ⚠️ 2026-09-23（审核报告）：重入防护。
+    //
+    // 处理器自身也会访问内存（CaptureStackBackTrace 走栈、VirtualQuery、
+    // memcpy、GetModuleFileNameW）。若它**自己**再触发异常（栈已损坏、
+    // 页已失效），VEH 会被重新进入 → 无限递归 → 栈溢出。
+    // thread_local 标志让第二次进入立刻退出，保证只产出一份现场。
+    static thread_local bool t_in_crash_handler = false;
+    if (t_in_crash_handler)
+        return EXCEPTION_CONTINUE_SEARCH;
+    t_in_crash_handler = true;
+
     // 只捕获访问违例/非法指令等致命异常；调试器在场时不介入
     if (IsDebuggerPresent())
         return EXCEPTION_CONTINUE_SEARCH;
@@ -1954,21 +1965,24 @@ static LONG WINAPI CrashHandler(PEXCEPTION_POINTERS ep)
         return EXCEPTION_CONTINUE_SEARCH;
 
     void *addr = ep->ExceptionRecord->ExceptionAddress;
-    // 记录异常信息（含线程 ID——区分异步加载线程/渲染线程/游戏线程）
-    TL_LOG(L"[CRASH] exception=0x%08X addr=%p tid=0x%X", code, addr, GetCurrentThreadId());
+    // ⚠️ 2026-09-23：全部改用 TLC_LOG（= log_crash_write），**不能用 TL_LOG**。
+    // TL_LOG 会阻塞在非递归的 g_mutex 上；若崩溃正发生在持有该锁的代码里
+    // （fwprintf/fflush 内部违例、堆损坏），就会自死锁 ——
+    // 崩溃报告永远写不出来，进程还挂在那里。详见 log.h 的说明。
+    TLC_LOG(L"[CRASH] exception=0x%08X addr=%p tid=0x%X", code, addr, GetCurrentThreadId());
     if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
-        TL_LOG(L"[CRASH] access violation %s address=0x%llX",
-               ep->ExceptionRecord->ExceptionInformation[0] == 0 ? L"READ" : L"WRITE",
-               (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1]);
+        TLC_LOG(L"[CRASH] access violation %s address=0x%llX",
+                ep->ExceptionRecord->ExceptionInformation[0] == 0 ? L"READ" : L"WRITE",
+                (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1]);
     // 寄存器上下文（定位空调用来源：RIP=0 时看哪个寄存器为 0 被 call）
     if (ep->ContextRecord) {
         auto *ctx = ep->ContextRecord;
-        TL_LOG(L"[CRASH] regs RAX=%p RBX=%p RCX=%p RDX=%p RSI=%p RDI=%p RSP=%p RBP=%p",
-               (void *)ctx->Rax, (void *)ctx->Rbx, (void *)ctx->Rcx, (void *)ctx->Rdx,
-               (void *)ctx->Rsi, (void *)ctx->Rdi, (void *)ctx->Rsp, (void *)ctx->Rbp);
-        TL_LOG(L"[CRASH] regs R8=%p R9=%p R10=%p R11=%p R12=%p R13=%p R14=%p R15=%p",
-               (void *)ctx->R8, (void *)ctx->R9, (void *)ctx->R10, (void *)ctx->R11,
-               (void *)ctx->R12, (void *)ctx->R13, (void *)ctx->R14, (void *)ctx->R15);
+        TLC_LOG(L"[CRASH] regs RAX=%p RBX=%p RCX=%p RDX=%p RSI=%p RDI=%p RSP=%p RBP=%p",
+                (void *)ctx->Rax, (void *)ctx->Rbx, (void *)ctx->Rcx, (void *)ctx->Rdx,
+                (void *)ctx->Rsi, (void *)ctx->Rdi, (void *)ctx->Rsp, (void *)ctx->Rbp);
+        TLC_LOG(L"[CRASH] regs R8=%p R9=%p R10=%p R11=%p R12=%p R13=%p R14=%p R15=%p",
+                (void *)ctx->R8, (void *)ctx->R9, (void *)ctx->R10, (void *)ctx->R11,
+                (void *)ctx->R12, (void *)ctx->R13, (void *)ctx->R14, (void *)ctx->R15);
     }
 
     // 模块级调用栈（无符号解析——输出 module+0xOFFSET 便于定位所在模块）
@@ -1985,8 +1999,8 @@ static LONG WINAPI CrashHandler(PEXCEPTION_POINTERS ep)
             if (slash) wcscpy_s(modName, slash + 1);
         }
         uintptr_t base = mod ? (uintptr_t)mod : 0;
-        TL_LOG(L"[CRASH]   #%02u %s+0x%llX (%p)", i, modName,
-               (unsigned long long)((uintptr_t)frames[i] - base), frames[i]);
+        TLC_LOG(L"[CRASH]   #%02u %s+0x%llX (%p)", i, modName,
+                (unsigned long long)((uintptr_t)frames[i] - base), frames[i]);
     }
 
     // 原始栈扫描：CaptureStackBackTrace 在栈损坏/堆损坏时失效（只见 ntdll 分发），
@@ -1994,7 +2008,7 @@ static LONG WINAPI CrashHandler(PEXCEPTION_POINTERS ep)
     // 定位 use-after-free 的真实调用链（如 d3d11.dll/YuanShen.exe/TextureLoader.dll）。
     if (ep->ContextRecord) {
         uintptr_t rsp = (uintptr_t)ep->ContextRecord->Rsp;
-        TL_LOG(L"[CRASH] raw-stack from RSP=%p:", (void *)rsp);
+        TLC_LOG(L"[CRASH] raw-stack from RSP=%p:", (void *)rsp);
         for (int i = 0; i < 96; i++) {
             uintptr_t addr = rsp + (uintptr_t)i * 8;
             MEMORY_BASIC_INFORMATION mbi = {};
@@ -2014,8 +2028,8 @@ static LONG WINAPI CrashHandler(PEXCEPTION_POINTERS ep)
                 wchar_t *slash = wcsrchr(modName, L'\\');
                 if (slash) wcscpy_s(modName, slash + 1);
                 uintptr_t base = (uintptr_t)mod;
-                TL_LOG(L"[CRASH]   [rsp+0x%03X] %s+0x%llX", i * 8, modName,
-                       (unsigned long long)(val - base));
+                TLC_LOG(L"[CRASH]   [rsp+0x%03X] %s+0x%llX", i * 8, modName,
+                        (unsigned long long)(val - base));
             }
         }
     }
