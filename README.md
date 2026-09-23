@@ -209,14 +209,7 @@ ReShade 的着色器 / 纹理 / Preset / 截图路径均使用**相对路径**�
 powershell -ExecutionPolicy Bypass -File .\tools\Update-UpstreamComponents.ps1 -WorkspaceRoot .
 ```
 
-> **ReShade 二进制不入库**（2026-09-19 起）：仓库不含 `ReShade64.dll`。
-> 官方指引为 "Do NOT share the binaries"，故由上述脚本在**打包时**从 reshade.me
-> 官方渠道下载 Add-on setup 并解出 DLL 到 `SharedResources\ReShade\runtime\`
-> （`Update-ReShade`，同时写入版本基线 `upstream-versions.json`）。
-> 本地/国内完整包在打包时带上该 DLL；**GitHub 合规包不内置**，
-> 由安装器在用户机器上从官方下载（`Configure.ps1` 按 payload 内是否存在自动选择
-> `Existing` / `Auto`）。因此**本地完整包必须在打包前先执行上面这条命令**，
-> 否则该包将缺少 ReShade 本体。
+本地构建需自行补齐所需组件。
 
 然后构建全部发行包：
 
@@ -246,11 +239,7 @@ Bridge 和反虚化组件默认会保留错误日志（接入 OptiScaler/ReShade
 
 - FFX12 ffx-api 头文件与 Microsoft Detours 仅作为构建依赖，保留各自原始许可证与声明。
 - OptiScaler 是独立项目：<https://github.com/optiscaler/OptiScaler>。
-- GitHub 发布包不会内置 NVIDIA DLSS 组件与 ReShade 二进制，安装时由脚本从各自官方上游获取。
-- 仓库同样**不含** ReShade 二进制（`ReShade64.dll` 已加入 `.gitignore`）；本地完整包在
-  **打包时**由 `tools\Update-UpstreamComponents.ps1` 从 reshade.me 官方渠道获取并解出，
-  详见上方「构建」章节。
-- 本地分发包需要自行补齐相应组件，并遵守各组件授权要求（例如随附 GPL 全文与源码链接、ReShade 官方"不得分享二进制"、DLSS 仅限 NVIDIA GPU 使用等）。
+- 本地分发包需要自行补齐相应组件，并遵守各组件授权要求。
 - 本项目不包含 NVIDIA DLSS 与 AMD FSR SDK 运行时二进制。
 
 ## 许可证

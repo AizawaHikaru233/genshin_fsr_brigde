@@ -215,16 +215,7 @@ First refresh the upstream component baseline (only needed when component versio
 powershell -ExecutionPolicy Bypass -File .\tools\Update-UpstreamComponents.ps1 -WorkspaceRoot .
 ```
 
-> **The ReShade binary is not stored in this repository** (since 2026-09-19):
-> `ReShade64.dll` is not committed. ReShade's official guidance is "Do NOT share the
-> binaries", so the script above downloads the official Add-on setup from reshade.me
-> **at packaging time** and extracts the DLL into `SharedResources\ReShade\runtime\`
-> (`Update-ReShade`, which also writes the version baseline to `upstream-versions.json`).
-> Local/domestic Full packages bundle that DLL; the **GitHub-compliant package does not** —
-> its installer fetches ReShade on the user's machine (`Configure.ps1` picks `Existing`
-> or `Auto` based on whether the payload already contains it). A **local Full package
-> therefore requires running the command above before packaging**, otherwise it will ship
-> without the ReShade runtime.
+Local builds must supply the required components themselves.
 
 Then build all release packages:
 
@@ -254,8 +245,7 @@ Do not submit game account details, login information, or screenshots containing
 
 - FFX12 ffx-api headers and Microsoft Detours are build dependencies only; their original licenses and notices are retained.
 - OptiScaler is an independent project: <https://github.com/optiscaler/OptiScaler>.
-- GitHub release packages do not bundle the NVIDIA DLSS component or ReShade binaries; the installer downloads them from their official upstream sources at install time.
-- Local distributions must complete the required components on their own and comply with each component's licensing terms (for example, shipping the GPL full text with source links, respecting ReShade's official "do not share the binaries" policy, and DLSS limited to NVIDIA GPUs).
+- Local distributions must complete the required components on their own and comply with each component's licensing terms.
 - This project does not include NVIDIA DLSS or AMD FSR SDK runtime binaries.
 
 ## License
