@@ -1465,19 +1465,25 @@ BootstrapConfig load_config()
 
     if (config.bridge_path.empty())
     {
+        // ⚠️ 2026-09-23：`..\..\FSRGraphicsPayload\...` 是**旧 Lite 包**的布局
+        // （由 `87c1ee5` 引入，存在于 1.2.0~2.2.0 五个发布版）⇒ **不能删**，
+        // 否则那些用户会失去可用的组件定位。
+        //
+        // 但它**必须排在最后**：若用户机器上残留一个**过期的** `FSRGraphicsPayload\`
+        // （旧版组件仍在），排在首位会**遮蔽**当前正确路径，导致加载到旧 DLL。
+        // 排在末位则：只有当前布局全都找不到时才回退到旧布局 —— 两边都安全。
         config.bridge_path = first_existing({
-            L"..\\..\\FSRGraphicsPayload\\Bridge\\Dx11FsrBridge.dll",
             L"Dx11FsrBridge.dll",
             L"Bridge\\Dx11FsrBridge.dll",
             L"..\\Bridge\\Dx11FsrBridge.dll",
             L"payload\\Bridge\\Dx11FsrBridge.dll",
             L"..\\payload\\Bridge\\Dx11FsrBridge.dll",
+            L"..\\..\\FSRGraphicsPayload\\Bridge\\Dx11FsrBridge.dll", // 旧 Lite 包布局（末位回退）
         });
     }
     if (config.optiscaler_path.empty())
     {
         config.optiscaler_path = first_existing({
-            L"..\\..\\FSRGraphicsPayload\\OptiScaler\\OptiScaler.dll",
             L"OptiScaler.dll",
             L"OptiScaler\\OptiScaler.dll",
             L"OptiScaler\\OptiScaler\\OptiScaler.dll",
@@ -1487,6 +1493,7 @@ BootstrapConfig load_config()
             L"payload\\OptiScaler\\OptiScaler\\OptiScaler.dll",
             L"..\\payload\\OptiScaler\\OptiScaler.dll",
             L"..\\payload\\OptiScaler\\OptiScaler\\OptiScaler.dll",
+            L"..\\..\\FSRGraphicsPayload\\OptiScaler\\OptiScaler.dll", // 旧 Lite 包布局（末位回退）
         });
     }
     // OptiScaler 超分组件目录（2026-09-20）
@@ -1518,23 +1525,23 @@ BootstrapConfig load_config()
     if (config.reshade_path.empty())
     {
         config.reshade_path = first_existing({
-            L"..\\..\\FSRGraphicsPayload\\ReShade\\ReShade64.dll",
             L"ReShade64.dll",
             L"ReShade\\ReShade64.dll",
             L"..\\ReShade\\ReShade64.dll",
             L"payload\\ReShade\\ReShade64.dll",
             L"..\\payload\\ReShade\\ReShade64.dll",
+            L"..\\..\\FSRGraphicsPayload\\ReShade\\ReShade64.dll", // 旧 Lite 包布局（末位回退）
         });
     }
     if (config.texture_loader_path.empty())
     {
         config.texture_loader_path = first_existing({
-            L"..\\..\\FSRGraphicsPayload\\TextureLoader\\TextureLoader.dll",
             L"TextureLoader.dll",
             L"TextureLoader\\TextureLoader.dll",
             L"..\\TextureLoader\\TextureLoader.dll",
             L"payload\\TextureLoader\\TextureLoader.dll",
             L"..\\payload\\TextureLoader\\TextureLoader.dll",
+            L"..\\..\\FSRGraphicsPayload\\TextureLoader\\TextureLoader.dll", // 旧 Lite 包布局（末位回退）
         });
     }
     // TextureLoader 在 NVIDIA 上存在无法修复的纹理加载严重错误（作者无 N 卡，无法定位根因），

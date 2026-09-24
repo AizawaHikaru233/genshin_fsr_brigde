@@ -62,4 +62,14 @@ if(FUFUGRAPHICS_BUILD_TESTS)
             "$<TARGET_FILE_DIR:FufuReshadeConfigTest>/ReShade.template.ini")
     enable_testing()
     add_test(NAME FufuReshadeConfigTest COMMAND FufuReshadeConfigTest)
+
+    # 组件路径解析顺序：验证旧 Lite 包布局 `..\..\FSRGraphicsPayload\...`
+    # **排在候选末位** —— 既不让残留的过期目录遮蔽当前路径，又保留对旧版用户的回退。
+    add_executable(FufuPathOrderTest FufuPathOrderTest.cpp)
+    target_compile_features(FufuPathOrderTest PRIVATE cxx_std_20)
+    target_compile_definitions(FufuPathOrderTest PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(FufuPathOrderTest PRIVATE /utf-8 /W3)
+    target_link_libraries(FufuPathOrderTest PRIVATE dxgi version)
+    add_test(NAME FufuPathOrderTest COMMAND FufuPathOrderTest)
 endif()
