@@ -82,6 +82,29 @@ int main()
     chk(ends_with(legacy.reshade_path, L"FSRGraphicsPayload\\ReShade\\ReShade64.dll"),
         "回退：ReShade 同样回退到旧布局");
 
+    // ------------------------------------------------------------------
+    // OptiScaler 双布局：`optiscaler_component_directory` 必须指向**组件实际所在目录**
+    //
+    // 背景（Configure.ps1:496-519）：`[Libraries] OptiDllPath` 是 OptiScaler 查找
+    // 超分组件的唯一依据。嵌套布局下若指向根层，OptiScaler 会"注入成功却找不到
+    // 任何超分后端"，且退出时 DETACH 卡死 → 进程残留。
+    // 判定标志物：amd_fidelityfx_upscaler_dx12.dll（两种布局下都必须存在）。
+    // ------------------------------------------------------------------
+    const std::filesystem::path opti_root = plugin_dir / L"payload" / L"OptiScaler";
+
+    // 平铺：标志物与主 DLL 同层
+    touch(opti_root / L"OptiScaler.dll");
+    touch(opti_root / L"amd_fidelityfx_upscaler_dx12.dll");
+    const BootstrapConfig flat = load_config();
+    chk(flat.optiscaler_component_directory == opti_root, "平铺：组件目录 = OptiScaler 根层");
+
+    // 嵌套：标志物在 OptiScaler\ 子目录
+    std::filesystem::remove(opti_root / L"amd_fidelityfx_upscaler_dx12.dll", ec);
+    touch(opti_root / L"OptiScaler" / L"amd_fidelityfx_upscaler_dx12.dll");
+    const BootstrapConfig nested = load_config();
+    chk(nested.optiscaler_component_directory == opti_root / L"OptiScaler",
+        "嵌套：组件目录 = OptiScaler\\ 子目录（不是根层）");
+
     std::filesystem::remove_all(sandbox, ec);
     std::printf("  通过 %d / 失败 %d\n", g_ok, g_bad);
     return g_bad == 0 ? 0 : 1;
