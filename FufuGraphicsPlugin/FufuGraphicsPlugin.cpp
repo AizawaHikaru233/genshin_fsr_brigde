@@ -403,6 +403,36 @@ bool ini_has_key_utf8(const std::filesystem::path &path, const std::string &sect
     return false;
 }
 
+// 键的值是否**为空**（键不存在、或 `key=` 后为空白 ⇒ 都算空）。
+//
+// ⚠️ 2026-09-23：`ini_has_key_utf8` **不能**用于此判断 —— 它对 `PresetPath=`
+// 这种"键在但值为空"的情况同样返回 true，会把空值当成"已配置"而跳过写入。
+bool ini_value_is_empty_utf8(const std::filesystem::path &path, const std::string &section, const std::string &key)
+{
+    std::string bytes;
+    if (!read_utf8_file(path, bytes))
+        return true; // 读不到就当空，交由调用方写入
+    const std::string wanted_section = lower_ascii(section);
+    const std::string wanted_key = lower_ascii(key);
+    std::string current_section;
+    for (const std::string &raw_line : split_ini_lines(bytes))
+    {
+        const std::string line = trim_ascii(raw_line);
+        if (line.size() >= 2 && line.front() == '[' && line.back() == ']')
+        {
+            current_section = lower_ascii(trim_ascii(line.substr(1, line.size() - 2)));
+            continue;
+        }
+        if (current_section != wanted_section || line.empty() || line.front() == ';' || line.front() == '#')
+            continue;
+        const std::size_t separator = line.find('=');
+        if (separator != std::string::npos &&
+            lower_ascii(trim_ascii(line.substr(0, separator))) == wanted_key)
+            return trim_ascii(line.substr(separator + 1)).empty();
+    }
+    return true; // 键不存在 ⇒ 空
+}
+
 bool set_ini_value_utf8(
     const std::filesystem::path &path,
     const std::string &section,
@@ -542,15 +572,29 @@ bool prepare_reshade_game_configuration(const BootstrapConfig &config)
     const std::filesystem::path shader_root = reshade_directory / L"reshade-shaders";
     const std::filesystem::path screenshots = game_directory / L"Screenshots";
     CreateDirectoryW(screenshots.c_str(), nullptr);
-    const bool configured =
-        set_ini_value_utf8(game_ini, "ADDON", "AddonPath",
-            wide_to_utf8((shader_root / L"Addons").wstring())) &&
-        set_ini_value_utf8(game_ini, "GENERAL", "EffectSearchPaths",
-            wide_to_utf8((shader_root / L"Shaders").wstring())) &&
-        set_ini_value_utf8(game_ini, "GENERAL", "TextureSearchPaths",
-            wide_to_utf8((shader_root / L"Textures").wstring())) &&
-        set_ini_value_utf8(game_ini, "GENERAL", "PresetPath", ".\\ReShadePreset.ini") &&
-        set_ini_value_utf8(game_ini, "SCREENSHOT", "SavePath", ".\\Screenshots");
+
+    // ---------------------------------------------------------------------
+    // 路径键写入策略（2026-09-23，与安装器 `Configure.ps1` 保持一致）
+    //
+    // **3 项指向 payload 的路径：每次覆写。** 它们指向 `payload\ReShade\reshade-shaders\`
+    // —— 非默认位置，ReShade 无从猜测；且随安装位置移动，必须刷新到当前实际路径。
+    //
+    // **2 项指向游戏目录的路径：仅在为空时写入。** `ReShade.ini` 本身就在游戏目录，
+    // 而 `.\ReShadePreset.ini` / `.\Screenshots` 正是相对该 ini 的默认基准
+    // ⇒ 不随安装位置移动。**本函数每次启动游戏都会执行**，原先无条件覆写会
+    // 把用户在 ReShade 界面里改过的设置（例如自定义截图目录）**每次启动都重置**。
+    // ---------------------------------------------------------------------
+    bool configured = true;
+    configured = set_ini_value_utf8(game_ini, "ADDON", "AddonPath",
+                     wide_to_utf8((shader_root / L"Addons").wstring())) && configured;
+    configured = set_ini_value_utf8(game_ini, "GENERAL", "EffectSearchPaths",
+                     wide_to_utf8((shader_root / L"Shaders").wstring())) && configured;
+    configured = set_ini_value_utf8(game_ini, "GENERAL", "TextureSearchPaths",
+                     wide_to_utf8((shader_root / L"Textures").wstring())) && configured;
+    if (ini_value_is_empty_utf8(game_ini, "GENERAL", "PresetPath"))
+        configured = set_ini_value_utf8(game_ini, "GENERAL", "PresetPath", ".\\ReShadePreset.ini") && configured;
+    if (ini_value_is_empty_utf8(game_ini, "SCREENSHOT", "SavePath"))
+        configured = set_ini_value_utf8(game_ini, "SCREENSHOT", "SavePath", ".\\Screenshots") && configured;
     if (!configured)
     {
         write_log("reshade_game_config_failed reason=ini_update path=" + wide_to_utf8(game_ini.wstring()));

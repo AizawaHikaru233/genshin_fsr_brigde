@@ -35,3 +35,31 @@ target_link_libraries(FufuGraphicsPlugin PRIVATE dxgi version)
 set_property(TARGET FufuGraphicsPlugin PROPERTY
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set_target_properties(FufuGraphicsPlugin PROPERTIES OUTPUT_NAME "FSR-Bridge-Plugin")
+
+# ---------------------------------------------------------------------------
+# 单元测试（默认关）：`FufuReshadeConfigTest`
+#
+# 验证 `prepare_reshade_game_configuration` 的路径写入策略 ——
+# 该函数**每次启动游戏都会执行**，若无条件覆写会把用户在 ReShade 界面里改过的
+# 设置（自定义截图目录等）**每次启动都重置**（2026-09-23 修正）。
+#
+# 为什么测试要 `#include` 被测 .cpp：其实现全在匿名命名空间内（内部链接），
+# 外部无法链接；同一 TU 内则可见。exe 所在目录即"游戏目录"
+# （`module_path(nullptr)` 取自身路径），故测试在自身目录造布局。
+# ---------------------------------------------------------------------------
+option(FUFUGRAPHICS_BUILD_TESTS "Build the Fufu bootstrap unit tests" OFF)
+if(FUFUGRAPHICS_BUILD_TESTS)
+    add_executable(FufuReshadeConfigTest FufuReshadeConfigTest.cpp)
+    target_compile_features(FufuReshadeConfigTest PRIVATE cxx_std_20)
+    target_compile_definitions(FufuReshadeConfigTest PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(FufuReshadeConfigTest PRIVATE /utf-8 /W3)
+    target_link_libraries(FufuReshadeConfigTest PRIVATE dxgi version)
+    # 测试从 exe 同目录读模板
+    add_custom_command(TARGET FufuReshadeConfigTest POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../SharedResources/ReShade/runtime/ReShade.ini"
+            "$<TARGET_FILE_DIR:FufuReshadeConfigTest>/ReShade.template.ini")
+    enable_testing()
+    add_test(NAME FufuReshadeConfigTest COMMAND FufuReshadeConfigTest)
+endif()
