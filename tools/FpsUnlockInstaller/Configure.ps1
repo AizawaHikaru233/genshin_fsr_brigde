@@ -124,17 +124,18 @@ $optiDll = Join-Path $optiDir 'OptiScaler.dll'
 $optiIni = Join-Path $optiDir 'OptiScaler.ini'
 $optiDefaultIni = Join-Path $optiDir 'OptiScaler.default.ini'
 $packagedDefaultConfigDir = Join-Path $payload 'default_config'
-$packagedOptiTemplateDir = $packagedDefaultConfigDir
+# ⚠️ 2026-09-23（审核项）：原先还各有一个 `$packagedOptiTemplateDir` /
+# `$packagedReShadeTemplateDir`，但两者的值**都等于** `$packagedDefaultConfigDir`
+# （纯别名，各只用一次）—— 已删除，直接用本变量，少两个易漂移的名字。
 $sharedOptiTemplateDir = Join-Path (Split-Path -Parent $root) 'SharedResources\OptiScaler\default_config'
-$optiTemplateDir = if (Test-Path -LiteralPath $packagedOptiTemplateDir -PathType Container) {
-    $packagedOptiTemplateDir
+$optiTemplateDir = if (Test-Path -LiteralPath $packagedDefaultConfigDir -PathType Container) {
+    $packagedDefaultConfigDir
 } else {
     $sharedOptiTemplateDir
 }
-$packagedReShadeTemplateDir = $packagedDefaultConfigDir
 $sharedReShadeTemplateDir = Join-Path (Split-Path -Parent $root) 'SharedResources\ReShade\default_config'
-$reShadeTemplateDir = if (Test-Path -LiteralPath $packagedReShadeTemplateDir -PathType Container) {
-    $packagedReShadeTemplateDir
+$reShadeTemplateDir = if (Test-Path -LiteralPath $packagedDefaultConfigDir -PathType Container) {
+    $packagedDefaultConfigDir
 } else {
     $sharedReShadeTemplateDir
 }
@@ -226,17 +227,23 @@ function Read-YesNo {
 function Select-SourceMode {
     param([string]$Label, [string]$RequestedMode, [bool]$ExistingAvailable)
     if (-not [string]::IsNullOrWhiteSpace($RequestedMode)) { return $RequestedMode }
+    # ⚠️ 2026-09-23（审核项）：本地已有版本时**直接采用**，不再询问。
+    #
+    # 这使下面的"3. 使用当前目录中已有的版本"分支**永不可达** —— 原先的菜单代码
+    # 显然期望把它作为可选项列出，与这里的提前返回自相矛盾。本次采取**行为不变**的
+    # 修法：删掉那个死分支（见下），保留"已有则直接用"的既有语义。
+    #
+    # 若要改成"总是询问"（例如希望重跑安装器时能选择重新下载最新版），
+    # 删掉本行即可 —— 但那是**行为变更**，需单独确认。
     if ($ExistingAvailable) { return 'Existing' }
     Write-Host ''
     Write-Host "$Label 获取方式：" -ForegroundColor Yellow
     Write-Host '  1. 从官方 GitHub 自动下载最新版（推荐）'
     Write-Host '  2. 使用已经手动下载的文件或目录'
-    if ($ExistingAvailable) { Write-Host '  3. 使用当前目录中已有的版本' }
     while ($true) {
         $choice = (Read-Host '请输入选项').Trim()
         if ($choice -eq '1') { return 'Auto' }
         if ($choice -eq '2') { return 'Manual' }
-        if ($choice -eq '3' -and $ExistingAvailable) { return 'Existing' }
         Write-Host '无效选项，请重新输入。' -ForegroundColor Yellow
     }
 }

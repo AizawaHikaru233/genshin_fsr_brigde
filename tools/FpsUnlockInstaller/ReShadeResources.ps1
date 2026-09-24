@@ -27,11 +27,19 @@ function Get-ReShadeResourceSpec {
             SweetFxSha256    = if ($null -ne $sfx) { [string]$sfx.sha256 } else { '7901037254B06B85E564F5B8774F2F59BF2503143CE1562F9AC704A3F3D74EC6' }
         }
     }
+    # ⚠️ 2026-09-23（审核项）：内置回退此前停在 ReShade **6.7.3**，而基线 JSON 已是
+    # **6.8.0** —— 两者不一致。回退只在"旧包没有 upstream-versions.json"时生效
+    # （当前打包脚本**始终**会带上该文件，见 Build-OnlineInstaller.ps1:245），
+    # 但一旦生效就会去下载**旧版本**，与基线声明的版本/哈希矛盾。
+    #
+    # **权威源是 `SharedResources/upstream-versions.json` 的 `reshade` 段**；
+    # 下面的值必须与之保持同步（本次已对齐 6.8.0）。
+    # 效果库（standard/lilium/sweetfx）**不在** JSON 里，故此处是它们的唯一来源，无同步问题。
     return [pscustomobject]@{
-        ReShadeVersion = '6.7.3'
-        ReShadeSetupUrl = 'https://reshade.me/downloads/ReShade_Setup_6.7.3_Addon.exe'
-        ReShadeSetupSha256 = 'C78DB69BD127E98054BD496FB422655F4A1CC664E28F8D12CE9835B2647BC571'
-        ReShadeDllSha256 = 'EC9245D05C11751F2AC0D2256E6921AD8FB36BE9172EF6D587856591EB729A25'
+        ReShadeVersion = '6.8.0'
+        ReShadeSetupUrl = 'https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe'
+        ReShadeSetupSha256 = 'AFE4C8F13048306307983B8B3D41D5BF00A86820440B0E57DEA10950E1176445'
+        ReShadeDllSha256 = '0CEE63F9C9F13F3AC909C5B4903F4DBB4B719A7AB3B4F13B0DEAF83C814B94F7'
         StandardCommit = '6db142b4b1a05c764222e5b0bd9a644b7ccfe1dc'
         StandardUrl = 'https://github.com/crosire/reshade-shaders/archive/6db142b4b1a05c764222e5b0bd9a644b7ccfe1dc.zip'
         StandardSha256 = '12D082C8AB1DBCB5E221E1B6116A0343F3182EE517F09BB966B117ACC7635312'
