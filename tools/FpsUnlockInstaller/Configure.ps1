@@ -1333,13 +1333,31 @@ function Initialize-ReShadeConfiguration {
             Set-Content -LiteralPath $IniPath -Value $generated -Encoding UTF8
         }
     }
-    # 路径键每次运行都覆写：组件目录/安装位置可能移动，必须刷新到当前实际路径。
-    # （preserveExistingIni 只决定是否从模板重置整份 ini，不再保护路径键。）
+    # ---------------------------------------------------------------------
+    # 路径键写入策略（2026-09-23 复核后修正）
+    #
+    # **3 项指向 payload 的路径：每次覆写。** 它们指向 `payload\ReShade\reshade-shaders\`
+    # —— 非默认位置，ReShade 无从猜测；组件目录/安装位置移动后必须刷新到当前实际路径。
+    #
+    # **2 项指向游戏目录的路径：仅在为空时写入。** `ReShade.ini` 本身就在游戏目录，
+    # 而 `PresetPath` / `SavePath` 的目标（`ReShadePreset.ini`、`Screenshots\`）正是
+    # 相对该 ini 的默认基准 —— ReShade 出厂模板里这两项**本来就是空的**，
+    # 且打包时**故意删除** `payload\ReShade\ReShadePreset.ini`（见 Build-OnlineInstaller.ps1）。
+    # ⇒ 它们**不随安装位置移动**，没有"每次刷新"的理由；原先每次覆写会
+    #   **抹掉用户在 ReShade 界面里改过的设置**（例如自定义截图目录）。
+    # ---------------------------------------------------------------------
     Set-IniValue -Path $IniPath -Section 'ADDON' -Key 'AddonPath' -Value $configAddonPath
     Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'EffectSearchPaths' -Value $configShaderPath
     Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'TextureSearchPaths' -Value $configTexturePath
-    Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'PresetPath' -Value $configPresetPath
-    Set-IniValue -Path $IniPath -Section 'SCREENSHOT' -Key 'SavePath' -Value $configScreenshotPath
+
+    $existingPresetPath = Get-IniValue -Path $IniPath -Section 'GENERAL' -Key 'PresetPath'
+    if ([string]::IsNullOrWhiteSpace($existingPresetPath)) {
+        Set-IniValue -Path $IniPath -Section 'GENERAL' -Key 'PresetPath' -Value $configPresetPath
+    }
+    $existingSavePath = Get-IniValue -Path $IniPath -Section 'SCREENSHOT' -Key 'SavePath'
+    if ([string]::IsNullOrWhiteSpace($existingSavePath)) {
+        Set-IniValue -Path $IniPath -Section 'SCREENSHOT' -Key 'SavePath' -Value $configScreenshotPath
+    }
     if (-not $PreservePreset -and ($Force -or -not (Test-Path -LiteralPath $PresetPath -PathType Leaf))) {
         if (Test-Path -LiteralPath $reshadePresetTemplate -PathType Leaf) {
             Copy-Item -LiteralPath $reshadePresetTemplate -Destination $PresetPath -Force
