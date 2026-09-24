@@ -890,6 +890,13 @@ static const wchar_t *g_stage_name[6] = {
     L"PS", L"VS", L"GS", L"HS", L"DS", L"CS"
 };
 
+// [bind] 等级 2 诊断的"每个 hash 只记首次"状态（2026-09-24）。
+// 见 HookSetShaderResourcesCommon 内的说明：原来每次绑定都记一行，
+// 实机 140 秒 899,670 行 / 75 MB，且 log.cpp 每行 fflush ⇒ 渲染线程被写盘拖住。
+static std::mutex g_bind_log_mutex;
+static std::set<uint32_t> g_bind_logged;
+static std::atomic<uint64_t> g_bind_log_suppressed{0};
+
 static void STDMETHODCALLTYPE HookSetShaderResourcesCommon(
     ID3D11DeviceContext *This,
     UINT StartSlot, UINT NumViews,
@@ -989,13 +996,28 @@ static void STDMETHODCALLTYPE HookSetShaderResourcesCommon(
                     InterlockedIncrement(&g_stats_bound);
                     // 2026-09-22（审核报告）：`stageIdx` 形参与 `g_stage_name[]`
                     // 此前都是**死代码**（形参从未使用、名字表从未被引用）。
-                    // 这里把它们用于**等级 2** 的绑定诊断 —— 默认 log_level=1
-                    // 不产生任何输出，只有排查时才打开，因此不影响热路径成本。
-                    // 价值：能回答"替换是在哪个着色器阶段生效的"。
-                    const wchar_t *stage = (stageIdx >= 0 && stageIdx < 6)
-                        ? g_stage_name[stageIdx] : L"?";
-                    TL_LOG_IF(2, L"[bind] stage=%ls slot=%u hash=0x%08X -> replacement SRV",
-                              stage, StartSlot + i, hash);
+                    // 这里把它们用于**等级 2** 的绑定诊断。
+                    //
+                    // ⚠️ 2026-09-24：原实现在**每次绑定**都记一行，注释断言
+                    // "只有排查时才打开，因此不影响热路径成本" —— **该判断不成立**：
+                    // 实机日志 140 秒产出 899,670 行 / 75 MB（≈6,400 行/秒），
+                    // 而 log.cpp 是**每行 fflush** ⇒ 渲染线程每秒上万次写盘系统调用。
+                    // 现改为**每个 hash 只记首次绑定**（替换条目有限 ⇒ 行数有限），
+                    // 已足够回答"替换是在哪个着色器阶段生效的"；被抑制的行数计入
+                    // [stat] 的 bind_log_suppressed，**不会静默丢失**。
+                    bool first_bind = false;
+                    {
+                        std::lock_guard<std::mutex> lk(g_bind_log_mutex);
+                        first_bind = g_bind_logged.insert(hash).second;
+                    }
+                    if (first_bind) {
+                        const wchar_t *stage = (stageIdx >= 0 && stageIdx < 6)
+                            ? g_stage_name[stageIdx] : L"?";
+                        TL_LOG_IF(2, L"[bind] stage=%ls slot=%u hash=0x%08X -> replacement SRV",
+                                  stage, StartSlot + i, hash);
+                    } else {
+                        g_bind_log_suppressed.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
         }
@@ -2282,10 +2304,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         //   hashed - matched = 哈希了但没命中（判断 mod 覆盖范围的关键量）
         {
             std::lock_guard<std::mutex> lk(g_lock);
-            TL_LOG(L"[stat] hashed=%ld matched=%ld bound=%ld cache_entries=%u cache_MB=%u",
+            TL_LOG(L"[stat] hashed=%ld matched=%ld bound=%ld cache_entries=%u cache_MB=%u bind_log_suppressed=%llu",
                    g_stats_created, g_stats_matched, g_stats_bound,
                    (unsigned)g_replacements.size(),
-                   (unsigned)(g_cacheBytesTotal.load(std::memory_order_relaxed) / (1024ull * 1024ull)));
+                   (unsigned)(g_cacheBytesTotal.load(std::memory_order_relaxed) / (1024ull * 1024ull)),
+                   (unsigned long long)g_bind_log_suppressed.load(std::memory_order_relaxed));
         }
         // 进程退出：统一释放全局持久化的替换缓存（正常运行时不随原纹理销毁，
         // 退出时一次清空；进程卸载后驱动侧资源由系统回收，此处显式 Release）
