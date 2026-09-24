@@ -243,6 +243,33 @@ function Set-IniPathValue {
     return $true
 }
 
+# 读取 ini 键的值（供"是否为空"判断用）。键不存在、段不存在、文件不存在 ⇒ 返回空串。
+#
+# ⚠️ 2026-09-23：`Repair-RuntimePaths` 需要区分"键在但值为空"与"已配置" ——
+# 只判断键是否存在是不够的（`PresetPath=` 也是"存在"）。
+# 注意 `Configure.ps1` 是**独立进程**调用（`-File`），故无法复用它的 `Get-IniValue`。
+function Get-IniPathValue {
+    param(
+        [string]$Path,
+        [string]$Section,
+        [string]$Key
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
+    $inSection = $false
+    foreach ($line in @(Get-Content -LiteralPath $Path -Encoding UTF8)) {
+        $text = [string]$line
+        if ($text.Trim() -match '^\[(.+)\]$') {
+            $inSection = $matches[1].Trim() -ieq $Section
+            continue
+        }
+        if (-not $inSection) { continue }
+        if ($text -match ('^\s*' + [regex]::Escape($Key) + '\s*=\s*(.*)$')) {
+            return $matches[1].Trim()
+        }
+    }
+    return ''
+}
+
 function Test-PathCompatibilityRisk {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
@@ -400,15 +427,33 @@ function Repair-RuntimePaths {
     }
     if ((Test-Path -LiteralPath $reShadePath -PathType Leaf) -and (Test-Path -LiteralPath $reShadeIni -PathType Leaf)) {
         $shaderDirectory = Join-Path $reShadeDirectory 'reshade-shaders'
+        # ---------------------------------------------------------------------
+        # 路径写入策略（2026-09-23，与 Configure.ps1 / 芙芙 bootstrap 保持一致）
+        #
+        # 本函数**每次安装器启动都会执行**（`Installer.ps1:1342`，另有"更换游戏路径"
+        # 之后的一处），所以它写什么、怎么写，直接决定用户的 ReShade 设置能否留存。
+        #
+        # **3 项指向 payload 的路径：每次覆写。** 它们是"运行时路径"，随安装位置移动
+        # —— 这正是本函数叫 `Repair-RuntimePaths` 的意义所在。
+        #
+        # **2 项指向游戏目录的路径（PresetPath / SavePath）：仅在为空时写入。**
+        # 它们**不随安装位置移动**（目标是相对 `ReShade.ini` 的默认基准），
+        # 不属于"运行时路径"，本就不该被"修复"；原先无条件覆写会把用户在
+        # ReShade 界面里改过的设置（自定义截图目录等）**每次启动安装器都重置**。
+        # ---------------------------------------------------------------------
         Set-IniPathValue -Path $reShadeIni -Section 'ADDON' -Key 'AddonPath' `
             -Value ([IO.Path]::GetFullPath((Join-Path $shaderDirectory 'Addons'))) | Out-Null
         Set-IniPathValue -Path $reShadeIni -Section 'GENERAL' -Key 'EffectSearchPaths' `
             -Value ([IO.Path]::GetFullPath((Join-Path $shaderDirectory 'Shaders'))) | Out-Null
         Set-IniPathValue -Path $reShadeIni -Section 'GENERAL' -Key 'TextureSearchPaths' `
             -Value ([IO.Path]::GetFullPath((Join-Path $shaderDirectory 'Textures'))) | Out-Null
-        Set-IniPathValue -Path $reShadeIni -Section 'GENERAL' -Key 'PresetPath' -Value $reShadePreset | Out-Null
-        Set-IniPathValue -Path $reShadeIni -Section 'SCREENSHOT' -Key 'SavePath' `
-            -Value (Join-Path $gameDirectory 'Screenshots') | Out-Null
+        if ([string]::IsNullOrWhiteSpace((Get-IniPathValue -Path $reShadeIni -Section 'GENERAL' -Key 'PresetPath'))) {
+            Set-IniPathValue -Path $reShadeIni -Section 'GENERAL' -Key 'PresetPath' -Value $reShadePreset | Out-Null
+        }
+        if ([string]::IsNullOrWhiteSpace((Get-IniPathValue -Path $reShadeIni -Section 'SCREENSHOT' -Key 'SavePath'))) {
+            Set-IniPathValue -Path $reShadeIni -Section 'SCREENSHOT' -Key 'SavePath' `
+                -Value (Join-Path $gameDirectory 'Screenshots') | Out-Null
+        }
         Remove-Item -LiteralPath (Join-Path $reShadeDirectory 'ReShade.ini'), `
             (Join-Path $reShadeDirectory 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
     }
