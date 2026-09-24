@@ -2020,17 +2020,45 @@ static LONG WINAPI CrashHandler(PEXCEPTION_POINTERS ep)
     t_in_crash_handler = true;
 
     // 只捕获访问违例/非法指令等致命异常；调试器在场时不介入
-    if (IsDebuggerPresent())
+    //
+    // ⚠️ 2026-09-23（诊断补强）：这两条原先**静默**返回，于是"日志里没有 [CRASH] 行"
+    // 永远无法区分"异常真的没发生"与"被这里跳过" —— 实机排查时已经因此困惑过一次
+    // （新基线日志无 [CRASH] 行 ⇒ 究竟没崩，还是被拦？）。现在把跳过原因写进日志。
+    // **注意：重入那条必须保持静默**（它自己也会走 TLC_LOG，否则无限递归）。
+    if (IsDebuggerPresent()) {
+        TLC_LOG(L"[CRASH] skipped reason=debugger_present");
         return EXCEPTION_CONTINUE_SEARCH;
+    }
     if (!ep || !ep->ExceptionRecord)
-        return EXCEPTION_CONTINUE_SEARCH;
+        return EXCEPTION_CONTINUE_SEARCH; // 静默：唯一必须不记录的分支（防递归）
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
         code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
-        code != EXCEPTION_ARRAY_BOUNDS_EXCEEDED)
+        code != EXCEPTION_ARRAY_BOUNDS_EXCEEDED) {
+        TLC_LOG(L"[CRASH] skipped reason=non_fatal_code code=0x%08X addr=%p", code,
+                ep->ExceptionRecord->ExceptionAddress);
         return EXCEPTION_CONTINUE_SEARCH;
+    }
 
     void *addr = ep->ExceptionRecord->ExceptionAddress;
+
+    // 故障地址归属模块。原先只解析**栈帧**归属，故障地址与 R13 都是裸值 ——
+    // 而实机案例里出错指令在反作弊模块（MHYPBase.dll）、R13 是它正在扫描的
+    // 另一个模块基址，两者都只能用裸地址表示 ⇒ **无法指名"在扫谁的内存"**。
+    // 这里补上故障地址的模块解析；R13 在下方寄存器块之后单独解析。
+    {
+        HMODULE amod = nullptr;
+        wchar_t aname[MAX_PATH] = L"<unknown>";
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)addr, &amod)) {
+            GetModuleFileNameW(amod, aname, MAX_PATH);
+            wchar_t *slash = wcsrchr(aname, L'\\');
+            if (slash) wcscpy_s(aname, slash + 1);
+        }
+        TLC_LOG(L"[CRASH] fault_module %s+0x%llX", aname,
+                (unsigned long long)((uintptr_t)addr - (uintptr_t)amod));
+    }
     // ⚠️ 2026-09-23：全部改用 TLC_LOG（= log_crash_write），**不能用 TL_LOG**。
     // TL_LOG 会阻塞在非递归的 g_mutex 上；若崩溃正发生在持有该锁的代码里
     // （fwprintf/fflush 内部违例、堆损坏），就会自死锁 ——
@@ -2049,6 +2077,21 @@ static LONG WINAPI CrashHandler(PEXCEPTION_POINTERS ep)
         TLC_LOG(L"[CRASH] regs R8=%p R9=%p R10=%p R11=%p R12=%p R13=%p R14=%p R15=%p",
                 (void *)ctx->R8, (void *)ctx->R9, (void *)ctx->R10, (void *)ctx->R11,
                 (void *)ctx->R12, (void *)ctx->R13, (void *)ctx->R14, (void *)ctx->R15);
+        // R13 在实机案例里是"被扫描模块的基址"（出错地址 = R13 + 0x93xxxx）。
+        // 裸值无法指名模块 ⇒ 解析它，直接说出反作弊在扫谁的内存。
+        {
+            HMODULE rmod = nullptr;
+            wchar_t rname[MAX_PATH] = L"<unknown>";
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCWSTR)ctx->R13, &rmod)) {
+                GetModuleFileNameW(rmod, rname, MAX_PATH);
+                wchar_t *slash = wcsrchr(rname, L'\\');
+                if (slash) wcscpy_s(rname, slash + 1);
+            }
+            TLC_LOG(L"[CRASH] r13_module %s+0x%llX", rname,
+                    (unsigned long long)(ctx->R13 - (uintptr_t)rmod));
+        }
     }
 
     // 模块级调用栈（无符号解析——输出 module+0xOFFSET 便于定位所在模块）
