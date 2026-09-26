@@ -70,6 +70,7 @@ add_library(Dx11FsrBridge SHARED
     RenderScaleMenu.cpp
     Fsr2FamilyTakeover.cpp
     Il2CppCallSiteHook.cpp
+    JitterFlagProbe.cpp
     Ffx12Backend.cpp
     Fsr2InputDump.cpp
 )
@@ -223,6 +224,16 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     target_compile_definitions(Fsr2InputDumpTest PRIVATE FSR2DUMP_NO_LOGGER)
     target_include_directories(Fsr2InputDumpTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME Fsr2InputDumpTest COMMAND Fsr2InputDumpTest)
+
+    # 【只读观测】jitter 标志探针：签名定位 + 只读 stub 的透传/还原 + 限流状态机。
+    # 不需要游戏、不需要 GPU、不链接 BridgeLogger（日志走注入的 sink）。
+    add_executable(JitterFlagProbeTest
+        JitterFlagProbeTest.cpp
+        JitterFlagProbe.cpp
+    )
+    fsrbridge_configure_test(JitterFlagProbeTest)
+    target_include_directories(JitterFlagProbeTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME JitterFlagProbeTest COMMAND JitterFlagProbeTest)
 endif()
 
 if(DX11FSRBRIDGE_BUILD_BACKEND_TEST)

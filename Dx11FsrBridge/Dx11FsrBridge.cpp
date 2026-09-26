@@ -13,6 +13,7 @@
 #include "RenderScaleMenu.h"
 #include "Fsr2FamilyTakeover.h"
 #include "Il2CppCallSiteHook.h"
+#include "JitterFlagProbe.h"
 #include "Ffx12Backend.h"
 #include "Fsr2InputDump.h"
 #include "BridgeLogger.h"
@@ -244,6 +245,13 @@ struct Config
     std::uint32_t ffx12_camera_rva = 0x06B558D0;
     bool ffx12_projection_hook = false; // 观察已构造的 Camera projection matrix
     std::uint32_t ffx12_projection_setter_rva = 0x013DC510;
+    // 【只读观测】jitter 标志 setter 探针（默认关闭）。钩住
+    // Camera.set_useJitteredProjectionMatrixForTransparentRendering，**只记录实参**，
+    // 用来证伪/坐实"游戏传了 false ⇒ 透明队列用未抖动矩阵 ⇒ 效果部件时域 AA 失效"。
+    // 定位走签名发现（锚点 = 特征识别出的 ConfigureJitteredProjectionMatrix），
+    // 不写死 RVA。详见 JitterFlagProbe.h。
+    bool jitter_flag_probe = false;
+    std::uint32_t jitter_flag_probe_frames = 0; // 0 = 一直记录；N = 只记录前 N 帧
     // Phase 1：进程内 FSR2 2.3.4 后端（ffxApi → amd_fidelityfx_upscaler_dx12.dll）。
     // 桥直接驱动 AMD SDK（不经 OptiScaler）；Phase 2 的调用点接管会调用它的 dispatch。
     bool ffx12 = false;
@@ -3883,6 +3891,13 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12CameraHook", 0, config_path.c_str()) != 0;
     g_config.ffx12_projection_hook =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ProjectionHook", 0, config_path.c_str()) != 0;
+    // 【只读观测】jitter 标志探针。⚠️ 键名/段位必须与发布 ini 一致：
+    // 段必须是 `[Dx11FsrBridge]`（放错段读不到，本项目踩过），且必须在**生产分支**读取
+    // （load_config 无条件执行，不受 DX11FSRBRIDGE_RELEASE_RUNTIME 影响）。
+    g_config.jitter_flag_probe =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"JitterFlagProbe", 0, config_path.c_str()) != 0;
+    g_config.jitter_flag_probe_frames = static_cast<std::uint32_t>(
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"JitterFlagProbeFrames", 0, config_path.c_str()));
     const auto read_hex_rva = [&](const wchar_t *key, std::uint32_t fallback) {
         wchar_t buf[32] {};
         GetPrivateProfileStringW(L"Dx11FsrBridge", key, L"", buf, static_cast<DWORD>(std::size(buf)),
@@ -13351,6 +13366,71 @@ static void route_from_d3d11_device(ID3D11Device *d3d11_device)
         record_adapter_info(vendor, desc_text);
 }
 
+// ---------------------------------------------------------------------------
+// il2cpp 特征识别结果缓存（每个进程只算一次）
+//
+// 为什么需要缓存：`detect_ffx12_method_rvas()` 要遍历 .rdata/.data（本机实测约 62 MB
+// → 约 780 万个 u64）后再排序去重，一次性开销不可忽略；而现在有**两个**功能需要
+// 同一个相机锚点（il2cpp 调用点钩子、JitterFlagProbe 探针），各算一次等于把启动
+// 开销翻倍。
+//
+// 为什么两个功能**互不依赖**：探针只开 `JitterFlagProbe` 时也必须能工作 ——
+// 若把它塞进 `if (g_config.fsr2_il2cpp_hook)` 里，就会出现"ini 里设了没用"的
+// 静默失效（错误清单第 7/11 条那一族）。
+// ---------------------------------------------------------------------------
+struct Il2CppRvaCache
+{
+    bool detected = false;
+    std::uint32_t render = 0;
+    std::uint32_t ucb = 0;
+    std::uint32_t camera = 0;
+};
+
+const Il2CppRvaCache &il2cpp_rva_cache()
+{
+    // 线程安全的神奇静态：只在第一次调用时做特征识别，之后直接返回缓存。
+    static const Il2CppRvaCache cache = []()
+        {
+            Il2CppRvaCache result;
+            const std::uint64_t base = reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
+            result.detected =
+                il2cpp_callsite::detect_ffx12_method_rvas(base, result.render, result.ucb, result.camera);
+            return result;
+        }();
+    return cache;
+}
+
+// 主模块的 SizeOfImage（候选目标越界检查用）。失败返回 0（调用方据此拒绝安装）。
+std::uint64_t main_module_image_size()
+{
+    const auto *base = reinterpret_cast<const std::uint8_t *>(GetModuleHandleW(nullptr));
+    if (base == nullptr)
+        return 0;
+    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return 0;
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return 0;
+    return nt->OptionalHeader.SizeOfImage;
+}
+
+// 【只读观测】JitterFlagProbe 的日志出口与帧号来源。
+// 探针模块刻意不依赖 BridgeLogger ⇒ 这里注入；关闭时**不注册**（零开销）。
+void jitter_flag_probe_log(const char *line)
+{
+    if (line == nullptr)
+        return;
+    LOG_INFO(blog::cat::probe, std::string(line));
+}
+
+std::uint64_t jitter_flag_probe_frame()
+{
+    // 全局 Present 帧计数（Present 钩子里自增）。探针只把它当诊断数字用。
+    return g_state.frame_index;
+}
+
 void initialize()
 {
     wchar_t module_path[MAX_PATH] {};
@@ -13460,15 +13540,16 @@ void initialize()
         const std::uint64_t exe_base = reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
         // 特征识别优先（不依赖硬编码 RVA——国服/国际服/版本更新通用）：
         // g_MethodPointers + FFX_FSR2 30 方法尺寸序列 gap 匹配；失败用配置（硬编码兜底）。
-        std::uint32_t detected_render = 0, detected_ucb = 0, detected_camera = 0;
-        if (il2cpp_callsite::detect_ffx12_method_rvas(exe_base, detected_render, detected_ucb, detected_camera))
+        // 结果走缓存：JitterFlagProbe 用同一个锚点（见 il2cpp_rva_cache 的注释）。
+        const Il2CppRvaCache &detected = il2cpp_rva_cache();
+        if (detected.detected)
         {
-            hook_cfg.render_rva = detected_render;
-            hook_cfg.update_cmd_buffer_rva = detected_ucb;
-            hook_cfg.camera_rva = detected_camera;
-            LOG_INFO(blog::cat::hook, "fsr2_il2cpp_rva_feature_match render=" + hex64(detected_render) +
-                " ucb=" + hex64(detected_ucb) +
-                " camera=" + hex64(detected_camera));
+            hook_cfg.render_rva = detected.render;
+            hook_cfg.update_cmd_buffer_rva = detected.ucb;
+            hook_cfg.camera_rva = detected.camera;
+            LOG_INFO(blog::cat::hook, "fsr2_il2cpp_rva_feature_match render=" + hex64(detected.render) +
+                " ucb=" + hex64(detected.ucb) +
+                " camera=" + hex64(detected.camera));
         }
         LOG_DEBUG(blog::cat::upscale, "ffx12_camera_config probe=" +
             std::to_string(g_config.ffx12_probe_camera ? 1 : 0) +
@@ -13529,6 +13610,38 @@ void initialize()
         }
     }
 #endif
+    // ---- 【只读观测】jitter 标志 setter 探针（JitterFlagProbe=1，默认关）----
+    //
+    // ⚠️ 刻意放在 `DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL` **之外**：
+    // 探针是纯诊断，不该依赖翻译层宏（否则某些构建里"ini 里设了没用"，错误清单第 7 条）。
+    // 关闭时（默认）**连 sink 都不注册**、不碰任何游戏内存 ⇒ 零开销。
+    if (g_config.jitter_flag_probe)
+    {
+        const std::uint64_t probe_base = reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
+        const Il2CppRvaCache &probe_detected = il2cpp_rva_cache();
+        jitter_flag_probe::Config probe_cfg;
+        probe_cfg.enabled = true;
+        probe_cfg.frames_limit = g_config.jitter_flag_probe_frames;
+        // 锚点：特征识别优先，配置 RVA 兜底（load_config 已按 exe 名套用国际服的默认值）。
+        // 无论走哪条，install 都会先用 14 字节序言校验 —— 地址错只会"拒绝安装"，不会误 patch。
+        probe_cfg.camera_rva = probe_detected.detected ? probe_detected.camera : g_config.ffx12_camera_rva;
+        probe_cfg.image_size = main_module_image_size();
+        jitter_flag_probe::set_log_sink(&jitter_flag_probe_log);
+        jitter_flag_probe::set_frame_provider(&jitter_flag_probe_frame);
+        const char *probe_reason = nullptr;
+        if (jitter_flag_probe::install(probe_base, probe_cfg, &probe_reason))
+            LOG_INFO(blog::cat::hook, "jitter_flag_probe_active camera_rva=" + hex64(probe_cfg.camera_rva) +
+                " frames_limit=" + std::to_string(probe_cfg.frames_limit) +
+                " feature_detected=" + std::to_string(probe_detected.detected ? 1 : 0));
+        else
+            // ⚠️ 如实报出失败原因：分不清"锚点没找到 / 序言不匹配（游戏更新）/
+            // 分配失败"就只能靠猜，而三者处置完全不同（同 Il2CppCallSiteHook 的纪律）。
+            LOG_WARN(blog::cat::hook, "jitter_flag_probe_failed reason=" +
+                (probe_reason != nullptr ? std::string(probe_reason) : std::string("unknown")) +
+                " camera_rva=" + hex64(probe_cfg.camera_rva) +
+                " image_size=" + std::to_string(probe_cfg.image_size) +
+                " feature_detected=" + std::to_string(probe_detected.detected ? 1 : 0));
+    }
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     // Release 构建同样需要 OSD（show_osd 配置控制）：此前被 Release 条件编译切掉，
     // 导致 OSD 悬浮窗从未启动（"无可见 OSD"根因）。以下两行移到 #endif 之后。
@@ -13618,6 +13731,9 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         if (reserved != nullptr)
             ffx12::set_process_exiting();
         il2cpp_callsite::shutdown();
+        // 【只读观测】jitter 标志探针的还原。不取任何锁（只做原子交换 +
+        // VirtualProtect + 校验后 memcpy），故同样满足本分支的 loader-lock 纪律。
+        jitter_flag_probe::shutdown();
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         {
             std::lock_guard lock(g_ps_trace_mutex);
