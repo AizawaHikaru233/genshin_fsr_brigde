@@ -377,15 +377,25 @@ std::vector<std::string> split_ini_lines(const std::string &text)
     return lines;
 }
 
-bool ini_has_key_utf8(const std::filesystem::path &path, const std::string &section, const std::string &key)
+// 在已按行拆分的 ini 文本中定位 `[section]` 下 `key` 的值。
+//
+// ⚠️ 2026-09-23（`[待办 4]` ②「section 扫描循环可读性」）：此前
+// `ini_has_key_utf8` 与 `ini_value_is_empty_utf8` 各写了一份**逐字相同**的
+// 段扫描循环（只差返回值），改一处容易漏改另一处。现在只留这一份。
+//
+// 语义（与旧实现逐条一致，勿轻改）：
+//   - 段名/键名都做 `trim` + 小写比较（ini 大小写不敏感）
+//   - 空行、`;` `#` 开头的注释行跳过
+//   - 行内以**第一个** `=` 分隔；键名右侧 trim 后比较
+//   - 找到返回 true，`*value` 为 `=` 右侧 trim 后的内容（可为空串）
+bool find_ini_value_utf8(const std::vector<std::string> &lines,
+                         const std::string &section, const std::string &key,
+                         std::string *value)
 {
-    std::string bytes;
-    if (!read_utf8_file(path, bytes))
-        return false;
     const std::string wanted_section = lower_ascii(section);
     const std::string wanted_key = lower_ascii(key);
     std::string current_section;
-    for (const std::string &raw_line : split_ini_lines(bytes))
+    for (const std::string &raw_line : lines)
     {
         const std::string line = trim_ascii(raw_line);
         if (line.size() >= 2 && line.front() == '[' && line.back() == ']')
@@ -398,9 +408,21 @@ bool ini_has_key_utf8(const std::filesystem::path &path, const std::string &sect
         const std::size_t separator = line.find('=');
         if (separator != std::string::npos &&
             lower_ascii(trim_ascii(line.substr(0, separator))) == wanted_key)
+        {
+            if (value != nullptr)
+                *value = trim_ascii(line.substr(separator + 1));
             return true;
+        }
     }
     return false;
+}
+
+bool ini_has_key_utf8(const std::filesystem::path &path, const std::string &section, const std::string &key)
+{
+    std::string bytes;
+    if (!read_utf8_file(path, bytes))
+        return false;
+    return find_ini_value_utf8(split_ini_lines(bytes), section, key, nullptr);
 }
 
 // 键的值是否**为空**（键不存在、或 `key=` 后为空白 ⇒ 都算空）。
@@ -412,25 +434,10 @@ bool ini_value_is_empty_utf8(const std::filesystem::path &path, const std::strin
     std::string bytes;
     if (!read_utf8_file(path, bytes))
         return true; // 读不到就当空，交由调用方写入
-    const std::string wanted_section = lower_ascii(section);
-    const std::string wanted_key = lower_ascii(key);
-    std::string current_section;
-    for (const std::string &raw_line : split_ini_lines(bytes))
-    {
-        const std::string line = trim_ascii(raw_line);
-        if (line.size() >= 2 && line.front() == '[' && line.back() == ']')
-        {
-            current_section = lower_ascii(trim_ascii(line.substr(1, line.size() - 2)));
-            continue;
-        }
-        if (current_section != wanted_section || line.empty() || line.front() == ';' || line.front() == '#')
-            continue;
-        const std::size_t separator = line.find('=');
-        if (separator != std::string::npos &&
-            lower_ascii(trim_ascii(line.substr(0, separator))) == wanted_key)
-            return trim_ascii(line.substr(separator + 1)).empty();
-    }
-    return true; // 键不存在 ⇒ 空
+    std::string value;
+    if (!find_ini_value_utf8(split_ini_lines(bytes), section, key, &value))
+        return true; // 键不存在 ⇒ 空
+    return value.empty();
 }
 
 bool set_ini_value_utf8(
