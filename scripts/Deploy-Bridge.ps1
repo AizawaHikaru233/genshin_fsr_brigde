@@ -54,8 +54,10 @@ $configValues = [ordered]@{
     # 诊断探针（默认关）。JitterFlagProbe=1 只读观测
     # useJitteredProjectionMatrixForTransparentRendering 的实参，**不修改任何行为**。
     # 放在这里是为了避免"键不存在 ⇒ 依赖代码默认值 ⇒ 默认值一变无人察觉"（同 RenderScaleMenu 的教训）。
-    'JitterFlagProbe'      = '0'
+    'JitterFlagProbe'      = '1'
     'JitterFlagProbeFrames'= '0'      # 0 = 一直记录；N = 只记录前 N 帧
+    'JitterFlagForce'      = '1'      # 1 = 强制 useJitteredProjectionMatrixForTransparentRendering=true（A/B 实验）
+    'JitterFlagHotkey'     = '0'      # VK 码；114=F3（0=无热键）
     # FSR2 输入纹理转储（默认关）。抓帧用热键，**跑完务必改回 0**（每组 3 帧约 130 MB）。
     'Fsr2InputDump'          = '0'
     'Fsr2InputDumpFrames'    = '3'
