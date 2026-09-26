@@ -1120,12 +1120,46 @@ DWORD WINAPI worker_thread(void *parameter)
     std::array<std::uint8_t *, 5> targets {};
     ModuleFingerprint fingerprint {};
     std::array<std::uint32_t, 5> cached_rvas {};
+
+    // ① **首选 RVA 优先**（2026-09-26 第六次修正）
+    //
+    // 有些函数**无法用纯字节模式唯一定位** —— `ObjectActive`（`GameObject::SetActive`）
+    // 在本镜像里有 **45 个逐字节同形的 IL2CPP 包装器**，差别只在 `E8`/`E9` 位移里，
+    // 而位移是由调用者地址派生的 ⇒ 掩掉则全中、保留则等于选错。详见
+    // `PatternScanner.hpp` 里 `Signature::preferred_rva` 的说明。
+    //
+    // ⇒ 采用"记录地址 + **运行时校验**"：校验用**全掩码**模式，
+    //   地址一旦随版本漂移就会被发现 ✓（绝不静默拿错函数）。
+    //
+    // ⚠️ **必须放在缓存之前**：旧缓存里可能存着**错误孪生**的 RVA
+    //   （`0x00C53D10` 同样能通过全掩码校验 ⇒ 缓存那道校验**挡不住它** ✗）。
+    for (std::size_t index = 0; index < targets.size(); ++index)
+    {
+        const auto &signature = pattern_scanner::k_signatures[index];
+        if (signature.preferred_rva == 0)
+            continue;
+        targets[index] = read_cached_signature(main_module, signature, signature.preferred_rva);
+        char message[176] {};
+        if (targets[index] != nullptr)
+            std::snprintf(message, sizeof(message), "%.*s resolved via preferred rva=0x%08X (verified)",
+                static_cast<int>(signature.name.size()), signature.name.data(),
+                static_cast<unsigned>(signature.preferred_rva));
+        else
+            std::snprintf(message, sizeof(message),
+                "%.*s preferred rva=0x%08X FAILED verification; falling back to scan",
+                static_cast<int>(signature.name.size()), signature.name.data(),
+                static_cast<unsigned>(signature.preferred_rva));
+        log_line(message);
+    }
+
     bool cache_valid = get_module_fingerprint(main_module, fingerprint) &&
         read_feature_cache(main_module, fingerprint, cached_rvas);
     if (cache_valid)
     {
         for (std::size_t index = 0; index < targets.size(); ++index)
         {
+            if (targets[index] != nullptr)
+                continue; // 已由首选 RVA 解出
             targets[index] = read_cached_signature(main_module,
                 pattern_scanner::k_signatures[index], cached_rvas[index]);
             if (targets[index] == nullptr)
@@ -1142,7 +1176,11 @@ DWORD WINAPI worker_thread(void *parameter)
     else
     {
         for (std::size_t index = 0; index < targets.size(); ++index)
+        {
+            if (targets[index] != nullptr)
+                continue; // 已由首选 RVA 解出
             targets[index] = scan_unique_signature(base, size, pattern_scanner::k_signatures[index]);
+        }
         if (std::all_of(targets.begin(), targets.end(), [](const auto *target) { return target != nullptr; }) &&
             get_module_fingerprint(main_module, fingerprint))
             write_feature_cache(main_module, fingerprint, targets);
