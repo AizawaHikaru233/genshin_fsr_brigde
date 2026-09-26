@@ -11114,8 +11114,9 @@ bool try_fsr2_translation_draw(
 #endif // !DX11FSRBRIDGE_RELEASE_RUNTIME
 
                 // FSR2 输入纹理转储（诊断，默认关；Fsr2InputDump=1 才启用）。
+                // **必须无条件调用**：热键/延时触发要在里面轮询，若先判"已启用"再调用，
+                // 开关关闭时永远不会进入 ⇒ 热键永远武装不上。关闭时内部走一次原子读即返回。
                 // 只在这里喂参数与纹理，读回由模块跨帧延迟完成——不在本 draw 内做 CPU 同步。
-                if (fsr2dump::enabled())
                 {
                     bool dump_dx11on12 = false, dump_gpu_only = false;
                     ffx12::interop_capabilities(dump_dx11on12, dump_gpu_only);

@@ -314,8 +314,13 @@ struct State
     bool save_raw = true;
     bool save_png = true;
     std::filesystem::path dir;
+    TriggerConfig trigger;
+    TriggerRuntime trigger_rt;
     Pending pending;
 };
+
+// 默认配置（无开关、无触发）下的每帧快路径：一次 relaxed 原子读即返回。
+std::atomic_bool g_maybe_active { false };
 
 State &state()
 {
@@ -762,6 +767,69 @@ std::vector<std::uint8_t> make_raw_header(std::uint32_t w, std::uint32_t h, std:
     return v;
 }
 
+TriggerOut trigger_update(const TriggerConfig &cfg, TriggerRuntime &rt, std::uint64_t now_tick,
+                          bool hotkey_edge)
+{
+    TriggerOut out;
+    if (rt.start_tick == 0)
+        rt.start_tick = now_tick;
+
+    // 未配置任何触发 ⇒ 保持旧行为：立刻开抓（配置者显然就是想要最近这些帧）。
+    if (!cfg.require_trigger && rt.session_count == 0 && !rt.session_active)
+    {
+        rt.session_active = true;
+        rt.frames_done = 0;
+        rt.next_capture_tick = now_tick;
+        ++rt.session_count;
+        out.started = true;
+        out.source = "immediate";
+    }
+
+    // 会话进行中忽略新的触发：不混轮次（抓满即结束，之后热键可再触发）。
+    if (!rt.session_active)
+    {
+        bool start = false;
+        const char *source = "";
+        if (hotkey_edge && cfg.hotkey != 0)
+        {
+            start = true;
+            source = "hotkey";
+        }
+        else if (!rt.autostart_fired && cfg.autostart_sec > 0 &&
+                 now_tick - rt.start_tick >= static_cast<std::uint64_t>(cfg.autostart_sec) * 1000u)
+        {
+            // 自动触发只发生一次
+            start = true;
+            source = "timer";
+        }
+        if (cfg.autostart_sec > 0 && !rt.autostart_fired && now_tick - rt.start_tick >=
+                static_cast<std::uint64_t>(cfg.autostart_sec) * 1000u)
+            rt.autostart_fired = true;
+        if (start)
+        {
+            rt.session_active = true;
+            rt.frames_done = 0;
+            rt.next_capture_tick = now_tick;
+            ++rt.session_count;
+            out.started = true;
+            out.source = source;
+        }
+    }
+
+    if (rt.session_active && now_tick >= rt.next_capture_tick)
+    {
+        out.capture_now = true;
+        ++rt.frames_done;
+        rt.next_capture_tick = now_tick + cfg.interval_ms;
+        if (rt.frames_done >= (cfg.frames == 0 ? 1u : cfg.frames))
+        {
+            rt.session_active = false;
+            out.finished = true;
+        }
+    }
+    return out;
+}
+
 // ---------------- 对外流程 ----------------
 
 void configure(const wchar_t *ini_path)
@@ -793,18 +861,48 @@ void configure(const wchar_t *ini_path)
         dir = std::filesystem::path(ini_path).parent_path() / L"fsr2dump";
     }
     s.dir = dir;
-}
 
-bool enabled()
-{
-    std::lock_guard<std::mutex> lock(state_mutex());
-    const State &s = state();
-    return s.enabled && !s.refused_unsafe && s.frames_done < s.frames_wanted;
+    // 触发：延时自动开始 / 热键 / 帧间间隔。
+    // 语义对齐既有 TextureTrace（TextureTraceHotkey / TextureTraceAutoStartSec），
+    // 但那段代码在发布构建里被 #if 编译掉，故这里自成一套。
+    s.trigger.frames = s.frames_wanted;
+    s.trigger.interval_ms = static_cast<std::uint32_t>(
+        std::max<UINT>(0u, GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2InputDumpIntervalMs", 0,
+                                                 ini_path)));
+    s.trigger.autostart_sec = static_cast<std::uint32_t>(
+        std::max<UINT>(0u, GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2InputDumpAutoStartSec", 0,
+                                                 ini_path)));
+    s.trigger.hotkey = static_cast<std::uint32_t>(
+        std::max<UINT>(0u, GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2InputDumpHotkey", 0,
+                                                 ini_path)));
+    // 两个触发都没配 ⇒ 立刻开抓（保持既有行为，避免"配了开关却什么都不抓"）
+    s.trigger.require_trigger = (s.trigger.autostart_sec > 0) || (s.trigger.hotkey > 0);
+    s.trigger_rt = TriggerRuntime {};
+    s.trigger_rt.start_tick = GetTickCount64();
+
+    // 只在"开关打开"时才让每帧快路径放行
+    g_maybe_active.store(s.enabled, std::memory_order_relaxed);
+
+    if (s.enabled)
+    {
+        FSR2DUMP_LOG(INFO,
+                 "fsr2_input_dump armed frames=" + std::to_string(s.frames_wanted) +
+                     " interval_ms=" + std::to_string(s.trigger.interval_ms) +
+                     " autostart_sec=" + std::to_string(s.trigger.autostart_sec) +
+                     " hotkey=" + std::to_string(s.trigger.hotkey) +
+                     " trigger=" + std::string(s.trigger.require_trigger
+                                                   ? (s.trigger.hotkey ? "hotkey" : "timer")
+                                                   : "immediate") +
+                     " dir=" + s.dir.string());
+    }
 }
 
 void on_dispatch(ID3D11DeviceContext *ctx, const FrameDesc &desc, bool allow_readback)
 {
     if (!ctx)
+        return;
+    // 快路径：默认配置（开关关闭）下每帧只花一次 relaxed 原子读。
+    if (!g_maybe_active.load(std::memory_order_relaxed))
         return;
     std::lock_guard<std::mutex> lock(state_mutex());
     State &s = state();
@@ -824,7 +922,29 @@ void on_dispatch(ID3D11DeviceContext *ctx, const FrameDesc &desc, bool allow_rea
         return;
     }
 
-    // ① 先落盘上一帧排队的捕获（那时 GPU 早已完成 ⇒ Map 不会长时间阻塞）
+    // 轮询热键（与 TextureTrace 同法：GetAsyncKeyState 的 bit0 = 自上次调用后按下过）
+    bool hotkey_edge = false;
+    if (s.trigger.hotkey != 0)
+        hotkey_edge = (GetAsyncKeyState(static_cast<int>(s.trigger.hotkey)) & 1) != 0;
+
+    const TriggerOut out = trigger_update(s.trigger, s.trigger_rt, GetTickCount64(), hotkey_edge);
+    if (out.started)
+    {
+        FSR2DUMP_LOG(INFO, std::string("fsr2_input_dump triggered source=") + out.source +
+                     " session=" + std::to_string(s.trigger_rt.session_count) +
+                     " frames=" + std::to_string(s.trigger.frames) +
+                     " interval_ms=" + std::to_string(s.trigger.interval_ms));
+    }
+    if (out.finished)
+    {
+        FSR2DUMP_LOG(INFO, "fsr2_input_dump session done frames=" +
+                     std::to_string(s.trigger_rt.frames_done) +
+                     " total_frames=" + std::to_string(s.frames_done) +
+                     " dir=" + s.dir.string());
+    }
+
+    // ① 先落盘上一帧排队的捕获（那时 GPU 早已完成 ⇒ Map 不会长时间阻塞）。
+    //    注意：即使本轮已抓满也必须做完，否则最后一帧会丢。
     if (s.pending.used)
     {
         std::vector<std::string> written;
@@ -839,6 +959,7 @@ void on_dispatch(ID3D11DeviceContext *ctx, const FrameDesc &desc, bool allow_rea
             ctx->Unmap(it.staging, 0);
         }
         write_meta(s.dir, s.pending, written);
+        ++s.frames_done;
         FSR2DUMP_LOG(INFO,
                  "fsr2_input_dump frame=" + std::to_string(s.pending.frame_index) +
                      " render=" + std::to_string(s.pending.render_w) + "x" +
@@ -846,21 +967,20 @@ void on_dispatch(ID3D11DeviceContext *ctx, const FrameDesc &desc, bool allow_rea
                      " files=" + std::to_string(written.size()) +
                      " dir=" + s.dir.string());
         release_pending(s.pending);
-        ++s.frames_done;
-        if (s.frames_done >= s.frames_wanted)
-        {
-            FSR2DUMP_LOG(INFO, "fsr2_input_dump done frames=" + std::to_string(s.frames_done));
-            return;
-        }
     }
 
-    // ② 排队本帧捕获（只发 GPU 拷贝，不 Map/Flush）
+    // ② 只有触发状态机说"本帧该抓"时才排新捕获
+    if (!out.capture_now)
+        return;
+
+    // 排队本帧捕获（只发 GPU 拷贝，不 Map/Flush）
     ID3D11Device *dev = nullptr;
     ctx->GetDevice(&dev);
     if (!dev)
     {
         FSR2DUMP_LOG(WARN, "fsr2_input_dump cannot get device; disabled");
         s.enabled = false;
+        g_maybe_active.store(false, std::memory_order_relaxed);
         return;
     }
     Pending p;
@@ -916,16 +1036,16 @@ void on_dispatch(ID3D11DeviceContext *ctx, const FrameDesc &desc, bool allow_rea
     {
         s.logged_ready = true;
         FSR2DUMP_LOG(INFO,
-                 "fsr2_input_dump armed frames=" + std::to_string(s.frames_wanted) +
-                     " raw=" + std::to_string(s.save_raw ? 1 : 0) +
+                 "fsr2_input_dump first capture raw=" + std::to_string(s.save_raw ? 1 : 0) +
                      " png=" + std::to_string(s.save_png ? 1 : 0) +
                      " max_dim=" + std::to_string(s.max_dim) +
-                     " dir=" + s.dir.string() + (reasons.empty() ? "" : (" skipped=" + reasons)));
+                     (reasons.empty() ? "" : (" skipped=" + reasons)));
     }
     if (p.items.empty())
     {
         FSR2DUMP_LOG(WARN, "fsr2_input_dump no input captured; disabled. reasons=" + reasons);
         s.enabled = false;
+        g_maybe_active.store(false, std::memory_order_relaxed);
         return;
     }
     release_pending(s.pending);

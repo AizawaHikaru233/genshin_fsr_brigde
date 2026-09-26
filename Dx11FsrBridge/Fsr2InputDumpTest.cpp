@@ -237,6 +237,109 @@ int main()
         check("尾部补零", hdr[63] == 0);
     }
 
+    // ---------- 6. 触发状态机（延时自动 / 热键 / 间隔） ----------
+    {
+        // (a) 未配置触发 ⇒ 立刻开抓（保持旧行为），且抓满 frames 帧即停
+        {
+            fsr2dump::TriggerConfig cfg;
+            cfg.frames = 2;
+            cfg.require_trigger = false;
+            fsr2dump::TriggerRuntime rt;
+            const std::uint64_t t = 1000;
+            fsr2dump::TriggerOut a = fsr2dump::trigger_update(cfg, rt, t, false);
+            check("触发:未配置 ⇒ 立刻开抓", a.started && a.capture_now && !a.finished);
+            check("触发:source=immediate", std::string(a.source) == "immediate");
+            fsr2dump::TriggerOut b = fsr2dump::trigger_update(cfg, rt, t + 1, false);
+            check("触发:第2帧抓到且本轮结束", b.capture_now && b.finished);
+            fsr2dump::TriggerOut c = fsr2dump::trigger_update(cfg, rt, t + 2, false);
+            check("触发:未配置时不会无限抓（抓满即停）", !c.capture_now && !c.started);
+        }
+
+        // (b) 热键触发：可重复；会话进行中忽略新的按下
+        {
+            fsr2dump::TriggerConfig cfg;
+            cfg.frames = 3;
+            cfg.hotkey = 122;
+            cfg.require_trigger = true;
+            fsr2dump::TriggerRuntime rt;
+            const std::uint64_t t = 5000;
+            check("触发:配了热键但没按 ⇒ 不抓",
+                  !fsr2dump::trigger_update(cfg, rt, t, false).capture_now);
+            fsr2dump::TriggerOut s1 = fsr2dump::trigger_update(cfg, rt, t + 10, true);
+            check("触发:热键按下 ⇒ 开抓且当帧即抓",
+                  s1.started && s1.capture_now && std::string(s1.source) == "hotkey");
+            fsr2dump::TriggerOut s2 = fsr2dump::trigger_update(cfg, rt, t + 11, true);
+            check("触发:会话中再按热键被忽略", !s2.started && s2.capture_now);
+            fsr2dump::TriggerOut s3 = fsr2dump::trigger_update(cfg, rt, t + 12, false);
+            check("触发:第3帧抓完 ⇒ finished", s3.finished && s3.capture_now);
+            check("触发:轮次计数=1", rt.session_count == 1);
+            fsr2dump::TriggerOut s4 = fsr2dump::trigger_update(cfg, rt, t + 20, true);
+            check("触发:抓完后热键可再次触发", s4.started && s4.capture_now);
+            check("触发:轮次计数=2", rt.session_count == 2);
+        }
+
+        // (c) 延时自动：到点触发一次，之后不再自动触发
+        {
+            fsr2dump::TriggerConfig cfg;
+            cfg.frames = 1;
+            cfg.autostart_sec = 30;
+            cfg.require_trigger = true;
+            fsr2dump::TriggerRuntime rt;
+            const std::uint64_t t = 100000;
+            check("触发:延时未到 ⇒ 不抓", !fsr2dump::trigger_update(cfg, rt, t, false).capture_now);
+            check("触发:延时 29.9s ⇒ 不抓",
+                  !fsr2dump::trigger_update(cfg, rt, t + 29900, false).capture_now);
+            fsr2dump::TriggerOut a = fsr2dump::trigger_update(cfg, rt, t + 30000, false);
+            check("触发:延时 30s ⇒ 自动开抓",
+                  a.started && a.capture_now && std::string(a.source) == "timer");
+            check("触发:自动只发生一次（标志置位）", rt.autostart_fired);
+            fsr2dump::TriggerOut b = fsr2dump::trigger_update(cfg, rt, t + 90000, false);
+            check("触发:再等 60s 也不会自动重复", !b.started && !b.capture_now);
+        }
+
+        // (d) 热键与定时都配 ⇒ 谁先到算谁；热键不消耗自动触发额度
+        {
+            fsr2dump::TriggerConfig cfg;
+            cfg.frames = 1;
+            cfg.hotkey = 122;
+            cfg.autostart_sec = 30;
+            cfg.require_trigger = true;
+            fsr2dump::TriggerRuntime rt;
+            const std::uint64_t t = 7000;
+            fsr2dump::TriggerOut a = fsr2dump::trigger_update(cfg, rt, t + 100, true);
+            check("触发:热键先到 ⇒ source=hotkey", a.started && std::string(a.source) == "hotkey");
+            check("触发:热键触发不消耗自动触发", !rt.autostart_fired);
+        }
+
+        // (e) 帧间间隔：未到间隔不抓，到了才抓
+        {
+            fsr2dump::TriggerConfig cfg;
+            cfg.frames = 3;
+            cfg.interval_ms = 100;
+            cfg.require_trigger = false;
+            fsr2dump::TriggerRuntime rt;
+            const std::uint64_t t = 2000;
+            fsr2dump::TriggerOut a = fsr2dump::trigger_update(cfg, rt, t, false);
+            check("间隔:首帧立刻抓", a.capture_now && !a.finished);
+            fsr2dump::TriggerOut b = fsr2dump::trigger_update(cfg, rt, t + 50, false);
+            check("间隔:未到 100ms ⇒ 不抓", !b.capture_now);
+            fsr2dump::TriggerOut c = fsr2dump::trigger_update(cfg, rt, t + 100, false);
+            check("间隔:到 100ms ⇒ 抓", c.capture_now && !c.finished);
+            fsr2dump::TriggerOut d = fsr2dump::trigger_update(cfg, rt, t + 200, false);
+            check("间隔:第3帧抓完 ⇒ finished", d.capture_now && d.finished);
+        }
+
+        // (f) 退化输入 frames=0 不应永不停机（按 1 帧处理）
+        {
+            fsr2dump::TriggerConfig cfg;
+            cfg.frames = 0;
+            cfg.require_trigger = false;
+            fsr2dump::TriggerRuntime rt;
+            fsr2dump::TriggerOut a = fsr2dump::trigger_update(cfg, rt, 42, false);
+            check("退化:frames=0 按 1 帧处理并结束", a.capture_now && a.finished);
+        }
+    }
+
     std::printf("\n合计: %d 通过, %d 失败\n", g_pass, g_fail);
     if (g_fail == 0)
     {

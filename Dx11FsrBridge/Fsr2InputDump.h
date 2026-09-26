@@ -67,10 +67,10 @@ struct FrameDesc
 // 读一次 INI 完成配置（幂等）。ini_path 为 Bridge ini 的完整路径；为空则视为未启用。
 void configure(const wchar_t *ini_path);
 
-// 是否已启用（且未被 On12 安全闸拒绝）
-bool enabled();
-
-// 每个 accumulate dispatch 调用一次。
+// 每个 accumulate dispatch 调用一次（**无论开关是否打开**）。
+// 必须无条件调用：热键/延时触发本身要在这里轮询，若先判 enabled() 再调用，
+// 触发就永远不会发生（开关关闭时 enabled() 为 false ⇒ 死锁在"未启用"上）。
+// 关闭且未配置触发时内部走一条原子快路径直接返回，开销可忽略。
 //   ctx            —— 游戏 D3D11 上下文
 //   desc           —— 本帧输入与参数
 //   allow_readback —— false 表示当前是 D3D11On12 共享队列路径，读回不安全（直接拒绝）
@@ -78,6 +78,44 @@ void on_dispatch(ID3D11DeviceContext *ctx, const FrameDesc &desc, bool allow_rea
 
 // 进程退出/卸载时释放未落盘的 staging
 void shutdown();
+
+// —— 触发（延时自动 / 热键），纯状态机，可单测 ——
+
+// 语义对齐本仓库既有的 TextureTrace（同一套 GetTickCount64 计时 + GetAsyncKeyState 轮询），
+// 但**不复用它的代码块**：那段代码在 `#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)` 里，
+// 而发布构建恰恰定义了该宏（CMakeLists 默认 ON）⇒ 放在那里热键在发布版里根本不编译。
+struct TriggerConfig
+{
+    std::uint32_t frames = 3;        // 每轮抓几帧
+    std::uint32_t interval_ms = 0;   // 帧间间隔（0 = 连抓）
+    std::uint32_t autostart_sec = 0; // > 0：启动后 N 秒自动触发一次（只一次）
+    std::uint32_t hotkey = 0;        // > 0：VK 码，按下即触发（可重复触发）
+    bool require_trigger = false;    // 上面两项都没配时为 false ⇒ 立刻开抓（保持旧行为）
+};
+
+struct TriggerRuntime
+{
+    std::uint64_t start_tick = 0;
+    bool autostart_fired = false;
+    bool session_active = false;
+    std::uint32_t frames_done = 0;
+    std::uint64_t next_capture_tick = 0;
+    std::uint64_t session_count = 0;
+};
+
+struct TriggerOut
+{
+    bool capture_now = false; // 本帧该抓
+    bool started = false;     // 本轮刚开
+    bool finished = false;    // 本轮刚结束
+    const char *source = "";  // "hotkey" / "timer" / "immediate"
+};
+
+// 纯函数：给定配置、运行态、当前 tick 与"热键是否刚按下"，推进状态机。
+// 保证：会话进行中忽略新的热键（不混轮次）；一轮抓满 frames 帧即结束；
+//       自动触发只发生一次；会话结束后热键仍可再次触发。
+TriggerOut trigger_update(const TriggerConfig &cfg, TriggerRuntime &rt, std::uint64_t now_tick,
+                          bool hotkey_edge);
 
 // —— 以下为可单测的纯函数（无 D3D 依赖）——
 
