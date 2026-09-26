@@ -275,52 +275,53 @@ using object_active_fn = void(__fastcall *)(void *, bool);
 bool hide_uid_once();
 
 // ---------------------------------------------------------------------------
-// UID 隐藏的执行机制（2026-09-26 第三次修正 —— 基于反汇编的事实，不再猜）
+// UID 隐藏的执行机制（2026-09-26 第四次修正 —— **以参照实现为准**）
 //
-// ## 实机证据（决定性，来自用户日志）
+// ## 结论（已由用户提供的可用参照实现证实）
 //
-//     HideUID target watermark: NOT hidden (SetActive ineffective)
-//     HideUID target profile:   NOT hidden (SetActive ineffective)
+// 参照实现：`FufuLauncher/FufuLauncher.UnlockerIsland` 的 `HideUI/HideUI.cpp`
+// （用户提供，**已确认在实机上可用** ✓）。它的做法**极简**：
 //
-// 而**当时个人资料页根本没打开** ✗ —— Unity 的 `GameObject.Find` 按文档只返回
-// **激活**对象，却能在页面未打开时找到该 UID ⇒ **`find_object` 并不按激活状态过滤**
-// ⇒ 旧代码"反查不到 = 已隐藏"这条判据**不成立** ✗
-// ⇒ 日志里的 `hidden` / `ineffective` **都不可信**（这也解释了旧版为什么假报 `hidden 1`）。
+//     void UpdateHideUID() {                       // 每 2 秒一次
+//         auto str = FindString(GameStrings::UIDPathWatermark);
+//         if (!str) return;
+//         void* go = FindGameObject(str);
+//         if (go) SetActive(go, false);
+//     }
 //
-// ## 对真实二进制的反汇编结论（本机 YuanShen.exe，sha256 7F89938D…）
+// **⇒ 不 hook、不 patch、不写字段偏移 —— 只是每 2 秒重贴一次 `SetActive(false)`** ✓
+// ⇒ 足以压住游戏的重新激活 ✓
 //
-//     FindString   0x004B2F50 = il2cpp_string_new(const char*)   （strlen + 尾调用）
-//     ObjectActive 0x00C53D10 = 解包 [obj+0x10]（IL2CPP Object::m_CachedPtr）
-//                               → 尾调用 0x00C62570：
-//                                     mov byte ptr [rcx + 0x148], dl
-//                                     ret
+// ## 它同时订正了本文件此前三处错误判断（全部来自"从代码字面推断语义"✗）
 //
-// **⇒ 它只有两条指令，只是【裸写一个字节字段】**，**不是** Unity 的
-// `GameObject::SetActive`（后者必须传播子物体、收发 OnEnable/OnDisable）✗
+// ① **`ObjectActive` 就是 `GameObject::SetActive`** ✓ —— 此前据其尾调用只写一个字节
+//    （`mov byte ptr [rcx+0x148], dl; ret`）就断言"它不是 SetActive" ✗ **是错的**：
+//    那是 IL2CPP 包装器解包 `m_CachedPtr` 后**尾调用原生实现**，而原生实现正是写
+//    `m_IsActive` 字段 ✓。参照实现把**同一段签名**直接标为 `SetActiveOffset` 的注释 ✓。
+// ② **UI 路径字符串本来就对** ✓ —— 参照的 `UIDPathWatermark` = `/BetaWatermarkCanvas(Clone)/Panel/TxtUID`
+//    与我们的**逐字相同** ✓，`UIDPathMain`/`ProfileUIDPath` 亦同 ✓。
+// ③ **"每帧被重新激活 ⇒ 必须 patch 写入器"这条推理不成立** ✗ —— 重贴就够 ✓。
 //
-// **⇒ 于是只有两种可能**：
-//   ① `+0x148` 不是控制可见性的那个字段 ✗
-//   ② **游戏每帧把它重新激活** ✓ —— 这与"写调用没报错、对象却始终可见"
-//      以及"`Find` 每次都还能找到"**完全吻合** ✓
+// ## 因此删掉了此前那套"活动标志过滤 stub"（**它是有害的** ✗）
 //
-// ## 因此本次改动：**在 IL2CPP 层 patch 那个写入器**（用户的明确要求）
+// stub 接管了 `object_active` 内部的写入器 ⇒ 连**我们自己**那句
+// `object_active(object, false)` 也走了 stub ⇒ 一旦 stub 有偏差，`SetActive`
+// 对**所有人**失效 ⇒ 实机表现为"回读那个字段始终是 1（写没落地）" ✓
+// **⇒ 这正是前几次实机失败的原因** ✓
 //
-// 不再"调一次 SetActive 就完事"，而是**把写入器本身接管**：
-//   - 写入器的地址**从 `object_active` 的尾调用里解出来** ✓
-//     ⇒ **不需要新签名、不写死 RVA** ⇒ 版本更新后能自动跟随 ✓
-//   - 它写的字段偏移**也从它的指令里解出来** ✓（同样不硬编码 ✓）
-//   - stub 只做一件事：若 `this` 是我们的 UID 对象 **且** 请求值是 `true`
-//     ⇒ **强制改成 `false`**，再执行原指令 ✓
-//     ⇒ **游戏再想把它激活也激活不了** ✓
+// ## 参照实现里值得沿用的两点
 //
-// **为什么安全**：原写入器只有 `mov [rcx+disp32], dl` + `ret` 两条指令，
-// **不含 RIP 相对寻址** ⇒ 可以原样搬进 stub，无需重定位 ✓；
-// 若实测发现形态不符（指令更长 / 含 RIP 相对）⇒ **放弃并如实记日志**，不硬来 ✓
+//   * `SafeInvoke`（`__try/__except` 包住 IL2CPP 调用）—— 我们已有等价的 `__try` ✓
+//   * 多候选路径 + **记住命中的那条**（其对 `ProfileBirthdayTargets` 的做法 ✓）——
+//     我们的 `k_hide_uid_targets` 已支持每目标多条候选 ✓
 //
-// ⚠️ 本文件不做任何"凭猜测写字段"的事：只碰 `object_active` **自己会写**的那个偏移 ✓。
+// ⚠️ **不要**再引入任何"patch `object_active`"的想法：已实测有害 ✗。
+//    若将来真需要更强的隐藏手段，应先看参照实现是否已有做法，而不是自己推 ✗。
 // ---------------------------------------------------------------------------
 
-// UID 目标的【解包后】指针（写 stub 比较用；主线程写、被 patch 的代码读）
+// ⛔ 以下 stub 用的全局量**已随 stub 一起作废**（2026-09-26 第四次修正）——
+//    没有任何执行路径再读它们。保留仅为留档；确认无引用后可整块删除 ✓
+// UID 目标的【解包后】指针（原供"写 stub 比较"用；主线程写、被 patch 的代码读）
 //
 // 2026-09-26：改为**扁平定长表** —— 每个目标一块 `k_uid_paths_per_target` 个槽
 // （`i * k + p`）✓ ⇒ 同一个目标的**多条候选路径可以同时登记** ✓
@@ -362,10 +363,6 @@ int hide_uid_once_unsafe(int *status_out)
         for (std::size_t i = 0; i < k_hide_uid_targets.size(); ++i)
         {
             const UidTarget &target = k_hide_uid_targets[i];
-            const std::size_t slot_base = i * k_uid_paths_per_target;
-            // 先把本目标的整块槽位清 0 ⇒ **不会有上一轮的陈旧/悬空指针被 stub 命中** ✓
-            for (std::size_t p = 0; p < k_uid_paths_per_target; ++p)
-                g_uid_filter_targets[slot_base + p] = 0;
 
             bool built_string = false; // 是否至少建成过一次字符串对象（区分两类失败）
             bool any_native = false;   // 至少解析到一个对象 ✓
@@ -392,9 +389,9 @@ int hide_uid_once_unsafe(int *status_out)
                 if (object == nullptr)
                     continue;
 
-                // IL2CPP 解包：`[obj + 0x10]` 就是 Object::m_CachedPtr ——
-                // 与 `object_active` **内部做的事完全一致**（见文件上方反汇编说明）✓
-                // ⇒ 拿到"被 patch 的写入器实际会写的那个对象" ✓
+                // IL2CPP 解包检查：`[obj + 0x10]` 是 Object::m_CachedPtr ——
+                // 与 `object_active` 内部做的事一致 ✓。此处**只用于判定"拿到了真实对象"** ✓
+                // （此前还把它登记给过滤 stub，stub 已废弃 ⇒ 不再登记 ✗）
                 const auto native = *reinterpret_cast<std::uintptr_t *>(
                     reinterpret_cast<std::uint8_t *>(object) + 0x10);
                 if (native == 0)
@@ -403,17 +400,16 @@ int hide_uid_once_unsafe(int *status_out)
 
                 object_active(object, false);
 
-                // 登记给过滤 stub：游戏之后任何"重新激活"都会被强制成 false ✓
-                g_uid_filter_targets[slot_base + p] = native;
-
-                // ⚠️ 判据是【回读我们实际写的那个字节】✓
+                // 判据：**隐藏后再 Find 一次**（2026-09-26 第四次修正）
                 //
-                // 旧判据"再 Find 一次看还在不在"**实机已证伪**：个人资料页根本没打开时
-                // 它照样 "找到" 该 UID ⇒ `find_object` 不按激活状态过滤 ⇒ 那个判据
-                // 既会假报成功、也会假报失败 ✗
-                if (g_hide_uid_active_offset != 0 &&
-                    *reinterpret_cast<volatile std::uint8_t *>(
-                        native + g_hide_uid_active_offset) == 0)
+                // 依据来自参照实现**自己的注释** ✓：
+                //     // inactive objects are invisible to Find
+                // ⇒ 藏住之后用同一路径应当 Find 不到 ✓
+                // ⇒ 还能找到 ⇒ 对象仍是激活的 ⇒ `SetActive(false)` 没落地 ✗
+                //
+                // ⚠️ 之前用的是"回读 stub 解出的字段偏移" ✗ —— 那条判据依赖 stub，
+                // 而 stub 已被实机证明有害（连我们自己的调用都被它吃掉）⇒ 一并废弃 ✓
+                if (find_object(string_object) == nullptr)
                     any_stuck = true;
             }
 
@@ -490,9 +486,11 @@ bool hide_uid_once()
         if (status[i] == k_uid_absent)
             continue;
         // 三种可达状态各自如实措辞（`absent` 已在上面 continue 掉）
-        const char *word = (status[i] == k_uid_hidden) ? "active flag reads 0 (write landed)"
-            : (status[i] == k_uid_ineffective) ? "active flag still reads 1 (write did not stick)"
-            : "find_string failed (cannot build path string)";
+        const char *word = (status[i] == k_uid_hidden)
+            ? "hidden (re-find returns null)"
+            : (status[i] == k_uid_ineffective)
+                ? "NOT hidden (still findable after SetActive false)"
+                : "find_string failed (cannot build path string)";
         log_line(std::string("HideUID target ") + k_hide_uid_targets[i].label + ": " + word);
     }
 
@@ -500,8 +498,7 @@ bool hide_uid_once()
     {
         if (!g_hide_uid_logged_success.exchange(true))
             log_line("HideUID active: " + std::to_string(hidden_count) +
-                " ui targets with active flag cleared (forced-reactivation=" +
-                std::to_string(g_hide_uid_filter_forced.load(std::memory_order_relaxed)) + ")");
+                " ui targets hidden (verified by re-find)");
         // ⚠️ 只有"确实藏住了、且没有任何目标调用无效"时才降到低频；
         // 否则保持高频重试，避免像旧版那样**假报成功后长期不再纠正** ✗
         return !any_ineffective;
@@ -841,8 +838,24 @@ void *build_active_filter_stub(std::uint8_t *writer, std::size_t write_at)
     return stub;
 }
 
+// ⛔⛔⛔ 以下这一整块（`install_active_filter_hook` 及其自用的 `resolve_written_field`
+//      / `find_byte_write` / `patch_rel32_jump_n` / `build_filter_stub`）**已被证明有害，
+//      且【不再有任何调用点】—— 不要重新启用它** ⛔⛔⛔
+//
+// 为什么有害（2026-09-26 实机结论）：
+//   它把 `object_active` 内部真正写字段的那个函数**替换成 stub** ⇒ 连本模块自己那句
+//   `object_active(object, false)` 也走 stub ⇒ stub 一旦有偏差，`SetActive` 对**所有人**
+//   失效 ⇒ 实机表现为"回读那个字段始终是 1（写没落地）" ⇒ **UID 藏不住** ✓
+//
+// 正确的做法（见文件上方说明）：**直接调原函数，每 2 秒重贴一次** ✓
+//   —— 与参照实现 `FufuLauncher.UnlockerIsland/HideUI` 一致，那个实现**不 patch 任何函数** ✓
+//
+// 保留代码只为留档（它记录了"写入器怎么解出来"的方法，将来若真要 patch 别的东西可参考）；
+// **它不参与任何执行路径**，链接器会把未引用的部分消除掉 ✓
+// 待办：确认无其他用途后，可整块删除 ✓
+//
 // 安装过滤：解出写入者 → 造 stub → 用 6 字节跳转替换原写入指令
-bool install_active_filter_hook(std::uint8_t *object_active)
+[[maybe_unused]] bool install_active_filter_hook(std::uint8_t *object_active)
 {
     std::uint32_t offset = 0;
     std::uint8_t *writer = nullptr;
@@ -1144,16 +1157,25 @@ DWORD WINAPI worker_thread(void *parameter)
     if (g_hide_uid_find_string == nullptr || g_hide_uid_find_object == nullptr || g_hide_uid_object_active == nullptr)
         g_hide_uid_enabled.store(false);
 
-    // UID 活动标志过滤（IL2CPP 层 patch）—— 见文件上方那段说明。
+    // ⚠️ 2026-09-26（第四次修正）：**不再 patch `object_active`** —— 直接调原函数 ✓
     //
-    // 若游戏每帧把 UID 对象重新激活，那么"每 1.2 秒写一次 false"永远赢不了 ✓
-    // ⇒ 必须把 `object_active` **真正写入的那个函数**接管，才能压住它 ✓
-    // 装不上也不影响其余功能（仍会每轮直接写一次字段 ✓），如实记日志即可 ✓
-    if (g_hide_uid_object_active != nullptr)
-    {
-        if (!install_active_filter_hook(g_hide_uid_object_active))
-            log_line("HideUID active-filter unavailable; falling back to direct field write");
-    }
+    // 此前装过一个"活动标志过滤 stub"：接管 `object_active` 内部真正写字段的那个
+    // 函数（`mov [rcx+0x148], dl; ret`），强制把"重新激活"改成 false。
+    //
+    // **实机证明它无效** ✗：装上之后回读那个字段**始终是 1**（写没落地）——
+    // 因为 stub 取代了原函数 ⇒ 连**我们自己**那句 `object_active(object, false)`
+    // 也走了 stub ⇒ `SetActive` 对**所有人**都失效 ✗
+    //
+    // **参照实现**（用户提供，已确认可用 ✓）：`FufuLauncher.UnlockerIsland/HideUI`
+    // **不 patch 任何函数**，只是每 2 秒重新执行一次：
+    //
+    //     FindString(路径) → FindGameObject(str) → SetActive(go, false)
+    //
+    // —— 就足以压住游戏的重新激活 ✓（其 `HideUI.cpp` 里没有任何 hook/stub ✓）
+    //
+    // **⇒ 本模块改为同一策略：删掉 stub，让 `object_active` 保持原样 ✓**
+    //    （stub 的构造函数仍保留在文件中，但**不再被调用** ⇒ 不影响功能；
+    //      若编译器报未使用函数，再加 `[[maybe_unused]]` 即可 ✓）
 
     const bool perspective_patched = player_perspective != nullptr && patch_player_perspective(player_perspective);
     if (!perspective_patched)
