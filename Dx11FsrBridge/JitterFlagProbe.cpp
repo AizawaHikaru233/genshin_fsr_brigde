@@ -69,10 +69,22 @@ std::atomic<std::uint8_t> g_last_value { 0 };
 std::atomic_uint64_t g_last_camera { 0 };
 std::atomic_uint64_t g_last_frame { 0 };
 
+// ---- 【强制 true】状态（JitterFlagForce / 热键）----
+// stub 不内联读它，而是读 observer 的返回值 ⇒ 这里每次调用都重新 load，
+// 因此热键翻转**下一次 setter 调用就生效**（不需要重装钩子）。
+std::atomic<std::uint8_t> g_force { 0 };
+std::atomic_uint64_t g_overridden { 0 };      // 实际改写了实参的调用次数
+std::atomic<std::uint8_t> g_last_forwarded { 0 };
+// 调用点静态常量实参（安装时由签名发现给出）。放进观测行里，
+// 好让 A/B 时**一行**就能同时看到：静态原值 / 运行时原值 / 我们传出的值。
+std::atomic<int> g_callsite_imm { -1 };
+
 // 日志限流状态。
 // ⚠️ 刻意**不加锁**：写方只有游戏渲染线程（OnPreCull → 每帧一次），
 // shutdown() 不碰这些字段。多相机并发时最坏结果是多一行/少一行心跳，对诊断无影响；
 // 而加锁会让本模块在 DLL_PROCESS_DETACH 里变得不 loader-lock 安全。
+// ⚠️ set_force()（热键线程）也**不**碰它 —— 翻转后"下一行日志"由 decide_emit 的
+// `forwarded != last_forwarded` 判据自然带出（见头文件说明）。
 EmitState g_emit_state;
 
 void write_u64(std::uint8_t *dst, std::uint64_t value)
@@ -127,11 +139,21 @@ int parse_callsite_imm(const std::uint8_t *code, std::size_t call_offset)
     return -1;
 }
 
-// 由 stub 调用（rcx = Camera*，dl = 实参）。**只读**：不解引用 camera 指针。
-__declspec(noinline) void on_flag_setter_enter(void *camera_ptr, std::uint64_t value_raw)
+// 由 stub 调用（rcx = Camera*，rdx = 实参原始值）。**只读**：不解引用 camera 指针。
+//
+// ⚠️ 返回值 = **stub 要转发给原 setter 的 rdx**：
+//   force=0 → 原始 rdx（逐位相同 ⇒ 行为零改动）；
+//   force=1 → 1（这就是"强制 true"的**全部**改动）。
+// 这样"日志里的 forced=" 与"实际传出去的值"必然一致 —— 同一个表达式算出来的。
+__declspec(noinline) std::uint64_t on_flag_setter_enter(void *camera_ptr, std::uint64_t value_raw)
 {
     // ABI：bool 走 dl；rdx 高位未定义 ⇒ 只取低 8 位（与原函数的 `movzx edi,dl` 一致）。
     const std::uint8_t value = static_cast<std::uint8_t>(value_raw & 0xFFu);
+    const bool force = g_force.load(std::memory_order_relaxed) != 0;
+    const std::uint64_t forwarded = decide_forwarded_value(force, value_raw);
+    if (forwarded != value_raw)
+        g_overridden.fetch_add(1, std::memory_order_relaxed);
+
     const std::uint64_t call_index = g_calls.fetch_add(1, std::memory_order_relaxed) + 1;
 
     if (value != 0)
@@ -139,6 +161,7 @@ __declspec(noinline) void on_flag_setter_enter(void *camera_ptr, std::uint64_t v
     else
         g_saw_false.store(true, std::memory_order_relaxed);
     g_last_value.store(value, std::memory_order_relaxed);
+    g_last_forwarded.store(static_cast<std::uint8_t>(forwarded & 0xFFu), std::memory_order_relaxed);
     g_last_camera.store(reinterpret_cast<std::uint64_t>(camera_ptr), std::memory_order_relaxed);
 
     const FrameProvider provider = g_frame_provider.load(std::memory_order_relaxed);
@@ -147,27 +170,41 @@ __declspec(noinline) void on_flag_setter_enter(void *camera_ptr, std::uint64_t v
     const std::uint64_t frame = provider != nullptr ? provider() : call_index;
     g_last_frame.store(frame, std::memory_order_relaxed);
 
-    const EmitDecision decision = decide_emit(g_emit_state, value, frame, call_index, g_frames_limit);
+    // ⚠️ 限流只影响**日志**，绝不影响转发：下面所有提前返回都必须返回 forwarded。
+    const EmitDecision decision = decide_emit(g_emit_state, value, static_cast<std::uint8_t>(forwarded & 0xFFu),
+                                              frame, call_index, g_frames_limit);
     if (!decision.emit)
-        return;
+        return forwarded;
 
     const LogSink sink = g_log_sink.load(std::memory_order_relaxed);
     if (sink == nullptr)
-        return;
+        return forwarded;
 
     // 栈上格式化：钩子内不做分配、不取锁、不碰日志器内部状态。
-    char line[192] {};
-    std::snprintf(line, sizeof(line), "jitter_flag value=%s camera=0x%llx frame=%llu calls=%llu reason=%s",
+    char line[224] {};
+    std::snprintf(line, sizeof(line),
+                  "jitter_flag value=%s forced=%s callsite_imm=%d camera=0x%llx frame=%llu calls=%llu reason=%s",
                   value != 0 ? "true" : "false",
+                  (forwarded & 0xFFu) != 0 ? "true" : "false",
+                  g_callsite_imm.load(std::memory_order_relaxed),
                   static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(camera_ptr)),
                   static_cast<unsigned long long>(frame),
                   static_cast<unsigned long long>(call_index), decision.reason);
     sink(line);
+    return forwarded;
 }
 
 } // namespace
 
-EmitDecision decide_emit(EmitState &state, std::uint8_t value, std::uint64_t frame,
+std::uint64_t decide_forwarded_value(bool force, std::uint64_t original_value_raw)
+{
+    // force=0：**逐位原样**返回。刻意不"顺手规范化"成 0/1 ——
+    // 那会改掉 rdx 高位（原始实参里那几位是未定义垃圾），
+    // 虽然原函数的 `movzx edi,dl` 不读它们，但"只读观测"模式必须做到字面意义的零改动。
+    return force ? 1ull : original_value_raw;
+}
+
+EmitDecision decide_emit(EmitState &state, std::uint8_t value, std::uint8_t forwarded, std::uint64_t frame,
                          std::uint64_t call_index, std::uint32_t frames_limit,
                          std::uint32_t heartbeat_interval)
 {
@@ -183,8 +220,9 @@ EmitDecision decide_emit(EmitState &state, std::uint8_t value, std::uint64_t fra
         out.emit = true;
         out.reason = "first";
     }
-    else if (value != state.last_value)
+    else if (value != state.last_value || forwarded != state.last_forwarded)
     {
+        // 原值变了（游戏自己改的）或转发值变了（我们按热键翻的）都要立刻可见。
         out.emit = true;
         out.reason = "change";
     }
@@ -202,6 +240,7 @@ EmitDecision decide_emit(EmitState &state, std::uint8_t value, std::uint64_t fra
     }
     state.seen_any = true;
     state.last_value = value;
+    state.last_forwarded = forwarded;
     return out;
 }
 
@@ -333,27 +372,31 @@ bool locate_flag_setter(const std::uint8_t *image, std::uint64_t image_size, std
 namespace
 {
 
-// 构建只读 stub：保存 rcx/rdx → 调 observer → **原样恢复** → 重放原 16 字节序言 → 跳回。
+// 构建 stub：保存 rcx → 调 observer → **rcx 原样恢复、rdx 取 observer 返回值**
+// → 重放原 16 字节序言 → 跳回。
 // 形状与 Il2CppCallSiteHook.cpp 的 build_projection_stub 一致（那边同样重放
 // `mov [rsp+8],rbx; push rdi; sub rsp,0x20; ...`，已在实机验证可行）。
-// 保存槽放在影子空间（+0x20/+0x28）之后：放在 +0x18 会被被调方覆盖。
+// 保存槽放在影子空间之后（+0x20）：放在 +0x18 会被被调方覆盖。
+// ⚠️ **刻意只保存 rcx**：rdx 不再需要"保存再恢复"——它由 observer 的返回值给出
+//（force=0 时该返回值就是原始 rdx 的逐位拷贝）⇒ 少一个死存储，stub 里每个字节都承重。
 void build_flag_stub(std::uint8_t *target, std::uint8_t *stub)
 {
-    constexpr std::size_t k_needed = 4 + 5 + 5 + 10 + 2 + 5 + 5 + 4 + k_patch_len + 10 + 2;
+    constexpr std::size_t k_needed = 4 + 5 + 10 + 2 + 5 + 3 + 4 + k_patch_len + 10 + 2;
     static_assert(k_needed <= k_stub_len, "stub 超出 k_stub_len —— 同步调整 k_stub_len");
     const std::uint64_t observer = reinterpret_cast<std::uint64_t>(&on_flag_setter_enter);
     std::size_t p = 0;
     // sub rsp, 0x38
     stub[p++] = 0x48; stub[p++] = 0x83; stub[p++] = 0xEC; stub[p++] = 0x38;
-    // mov [rsp+0x20], rcx ; mov [rsp+0x28], rdx
+    // mov [rsp+0x20], rcx  = 48 89 4C 24 20      （保存 this）
     stub[p++] = 0x48; stub[p++] = 0x89; stub[p++] = 0x4C; stub[p++] = 0x24; stub[p++] = 0x20;
-    stub[p++] = 0x48; stub[p++] = 0x89; stub[p++] = 0x54; stub[p++] = 0x24; stub[p++] = 0x28;
-    // mov rax, observer ; call rax
+    // mov rax, observer ; call rax                （observer 看到的是**原始** rcx/rdx）
     stub[p++] = 0x48; stub[p++] = 0xB8; write_u64(stub + p, observer); p += 8;
     stub[p++] = 0xFF; stub[p++] = 0xD0;
-    // mov rcx, [rsp+0x20] ; mov rdx, [rsp+0x28]
+    // mov rcx, [rsp+0x20]  = 48 8B 4C 24 20      （this 指针**逐位原样**恢复）
     stub[p++] = 0x48; stub[p++] = 0x8B; stub[p++] = 0x4C; stub[p++] = 0x24; stub[p++] = 0x20;
-    stub[p++] = 0x48; stub[p++] = 0x8B; stub[p++] = 0x54; stub[p++] = 0x24; stub[p++] = 0x28;
+    // mov rdx, rax         = 48 89 C2            （★ 唯一被"改"的东西：转发值）
+    // —— force=0 时 rax 就是原始 rdx（逐位相同）⇒ 与改动前的 stub 语义完全等价。
+    stub[p++] = 0x48; stub[p++] = 0x89; stub[p++] = 0xC2;
     // add rsp, 0x38
     stub[p++] = 0x48; stub[p++] = 0x83; stub[p++] = 0xC4; stub[p++] = 0x38;
     // 原 16 字节序言
@@ -443,18 +486,22 @@ bool install(std::uint64_t exe_base, const Config &cfg, const char **out_reason)
 
     g_frames_limit = cfg.frames_limit;
     g_target = target;
+    // 初值来自 ini（JitterFlagForce）。热键之后可以随时翻转它 —— stub 每次调用都重读，
+    // 因此**不需要重装钩子**就能在同一次会话内 A/B。
+    g_force.store(cfg.force ? 1 : 0, std::memory_order_relaxed);
+    g_callsite_imm.store(callsite_imm, std::memory_order_relaxed);
     g_active.store(true, std::memory_order_release);
 
-    // 安装成功后立刻打一行"证据行"：把**签名发现的结果**与**调用点的静态常量实参**
-    // 写进日志。静态常量就是那条 `= false` 的机器码（`xor edx,edx`）；
+    // 安装成功后立刻打一行"证据行"：把**签名发现的结果**、**调用点的静态常量实参**
+    // 与 **force 初值**写进日志。静态常量就是那条 `= false` 的机器码（`xor edx,edx`）；
     // 它与运行时钩子互相独立 —— 两者一致才说明钩子挂在了正确的地方。
     if (const LogSink sink = g_log_sink.load(std::memory_order_relaxed))
     {
-        char line[192] {};
+        char line[224] {};
         std::snprintf(line, sizeof(line),
-                      "jitter_flag_probe_installed setter_rva=0x%x callsite_imm=%d camera_rva=0x%x",
+                      "jitter_flag_probe_installed setter_rva=0x%x callsite_imm=%d camera_rva=0x%x force=%d",
                       static_cast<unsigned>(setter_rva), callsite_imm,
-                      static_cast<unsigned>(cfg.camera_rva));
+                      static_cast<unsigned>(cfg.camera_rva), cfg.force ? 1 : 0);
         sink(line);
     }
     return true;
@@ -488,6 +535,9 @@ void shutdown()
     // 内存而崩溃。stub 仅 96 字节，泄漏远优于崩溃。（与 Il2CppCallSiteHook 同一处置。）
     g_target = nullptr;
     g_stub = nullptr;
+    // force 状态复位：还原后 stub 已不可达，"强制开着"这个残留状态会误导下一个读者
+    // （以及误报给 A/B 结论）。init 侧会按 ini 重新安装。
+    g_force.store(0, std::memory_order_relaxed);
 }
 
 bool active()
@@ -498,6 +548,47 @@ bool active()
 std::uint64_t observed_count()
 {
     return g_calls.load(std::memory_order_relaxed);
+}
+
+bool set_force(bool on, const char *source, std::uint64_t frame)
+{
+    const std::uint8_t next = on ? 1 : 0;
+    const std::uint8_t previous = g_force.exchange(next, std::memory_order_acq_rel);
+    if (previous == next)
+        return false;
+
+    // 每次**真的**切换都必打一行（这正是 A/B 的时间锚点：日志里能定位到哪一帧翻的面）。
+    // 状态未变时不打 —— 热键是边沿检测，但万一被重复调用也不该刷屏。
+    if (const LogSink sink = g_log_sink.load(std::memory_order_relaxed))
+    {
+        char line[192] {};
+        std::snprintf(line, sizeof(line), "jitter_flag_force toggled on=%s source=%s frame=%llu",
+                      on ? "true" : "false", source != nullptr ? source : "unknown",
+                      static_cast<unsigned long long>(frame));
+        sink(line);
+    }
+    return true;
+}
+
+bool force_enabled()
+{
+    return g_force.load(std::memory_order_relaxed) != 0;
+}
+
+bool last_forwarding(std::uint8_t *out_original, std::uint8_t *out_forwarded)
+{
+    if (g_calls.load(std::memory_order_relaxed) == 0)
+        return false;
+    if (out_original != nullptr)
+        *out_original = g_last_value.load(std::memory_order_relaxed);
+    if (out_forwarded != nullptr)
+        *out_forwarded = g_last_forwarded.load(std::memory_order_relaxed);
+    return true;
+}
+
+std::uint64_t overridden_count()
+{
+    return g_overridden.load(std::memory_order_relaxed);
 }
 
 bool last_observation(std::uint8_t *out_value, std::uint64_t *out_camera, std::uint64_t *out_frame)

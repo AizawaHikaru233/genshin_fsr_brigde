@@ -1,12 +1,14 @@
 // JitterFlagProbeTest.cpp — JitterFlagProbe 的独立自测（不需要游戏、不需要 GPU）。
 //
-// 覆盖四件事（对应交付里"怎么证明"的每一条）：
+// 覆盖五件事（对应交付里"怎么证明"的每一条）：
 //   ① 定位：在**真实机器码形状**（取自两份实机构建的反汇编）上验证签名发现；
 //      含负例（找不到 / 并列候选）与 Tier-2 裁决。
-//   ② 只读：装钩后调用假 setter，验证 observer 记录的实参正确、
+//   ② 只读（force=0）：装钩后调用假 setter，验证 observer 记录的实参正确、
 //      **函数仍然正常执行且返回值/副作用不变**（= 行为零改动）。
-//   ③ 限流：decide_emit 状态机（首次/变化/心跳/不刷屏/帧数上限）。
-//   ④ 关闭与还原：enabled=false 时零字节改动；shutdown() 还原原始序言。
+//   ③ 【强制 true】（force=1）：**假 setter 体内真的收到 true**，
+//      而 observer 记录的仍是**原始 false**（日志能同时给出"原值"与"传出的值"）。
+//   ④ 限流：decide_emit 状态机（首次/变化/心跳/不刷屏/帧数上限）。
+//   ⑤ 关闭与还原：enabled=false 时零字节改动；shutdown() 还原原始序言。
 // ASCII-only（与仓库既有测试一致）。
 #include "JitterFlagProbe.h"
 
@@ -142,17 +144,28 @@ void build_image()
 using flag_fn = bool (*)(void *camera, bool value);
 
 const char *g_last_line = nullptr;
-char g_lines[8][256] {};
+char g_lines[16][256] {};
 std::size_t g_line_count = 0;
 
 void test_sink(const char *line)
 {
-    if (g_line_count < 8)
+    if (g_line_count < 16)
     {
         std::snprintf(g_lines[g_line_count], sizeof(g_lines[0]), "%s", line);
         g_last_line = g_lines[g_line_count];
     }
     ++g_line_count;
+}
+
+// 在所有已记录行里找子串
+bool any_line_has(const char *needle)
+{
+    for (std::size_t i = 0; i < g_line_count && i < 16; ++i)
+    {
+        if (std::strstr(g_lines[i], needle) != nullptr)
+            return true;
+    }
+    return false;
 }
 
 std::uint64_t g_fake_frame = 0;
@@ -276,7 +289,7 @@ void run_install_tests()
 
     // 日志：至少出现首次行与变化行，且形如 jitter_flag value=...
     bool saw_first = false, saw_change = false, saw_installed = false;
-    for (std::size_t i = 0; i < g_line_count && i < 8; ++i)
+    for (std::size_t i = 0; i < g_line_count && i < 16; ++i)
     {
         if (std::strncmp(g_lines[i], "jitter_flag value=", 18) == 0)
         {
@@ -291,6 +304,8 @@ void run_install_tests()
     CHECK(saw_installed, "log: 安装证据行（含 setter_rva / callsite_imm）");
     CHECK(saw_first, "log: 首次观测行（证明钩子确实装上了）");
     CHECK(saw_change, "log: 值变化行（false -> true）");
+    CHECK(any_line_has("value=false forced=false"),
+          "log: force=0 时观测行的 forced 与 value 一致（= 没改任何东西）");
 
     // 还原
     jitter_flag_probe::shutdown();
@@ -307,56 +322,156 @@ void run_install_tests()
 }
 
 // ---- ③ 限流状态机 ----
+// ⚠️ decide_emit 现在同时看 value（原值）与 forwarded（转发值），因此下面每次调用都
+// 显式给出两者；"只读观测"场景里二者相等。
 void run_emit_tests()
 {
     using namespace jitter_flag_probe;
     EmitState st;
-    EmitDecision d = decide_emit(st, 0, 0, 1, 0, 300);
+    EmitDecision d = decide_emit(st, 0, 0, 0, 1, 0, 300);
     CHECK(d.emit && std::strcmp(d.reason, "first") == 0, "emit: 首次必打");
 
     bool spam = false;
     for (std::uint64_t call = 2; call <= 300; ++call)
     {
-        d = decide_emit(st, 0, call - 1, call, 0, 300);
+        d = decide_emit(st, 0, 0, call - 1, call, 0, 300);
         if (d.emit)
             spam = true;
     }
     CHECK(!spam, "emit: 值不变时 300 次调用内**一行都不多打**（不刷屏）");
 
-    d = decide_emit(st, 0, 300, 301, 0, 300);
+    d = decide_emit(st, 0, 0, 300, 301, 0, 300);
     CHECK(d.emit && std::strcmp(d.reason, "heartbeat") == 0, "emit: 第 301 次调用打心跳");
 
-    d = decide_emit(st, 1, 301, 302, 0, 300);
-    CHECK(d.emit && std::strcmp(d.reason, "change") == 0, "emit: 值变化立刻打（不等心跳）");
+    d = decide_emit(st, 1, 1, 301, 302, 0, 300);
+    CHECK(d.emit && std::strcmp(d.reason, "change") == 0, "emit: 原值变化立刻打（不等心跳）");
+
+    // ★ force 翻转：原值**没变**（游戏仍传 false），只有转发值变了 0->1 ⇒ 也必须立刻打。
+    // 否则按了热键之后要等最多 300 次调用才能在日志里看到 forced=true，
+    // 而"force 到底生效了没"正是 A/B 最需要立刻确认的一项。
+    EmitState st_force;
+    decide_emit(st_force, 0, 0, 0, 1, 0, 300);
+    d = decide_emit(st_force, 0, 1, 1, 2, 0, 300);
+    CHECK(d.emit && std::strcmp(d.reason, "change") == 0,
+          "emit: force 翻转（原值不变、转发值 0->1）立刻打一行");
+    d = decide_emit(st_force, 0, 0, 2, 3, 0, 300);
+    CHECK(d.emit && std::strcmp(d.reason, "change") == 0,
+          "emit: force 翻回（转发值 1->0）同样立刻打一行");
 
     // 值不变时的不刷屏性：600 次调用里只应有 1 行心跳（第 301 次）
     EmitState st2;
-    decide_emit(st2, 0, 0, 1, 0, 300);
+    decide_emit(st2, 0, 0, 0, 1, 0, 300);
     int heartbeats = 0;
     for (std::uint64_t call = 2; call <= 600; ++call)
     {
-        if (decide_emit(st2, 0, call - 1, call, 0, 300).emit)
+        if (decide_emit(st2, 0, 0, call - 1, call, 0, 300).emit)
             ++heartbeats;
     }
     CHECK(heartbeats == 1, "emit: 600 次等值调用里只有 1 行心跳（绝不刷屏）");
 
     // 帧数上限
     EmitState st3;
-    d = decide_emit(st3, 0, 10, 1, 10, 300);
+    d = decide_emit(st3, 0, 0, 10, 1, 10, 300);
     CHECK(d.emit, "emit: frame <= frames_limit 时正常记录");
-    d = decide_emit(st3, 1, 11, 2, 10, 300);
+    d = decide_emit(st3, 1, 1, 11, 2, 10, 300);
     CHECK(!d.emit, "emit: frame > frames_limit 后一律不打（即使值变化）");
 
     // 帧号冻结时心跳仍应发生（心跳用调用计数，不用帧号）
     EmitState st4;
-    decide_emit(st4, 0, 0, 1, 0, 5);
+    decide_emit(st4, 0, 0, 0, 1, 0, 5);
     bool heartbeat = false;
     for (std::uint64_t call = 2; call <= 6; ++call)
     {
-        if (decide_emit(st4, 0, 0, call, 0, 5).emit)
+        if (decide_emit(st4, 0, 0, 0, call, 0, 5).emit)
             heartbeat = true;
     }
     CHECK(heartbeat, "emit: 帧号冻结（恒为 0）时心跳仍会发生");
+}
+
+// ---- ④ 【强制 true】端到端 ----
+// 关键断言不是"我们自己说改了"，而是**假 setter 体内真的收到 true**
+// （假 setter 体会把收到的 dil 写回 camera 字节，并把它当返回值返回）。
+void run_force_tests()
+{
+    using namespace jitter_flag_probe;
+    auto *flag = reinterpret_cast<flag_fn>(g_image + k_flag_rva);
+
+    // 纯函数：force 的**全部语义**
+    CHECK(decide_forwarded_value(false, 0) == 0, "forward: force=0 原样返回 0");
+    CHECK(decide_forwarded_value(false, 0xDEADBEEFCAFEF00Dull) == 0xDEADBEEFCAFEF00Dull,
+          "forward: force=0 **逐位原样**返回（连 rdx 高位也不动）");
+    CHECK(decide_forwarded_value(true, 0) == 1, "forward: force=1 时 false 被改成 1");
+    CHECK(decide_forwarded_value(true, 0xDEADBEEFCAFEF00Dull) == 1,
+          "forward: force=1 时**无论**原值是什么都变成 1");
+
+    // 重装（前面的 shutdown 已还原）—— 初值 force=false
+    Config cfg;
+    cfg.enabled = true;
+    cfg.force = false;
+    cfg.camera_rva = k_anchor_rva;
+    cfg.image_size = k_image_size;
+    const char *reason = nullptr;
+    CHECK(install(reinterpret_cast<std::uint64_t>(g_image), cfg, &reason), "force: 重新安装成功");
+    CHECK(!force_enabled(), "force: 初值来自 cfg.force=false");
+    CHECK(any_line_has("jitter_flag_probe_installed") && any_line_has("force=0"),
+          "log: 安装行带 force 初值（force=0）");
+
+    // force=0：行为与只读时完全一致
+    std::uint8_t camera = 0xAA;
+    g_fake_frame = 100;
+    const std::uint64_t over_before = overridden_count();
+    CHECK(flag(&camera, false) == false, "force=0: 返回值不变（false）");
+    CHECK(camera == 0x00, "force=0: setter 体内收到的仍是 false");
+    CHECK(overridden_count() == over_before, "force=0: 没有任何一次改写被记入 overridden_count");
+    std::uint8_t orig = 0xFF, fwd = 0xFF;
+    CHECK(last_forwarding(&orig, &fwd) && orig == 0 && fwd == 0, "force=0: 原值=转发值=0");
+
+    // 切到 force=1（模拟热键）
+    const std::size_t lines_before_toggle = g_line_count;
+    CHECK(set_force(true, "hotkey", 1234), "force: set_force(true) 返回 true（状态确实变了）");
+    CHECK(force_enabled(), "force: force_enabled() 为 true");
+    CHECK(g_line_count > lines_before_toggle, "log: 切换必打一行");
+    CHECK(any_line_has("jitter_flag_force toggled on=true source=hotkey frame=1234"),
+          "log: 切换行格式为 jitter_flag_force toggled on=... source=... frame=...");
+
+    // ★ 核心断言：游戏传 false，但 setter 体内**真的收到 true**
+    camera = 0xAA;
+    g_fake_frame = 101;
+    CHECK(flag(&camera, false) == true, "force=1: 返回值变成 true（实参确实被改成 true）");
+    CHECK(camera == 0x01, "force=1: **setter 体内收到的实参是 true**");
+    CHECK(last_observation(&orig, nullptr, nullptr) && orig == 0,
+          "force=1: observer 记录的**仍是原始值 false**（日志能给出原值）");
+    CHECK(last_forwarding(&orig, &fwd) && orig == 0 && fwd == 1,
+          "force=1: 原值=0 而转发值=1（原值与传出的值可同时观察）");
+    CHECK(overridden_count() == over_before + 1, "force=1: overridden_count 记到 1 次真实改写");
+    CHECK(any_line_has("value=false forced=true"),
+          "log: 观测行同时给出 value=false（原值）与 forced=true（实际传出的值）");
+    CHECK(any_line_has("callsite_imm=0"), "log: 观测行给出 callsite_imm=0（静态原值）");
+
+    // 幂等切换：状态没变就不打行（防止被重复调用时刷屏）
+    const std::size_t lines_before_idempotent = g_line_count;
+    CHECK(!set_force(true, "hotkey", 1235), "force: 重复置 true 返回 false（状态未变）");
+    CHECK(g_line_count == lines_before_idempotent, "log: 状态未变时不打行");
+
+    // 翻回 force=0
+    CHECK(set_force(false, "hotkey", 1300), "force: 翻回 false");
+    CHECK(!force_enabled(), "force: force_enabled() 变回 false");
+    camera = 0xAA;
+    g_fake_frame = 102;
+    CHECK(flag(&camera, false) == false, "force: 翻回后返回值恢复 false");
+    CHECK(camera == 0x00, "force: 翻回后 setter 体内收到的又是 false（热键可随时撤销）");
+    CHECK(overridden_count() == over_before + 1, "force: 翻回后不再改写（改写次数停在 1）");
+
+    // 还原：仍然只在字节是我们的 jmp 时还原；且 force 状态复位
+    CHECK(set_force(true, "hotkey", 1400), "force: 还原前先重新打开");
+    shutdown();
+    CHECK(!active(), "force: shutdown 后 active() 为 false");
+    CHECK(!force_enabled(), "force: shutdown 把 force 状态复位为 false");
+    CHECK(std::memcmp(g_image + k_flag_rva, k_flag_head, sizeof(k_flag_head)) == 0,
+          "force: shutdown 后原始序言逐字节还原");
+    camera = 0xAA;
+    CHECK(flag(&camera, false) == false && camera == 0x00,
+          "force: 还原后即使 force 曾开着也不再改写真参");
 }
 
 } // namespace
@@ -367,6 +482,7 @@ int main()
     build_image();
     run_locate_tests();
     run_install_tests();
+    run_force_tests();
     run_emit_tests();
     if (failures == 0)
         std::printf("ALL PASS\n");
