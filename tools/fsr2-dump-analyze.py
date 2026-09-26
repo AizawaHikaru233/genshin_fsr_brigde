@@ -35,25 +35,38 @@ RAW_HEADER_SIZE = 64
 
 # DXGI_FORMAT 子集（与 Fsr2InputDump.cpp 的 bytes_per_pixel / decode_channels 对齐）
 BPP = {
-    2: 4, 10: 4, 11: 4, 24: 4, 28: 4, 29: 4, 87: 4, 88: 4, 91: 4,
-    40: 2, 41: 2,   # R16G16_FLOAT, R16_FLOAT
-    49: 2, 54: 2,   # R16_UNORM, R16_TYPELESS
-    61: 1, 62: 1,   # R8_UNORM, R8_TYPELESS
-    39: 8, 20: 8,   # R32G8X24_TYPELESS, D32_FLOAT_S8X24_UINT
-    45: 4,          # R24_UNORM_X8_TYPELESS
+    2: 16,   # R32G32B32A32_FLOAT
+    10: 8,   # R16G16B16A16_FLOAT
+    16: 8,   # R32G32_FLOAT
+    19: 8,   # R32G8X24_TYPELESS
+    20: 8,   # D32_FLOAT_S8X24_UINT
+    21: 8,   # R32_FLOAT_X8X24_TYPELESS
+    23: 4,   # R10G10B10A2_TYPELESS  ← 本游戏的 motion
+    24: 4,   # R10G10B10A2_UNORM
+    26: 4,   # R11G11B10_FLOAT
+    27: 4, 28: 4, 29: 4,   # R8G8B8A8 TYPELESS/UNORM/UNORM_SRGB
+    34: 4,   # R16G16_FLOAT
+    39: 4,   # R32_TYPELESS
+    40: 4,   # D32_FLOAT
+    41: 4,   # R32_FLOAT
+    45: 4,   # D24_UNORM_S8_UINT
+    46: 4,   # R24_UNORM_X8_TYPELESS
+    53: 2, 54: 2, 55: 2, 56: 2,   # R16_TYPELESS / R16_FLOAT / D16_UNORM / R16_UNORM
+    60: 1, 61: 1,   # R8_TYPELESS / R8_UNORM
+    87: 4, 90: 4,   # B8G8R8A8_UNORM / _TYPELESS
 }
 FMT_NAME = {
-    24: "R10G10B10A2_UNORM", 25: "R10G10B10A2_TYPELESS",
-    28: "R8G8B8A8_UNORM", 29: "R8G8B8A8_UNORM_SRGB", 27: "R8G8B8A8_TYPELESS",
-    61: "R8_UNORM", 62: "R8_TYPELESS",
-    54: "R16_FLOAT", 34: "R16G16_FLOAT", 10: "R16G16B16A16_FLOAT",
-    41: "R32_FLOAT", 40: "D32_FLOAT", 39: "R32_TYPELESS",
-    20: "R32G8X24_TYPELESS", 19: "D32_FLOAT_S8X24_UINT",
-    45: "R24_UNORM_X8_TYPELESS", 46: "D24_UNORM_S8_UINT",
-    43: "R11G11B10_FLOAT", 49: "R16_UNORM",
+    2: "R32G32B32A32_FLOAT", 10: "R16G16B16A16_FLOAT", 16: "R32G32_FLOAT",
+    19: "R32G8X24_TYPELESS", 20: "D32_FLOAT_S8X24_UINT", 21: "R32_FLOAT_X8X24_TYPELESS",
+    23: "R10G10B10A2_TYPELESS", 24: "R10G10B10A2_UNORM", 26: "R11G11B10_FLOAT",
+    27: "R8G8B8A8_TYPELESS", 28: "R8G8B8A8_UNORM", 29: "R8G8B8A8_UNORM_SRGB",
+    34: "R16G16_FLOAT", 39: "R32_TYPELESS", 40: "D32_FLOAT", 41: "R32_FLOAT",
+    45: "D24_UNORM_S8_UINT", 46: "R24_UNORM_X8_TYPELESS",
+    53: "R16_TYPELESS", 54: "R16_FLOAT", 55: "D16_UNORM", 56: "R16_UNORM",
+    60: "R8_TYPELESS", 61: "R8_UNORM", 87: "B8G8R8A8_UNORM", 90: "B8G8R8A8_TYPELESS",
 }
-DEPTH_FMTS = {20, 19, 45, 46, 40, 39, 49}
-MOTION_FMTS = {24, 25}
+DEPTH_FMTS = {19, 20, 21, 39, 40, 45, 46, 55, 56}
+MOTION_FMTS = {23, 24}
 
 MOTION_NEUTRAL = 0.498039
 
@@ -87,11 +100,13 @@ def decode_px(fmt, data, off):
     """解出 (r, g, b, a)；未知格式返回 None。"""
     if fmt in (28, 29, 27):          # R8G8B8A8
         return data[off] / 255.0, data[off + 1] / 255.0, data[off + 2] / 255.0, data[off + 3] / 255.0
-    if fmt in MOTION_FMTS or fmt == 87:  # R10G10B10A2
+    if fmt in (87, 90):              # B8G8R8A8
+        return data[off + 2] / 255.0, data[off + 1] / 255.0, data[off] / 255.0, data[off + 3] / 255.0
+    if fmt in MOTION_FMTS:           # 10:10:10:2
         v = struct.unpack_from("<I", data, off)[0]
         return ((v & 0x3FF) / 1023.0, ((v >> 10) & 0x3FF) / 1023.0,
                 ((v >> 20) & 0x3FF) / 1023.0, ((v >> 30) & 3) / 3.0)
-    if fmt in (61, 62):              # R8_UNORM
+    if fmt in (60, 61):              # R8_TYPELESS / R8_UNORM
         g = data[off] / 255.0
         return g, g, g, 1.0
     if fmt in (54,):                 # R16_FLOAT
@@ -103,13 +118,13 @@ def decode_px(fmt, data, off):
     if fmt == 10:                    # R16G16B16A16_FLOAT
         h0, h1, h2, h3 = struct.unpack_from("<HHHH", data, off)
         return (_half_to_float(h0), _half_to_float(h1), _half_to_float(h2), _half_to_float(h3))
-    if fmt in (41, 40, 39):          # R32_FLOAT / D32_FLOAT / R32_TYPELESS
+    if fmt in (39, 40, 41, 16, 2):   # R32/D32 系 + R32G32/R32G32B32A32（后两者取 r）
         g = struct.unpack_from("<f", data, off)[0]
         return g, g, g, 1.0
     if fmt in (20, 19):              # 深度在前 4 字节
         g = struct.unpack_from("<f", data, off)[0]
         return g, g, g, 1.0
-    if fmt == 49:                    # R16_UNORM
+    if fmt in (55, 56):              # D16_UNORM / R16_UNORM
         g = struct.unpack_from("<H", data, off)[0] / 65535.0
         return g, g, g, 1.0
     if fmt in (45, 46):              # R24_UNORM_X8
