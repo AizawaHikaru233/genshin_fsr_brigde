@@ -108,23 +108,37 @@ std::uint8_t *g_hide_uid_object_active = nullptr;
 //   - **隐藏后立刻用 `find_object` 反查验证** ✓✓✓
 //     Unity 的 `GameObject.Find` **只返回激活对象** ⇒ "反查不到"即**确实隐藏了** ✓
 //     ⇒ `hidden N` 从此只统计**验证过**的隐藏，不再说谎 ✓
+// 每个目标的候选路径数。**固定块**便于给过滤 stub 静态分配槽位（`i * k + p`）✓
+constexpr std::size_t k_uid_paths_per_target = 5;
+
 struct UidTarget
 {
-    const char *label;                  // 日志用的短名
-    std::array<const char *, 3> paths;  // 候选路径；空串/nullptr 表示无效项
+    const char *label;                                  // 日志用的短名
+    std::array<const char *, k_uid_paths_per_target> paths; // 候选；nullptr/空串=无效项
 };
 
 constexpr std::array<UidTarget, 3> k_hide_uid_targets {
+    // ⚠️ 2026-09-26：水印额外加了**整块画布**候选 ✓ ——
+    // `BetaWatermarkCanvas` 是**专供水印**的画布 ⇒ 连同画布一起隐藏不会误伤别的 UI ✓
+    // （实测 `.../Panel/TxtUID` 能解析到对象、但写 `+0x148` 不生效 ⇒ 需要更大粒度的目标兜底 ✓）
+    // **个人资料页 / 地图页绝不能这样做** ✗ —— 躲它们的祖先把整页都藏掉了 ✗
     UidTarget { "watermark", { "/BetaWatermarkCanvas(Clone)/Panel/TxtUID",
+                               "/BetaWatermarkCanvas(Clone)",
                                "/BetaWatermarkCanvas/Panel/TxtUID",
+                               "/BetaWatermarkCanvas",
                                "BetaWatermarkCanvas(Clone)/Panel/TxtUID" } },
     UidTarget { "profile", { "/Canvas/Pages/PlayerProfilePage/GrpProfile/Right/GrpPlayerCard/UID",
                              "/Canvas/Pages/PlayerProfilePage/GrpProfile/Right/GrpPlayerCard/UID(Clone)",
-                             "Canvas/Pages/PlayerProfilePage/GrpProfile/Right/GrpPlayerCard/UID" } },
+                             "Canvas/Pages/PlayerProfilePage/GrpProfile/Right/GrpPlayerCard/UID",
+                             nullptr, nullptr } },
     UidTarget { "map", { "/Canvas/Pages/InLevelMapPage/GrpMap/GrpPlayer/UID",
                          "/Canvas/Pages/InLevelMapPage/GrpMap/GrpPlayer/UID(Clone)",
-                         "Canvas/Pages/InLevelMapPage/GrpMap/GrpPlayer/UID" } },
+                         "Canvas/Pages/InLevelMapPage/GrpMap/GrpPlayer/UID",
+                         nullptr, nullptr } },
 };
+
+// 过滤 stub 的槽位总数：每个目标一块 `k_uid_paths_per_target`（当前 3×5=15，留 1 个恒零哨兵）✓
+constexpr std::size_t k_uid_filter_slots = k_hide_uid_targets.size() * k_uid_paths_per_target + 1;
 
 // 目标处理结果（POD；`__try` 内不得出现带析构的对象 ⇒ MSVC C2712）
 //
@@ -307,7 +321,11 @@ bool hide_uid_once();
 // ---------------------------------------------------------------------------
 
 // UID 目标的【解包后】指针（写 stub 比较用；主线程写、被 patch 的代码读）
-std::array<std::uintptr_t, k_hide_uid_targets.size()> g_uid_filter_targets {};
+//
+// 2026-09-26：改为**扁平定长表** —— 每个目标一块 `k_uid_paths_per_target` 个槽
+// （`i * k + p`）✓ ⇒ 同一个目标的**多条候选路径可以同时登记** ✓
+// 这样"藏 TxtUID 不生效"时，**整块画布**那条候选也能一起被过滤 ✓（提升一次命中的概率）
+std::array<std::uintptr_t, k_uid_filter_slots> g_uid_filter_targets {};
 // `object_active` 实际写入的字节偏移（从指令里解出 —— 不是硬编码 ✓）
 std::uint32_t g_hide_uid_active_offset = 0;
 // 原写入器地址（stub 装好前的备份，供诊断）
@@ -343,14 +361,25 @@ int hide_uid_once_unsafe(int *status_out)
     {
         for (std::size_t i = 0; i < k_hide_uid_targets.size(); ++i)
         {
-            status_out[i] = k_uid_absent;
             const UidTarget &target = k_hide_uid_targets[i];
+            const std::size_t slot_base = i * k_uid_paths_per_target;
+            // 先把本目标的整块槽位清 0 ⇒ **不会有上一轮的陈旧/悬空指针被 stub 命中** ✓
+            for (std::size_t p = 0; p < k_uid_paths_per_target; ++p)
+                g_uid_filter_targets[slot_base + p] = 0;
+
             bool built_string = false; // 是否至少建成过一次字符串对象（区分两类失败）
-            std::uintptr_t native_found = 0;
+            bool any_native = false;   // 至少解析到一个对象 ✓
+            bool any_stuck = false;    // 至少一个候选的写入**落地**了 ✓
 
             // 逐个候选现场解析：**不缓存**任何指针 ⇒ 无悬空指针问题 ✓
-            for (const char *candidate : target.paths)
+            //
+            // ⚠️ 2026-09-26：**不再在第一个成功候选处 break** ✗ ——
+            // 原来 break 掉 ⇒ "藏 TxtUID 不生效"时**整块画布**那条候选永远没机会试 ✗。
+            // 现在**每个能解析到的候选都藏一遍，并各自登记到独立槽位** ✓
+            // （对水印而言连画布一起藏是正确语义；profile/map 刻意没有祖先候选 ✓）
+            for (std::size_t p = 0; p < target.paths.size(); ++p)
             {
+                const char *candidate = target.paths[p];
                 if (candidate == nullptr || *candidate == '\0')
                     continue;
 
@@ -368,37 +397,38 @@ int hide_uid_once_unsafe(int *status_out)
                 // ⇒ 拿到"被 patch 的写入器实际会写的那个对象" ✓
                 const auto native = *reinterpret_cast<std::uintptr_t *>(
                     reinterpret_cast<std::uint8_t *>(object) + 0x10);
+                if (native == 0)
+                    continue;
+                any_native = true;
 
                 object_active(object, false);
 
-                // ⚠️ 判据换成【回读我们实际写的那个字节】✓
+                // 登记给过滤 stub：游戏之后任何"重新激活"都会被强制成 false ✓
+                g_uid_filter_targets[slot_base + p] = native;
+
+                // ⚠️ 判据是【回读我们实际写的那个字节】✓
                 //
-                // 旧判据是"再 Find 一次看还在不在"，但**实机已证伪**：
-                // 个人资料页根本没打开时它照样 "找到" 了该 UID ⇒ `find_object`
-                // 并不按激活状态过滤 ⇒ 那个判据既会假报成功、也会假报失败 ✗
-                if (native != 0 && g_hide_uid_active_offset != 0)
-                {
-                    const auto value = *reinterpret_cast<volatile std::uint8_t *>(
-                        native + g_hide_uid_active_offset);
-                    status_out[i] = value == 0 ? k_uid_hidden : k_uid_ineffective;
-                    if (value == 0)
-                        ++hidden_count;
-                    native_found = native;
-                }
-                else
-                {
-                    status_out[i] = k_uid_ineffective;
-                }
-                break; // 该目标已处理，试下一个目标
+                // 旧判据"再 Find 一次看还在不在"**实机已证伪**：个人资料页根本没打开时
+                // 它照样 "找到" 该 UID ⇒ `find_object` 不按激活状态过滤 ⇒ 那个判据
+                // 既会假报成功、也会假报失败 ✗
+                if (g_hide_uid_active_offset != 0 &&
+                    *reinterpret_cast<volatile std::uint8_t *>(
+                        native + g_hide_uid_active_offset) == 0)
+                    any_stuck = true;
             }
 
-            // 登记给过滤 stub：游戏之后任何"重新激活"都会被强制成 false ✓
-            // 找不到时清 0 ⇒ **不会有悬空指针被 stub 命中** ✓
-            g_uid_filter_targets[i] = native_found;
-
-            // 字符串都没建成 ⇒ 与"路径找不到对象"是**不同**的故障，如实区分 ✓
-            if (status_out[i] == k_uid_absent && !built_string)
-                status_out[i] = k_uid_no_string;
+            // 状态：**任一候选写落地即算"藏住"** ✓（计数仍是"目标数" ✓，与日志语义一致）
+            if (any_stuck)
+            {
+                status_out[i] = k_uid_hidden;
+                ++hidden_count;
+            }
+            else if (any_native)
+                status_out[i] = k_uid_ineffective;
+            else if (built_string)
+                status_out[i] = k_uid_absent;
+            else
+                status_out[i] = k_uid_no_string; // 与"找不到对象"是不同故障 ✓
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -638,8 +668,23 @@ bool find_byte_write(const std::uint8_t *code, std::size_t size, std::uint32_t *
         if (code[i] != 0x88)
             continue;
         const std::uint8_t modrm = code[i + 1];
-        if ((modrm & 0xC0) != 0x80 || (modrm & 0x07) != 0x05)
-            continue; // 要求 [reg + disp32] 形态
+        // ⚠️ 2026-09-26 修正（按实机日志 `cannot resolve written field` 定位到根因）：
+        //
+        // 原条件还多要求 `(modrm & 7) == 5`，那**只匹配 `[rbp/r13 + disp32]`** ✗ ——
+        // 而本机写入器是 `mov byte ptr [rcx+0x148], dl` = `88 91 48 01 00 00`
+        // （modrm=0x91 ⇒ rm=**001**）✗ ⇒ **这条判定永远匹配不到它** ✗✓✓
+        // ⇒ `resolve_written_field` 必然失败 ⇒ 过滤 stub 从未装上 ⇒
+        //   实机日志出现 `HideUID active-filter: cannot resolve written field; skipped` ✓
+        //
+        // `mod = 10` 时**不存在 RIP 相对形态**（RIP 相对要求 `mod = 00` + rm = 101）✓
+        // ⇒ 接受任意 `mod = 10` 仍然满足本函数的前提："可原样搬运、无需重定位" ✓
+        // 唯一必须排除的是 `rm = 100`（后跟 SIB ⇒ 整条 7 字节，搬 6 字节会截断）✗
+        if ((modrm & 0xC0) != 0x80 || (modrm & 0x07) == 0x04)
+            continue;
+        // `0x88` 之前若是 REX 前缀（40-4F），寄存器号在 REX 里 ✗ —— 本函数只搬
+        // 6 字节会丢掉它 ⇒ 拒绝（本项目目标形态 `88 91 …` 无 REX ✓）
+        if (i > 0 && (code[i - 1] & 0xF0) == 0x40)
+            continue;
         std::uint32_t displacement = 0;
         std::memcpy(&displacement, code + i + 2, sizeof(displacement));
         if (displacement == 0 || displacement > 0x2000)
@@ -669,8 +714,22 @@ bool resolve_written_field(std::uint8_t *function, std::uint32_t *offset_out, st
         return true;
     }
 
-    // 尾调用：只在函数头 48 字节内找，避免误认函数体深处的其它 E9
-    for (std::size_t i = 0; i + 5 <= 48; ++i)
+    // 尾调用：在**整个 head 缓冲**内找。
+    //
+    // ⚠️ 2026-09-26 修正（与 `find_byte_write` 的 modrm 修正同批，同一个实机日志）：
+    //
+    // 原窗口是 `i + 5 <= 48` ⇒ i 最大 **43** ✗ —— 而本机 `ObjectActive` 的尾调用
+    // `E9` 落在**偏移 49** ✗（逐字节数：48 89 5C 24 08 / 57 / 48 83 EC 20 / 0F B6 FA /
+    // 48 8B D9 / 48 85 C9 / 74 ?? / E8 … / 48 85 C0 / 74 ?? / 40 84 FF / 48 8B C8 /
+    // 0F 95 C2 / 48 8B 5C 24 30 / 48 83 C4 20 / 5F ⇒ 49 处才是 E9）
+    // ⇒ **差 6 字节没搜到** ✗✓✓ —— 这是 `cannot resolve written field` 的第二个成因 ✓
+    //
+    // 放宽窗口带来的"误认函数体深处的 E9"风险，由两条约束兜住：
+    //   ① 目标处必须真的有 `mov [reg+disp32], r8` ✓（`find_byte_write` 判定 ✓）
+    //   ② 取**最后一个**命中 ✓ —— 尾调用在函数体末尾，函数中途的 E9 会排在它前面 ✓
+    std::uint8_t *tail_writer = nullptr;
+    std::uint32_t tail_offset = 0;
+    for (std::size_t i = 0; i + 5 <= sizeof(head); ++i)
     {
         if (head[i] != 0xE9)
             continue;
@@ -680,12 +739,27 @@ bool resolve_written_field(std::uint8_t *function, std::uint32_t *offset_out, st
         std::uint8_t tail[32] {};
         if (!safe_read_code(target, tail, sizeof(tail)))
             continue;
-        if (find_byte_write(tail, sizeof(tail), offset_out, nullptr))
+        std::uint32_t candidate_offset = 0;
+        if (find_byte_write(tail, sizeof(tail), &candidate_offset, nullptr))
         {
-            if (writer_out != nullptr)
-                *writer_out = target;
-            return true;
+            tail_writer = target;
+            tail_offset = candidate_offset;
         }
+    }
+    if (tail_writer != nullptr)
+    {
+        if (offset_out != nullptr)
+            *offset_out = tail_offset;
+        if (writer_out != nullptr)
+            *writer_out = tail_writer;
+        const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+        char message[192] {};
+        std::snprintf(message, sizeof(message),
+            "HideUID active-filter: resolved via tail call, writer=+0x%llX field=+0x%X",
+            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(tail_writer) - base),
+            static_cast<unsigned>(tail_offset));
+        log_line(message);
+        return true;
     }
     return false;
 }
@@ -730,13 +804,13 @@ void *build_active_filter_stub(std::uint8_t *writer, std::size_t write_at)
     std::memcpy(stub + p, &targets, sizeof(targets));
     p += sizeof(targets);
 
-    std::array<std::size_t, k_hide_uid_targets.size()> jump_positions {};
-    for (std::size_t i = 0; i < k_hide_uid_targets.size(); ++i)
+    std::array<std::size_t, k_uid_filter_slots> jump_positions {};
+    for (std::size_t i = 0; i < k_uid_filter_slots; ++i)
     {
         stub[p++] = 0x4C; stub[p++] = 0x8B; stub[p++] = 0x48;
-        stub[p++] = static_cast<std::uint8_t>(i * 8);      // mov r9, [rax + 8i]
-        stub[p++] = 0x4C; stub[p++] = 0x39; stub[p++] = 0xC9; // cmp rcx, r9
-        stub[p++] = 0x74;                                   // je FORCE
+        stub[p++] = static_cast<std::uint8_t>((i * 8) & 0xFF); // mov r9, [rax + 8i]
+        stub[p++] = 0x4C; stub[p++] = 0x39; stub[p++] = 0xC9;  // cmp rcx, r9
+        stub[p++] = 0x74;                                       // je FORCE
         jump_positions[i] = p++;
     }
     const std::size_t jmp_write_at = p;
