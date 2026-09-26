@@ -71,6 +71,7 @@ add_library(Dx11FsrBridge SHARED
     Fsr2FamilyTakeover.cpp
     Il2CppCallSiteHook.cpp
     Ffx12Backend.cpp
+    Fsr2InputDump.cpp
 )
 
 # 旧方案已彻底移除：Fsr2TranslationLayer（旧翻译层）与 Dx11On12Swapchain（On12 引导）
@@ -209,6 +210,19 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     target_include_directories(Il2CppCallSiteHookTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     enable_testing()
     add_test(NAME Il2CppCallSiteHookTest COMMAND Il2CppCallSiteHookTest)
+
+    # FSR2 输入纹理转储的纯函数单测：PNG 结构/CRC/zlib 回读、motion 平方解码、
+    # 半精度转换、raw 头。**不需要 GPU、不需要游戏、不链接 BridgeLogger**
+    # （用 FSR2DUMP_NO_LOGGER 把日志裁剪为空操作）。
+    # 这些公式必须与 Ffx12Backend.cpp 的 CS 一致——不一致会让诊断图本身说谎。
+    add_executable(Fsr2InputDumpTest
+        Fsr2InputDumpTest.cpp
+        Fsr2InputDump.cpp
+    )
+    fsrbridge_configure_test(Fsr2InputDumpTest)
+    target_compile_definitions(Fsr2InputDumpTest PRIVATE FSR2DUMP_NO_LOGGER)
+    target_include_directories(Fsr2InputDumpTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME Fsr2InputDumpTest COMMAND Fsr2InputDumpTest)
 endif()
 
 if(DX11FSRBRIDGE_BUILD_BACKEND_TEST)

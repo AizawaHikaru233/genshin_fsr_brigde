@@ -14,6 +14,7 @@
 #include "Fsr2FamilyTakeover.h"
 #include "Il2CppCallSiteHook.h"
 #include "Ffx12Backend.h"
+#include "Fsr2InputDump.h"
 #include "BridgeLogger.h"
 // 旧方案（On12 引导 / FSR2 翻译层）已移除，不再编译。
 
@@ -3827,6 +3828,8 @@ void load_config()
         512u);
     g_config.capture_metadata_only =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"CaptureMetadataOnly", 0, config_path.c_str()) != 0;
+    // FSR2 输入纹理转储（诊断，默认关）。放在无条件区，避免被下面的 #if 吞掉。
+    fsr2dump::configure(config_path.c_str());
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     g_config.enable_fsr2_get_proc_address_shim =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableFsr2GetProcAddressShim", 1, config_path.c_str()) != 0;
@@ -11109,6 +11112,45 @@ bool try_fsr2_translation_draw(
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
                 probe_native_params_once(context, call_params, color_tex, depth_tex, motion_tex);
 #endif // !DX11FSRBRIDGE_RELEASE_RUNTIME
+
+                // FSR2 输入纹理转储（诊断，默认关；Fsr2InputDump=1 才启用）。
+                // 只在这里喂参数与纹理，读回由模块跨帧延迟完成——不在本 draw 内做 CPU 同步。
+                if (fsr2dump::enabled())
+                {
+                    bool dump_dx11on12 = false, dump_gpu_only = false;
+                    ffx12::interop_capabilities(dump_dx11on12, dump_gpu_only);
+                    fsr2dump::FrameDesc dump_desc;
+                    dump_desc.color = color_tex;
+                    dump_desc.depth = depth_tex;
+                    dump_desc.motion = motion_tex;
+                    dump_desc.transparency = transparency_tex;
+                    dump_desc.output = output_tex;
+                    dump_desc.render_w = sdk_in.render_w;
+                    dump_desc.render_h = sdk_in.render_h;
+                    dump_desc.display_w = sdk_in.display_w;
+                    dump_desc.display_h = sdk_in.display_h;
+                    dump_desc.jitter_x = sdk_in.jitter_x;
+                    dump_desc.jitter_y = sdk_in.jitter_y;
+                    dump_desc.motion_scale_x = sdk_in.motion_scale_x;
+                    dump_desc.motion_scale_y = sdk_in.motion_scale_y;
+                    dump_desc.frame_time_delta_ms = sdk_in.frame_time_delta_ms;
+                    dump_desc.use_reactive_mask = sdk_in.use_reactive_mask;
+                    dump_desc.use_transparency_mask = sdk_in.use_transparency_mask;
+                    dump_desc.enable_sharpening = sdk_in.enable_sharpening;
+                    dump_desc.sharpness = sdk_in.sharpness;
+                    dump_desc.reset = sdk_in.reset;
+                    dump_desc.frame_index = call_params.frame_index;
+                    dump_desc.instance = call_params.instance;
+                    {
+                        std::uint32_t dfc = 0, dfd = 0, dfm = 0, dfo = 0;
+                        ffx12::input_formats(dfc, dfd, dfm, dfo);
+                        dump_desc.fmt_color = dfc;
+                        dump_desc.fmt_depth = dfd;
+                        dump_desc.fmt_motion = dfm;
+                        dump_desc.fmt_output = dfo;
+                    }
+                    fsr2dump::on_dispatch(context, dump_desc, !dump_dx11on12);
+                }
 
                 if (ffx12::dispatch(sdk_in, context, call_params.instance))
                 {
