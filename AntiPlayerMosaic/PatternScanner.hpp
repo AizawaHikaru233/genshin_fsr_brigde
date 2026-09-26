@@ -60,6 +60,18 @@ inline constexpr Signature k_signatures[] {
     //
     // **5/5 恰好唯一** ✓ —— 命中 RVA 与部署版 DLL 日志（2026-09-26 实机）逐条一致。
     //
+    // 代价（实测，勿凭直觉判断）：掩掉位移会让"最长非通配连续段"变短，而
+    // `find_matches` 用该段首字节做 `memchr` ⇒ **探测量上升**。C++ 实测
+    // （`/O2`，遍历三个可执行节共 371 MB）逐条耗时：
+    //
+    //   FindString 23.3ms / FindObject 35.3ms / ObjectActive 263.5ms /
+    //   PlayerPerspective 51.9ms / PlayerDiveMosaic 263.9ms   ⇒ **合计 637.9ms**
+    //
+    // 这是**启动时一次**的后台线程扫描（成功后会写 `.features.cache`），
+    // 换来版本更新时的韧性 —— 划算。
+    // ⚠️ 别用 Python 脚本的耗时来判断：`bytes.find` 比 C 的 `memchr` 慢约两个数量级,
+    //    同一组签名在 Python 里是 ~62 秒，会得出"不可接受"的错误结论。
+    //
     // 术语：E8/E9 掩其后 4 字节；0F 8x 掩其后 4 字节；短跳转只掩其后 1 字节。
     // **不要误掩** ModRM（例：`48 83 7C 24 28 00` 里的 `7C` 是 ModRM，不是 jcc；
     // `7C` 既是 jcc 操作码又常作 ModRM ⇒ 前一条指令的边界必须先判定对）。
