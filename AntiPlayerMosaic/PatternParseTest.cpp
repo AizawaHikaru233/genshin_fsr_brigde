@@ -17,6 +17,32 @@ int main()
         }
         std::printf("\n");
     }
+    // 带判据的函数（`discriminator` 非空）：
+    //   ① 判据模式必须能完整解析；
+    //   ② 包装器模式里必须**有且仅有**一个 `E9` —— `resolve_object_active` 的
+    //      `tail_jump_offset` 靠这一不变量定位尾调用，多一个就会取错位置。
+    for (const auto &sig : pattern_scanner::k_signatures)
+    {
+        if (sig.discriminator.empty())
+            continue;
+
+        const auto pd = pattern_scanner::parse_pattern(sig.discriminator);
+        std::printf("discriminator %-14s bytes=%3zu valid=%d",
+            std::string(sig.name).c_str(), pd.bytes.size(), pd.valid ? 1 : 0);
+        if (!pd.valid) { std::printf("  error_offset=%zu  <-- NOT VALID (BUG)\n", pd.error_offset); ++failures; }
+        else { std::printf("\n"); }
+
+        const auto pw = pattern_scanner::parse_pattern(sig.text);
+        std::size_t tail_jumps = 0;
+        for (std::size_t i = 0; i < pw.bytes.size(); ++i)
+        {
+            if (!pw.bytes[i].wildcard && pw.bytes[i].value == 0xE9)
+                ++tail_jumps;
+        }
+        std::printf("tail-E9 count %-14s count=%zu", std::string(sig.name).c_str(), tail_jumps);
+        if (tail_jumps != 1) { std::printf("  <-- EXPECTED 1 (BUG)\n"); ++failures; }
+        else { std::printf(" (ok)\n"); }
+    }
     // 故意构造两类坏签名，均应被检出（这是本次新增 valid 标志的目的）
     //
     // ① 拼接处漏空格 → 非法十六进制。

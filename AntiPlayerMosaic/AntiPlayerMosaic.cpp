@@ -662,6 +662,125 @@ std::uint8_t *scan_unique_signature(
     return matches[0];
 }
 
+// 包装器模式里那个 `E9 rel32`（尾调用）的位置。`E9` 在模式里只出现一次，故无歧义；
+// 找不到就返回 npos，由调用方显式失败。
+std::size_t tail_jump_offset(const pattern_scanner::Pattern &pattern)
+{
+    for (std::size_t i = 0; i < pattern.bytes.size(); ++i)
+    {
+        if (!pattern.bytes[i].wildcard && pattern.bytes[i].value == 0xE9)
+            return i;
+    }
+    return static_cast<std::size_t>(-1);
+}
+
+// `ObjectActive` 专用解析：它的包装器模式有 **45 个逐字节同形的孪生**
+//（差别只在随调用者地址派生出的 `E8`/`E9` 位移上）⇒ 包装器层面无法唯一识别。
+//
+// 做法（全程内容特征，**不写死任何地址**）：
+//   ① 用 `signature.discriminator` 唯一命中原生实现，即真正的 `GameObject::SetActive`；
+//   ② 扫出全部包装器候选；
+//   ③ 取**尾调用它**的那一个（包装器末尾是 `E9 rel32`）。
+//
+// 任何一步命中数不是 1 就返回 nullptr 并记日志 —— **失败即放弃，绝不猜**：
+// 猜错会去调用另一个函数的孪生，症状是"调了、不报错、什么也不发生"，极难归因。
+std::uint8_t *resolve_object_active(
+    std::uint8_t *base,
+    std::size_t image_size,
+    const pattern_scanner::Signature &signature)
+{
+    const std::string name(signature.name);
+    const auto wrapper_pattern = pattern_scanner::parse_pattern(signature.text);
+    const auto impl_pattern = pattern_scanner::parse_pattern(signature.discriminator);
+    if (!wrapper_pattern.valid || !impl_pattern.valid)
+    {
+        log_line(name + " pattern parse failed (signature text malformed)");
+        return nullptr;
+    }
+
+    const std::size_t jump_offset = tail_jump_offset(wrapper_pattern);
+    if (jump_offset == static_cast<std::size_t>(-1))
+    {
+        log_line(name + " wrapper pattern has no tail E9; cannot disambiguate");
+        return nullptr;
+    }
+
+    if (image_size < sizeof(IMAGE_DOS_HEADER))
+        return nullptr;
+    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 ||
+        static_cast<std::size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > image_size)
+    {
+        log_line(name + " image is not a mapped PE image (bad DOS header)");
+        return nullptr;
+    }
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+    {
+        log_line(name + " image is not a mapped PE image (bad NT header)");
+        return nullptr;
+    }
+
+    std::vector<std::uint8_t *> impl_hits;
+    std::vector<std::uint8_t *> wrappers;
+    const auto *sections = IMAGE_FIRST_SECTION(nt);
+    // 必须遍历**全部可执行节**：本 EXE 有三个（.text / il2cpp / .upx0），漏掉 il2cpp
+    // 会得出"0 命中、游戏改了代码"的反向结论。
+    for (unsigned section_index = 0; section_index < nt->FileHeader.NumberOfSections; ++section_index)
+    {
+        const auto &section = sections[section_index];
+        if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 || section.VirtualAddress >= image_size)
+            continue;
+
+        std::size_t section_size = section.Misc.VirtualSize != 0 ? section.Misc.VirtualSize : section.SizeOfRawData;
+        section_size = (std::min)(section_size, image_size - section.VirtualAddress);
+        auto *section_base = base + section.VirtualAddress;
+
+        for (const auto offset : pattern_scanner::find_matches(section_base, section_size, impl_pattern))
+            impl_hits.push_back(section_base + offset);
+        for (const auto offset : pattern_scanner::find_matches(section_base, section_size, wrapper_pattern))
+            wrappers.push_back(section_base + offset);
+    }
+
+    if (impl_hits.size() != 1)
+    {
+        log_line(name + " impl scan failed: matches=" + std::to_string(impl_hits.size()));
+        return nullptr;
+    }
+    std::uint8_t *const impl = impl_hits.front();
+
+    std::uint8_t *picked = nullptr;
+    std::size_t picked_count = 0;
+    for (auto *wrapper : wrappers)
+    {
+        if (wrapper + jump_offset + 5 > base + image_size)
+            continue;
+        std::int32_t relative = 0;
+        std::memcpy(&relative, wrapper + jump_offset + 1, sizeof(relative));
+        if (wrapper + jump_offset + 5 + relative == impl)
+        {
+            picked = wrapper;
+            ++picked_count;
+        }
+    }
+    if (picked_count != 1)
+    {
+        log_line(name + " disambiguation failed: wrappers=" + std::to_string(wrappers.size()) +
+            " tail-matching-impl=" + std::to_string(picked_count));
+        return nullptr;
+    }
+
+    char message[192] {};
+    std::snprintf(message, sizeof(message),
+        "%.*s resolved: rva=0x%08llX (impl=0x%08llX, %llu twins, by tail call)",
+        static_cast<int>(signature.name.size()), signature.name.data(),
+        static_cast<unsigned long long>(picked - base),
+        static_cast<unsigned long long>(impl - base),
+        static_cast<unsigned long long>(wrappers.size()));
+    log_line(message);
+    return picked;
+}
+
 // 有界等待主模块代码段可读（替代固定 `Sleep(3000)`）。
 //
 // 判定依据：主模块映像的**首个页面**可读且已提交。就绪即继续（不白等），未就绪则
@@ -738,29 +857,17 @@ DWORD WINAPI worker_thread(void *parameter)
     ModuleFingerprint fingerprint {};
     std::array<std::uint32_t, 5> cached_rvas {};
 
-    // ① **首选 RVA 优先**：`ObjectActive` 这类无法用纯字节模式唯一定位的函数，记下地址
-    //    后仍必须用全掩码模式在该地址处**运行时校验** —— 地址随版本漂移会被发现，
-    //    绝不静默拿错函数（详见 `PatternScanner.hpp` 的 `preferred_rva`）。
+    // ① **带判据的函数优先解析**：`ObjectActive` 的包装器模式有 45 个逐字节同形的孪生，
+    //    只能靠 `discriminator`（原生实现的特征模式）加尾调用关系**动态**选定。
     //
-    // ⚠️ **必须排在缓存之前**：旧缓存里可能存着**错误孪生**的 RVA，
-    //    而它同样能通过全掩码校验 ⇒ 缓存那道校验挡不住它。
+    // ⚠️ **必须排在缓存之前**：旧缓存里可能存着**错误孪生**的 RVA，而它同样能通过
+    //    包装器模式校验 ⇒ 缓存那道校验挡不住它，不能让它抢先。
     for (std::size_t index = 0; index < targets.size(); ++index)
     {
         const auto &signature = pattern_scanner::k_signatures[index];
-        if (signature.preferred_rva == 0)
+        if (signature.discriminator.empty())
             continue;
-        targets[index] = read_cached_signature(main_module, signature, signature.preferred_rva);
-        char message[176] {};
-        if (targets[index] != nullptr)
-            std::snprintf(message, sizeof(message), "%.*s resolved via preferred rva=0x%08X (verified)",
-                static_cast<int>(signature.name.size()), signature.name.data(),
-                static_cast<unsigned>(signature.preferred_rva));
-        else
-            std::snprintf(message, sizeof(message),
-                "%.*s preferred rva=0x%08X FAILED verification; falling back to scan",
-                static_cast<int>(signature.name.size()), signature.name.data(),
-                static_cast<unsigned>(signature.preferred_rva));
-        log_line(message);
+        targets[index] = resolve_object_active(base, size, signature);
     }
 
     bool cache_valid = get_module_fingerprint(main_module, fingerprint) &&

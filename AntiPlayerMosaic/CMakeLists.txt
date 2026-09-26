@@ -48,3 +48,22 @@ if(ANTIPLAYER_BUILD_PATTERN_TEST)
     enable_testing()
     add_test(NAME PatternParseTest COMMAND PatternParseTest)
 endif()
+
+# `SetActive` 动态解析回归测试。
+#
+# 覆盖：国服（YuanShen.exe）与国际服（GenshinImpact.exe）两份客户端都能唯一解出
+# 原生实现及**尾调用它**的包装器；判据被破坏时必须失败（fail-closed，不许猜函数）。
+# 该测试直接编入产品源码（测的是真实现，不是复刻）；二进制不在本机时用例记 SKIP。
+# 默认 OFF（不影响正常构建）。
+option(ANTIPLAYER_BUILD_RESOLVE_TEST "Build the SetActive dynamic-resolve test" OFF)
+if(ANTIPLAYER_BUILD_RESOLVE_TEST)
+    add_executable(ObjectActiveResolveTest ObjectActiveResolveTest.cpp)
+    target_compile_features(ObjectActiveResolveTest PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(ObjectActiveResolveTest PRIVATE /utf-8 /W3)
+    endif()
+    target_include_directories(ObjectActiveResolveTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(ObjectActiveResolveTest PRIVATE kernel32)
+    enable_testing()
+    add_test(NAME ObjectActiveResolveTest COMMAND ObjectActiveResolveTest)
+endif()
