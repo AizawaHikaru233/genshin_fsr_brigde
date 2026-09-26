@@ -91,11 +91,53 @@ void *g_player_perspective_stub = nullptr;
 std::uint8_t *g_hide_uid_find_string = nullptr;
 std::uint8_t *g_hide_uid_find_object = nullptr;
 std::uint8_t *g_hide_uid_object_active = nullptr;
-constexpr std::array<const char *, 3> k_hide_uid_paths {
-    "/BetaWatermarkCanvas(Clone)/Panel/TxtUID",
-    "/Canvas/Pages/PlayerProfilePage/GrpProfile/Right/GrpPlayerCard/UID",
-    "/Canvas/Pages/InLevelMapPage/GrpMap/GrpPlayer/UID",
+// UID 目标表（2026-09-26 重构：从"三条写死路径 + 永久缓存"改为"多候选 + 每轮现场解析 + 反查验证"）。
+//
+// **原实现的三个缺陷（实机已复现）**：
+//   1. 三条路径写死 ⇒ 游戏改 UI 结构就静默失效（`continue`，不落任何日志）✗
+//   2. `find_object` 的结果被**永久缓存** ⇒ `BetaWatermarkCanvas(Clone)` 这类
+//      **Clone 会被销毁重建**，缓存指针随即**悬空** ✗；而 `object_active(悬空, false)`
+//      **既不抛异常、也不生效** ⇒ 仍 `++hidden_count` ✗
+//      ⇒ 日志打出 `hidden 1` 而实际一个都没藏住 ✓（这就是实机看到的假报）
+//   3. 只要有一个目标"成功"就把重试间隔拉到 8 秒 ⇒ 假报之后再难纠正 ✗
+//
+// **现在**：
+//   - 每个逻辑目标给**多条候选路径**（带/不带 `(Clone)`、带/不带前导斜杠）✓
+//   - **不缓存任何指针**，每轮现场 `find_string` + `find_object` ✓
+//     （3 目标 × 3 候选，每 8 秒一次 —— 代价可忽略，却彻底消除悬空指针这一类问题）
+//   - **隐藏后立刻用 `find_object` 反查验证** ✓✓✓
+//     Unity 的 `GameObject.Find` **只返回激活对象** ⇒ "反查不到"即**确实隐藏了** ✓
+//     ⇒ `hidden N` 从此只统计**验证过**的隐藏，不再说谎 ✓
+struct UidTarget
+{
+    const char *label;                  // 日志用的短名
+    std::array<const char *, 3> paths;  // 候选路径；空串/nullptr 表示无效项
 };
+
+constexpr std::array<UidTarget, 3> k_hide_uid_targets {
+    UidTarget { "watermark", { "/BetaWatermarkCanvas(Clone)/Panel/TxtUID",
+                               "/BetaWatermarkCanvas/Panel/TxtUID",
+                               "BetaWatermarkCanvas(Clone)/Panel/TxtUID" } },
+    UidTarget { "profile", { "/Canvas/Pages/PlayerProfilePage/GrpProfile/Right/GrpPlayerCard/UID",
+                             "/Canvas/Pages/PlayerProfilePage/GrpProfile/Right/GrpPlayerCard/UID(Clone)",
+                             "Canvas/Pages/PlayerProfilePage/GrpProfile/Right/GrpPlayerCard/UID" } },
+    UidTarget { "map", { "/Canvas/Pages/InLevelMapPage/GrpMap/GrpPlayer/UID",
+                         "/Canvas/Pages/InLevelMapPage/GrpMap/GrpPlayer/UID(Clone)",
+                         "Canvas/Pages/InLevelMapPage/GrpMap/GrpPlayer/UID" } },
+};
+
+// 目标处理结果（POD；`__try` 内不得出现带析构的对象 ⇒ MSVC C2712）
+//
+// 注意：**没有 `exception` 这一项** —— 异常时 `__except` 直接返回 -1，不会写任何状态
+// （写了也无法确定是哪个目标抛的），所以列进来只会变成不可达分支 ✗。
+enum UidStatus : int
+{
+    k_uid_absent = 0,       // 候选路径全都没找到对象（UI 未出现，或路径已改）
+    k_uid_no_string = 1,    // 连字符串对象都没建出来（find_string 失败 ⇒ 另一类问题）✗
+    k_uid_hidden = 2,       // 反查不到 ⇒ **确实隐藏了** ✓
+    k_uid_ineffective = 3,  // 反查仍在 ⇒ 调用没生效 ✗
+};
+
 std::atomic_bool g_hide_uid_enabled { true };
 std::atomic_bool g_hide_uid_logged_success { false };
 std::atomic_bool g_hide_uid_logged_waiting { false };
@@ -106,9 +148,11 @@ constexpr ULONGLONG k_hide_uid_retry_interval_ms = 1200;
 constexpr ULONGLONG k_hide_uid_steady_interval_ms = 8000;
 constexpr ULONGLONG k_hide_uid_retry_cap_ms = 64000; // 连续失败退避上限（约 1 分钟）
 std::atomic<UINT32> g_hide_uid_retry_count { 0 };
-std::array<void *, k_hide_uid_paths.size()> g_hide_uid_string_cache {};
-std::array<void *, k_hide_uid_paths.size()> g_hide_uid_object_cache {};
+// 每个目标只报一次"状态已确定"（位掩码；避免 std::array<atomic_bool> 的初始化麻烦）
+std::atomic<unsigned> g_hide_uid_reported_mask { 0 };
 std::atomic_int g_hide_uid_exception_streak { 0 };
+// 上一轮每个目标的状态（仅用于诊断输出；由主线程独占写）
+std::array<int, k_hide_uid_targets.size()> g_hide_uid_last_status {};
 
 struct ModuleFingerprint
 {
@@ -231,7 +275,7 @@ std::filesystem::path module_dir(HMODULE module)
     return std::filesystem::path(std::wstring(buffer, buffer + length)).parent_path();
 }
 
-int hide_uid_once_unsafe()
+int hide_uid_once_unsafe(int *status_out)
 {
     const auto find_string = reinterpret_cast<find_string_fn>(g_hide_uid_find_string);
     const auto find_object = reinterpret_cast<find_object_fn>(g_hide_uid_find_object);
@@ -240,32 +284,46 @@ int hide_uid_once_unsafe()
 
     __try
     {
-        for (std::size_t i = 0; i < k_hide_uid_paths.size(); ++i)
+        for (std::size_t i = 0; i < k_hide_uid_targets.size(); ++i)
         {
-            void *string_object = g_hide_uid_string_cache[i];
-            if (string_object == nullptr)
-            {
-                string_object = find_string(k_hide_uid_paths[i]);
-                g_hide_uid_string_cache[i] = string_object;
-            }
-            if (string_object == nullptr)
-                continue;
+            status_out[i] = k_uid_absent;
+            const auto &target = k_hide_uid_targets[i];
+            bool built_string = false; // 是否至少建成过一次字符串对象（区分两类失败）
 
-            void *object = g_hide_uid_object_cache[i];
-            if (object == nullptr)
+            // 逐个候选现场解析：**不缓存**任何指针 ⇒ 无悬空指针问题 ✓
+            for (const char *candidate : target.paths)
             {
-                object = find_object(string_object);
-                g_hide_uid_object_cache[i] = object;
-            }
-            if (object == nullptr)
-                continue;
+                if (candidate == nullptr || *candidate == '\0')
+                    continue;
 
-            object_active(object, false);
-            ++hidden_count;
+                void *string_object = find_string(candidate);
+                if (string_object == nullptr)
+                    continue;
+                built_string = true;
+
+                void *object = find_object(string_object);
+                if (object == nullptr)
+                    continue;
+
+                // 隐藏，然后**立刻反查验证**：
+                // `GameObject.Find` 只返回激活对象 ⇒ 反查不到就是真的藏住了 ✓
+                object_active(object, false);
+                const bool still_found = find_object(string_object) != nullptr;
+                status_out[i] = still_found ? k_uid_ineffective : k_uid_hidden;
+                if (!still_found)
+                    ++hidden_count;
+                break; // 该目标已处理，试下一个目标
+            }
+
+            // 字符串都没建成 ⇒ 与"路径找不到对象"是**不同**的故障，如实区分 ✓
+            if (status_out[i] == k_uid_absent && !built_string)
+                status_out[i] = k_uid_no_string;
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
+        // 具体哪个目标抛的无法在此判断（__try 内不能有带析构的对象），
+        // 调用方据 status_out 中仍为 k_uid_absent 的项自行判断。
         return -1;
     }
 
@@ -285,19 +343,18 @@ bool hide_uid_once()
         return false;
     }
 
-    const int hidden_count = hide_uid_once_unsafe();
+    std::array<int, k_hide_uid_targets.size()> status {};
+    const int hidden_count = hide_uid_once_unsafe(status.data());
     if (hidden_count < 0)
     {
-        g_hide_uid_string_cache.fill(nullptr);
-        g_hide_uid_object_cache.fill(nullptr);
         const int streak = g_hide_uid_exception_streak.fetch_add(1, std::memory_order_relaxed) + 1;
         if (!g_hide_uid_logged_cache_reset.exchange(true))
-            log_line("HideUID cache reset after exception");
+            log_line("HideUID exception while hiding ui targets (streak=" + std::to_string(streak) + ")");
 
         if (streak >= 3)
         {
             if (!g_hide_uid_logged_failure.exchange(true))
-                log_line("HideUID disabled: repeated exceptions while using cached objects");
+                log_line("HideUID disabled: repeated exceptions while hiding ui targets");
             g_hide_uid_enabled.store(false);
         }
         return false;
@@ -306,11 +363,35 @@ bool hide_uid_once()
     g_hide_uid_exception_streak.store(0, std::memory_order_relaxed);
     g_hide_uid_logged_cache_reset.store(false);
 
+    // ---- 逐目标诊断（2026-09-26 新增）----
+    //
+    // 用户在实机上**只会跑一次、只给一份日志** ⇒ 这一份必须能定位问题 ✗
+    // 每个目标在**状态首次确定**、以及**状态变化**时各记一行 ✓（不刷屏 ✓）
+    bool any_ineffective = false;
+    for (std::size_t i = 0; i < status.size(); ++i)
+    {
+        if (status[i] == k_uid_ineffective)
+            any_ineffective = true;
+        if (status[i] == g_hide_uid_last_status[i])
+            continue;
+        g_hide_uid_last_status[i] = status[i];
+        // `absent` 是常态（个人资料页/地图页没打开时本来就找不到）⇒ 不记，避免噪音
+        if (status[i] == k_uid_absent)
+            continue;
+        // 三种可达状态各自如实措辞（`absent` 已在上面 continue 掉）
+        const char *word = (status[i] == k_uid_hidden) ? "hidden"
+            : (status[i] == k_uid_ineffective) ? "NOT hidden (SetActive ineffective)"
+            : "find_string failed (cannot build path string)";
+        log_line(std::string("HideUID target ") + k_hide_uid_targets[i].label + ": " + word);
+    }
+
     if (hidden_count > 0)
     {
         if (!g_hide_uid_logged_success.exchange(true))
-            log_line("HideUID active: hidden " + std::to_string(hidden_count) + " ui targets");
-        return true;
+            log_line("HideUID active: hidden " + std::to_string(hidden_count) + " ui targets (verified)");
+        // ⚠️ 只有"确实藏住了、且没有任何目标调用无效"时才降到低频；
+        // 否则保持高频重试，避免像旧版那样**假报成功后长期不再纠正** ✗
+        return !any_ineffective;
     }
 
     if (!g_hide_uid_logged_waiting.exchange(true))
