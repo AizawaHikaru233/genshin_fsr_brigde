@@ -51,6 +51,20 @@ $configValues = [ordered]@{
     # 异步写队列深度。必须在这里写：Add-LogSection 只在**没有** [Log] 段时才补整段，
     # 而已部署的 ini 都已有 [Log] 段 → 段内的新键永远不会被补上（实测 queue_capacity 缺失）。
     'queue_capacity'       = '8192'
+    # 诊断探针（默认关）。JitterFlagProbe=1 只读观测
+    # useJitteredProjectionMatrixForTransparentRendering 的实参，**不修改任何行为**。
+    # 放在这里是为了避免"键不存在 ⇒ 依赖代码默认值 ⇒ 默认值一变无人察觉"（同 RenderScaleMenu 的教训）。
+    'JitterFlagProbe'      = '0'
+    'JitterFlagProbeFrames'= '0'      # 0 = 一直记录；N = 只记录前 N 帧
+    # FSR2 输入纹理转储（默认关）。抓帧用热键，**跑完务必改回 0**（每组 3 帧约 130 MB）。
+    'Fsr2InputDump'          = '0'
+    'Fsr2InputDumpFrames'    = '3'
+    'Fsr2InputDumpIntervalMs'= '0'
+    'Fsr2InputDumpHotkey'    = '122'
+    'Fsr2InputDumpAutoStartSec' = '0'
+    'Fsr2InputDumpRaw'       = '1'
+    'Fsr2InputDumpPng'       = '1'
+    'Fsr2InputDumpMaxDim'    = '2048'
 }
 $logSection = @(
     '[Log]',
