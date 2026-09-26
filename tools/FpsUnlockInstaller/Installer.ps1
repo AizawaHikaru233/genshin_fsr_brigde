@@ -858,10 +858,17 @@ function Invoke-FoundationSetup {
         '-GamePath', $SelectedGamePath, '-FpsTarget', $FpsTarget.Value,
         '-UnlockerSource', $source.Mode, '-NonInteractive', '-Language', $script:Language
     )
-    if ($plugins.Bridge) { } else { $arguments += '-DisableBridge' }
-    if ($plugins.OptiScaler) { $arguments += @('-OptiScalerSource', 'Existing') } else { $arguments += '-DisableOptiScaler' }
-    if (-not $plugins.AntiBlur) { $arguments += '-DisableAntiBlur' }
-    if (-not $plugins.HDR) { $arguments += '-DisableHDR' }
+    # 首次运行（还没有 fps_config.json）时没有"已配置状态"可依据：
+    # Get-ConfiguredPluginState 会把所有模块判为未配置，下面逐条追加 -Disable* 之后
+    # 等于"一个都不装"，只留下一个 DllList 为空的配置 —— 用户看到"已安装 0 / 5"，
+    # 而且之后反复安装也无效（空 DllList 会让向导同样判为全部未安装）。
+    # ⇒ 首次运行按默认行为装全部模块（TextureLoader 仍按设计保持 opt-in，不在此列）。
+    if (-not $firstRun) {
+        if ($plugins.Bridge) { } else { $arguments += '-DisableBridge' }
+        if ($plugins.OptiScaler) { $arguments += @('-OptiScalerSource', 'Existing') } else { $arguments += '-DisableOptiScaler' }
+        if (-not $plugins.AntiBlur) { $arguments += '-DisableAntiBlur' }
+        if (-not $plugins.HDR) { $arguments += '-DisableHDR' }
+    }
     if ($source.Mode -eq 'Manual') { $arguments += @('-UnlockerPackagePath', $source.Path) }
     if ($NoShortcut) { $arguments += '-NoShortcut' }
     Write-Host ''

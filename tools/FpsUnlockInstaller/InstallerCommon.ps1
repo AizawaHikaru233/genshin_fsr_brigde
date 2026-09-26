@@ -204,11 +204,47 @@ function Set-JsonPropertyValue {
         $Object | Add-Member -MemberType NoteProperty -Name $Name -Value $Value
         return $true
     }
-    if ($property.Value -ne $Value) {
+    if (-not (Test-JsonPropertyValueEqual -Left $property.Value -Right $Value)) {
         $property.Value = $Value
         return $true
     }
     return $false
+}
+
+# 内部：判断两个 JSON 属性值是否相等，供上面的 setter 决定"是否需要写回"。
+#
+# ⚠️ 不能直接用 `-ne` 比较：右侧是数组时 PowerShell 把 `-ne` 当【过滤器】而不是比较。
+# `"DllList": []` 经 ConvertFrom-Json 之后属性值是**空字符串**（不是 $null），
+# 于是 `'' -ne @('a.dll','b.dll')` 的结果是空数组（布尔化为 $false）⇒ 被判为"相等"
+# ⇒ **跳过写入**。所有写 DllList 的调用因此全部静默失效，配置里始终是空表，
+# 表现为"安装完成后一个插件都没装上，且反复安装也无效"。
+#
+# 判定规则：一侧是列表时，另一侧的空字符串/$null 视为**空列表**（JSON 空数组的两种
+# 读取结果都表示"空"）；列表按元素逐个比较，标量沿用 `-eq` 语义。
+function Test-JsonPropertyValueEqual {
+    param(
+        [object]$Left,
+        [object]$Right
+    )
+    $leftIsEmpty = ($null -eq $Left) -or ($Left -is [string] -and [string]::IsNullOrEmpty($Left))
+    $rightIsEmpty = ($null -eq $Right) -or ($Right -is [string] -and [string]::IsNullOrEmpty($Right))
+    $leftIsList = ($Left -is [System.Collections.IList]) -and ($Left -isnot [string])
+    $rightIsList = ($Right -is [System.Collections.IList]) -and ($Right -isnot [string])
+    if ($leftIsList -or $rightIsList) {
+        # ⚠️ 全部用 `@(...)` 包住再取 .Count：`$x = if (...) { @() } else { @() }` 里
+        # 空数组经 if 输出后变成 $null，而 `[string[]]$x = $null` **仍然是 $null** ——
+        # 强转救不了，`$null.Count` 在 Set-StrictMode 下直接报错。
+        # `@($null).Count` 恒为 0，是这里唯一稳的写法（同一族的 PowerShell 数组陷阱）。
+        $leftItems = @(if ($leftIsList) { @($Left) })
+        $rightItems = @(if ($rightIsList) { @($Right) })
+        if ($leftItems.Count -ne $rightItems.Count) { return $false }
+        for ($index = 0; $index -lt $leftItems.Count; $index++) {
+            if ($leftItems[$index] -ne $rightItems[$index]) { return $false }
+        }
+        return $true
+    }
+    if ($leftIsEmpty -and $rightIsEmpty) { return $true }
+    return $Left -eq $Right
 }
 
 # ---------------------------------------------------------------------------
