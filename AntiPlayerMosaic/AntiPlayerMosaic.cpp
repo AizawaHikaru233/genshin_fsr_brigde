@@ -134,8 +134,8 @@ enum UidStatus : int
 {
     k_uid_absent = 0,       // 候选路径全都没找到对象（UI 未出现，或路径已改）
     k_uid_no_string = 1,    // 连字符串对象都没建出来（find_string 失败 ⇒ 另一类问题）✗
-    k_uid_hidden = 2,       // 反查不到 ⇒ **确实隐藏了** ✓
-    k_uid_ineffective = 3,  // 反查仍在 ⇒ 调用没生效 ✗
+    k_uid_hidden = 2,       // **回读**那个被写的字节为 0 ⇒ 写已落地 ✓（字段级判据，非视觉 ✓）
+    k_uid_ineffective = 3,  // **回读**仍为 1 ⇒ 写没留住（多半是游戏又把它设回去了）✗
 };
 
 std::atomic_bool g_hide_uid_enabled { true };
@@ -260,6 +260,63 @@ using object_active_fn = void(__fastcall *)(void *, bool);
 
 bool hide_uid_once();
 
+// ---------------------------------------------------------------------------
+// UID 隐藏的执行机制（2026-09-26 第三次修正 —— 基于反汇编的事实，不再猜）
+//
+// ## 实机证据（决定性，来自用户日志）
+//
+//     HideUID target watermark: NOT hidden (SetActive ineffective)
+//     HideUID target profile:   NOT hidden (SetActive ineffective)
+//
+// 而**当时个人资料页根本没打开** ✗ —— Unity 的 `GameObject.Find` 按文档只返回
+// **激活**对象，却能在页面未打开时找到该 UID ⇒ **`find_object` 并不按激活状态过滤**
+// ⇒ 旧代码"反查不到 = 已隐藏"这条判据**不成立** ✗
+// ⇒ 日志里的 `hidden` / `ineffective` **都不可信**（这也解释了旧版为什么假报 `hidden 1`）。
+//
+// ## 对真实二进制的反汇编结论（本机 YuanShen.exe，sha256 7F89938D…）
+//
+//     FindString   0x004B2F50 = il2cpp_string_new(const char*)   （strlen + 尾调用）
+//     ObjectActive 0x00C53D10 = 解包 [obj+0x10]（IL2CPP Object::m_CachedPtr）
+//                               → 尾调用 0x00C62570：
+//                                     mov byte ptr [rcx + 0x148], dl
+//                                     ret
+//
+// **⇒ 它只有两条指令，只是【裸写一个字节字段】**，**不是** Unity 的
+// `GameObject::SetActive`（后者必须传播子物体、收发 OnEnable/OnDisable）✗
+//
+// **⇒ 于是只有两种可能**：
+//   ① `+0x148` 不是控制可见性的那个字段 ✗
+//   ② **游戏每帧把它重新激活** ✓ —— 这与"写调用没报错、对象却始终可见"
+//      以及"`Find` 每次都还能找到"**完全吻合** ✓
+//
+// ## 因此本次改动：**在 IL2CPP 层 patch 那个写入器**（用户的明确要求）
+//
+// 不再"调一次 SetActive 就完事"，而是**把写入器本身接管**：
+//   - 写入器的地址**从 `object_active` 的尾调用里解出来** ✓
+//     ⇒ **不需要新签名、不写死 RVA** ⇒ 版本更新后能自动跟随 ✓
+//   - 它写的字段偏移**也从它的指令里解出来** ✓（同样不硬编码 ✓）
+//   - stub 只做一件事：若 `this` 是我们的 UID 对象 **且** 请求值是 `true`
+//     ⇒ **强制改成 `false`**，再执行原指令 ✓
+//     ⇒ **游戏再想把它激活也激活不了** ✓
+//
+// **为什么安全**：原写入器只有 `mov [rcx+disp32], dl` + `ret` 两条指令，
+// **不含 RIP 相对寻址** ⇒ 可以原样搬进 stub，无需重定位 ✓；
+// 若实测发现形态不符（指令更长 / 含 RIP 相对）⇒ **放弃并如实记日志**，不硬来 ✓
+//
+// ⚠️ 本文件不做任何"凭猜测写字段"的事：只碰 `object_active` **自己会写**的那个偏移 ✓。
+// ---------------------------------------------------------------------------
+
+// UID 目标的【解包后】指针（写 stub 比较用；主线程写、被 patch 的代码读）
+std::array<std::uintptr_t, k_hide_uid_targets.size()> g_uid_filter_targets {};
+// `object_active` 实际写入的字节偏移（从指令里解出 —— 不是硬编码 ✓）
+std::uint32_t g_hide_uid_active_offset = 0;
+// 原写入器地址（stub 装好前的备份，供诊断）
+std::uint8_t *g_hide_uid_active_writer = nullptr;
+// 过滤 stub 与命中统计（统计用于**判定这条 patch 是否真的被游戏用到** ✓）
+void *g_hide_uid_filter_stub = nullptr;
+std::atomic<std::uint64_t> g_hide_uid_filter_calls { 0 };
+std::atomic<std::uint64_t> g_hide_uid_filter_forced { 0 };
+
 void reset_release_log()
 {
 #if defined(ANTIPLAYER_RELEASE_RUNTIME)
@@ -287,8 +344,9 @@ int hide_uid_once_unsafe(int *status_out)
         for (std::size_t i = 0; i < k_hide_uid_targets.size(); ++i)
         {
             status_out[i] = k_uid_absent;
-            const auto &target = k_hide_uid_targets[i];
+            const UidTarget &target = k_hide_uid_targets[i];
             bool built_string = false; // 是否至少建成过一次字符串对象（区分两类失败）
+            std::uintptr_t native_found = 0;
 
             // 逐个候选现场解析：**不缓存**任何指针 ⇒ 无悬空指针问题 ✓
             for (const char *candidate : target.paths)
@@ -305,15 +363,38 @@ int hide_uid_once_unsafe(int *status_out)
                 if (object == nullptr)
                     continue;
 
-                // 隐藏，然后**立刻反查验证**：
-                // `GameObject.Find` 只返回激活对象 ⇒ 反查不到就是真的藏住了 ✓
+                // IL2CPP 解包：`[obj + 0x10]` 就是 Object::m_CachedPtr ——
+                // 与 `object_active` **内部做的事完全一致**（见文件上方反汇编说明）✓
+                // ⇒ 拿到"被 patch 的写入器实际会写的那个对象" ✓
+                const auto native = *reinterpret_cast<std::uintptr_t *>(
+                    reinterpret_cast<std::uint8_t *>(object) + 0x10);
+
                 object_active(object, false);
-                const bool still_found = find_object(string_object) != nullptr;
-                status_out[i] = still_found ? k_uid_ineffective : k_uid_hidden;
-                if (!still_found)
-                    ++hidden_count;
+
+                // ⚠️ 判据换成【回读我们实际写的那个字节】✓
+                //
+                // 旧判据是"再 Find 一次看还在不在"，但**实机已证伪**：
+                // 个人资料页根本没打开时它照样 "找到" 了该 UID ⇒ `find_object`
+                // 并不按激活状态过滤 ⇒ 那个判据既会假报成功、也会假报失败 ✗
+                if (native != 0 && g_hide_uid_active_offset != 0)
+                {
+                    const auto value = *reinterpret_cast<volatile std::uint8_t *>(
+                        native + g_hide_uid_active_offset);
+                    status_out[i] = value == 0 ? k_uid_hidden : k_uid_ineffective;
+                    if (value == 0)
+                        ++hidden_count;
+                    native_found = native;
+                }
+                else
+                {
+                    status_out[i] = k_uid_ineffective;
+                }
                 break; // 该目标已处理，试下一个目标
             }
+
+            // 登记给过滤 stub：游戏之后任何"重新激活"都会被强制成 false ✓
+            // 找不到时清 0 ⇒ **不会有悬空指针被 stub 命中** ✓
+            g_uid_filter_targets[i] = native_found;
 
             // 字符串都没建成 ⇒ 与"路径找不到对象"是**不同**的故障，如实区分 ✓
             if (status_out[i] == k_uid_absent && !built_string)
@@ -379,8 +460,8 @@ bool hide_uid_once()
         if (status[i] == k_uid_absent)
             continue;
         // 三种可达状态各自如实措辞（`absent` 已在上面 continue 掉）
-        const char *word = (status[i] == k_uid_hidden) ? "hidden"
-            : (status[i] == k_uid_ineffective) ? "NOT hidden (SetActive ineffective)"
+        const char *word = (status[i] == k_uid_hidden) ? "active flag reads 0 (write landed)"
+            : (status[i] == k_uid_ineffective) ? "active flag still reads 1 (write did not stick)"
             : "find_string failed (cannot build path string)";
         log_line(std::string("HideUID target ") + k_hide_uid_targets[i].label + ": " + word);
     }
@@ -388,7 +469,9 @@ bool hide_uid_once()
     if (hidden_count > 0)
     {
         if (!g_hide_uid_logged_success.exchange(true))
-            log_line("HideUID active: hidden " + std::to_string(hidden_count) + " ui targets (verified)");
+            log_line("HideUID active: " + std::to_string(hidden_count) +
+                " ui targets with active flag cleared (forced-reactivation=" +
+                std::to_string(g_hide_uid_filter_forced.load(std::memory_order_relaxed)) + ")");
         // ⚠️ 只有"确实藏住了、且没有任何目标调用无效"时才降到低频；
         // 否则保持高频重试，避免像旧版那样**假报成功后长期不再纠正** ✗
         return !any_ineffective;
@@ -430,6 +513,32 @@ bool patch_rel32_jump(std::uint8_t *address, std::uintptr_t absolute_target)
     const auto displacement = static_cast<std::int32_t>(diff);
     std::memcpy(patch.data() + 1, &displacement, sizeof(displacement));
     return patch_bytes(address, patch);
+}
+
+// 长度可指定的 rel32 跳转（2026-09-26）。
+//
+// 用于替换**短函数的第一条指令**：`mov [rcx+disp32], dl` 是 **6 字节**，
+// 而 5 字节的 `E9 rel32` 只会覆盖它的前 5 字节、把第 6 个字节留在原地 ✗
+// ⇒ 被替换处会残留一个字节，反汇编错位。
+// 这里按 `size` 写 `E9 rel32`，其余用 `0x90`(nop) 填满 ✓
+// （`size` 必须 ≥ 5；= 5 时等价于 patch_rel32_jump）。
+bool patch_rel32_jump_n(std::uint8_t *address, std::uintptr_t absolute_target, std::size_t size)
+{
+    if (size < 5)
+        return false;
+    const auto next = reinterpret_cast<std::uintptr_t>(address + 5);
+    const auto diff = static_cast<std::intptr_t>(absolute_target) - static_cast<std::intptr_t>(next);
+    if (diff < INT32_MIN || diff > INT32_MAX)
+        return false;
+
+    std::array<std::uint8_t, 32> patch {};
+    if (size > patch.size())
+        return false;
+    patch.fill(0x90);
+    patch[0] = 0xE9;
+    const auto displacement = static_cast<std::int32_t>(diff);
+    std::memcpy(patch.data() + 1, &displacement, sizeof(displacement));
+    return patch_bytes(address, patch.data(), size);
 }
 
 void hide_uid_from_main_thread()
@@ -498,6 +607,205 @@ void *allocate_near_address(void *target, std::size_t size)
     }
 
     return VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+}
+
+// ---------------------------------------------------------------------------
+// UID 活动状态过滤（IL2CPP 层 patch）—— 实现见文件上方那段说明
+// ---------------------------------------------------------------------------
+
+// 安全读可执行内存（SEH 保护：地址可能落在未提交页）
+bool safe_read_code(const std::uint8_t *address, std::uint8_t *out, std::size_t size)
+{
+    __try
+    {
+        for (std::size_t i = 0; i < size; ++i)
+            out[i] = address[i];
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return true;
+}
+
+// 在缓冲里找 1 字节写入 `88 <modrm=10xxx101> <disp32>`（即 `mov [reg+disp32], r8`）。
+// 这类指令**没有 RIP 相对寻址**，因此可以原样搬进 stub，无需重定位 ✓
+bool find_byte_write(const std::uint8_t *code, std::size_t size, std::uint32_t *offset_out,
+    std::size_t *at_out)
+{
+    for (std::size_t i = 0; i + 6 <= size; ++i)
+    {
+        if (code[i] != 0x88)
+            continue;
+        const std::uint8_t modrm = code[i + 1];
+        if ((modrm & 0xC0) != 0x80 || (modrm & 0x07) != 0x05)
+            continue; // 要求 [reg + disp32] 形态
+        std::uint32_t displacement = 0;
+        std::memcpy(&displacement, code + i + 2, sizeof(displacement));
+        if (displacement == 0 || displacement > 0x2000)
+            continue; // 合理性上界：IL2CPP 对象字段不会到 8 KB
+        if (offset_out != nullptr)
+            *offset_out = displacement;
+        if (at_out != nullptr)
+            *at_out = i;
+        return true;
+    }
+    return false;
+}
+
+// 解出"这个 setter 最终把 this 写到哪个字节偏移"，并把写入者地址一并给出。
+//   形态 A：函数体内直接写
+//   形态 B：尾调用（E9 rel32）到一个只做写入的小函数（本机 ObjectActive 即此形态 ✓）
+bool resolve_written_field(std::uint8_t *function, std::uint32_t *offset_out, std::uint8_t **writer_out)
+{
+    std::uint8_t head[64] {};
+    if (!safe_read_code(function, head, sizeof(head)))
+        return false;
+
+    if (find_byte_write(head, sizeof(head), offset_out, nullptr))
+    {
+        if (writer_out != nullptr)
+            *writer_out = function;
+        return true;
+    }
+
+    // 尾调用：只在函数头 48 字节内找，避免误认函数体深处的其它 E9
+    for (std::size_t i = 0; i + 5 <= 48; ++i)
+    {
+        if (head[i] != 0xE9)
+            continue;
+        std::int32_t relative = 0;
+        std::memcpy(&relative, head + i + 1, sizeof(relative));
+        auto *target = function + i + 5 + relative;
+        std::uint8_t tail[32] {};
+        if (!safe_read_code(target, tail, sizeof(tail)))
+            continue;
+        if (find_byte_write(tail, sizeof(tail), offset_out, nullptr))
+        {
+            if (writer_out != nullptr)
+                *writer_out = target;
+            return true;
+        }
+    }
+    return false;
+}
+
+// 构造过滤 stub：
+//     mov  rax, imm64(&g_uid_filter_targets)
+//     [每个槽位]  mov r9, [rax+8i] / cmp rcx, r9 / je FORCE
+//     jmp  WRITE
+//   FORCE:
+//     xor  edx, edx                  ; 请求值是 true ⇒ 强制成 false
+//     mov  rax, imm64(&forcedCounter)
+//     lock inc qword ptr [rax]       ; 统计"游戏试图重新激活"的次数（诊断关键 ✓）
+//   WRITE:
+//     <原写入指令，6 字节原样复制>     ; 不含 RIP 相对 ⇒ 可安全搬运
+//     ret
+//
+// 语义：只有 `this` 命中我们的 UID 对象、且请求为 true 时才改写；
+// 其余情况**完全等同原函数** ✓（不会影响游戏里任何其它对象）
+void *build_active_filter_stub(std::uint8_t *writer, std::size_t write_at)
+{
+    if (g_hide_uid_filter_stub != nullptr)
+        return g_hide_uid_filter_stub;
+
+    std::uint8_t original[8] {};
+    if (!safe_read_code(writer + write_at, original, sizeof(original)))
+        return nullptr;
+    if (original[6] != 0xC3)
+    {
+        // 形态不符（写入指令后面不是 ret）⇒ 不硬来 ✓
+        log_line("HideUID active-filter: writer shape unexpected (no ret after write); skipped");
+        return nullptr;
+    }
+
+    auto *stub = static_cast<std::uint8_t *>(allocate_near_address(writer, 0x1000));
+    if (stub == nullptr)
+        return nullptr;
+
+    std::size_t p = 0;
+    const auto targets = reinterpret_cast<std::uintptr_t>(&g_uid_filter_targets[0]);
+    stub[p++] = 0x48; // mov rax, imm64
+    stub[p++] = 0xB8;
+    std::memcpy(stub + p, &targets, sizeof(targets));
+    p += sizeof(targets);
+
+    std::array<std::size_t, k_hide_uid_targets.size()> jump_positions {};
+    for (std::size_t i = 0; i < k_hide_uid_targets.size(); ++i)
+    {
+        stub[p++] = 0x4C; stub[p++] = 0x8B; stub[p++] = 0x48;
+        stub[p++] = static_cast<std::uint8_t>(i * 8);      // mov r9, [rax + 8i]
+        stub[p++] = 0x4C; stub[p++] = 0x39; stub[p++] = 0xC9; // cmp rcx, r9
+        stub[p++] = 0x74;                                   // je FORCE
+        jump_positions[i] = p++;
+    }
+    const std::size_t jmp_write_at = p;
+    stub[p++] = 0xEB;                                       // jmp WRITE
+    const std::size_t jmp_write_disp = p++;
+
+    const std::size_t force_at = p;
+    stub[p++] = 0x31; stub[p++] = 0xD2;                     // xor edx, edx
+    const auto counter = reinterpret_cast<std::uintptr_t>(&g_hide_uid_filter_forced);
+    stub[p++] = 0x48; stub[p++] = 0xB8;                     // mov rax, imm64
+    std::memcpy(stub + p, &counter, sizeof(counter));
+    p += sizeof(counter);
+    stub[p++] = 0xF0; stub[p++] = 0x48; stub[p++] = 0xFF; stub[p++] = 0x00; // lock inc [rax]
+
+    const std::size_t write_in_stub = p;
+    std::memcpy(stub + p, original, 6);                     // 原写入指令
+    p += 6;
+    stub[p++] = 0xC3;                                       // ret
+
+    if (p > 0x1000)
+        return nullptr;
+    for (const std::size_t position : jump_positions)
+        stub[position] = static_cast<std::uint8_t>(force_at - (position + 1));
+    stub[jmp_write_disp] = static_cast<std::uint8_t>(write_in_stub - (jmp_write_at + 2));
+
+    FlushInstructionCache(GetCurrentProcess(), stub, p);
+    g_hide_uid_filter_stub = stub;
+    return stub;
+}
+
+// 安装过滤：解出写入者 → 造 stub → 用 6 字节跳转替换原写入指令
+bool install_active_filter_hook(std::uint8_t *object_active)
+{
+    std::uint32_t offset = 0;
+    std::uint8_t *writer = nullptr;
+    if (!resolve_written_field(object_active, &offset, &writer) || writer == nullptr)
+    {
+        log_line("HideUID active-filter: cannot resolve written field; skipped");
+        return false;
+    }
+    g_hide_uid_active_offset = offset;
+    g_hide_uid_active_writer = writer;
+
+    std::uint8_t body[64] {};
+    if (!safe_read_code(writer, body, sizeof(body)))
+        return false;
+    std::size_t write_at = 0;
+    std::uint32_t check = 0;
+    if (!find_byte_write(body, sizeof(body), &check, &write_at))
+        return false;
+
+    void *stub = build_active_filter_stub(writer, write_at);
+    if (stub == nullptr)
+        return false;
+
+    if (!patch_rel32_jump_n(writer + write_at, reinterpret_cast<std::uintptr_t>(stub), 6))
+    {
+        log_line("HideUID active-filter: patch failed");
+        return false;
+    }
+
+    const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    char message[192] {};
+    std::snprintf(message, sizeof(message),
+        "HideUID active-filter installed: writer=+0x%llX field=+0x%X (forces active=false for uid targets)",
+        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(writer) - base),
+        static_cast<unsigned>(offset));
+    log_line(message);
+    return true;
 }
 
 void *build_player_perspective_stub(std::uint8_t *player_perspective)
@@ -761,6 +1069,17 @@ DWORD WINAPI worker_thread(void *parameter)
 
     if (g_hide_uid_find_string == nullptr || g_hide_uid_find_object == nullptr || g_hide_uid_object_active == nullptr)
         g_hide_uid_enabled.store(false);
+
+    // UID 活动标志过滤（IL2CPP 层 patch）—— 见文件上方那段说明。
+    //
+    // 若游戏每帧把 UID 对象重新激活，那么"每 1.2 秒写一次 false"永远赢不了 ✓
+    // ⇒ 必须把 `object_active` **真正写入的那个函数**接管，才能压住它 ✓
+    // 装不上也不影响其余功能（仍会每轮直接写一次字段 ✓），如实记日志即可 ✓
+    if (g_hide_uid_object_active != nullptr)
+    {
+        if (!install_active_filter_hook(g_hide_uid_object_active))
+            log_line("HideUID active-filter unavailable; falling back to direct field write");
+    }
 
     const bool perspective_patched = player_perspective != nullptr && patch_player_perspective(player_perspective);
     if (!perspective_patched)
