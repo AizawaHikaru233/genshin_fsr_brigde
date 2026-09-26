@@ -16,38 +16,20 @@
 #include <string>
 #include <string_view>
 
-// 日志级别（2026-09-19 审核报告：替换"按英文关键词过滤"）。
+// 日志级别：Release 下 INFO 常开 —— 这些是一次性、可验证的生命周期事实，
+// 丢任何一条都无法从日志判断插件是否生效。DEBUG 仅非 release 构建输出。
 //
-// **原实现的问题**：用 10 个英文关键词（failed / disabled / error …）决定一行是否落盘。
-//   - 误**丢**：成功与生命周期行不含这些词 → 全部被静默丢弃。结果是
-//     **插件正常工作时日志为空**，完全无法用它验证插件是否生效。
-//     例：`AntiPlayerMosaic loaded`、`patched PlayerPerspective with main-thread hook`、
-//     `main module ready after X ms`、`HideUID active: hidden N ui targets` 都不落盘。
-//   - 更根本：靠自然语言措辞决定日志去留，**任何一次文案改动都可能静默改变行为**。
-//
-// 说明：本文件的重复性输出**已经有原子守卫**（`g_hide_uid_logged_*` 的
-// `exchange(true)`、`g_hide_uid_next_tick` 的 CAS 退避），所以并不存在刷屏风险；
-// 关键词过滤纯属多余且有害。
-//
-// **现在**：显式级别。Release 下 INFO 常开（每条都是一次性、可验证的生命周期事实），
-// DEBUG 仅在非 release 构建输出。当前没有高频细节行需要 DEBUG，
-// 故只保留级别参数本身，不留未使用的 log_debug 包装（避免死代码）。
-//
-// ⚠️ 2026-09-19：枚举与 `log_line` 的声明移到**匿名命名空间之前** ——
-// `read_cached_signature` / `scan_unique_signature`（在命名空间内、`log_line` 定义之前）
-// 需要在签名模式解析失败时记日志，原先它们看不到 `log_line`。
+// 级别与 `log_line` 的声明必须在**匿名命名空间之前**：命名空间内还需要它们
+//（`read_cached_signature` / `scan_unique_signature` 要记解析失败），
+// 而在命名空间内定义会变成另一个函数（内部链接）⇒ LNK2019。
 enum class LogLevel
 {
     Info,
     Debug
 };
 
-// `log_line` 的**定义**必须在匿名命名空间**之外**（2026-09-19）。
-//
-// 原因：`read_cached_signature` / `scan_unique_signature` 需要调用它，而这两个函数
-// 在匿名命名空间内、`log_line` 原定义之前。若只在命名空间外声明、在命名空间内定义，
-// 那是**两个不同的函数**（内部链接 vs 外部链接）→ 链接期 `LNK2019`。
-// 故把定义与它依赖的两个全局一起放在命名空间外（外部链接，声明与定义一致）。
+// `log_line` 的**定义**必须在匿名命名空间**之外**（否则命名空间内的同名函数是
+// 另一个函数 —— 内部链接，声明与定义不一致 ⇒ LNK2019）。它依赖的两个全局一并放这里。
 std::filesystem::path g_log_path;
 std::mutex g_log_mutex;
 
@@ -72,43 +54,28 @@ void log_line(const std::string &line, LogLevel level = LogLevel::Info)
 
 namespace
 {
-// "主模块已解析"门控（2026-09-19 审核报告）。
-//
-// 原名 `g_main_base`（`std::uint8_t *`），但**它存的值从未被读取** ——
-// 唯一的用途是 `if (g_main_base != nullptr)` 这一处非空判断
-//（扫描工作全部使用 `resolve_targets()` 内的局部 `base`）。
-// 即：用一个指针当布尔用，语义误导。
+// "主模块已解析"门控。
 //
 // 门控**必须保留**（不是死代码）：`hide_uid_from_main_thread` 是插进
 // `PlayerPerspective` 的 stub 回调，可能在签名解析完成前就被游戏主线程调用；
 // 而 `hide_uid_once()` 在所需签名未解析时会 `g_hide_uid_enabled.store(false)`
-// **永久禁用** HideUID。所以"未就绪时直接返回"是必要的保护。
+// **永久禁用** HideUID ⇒ "未就绪时直接返回"是必要的保护。
 //
-// 跨线程：worker 线程写、游戏主线程读 → 用 `atomic_bool`（原为普通指针，
-// 属数据竞争）。
+// 跨线程（worker 写、游戏主线程读）⇒ 必须用 `atomic_bool`。
 std::atomic_bool g_main_module_resolved { false };
 void *g_player_perspective_stub = nullptr;
 std::uint8_t *g_hide_uid_find_string = nullptr;
 std::uint8_t *g_hide_uid_find_object = nullptr;
 std::uint8_t *g_hide_uid_object_active = nullptr;
-// UID 目标表（2026-09-26 重构：从"三条写死路径 + 永久缓存"改为"多候选 + 每轮现场解析 + 反查验证"）。
+// UID 目标表：每个逻辑目标给**多条候选路径**（带/不带 `(Clone)`、带/不带前导斜杠）。
 //
-// **原实现的三个缺陷（实机已复现）**：
-//   1. 三条路径写死 ⇒ 游戏改 UI 结构就静默失效（`continue`，不落任何日志）✗
-//   2. `find_object` 的结果被**永久缓存** ⇒ `BetaWatermarkCanvas(Clone)` 这类
-//      **Clone 会被销毁重建**，缓存指针随即**悬空** ✗；而 `object_active(悬空, false)`
-//      **既不抛异常、也不生效** ⇒ 仍 `++hidden_count` ✗
-//      ⇒ 日志打出 `hidden 1` 而实际一个都没藏住 ✓（这就是实机看到的假报）
-//   3. 只要有一个目标"成功"就把重试间隔拉到 8 秒 ⇒ 假报之后再难纠正 ✗
-//
-// **现在**：
-//   - 每个逻辑目标给**多条候选路径**（带/不带 `(Clone)`、带/不带前导斜杠）✓
-//   - **不缓存任何指针**，每轮现场 `find_string` + `find_object` ✓
-//     （3 目标 × 3 候选，每 8 秒一次 —— 代价可忽略，却彻底消除悬空指针这一类问题）
-//   - **隐藏后立刻用 `find_object` 反查验证** ✓✓✓
-//     Unity 的 `GameObject.Find` **只返回激活对象** ⇒ "反查不到"即**确实隐藏了** ✓
-//     ⇒ `hidden N` 从此只统计**验证过**的隐藏，不再说谎 ✓
-// 每个目标的候选路径数。**固定块**便于给过滤 stub 静态分配槽位（`i * k + p`）✓
+// 三条约束都是实机踩出来的，勿简化：
+//   * **不缓存任何指针** —— `BetaWatermarkCanvas(Clone)` 这类 Clone 会被销毁重建，
+//     缓存下来的指针随即悬空；而对悬空指针调隐藏函数**既不抛异常也不生效**，
+//     却会让人以为"藏住了" ⇒ 必须每轮现场 `find_string` + `find_object`。
+//   * **隐藏后立刻反查验证** —— Unity 的 `GameObject.Find` 只返回激活对象，
+//     所以"反查不到"即确实藏住了 ⇒ `hidden N` 只统计验证过的隐藏，不说谎。
+//   * **只有确有隐藏才降频重试** —— 否则一次误报之后长时间不再纠正。
 constexpr std::size_t k_uid_paths_per_target = 5;
 
 struct UidTarget
@@ -118,10 +85,9 @@ struct UidTarget
 };
 
 constexpr std::array<UidTarget, 3> k_hide_uid_targets {
-    // ⚠️ 2026-09-26：水印额外加了**整块画布**候选 ✓ ——
-    // `BetaWatermarkCanvas` 是**专供水印**的画布 ⇒ 连同画布一起隐藏不会误伤别的 UI ✓
-    // （实测 `.../Panel/TxtUID` 能解析到对象、但写 `+0x148` 不生效 ⇒ 需要更大粒度的目标兜底 ✓）
-    // **个人资料页 / 地图页绝不能这样做** ✗ —— 躲它们的祖先把整页都藏掉了 ✗
+    // 水印额外给**整块画布**候选：`BetaWatermarkCanvas` 是专供水印的画布，
+    // 连画布一起隐藏不会误伤别的 UI。
+    // **个人资料页 / 地图页绝不能这么做** —— 藏它们的祖先把整页都藏掉了。
     UidTarget { "watermark", { "/BetaWatermarkCanvas(Clone)/Panel/TxtUID",
                                "/BetaWatermarkCanvas(Clone)",
                                "/BetaWatermarkCanvas/Panel/TxtUID",
@@ -137,19 +103,14 @@ constexpr std::array<UidTarget, 3> k_hide_uid_targets {
                          nullptr, nullptr } },
 };
 
-// 过滤 stub 的槽位总数：每个目标一块 `k_uid_paths_per_target`（当前 3×5=15，留 1 个恒零哨兵）✓
-constexpr std::size_t k_uid_filter_slots = k_hide_uid_targets.size() * k_uid_paths_per_target + 1;
-
-// 目标处理结果（POD；`__try` 内不得出现带析构的对象 ⇒ MSVC C2712）
-//
-// 注意：**没有 `exception` 这一项** —— 异常时 `__except` 直接返回 -1，不会写任何状态
-// （写了也无法确定是哪个目标抛的），所以列进来只会变成不可达分支 ✗。
+// 目标处理结果（POD；`__try` 内不得出现带析构的对象 ⇒ MSVC C2712）。
+// 不含"异常"项：异常时 `__except` 直接返回 -1，且无法确定是哪个目标抛的。
 enum UidStatus : int
 {
     k_uid_absent = 0,       // 候选路径全都没找到对象（UI 未出现，或路径已改）
-    k_uid_no_string = 1,    // 连字符串对象都没建出来（find_string 失败 ⇒ 另一类问题）✗
-    k_uid_hidden = 2,       // **回读**那个被写的字节为 0 ⇒ 写已落地 ✓（字段级判据，非视觉 ✓）
-    k_uid_ineffective = 3,  // **回读**仍为 1 ⇒ 写没留住（多半是游戏又把它设回去了）✗
+    k_uid_no_string = 1,    // 连字符串对象都没建出来（find_string 失败 —— 与"找不到对象"是不同故障）
+    k_uid_hidden = 2,       // 隐藏后同一路径**反查不到** ⇒ 确实藏住了
+    k_uid_ineffective = 3,  // 隐藏后**仍能反查到** ⇒ 对象仍是激活的，隐藏没落地
 };
 
 std::atomic_bool g_hide_uid_enabled { true };
@@ -200,10 +161,8 @@ std::filesystem::path feature_cache_path(HMODULE module)
         L"AntiPlayerMosaic.features.cache";
 }
 
-// 2026-09-19（审核报告）：删除未使用的 `fingerprint` 参数。
-// 它此前被 `(void)fingerprint;` 显式丢弃 —— 本函数**已经**做了等价于指纹校验的
-// 边界与内容检查（RVA 必须落在已提交的可执行页内，且该处机器码仍匹配签名），
-// 所以指纹参数是冗余的。删除而非"恢复校验"，避免重复同一件事。
+// 本函数**已经**做了等价于指纹校验的边界与内容检查（RVA 必须落在已提交的可执行页内，
+// 且该处机器码仍匹配签名），故无需再传指纹参数 —— 那只会重复同一件事。
 std::uint8_t *read_cached_signature(HMODULE module,
     const pattern_scanner::Signature &signature, std::uint32_t expected_rva)
 {
@@ -214,9 +173,8 @@ std::uint8_t *read_cached_signature(HMODULE module,
         (memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0)
         return nullptr;
     const auto pattern = pattern_scanner::parse_pattern(signature.text);
-    // 模式解析不完整 → 显式失败（2026-09-19 审核报告：原为静默截断）。
-    // 缓存路径也走这里：若签名被改坏，缓存命中也必须拒绝，否则会把
-    // "用错误模式算出的 RVA" 当成有效缓存。
+    // 模式解析不完整 → 显式失败（而非静默截断）。缓存路径也走这里：若签名被改坏，
+    // 缓存命中也必须拒绝，否则会把"用错误模式算出的 RVA"当成有效缓存。
     if (!pattern.valid)
     {
         log_line(std::string(signature.name) + " pattern parse failed at offset=" +
@@ -274,67 +232,11 @@ using object_active_fn = void(__fastcall *)(void *, bool);
 
 bool hide_uid_once();
 
-// ---------------------------------------------------------------------------
-// UID 隐藏的执行机制（2026-09-26 第四次修正 —— **以参照实现为准**）
-//
-// ## 结论（已由用户提供的可用参照实现证实）
-//
-// 参照实现：`FufuLauncher/FufuLauncher.UnlockerIsland` 的 `HideUI/HideUI.cpp`
-// （用户提供，**已确认在实机上可用** ✓）。它的做法**极简**：
-//
-//     void UpdateHideUID() {                       // 每 2 秒一次
-//         auto str = FindString(GameStrings::UIDPathWatermark);
-//         if (!str) return;
-//         void* go = FindGameObject(str);
-//         if (go) SetActive(go, false);
-//     }
-//
-// **⇒ 不 hook、不 patch、不写字段偏移 —— 只是每 2 秒重贴一次 `SetActive(false)`** ✓
-// ⇒ 足以压住游戏的重新激活 ✓
-//
-// ## 它同时订正了本文件此前三处错误判断（全部来自"从代码字面推断语义"✗）
-//
-// ① **`ObjectActive` 就是 `GameObject::SetActive`** ✓ —— 此前据其尾调用只写一个字节
-//    （`mov byte ptr [rcx+0x148], dl; ret`）就断言"它不是 SetActive" ✗ **是错的**：
-//    那是 IL2CPP 包装器解包 `m_CachedPtr` 后**尾调用原生实现**，而原生实现正是写
-//    `m_IsActive` 字段 ✓。参照实现把**同一段签名**直接标为 `SetActiveOffset` 的注释 ✓。
-// ② **UI 路径字符串本来就对** ✓ —— 参照的 `UIDPathWatermark` = `/BetaWatermarkCanvas(Clone)/Panel/TxtUID`
-//    与我们的**逐字相同** ✓，`UIDPathMain`/`ProfileUIDPath` 亦同 ✓。
-// ③ **"每帧被重新激活 ⇒ 必须 patch 写入器"这条推理不成立** ✗ —— 重贴就够 ✓。
-//
-// ## 因此删掉了此前那套"活动标志过滤 stub"（**它是有害的** ✗）
-//
-// stub 接管了 `object_active` 内部的写入器 ⇒ 连**我们自己**那句
-// `object_active(object, false)` 也走了 stub ⇒ 一旦 stub 有偏差，`SetActive`
-// 对**所有人**失效 ⇒ 实机表现为"回读那个字段始终是 1（写没落地）" ✓
-// **⇒ 这正是前几次实机失败的原因** ✓
-//
-// ## 参照实现里值得沿用的两点
-//
-//   * `SafeInvoke`（`__try/__except` 包住 IL2CPP 调用）—— 我们已有等价的 `__try` ✓
-//   * 多候选路径 + **记住命中的那条**（其对 `ProfileBirthdayTargets` 的做法 ✓）——
-//     我们的 `k_hide_uid_targets` 已支持每目标多条候选 ✓
-//
-// ⚠️ **不要**再引入任何"patch `object_active`"的想法：已实测有害 ✗。
-//    若将来真需要更强的隐藏手段，应先看参照实现是否已有做法，而不是自己推 ✗。
-// ---------------------------------------------------------------------------
 
-// ⛔ 以下 stub 用的全局量**已随 stub 一起作废**（2026-09-26 第四次修正）——
-//    没有任何执行路径再读它们。保留仅为留档；确认无引用后可整块删除 ✓
-// UID 目标的【解包后】指针（原供"写 stub 比较"用；主线程写、被 patch 的代码读）
-//
-// 2026-09-26：改为**扁平定长表** —— 每个目标一块 `k_uid_paths_per_target` 个槽
-// （`i * k + p`）✓ ⇒ 同一个目标的**多条候选路径可以同时登记** ✓
-// 这样"藏 TxtUID 不生效"时，**整块画布**那条候选也能一起被过滤 ✓（提升一次命中的概率）
-std::array<std::uintptr_t, k_uid_filter_slots> g_uid_filter_targets {};
-// `object_active` 实际写入的字节偏移（从指令里解出 —— 不是硬编码 ✓）
-std::uint32_t g_hide_uid_active_offset = 0;
-// 原写入器地址（stub 装好前的备份，供诊断）
-std::uint8_t *g_hide_uid_active_writer = nullptr;
-// 过滤 stub 与命中统计（统计用于**判定这条 patch 是否真的被游戏用到** ✓）
-void *g_hide_uid_filter_stub = nullptr;
-std::atomic<std::uint64_t> g_hide_uid_filter_calls { 0 };
-std::atomic<std::uint64_t> g_hide_uid_filter_forced { 0 };
+// ⚠️ **不要再尝试 patch `object_active`** —— 曾装过一个"活动标志过滤 stub"接管其内部
+// 写入器，实机证明**有害**：stub 连本模块自己的 `object_active(..., false)` 调用也一并吃掉，
+// 一旦 stub 有偏差就让 `SetActive` 对所有人失效。参照实现（FufuLauncher.UnlockerIsland 的
+// `HideUI.cpp`）**不 hook、不 patch 任何函数**，只是定期重贴一次 `SetActive(false)` —— 足够。
 
 void reset_release_log()
 {
@@ -368,12 +270,9 @@ int hide_uid_once_unsafe(int *status_out)
             bool any_native = false;   // 至少解析到一个对象 ✓
             bool any_stuck = false;    // 至少一个候选的写入**落地**了 ✓
 
-            // 逐个候选现场解析：**不缓存**任何指针 ⇒ 无悬空指针问题 ✓
-            //
-            // ⚠️ 2026-09-26：**不再在第一个成功候选处 break** ✗ ——
-            // 原来 break 掉 ⇒ "藏 TxtUID 不生效"时**整块画布**那条候选永远没机会试 ✗。
-            // 现在**每个能解析到的候选都藏一遍，并各自登记到独立槽位** ✓
-            // （对水印而言连画布一起藏是正确语义；profile/map 刻意没有祖先候选 ✓）
+            // 逐个候选现场解析（**不缓存**任何指针 ⇒ 无悬空指针），且**不提前 break**：
+            // 每个能解析到的候选都藏一遍 —— 否则"藏 TxtUID 不生效"时，整块画布那条
+            // 候选永远没机会试。（profile/map 刻意没有祖先候选，见目标表。）
             for (std::size_t p = 0; p < target.paths.size(); ++p)
             {
                 const char *candidate = target.paths[p];
@@ -389,9 +288,8 @@ int hide_uid_once_unsafe(int *status_out)
                 if (object == nullptr)
                     continue;
 
-                // IL2CPP 解包检查：`[obj + 0x10]` 是 Object::m_CachedPtr ——
-                // 与 `object_active` 内部做的事一致 ✓。此处**只用于判定"拿到了真实对象"** ✓
-                // （此前还把它登记给过滤 stub，stub 已废弃 ⇒ 不再登记 ✗）
+                // 解包 `Object::m_CachedPtr`（`[obj + 0x10]`，与 `object_active` 内部
+                // 做的事一致），仅用于判定"确实拿到了真实对象"。
                 const auto native = *reinterpret_cast<std::uintptr_t *>(
                     reinterpret_cast<std::uint8_t *>(object) + 0x10);
                 if (native == 0)
@@ -400,15 +298,8 @@ int hide_uid_once_unsafe(int *status_out)
 
                 object_active(object, false);
 
-                // 判据：**隐藏后再 Find 一次**（2026-09-26 第四次修正）
-                //
-                // 依据来自参照实现**自己的注释** ✓：
-                //     // inactive objects are invisible to Find
-                // ⇒ 藏住之后用同一路径应当 Find 不到 ✓
-                // ⇒ 还能找到 ⇒ 对象仍是激活的 ⇒ `SetActive(false)` 没落地 ✗
-                //
-                // ⚠️ 之前用的是"回读 stub 解出的字段偏移" ✗ —— 那条判据依赖 stub，
-                // 而 stub 已被实机证明有害（连我们自己的调用都被它吃掉）⇒ 一并废弃 ✓
+                // 判据：隐藏后**再 Find 一次**。`GameObject.Find` 只返回激活对象，
+                // 所以同一路径找不到即确实藏住了（参照实现亦以此为依据）。
                 if (find_object(string_object) == nullptr)
                     any_stuck = true;
             }
@@ -542,13 +433,9 @@ bool patch_rel32_jump(std::uint8_t *address, std::uintptr_t absolute_target)
     return patch_bytes(address, patch);
 }
 
-// 长度可指定的 rel32 跳转（2026-09-26）。
-//
-// 用于替换**短函数的第一条指令**：`mov [rcx+disp32], dl` 是 **6 字节**，
-// 而 5 字节的 `E9 rel32` 只会覆盖它的前 5 字节、把第 6 个字节留在原地 ✗
-// ⇒ 被替换处会残留一个字节，反汇编错位。
-// 这里按 `size` 写 `E9 rel32`，其余用 `0x90`(nop) 填满 ✓
-// （`size` 必须 ≥ 5；= 5 时等价于 patch_rel32_jump）。
+// 长度可指定的 rel32 跳转。用于替换**短函数的第一条指令**：被替换的指令可能长于
+// 5 字节（`E9 rel32` 只覆盖前 5 字节），残留的尾部字节会让反汇编错位 ⇒ 这里按
+// `size` 写 `E9 rel32`、其余用 `0x90`(nop) 填满。`size` 必须 ≥ 5。
 bool patch_rel32_jump_n(std::uint8_t *address, std::uintptr_t absolute_target, std::size_t size)
 {
     if (size < 5)
@@ -636,264 +523,6 @@ void *allocate_near_address(void *target, std::size_t size)
     return VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
 }
 
-// ---------------------------------------------------------------------------
-// UID 活动状态过滤（IL2CPP 层 patch）—— 实现见文件上方那段说明
-// ---------------------------------------------------------------------------
-
-// 安全读可执行内存（SEH 保护：地址可能落在未提交页）
-bool safe_read_code(const std::uint8_t *address, std::uint8_t *out, std::size_t size)
-{
-    __try
-    {
-        for (std::size_t i = 0; i < size; ++i)
-            out[i] = address[i];
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-    return true;
-}
-
-// 在缓冲里找 1 字节写入 `88 <modrm=10xxx101> <disp32>`（即 `mov [reg+disp32], r8`）。
-// 这类指令**没有 RIP 相对寻址**，因此可以原样搬进 stub，无需重定位 ✓
-bool find_byte_write(const std::uint8_t *code, std::size_t size, std::uint32_t *offset_out,
-    std::size_t *at_out)
-{
-    for (std::size_t i = 0; i + 6 <= size; ++i)
-    {
-        if (code[i] != 0x88)
-            continue;
-        const std::uint8_t modrm = code[i + 1];
-        // ⚠️ 2026-09-26 修正（按实机日志 `cannot resolve written field` 定位到根因）：
-        //
-        // 原条件还多要求 `(modrm & 7) == 5`，那**只匹配 `[rbp/r13 + disp32]`** ✗ ——
-        // 而本机写入器是 `mov byte ptr [rcx+0x148], dl` = `88 91 48 01 00 00`
-        // （modrm=0x91 ⇒ rm=**001**）✗ ⇒ **这条判定永远匹配不到它** ✗✓✓
-        // ⇒ `resolve_written_field` 必然失败 ⇒ 过滤 stub 从未装上 ⇒
-        //   实机日志出现 `HideUID active-filter: cannot resolve written field; skipped` ✓
-        //
-        // `mod = 10` 时**不存在 RIP 相对形态**（RIP 相对要求 `mod = 00` + rm = 101）✓
-        // ⇒ 接受任意 `mod = 10` 仍然满足本函数的前提："可原样搬运、无需重定位" ✓
-        // 唯一必须排除的是 `rm = 100`（后跟 SIB ⇒ 整条 7 字节，搬 6 字节会截断）✗
-        if ((modrm & 0xC0) != 0x80 || (modrm & 0x07) == 0x04)
-            continue;
-        // `0x88` 之前若是 REX 前缀（40-4F），寄存器号在 REX 里 ✗ —— 本函数只搬
-        // 6 字节会丢掉它 ⇒ 拒绝（本项目目标形态 `88 91 …` 无 REX ✓）
-        if (i > 0 && (code[i - 1] & 0xF0) == 0x40)
-            continue;
-        std::uint32_t displacement = 0;
-        std::memcpy(&displacement, code + i + 2, sizeof(displacement));
-        if (displacement == 0 || displacement > 0x2000)
-            continue; // 合理性上界：IL2CPP 对象字段不会到 8 KB
-        if (offset_out != nullptr)
-            *offset_out = displacement;
-        if (at_out != nullptr)
-            *at_out = i;
-        return true;
-    }
-    return false;
-}
-
-// 解出"这个 setter 最终把 this 写到哪个字节偏移"，并把写入者地址一并给出。
-//   形态 A：函数体内直接写
-//   形态 B：尾调用（E9 rel32）到一个只做写入的小函数（本机 ObjectActive 即此形态 ✓）
-bool resolve_written_field(std::uint8_t *function, std::uint32_t *offset_out, std::uint8_t **writer_out)
-{
-    std::uint8_t head[64] {};
-    if (!safe_read_code(function, head, sizeof(head)))
-        return false;
-
-    if (find_byte_write(head, sizeof(head), offset_out, nullptr))
-    {
-        if (writer_out != nullptr)
-            *writer_out = function;
-        return true;
-    }
-
-    // 尾调用：在**整个 head 缓冲**内找。
-    //
-    // ⚠️ 2026-09-26 修正（与 `find_byte_write` 的 modrm 修正同批，同一个实机日志）：
-    //
-    // 原窗口是 `i + 5 <= 48` ⇒ i 最大 **43** ✗ —— 而本机 `ObjectActive` 的尾调用
-    // `E9` 落在**偏移 49** ✗（逐字节数：48 89 5C 24 08 / 57 / 48 83 EC 20 / 0F B6 FA /
-    // 48 8B D9 / 48 85 C9 / 74 ?? / E8 … / 48 85 C0 / 74 ?? / 40 84 FF / 48 8B C8 /
-    // 0F 95 C2 / 48 8B 5C 24 30 / 48 83 C4 20 / 5F ⇒ 49 处才是 E9）
-    // ⇒ **差 6 字节没搜到** ✗✓✓ —— 这是 `cannot resolve written field` 的第二个成因 ✓
-    //
-    // 放宽窗口带来的"误认函数体深处的 E9"风险，由两条约束兜住：
-    //   ① 目标处必须真的有 `mov [reg+disp32], r8` ✓（`find_byte_write` 判定 ✓）
-    //   ② 取**最后一个**命中 ✓ —— 尾调用在函数体末尾，函数中途的 E9 会排在它前面 ✓
-    std::uint8_t *tail_writer = nullptr;
-    std::uint32_t tail_offset = 0;
-    for (std::size_t i = 0; i + 5 <= sizeof(head); ++i)
-    {
-        if (head[i] != 0xE9)
-            continue;
-        std::int32_t relative = 0;
-        std::memcpy(&relative, head + i + 1, sizeof(relative));
-        auto *target = function + i + 5 + relative;
-        std::uint8_t tail[32] {};
-        if (!safe_read_code(target, tail, sizeof(tail)))
-            continue;
-        std::uint32_t candidate_offset = 0;
-        if (find_byte_write(tail, sizeof(tail), &candidate_offset, nullptr))
-        {
-            tail_writer = target;
-            tail_offset = candidate_offset;
-        }
-    }
-    if (tail_writer != nullptr)
-    {
-        if (offset_out != nullptr)
-            *offset_out = tail_offset;
-        if (writer_out != nullptr)
-            *writer_out = tail_writer;
-        const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-        char message[192] {};
-        std::snprintf(message, sizeof(message),
-            "HideUID active-filter: resolved via tail call, writer=+0x%llX field=+0x%X",
-            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(tail_writer) - base),
-            static_cast<unsigned>(tail_offset));
-        log_line(message);
-        return true;
-    }
-    return false;
-}
-
-// 构造过滤 stub：
-//     mov  rax, imm64(&g_uid_filter_targets)
-//     [每个槽位]  mov r9, [rax+8i] / cmp rcx, r9 / je FORCE
-//     jmp  WRITE
-//   FORCE:
-//     xor  edx, edx                  ; 请求值是 true ⇒ 强制成 false
-//     mov  rax, imm64(&forcedCounter)
-//     lock inc qword ptr [rax]       ; 统计"游戏试图重新激活"的次数（诊断关键 ✓）
-//   WRITE:
-//     <原写入指令，6 字节原样复制>     ; 不含 RIP 相对 ⇒ 可安全搬运
-//     ret
-//
-// 语义：只有 `this` 命中我们的 UID 对象、且请求为 true 时才改写；
-// 其余情况**完全等同原函数** ✓（不会影响游戏里任何其它对象）
-void *build_active_filter_stub(std::uint8_t *writer, std::size_t write_at)
-{
-    if (g_hide_uid_filter_stub != nullptr)
-        return g_hide_uid_filter_stub;
-
-    std::uint8_t original[8] {};
-    if (!safe_read_code(writer + write_at, original, sizeof(original)))
-        return nullptr;
-    if (original[6] != 0xC3)
-    {
-        // 形态不符（写入指令后面不是 ret）⇒ 不硬来 ✓
-        log_line("HideUID active-filter: writer shape unexpected (no ret after write); skipped");
-        return nullptr;
-    }
-
-    auto *stub = static_cast<std::uint8_t *>(allocate_near_address(writer, 0x1000));
-    if (stub == nullptr)
-        return nullptr;
-
-    std::size_t p = 0;
-    const auto targets = reinterpret_cast<std::uintptr_t>(&g_uid_filter_targets[0]);
-    stub[p++] = 0x48; // mov rax, imm64
-    stub[p++] = 0xB8;
-    std::memcpy(stub + p, &targets, sizeof(targets));
-    p += sizeof(targets);
-
-    std::array<std::size_t, k_uid_filter_slots> jump_positions {};
-    for (std::size_t i = 0; i < k_uid_filter_slots; ++i)
-    {
-        stub[p++] = 0x4C; stub[p++] = 0x8B; stub[p++] = 0x48;
-        stub[p++] = static_cast<std::uint8_t>((i * 8) & 0xFF); // mov r9, [rax + 8i]
-        stub[p++] = 0x4C; stub[p++] = 0x39; stub[p++] = 0xC9;  // cmp rcx, r9
-        stub[p++] = 0x74;                                       // je FORCE
-        jump_positions[i] = p++;
-    }
-    const std::size_t jmp_write_at = p;
-    stub[p++] = 0xEB;                                       // jmp WRITE
-    const std::size_t jmp_write_disp = p++;
-
-    const std::size_t force_at = p;
-    stub[p++] = 0x31; stub[p++] = 0xD2;                     // xor edx, edx
-    const auto counter = reinterpret_cast<std::uintptr_t>(&g_hide_uid_filter_forced);
-    stub[p++] = 0x48; stub[p++] = 0xB8;                     // mov rax, imm64
-    std::memcpy(stub + p, &counter, sizeof(counter));
-    p += sizeof(counter);
-    stub[p++] = 0xF0; stub[p++] = 0x48; stub[p++] = 0xFF; stub[p++] = 0x00; // lock inc [rax]
-
-    const std::size_t write_in_stub = p;
-    std::memcpy(stub + p, original, 6);                     // 原写入指令
-    p += 6;
-    stub[p++] = 0xC3;                                       // ret
-
-    if (p > 0x1000)
-        return nullptr;
-    for (const std::size_t position : jump_positions)
-        stub[position] = static_cast<std::uint8_t>(force_at - (position + 1));
-    stub[jmp_write_disp] = static_cast<std::uint8_t>(write_in_stub - (jmp_write_at + 2));
-
-    FlushInstructionCache(GetCurrentProcess(), stub, p);
-    g_hide_uid_filter_stub = stub;
-    return stub;
-}
-
-// ⛔⛔⛔ 以下这一整块（`install_active_filter_hook` 及其自用的 `resolve_written_field`
-//      / `find_byte_write` / `patch_rel32_jump_n` / `build_filter_stub`）**已被证明有害，
-//      且【不再有任何调用点】—— 不要重新启用它** ⛔⛔⛔
-//
-// 为什么有害（2026-09-26 实机结论）：
-//   它把 `object_active` 内部真正写字段的那个函数**替换成 stub** ⇒ 连本模块自己那句
-//   `object_active(object, false)` 也走 stub ⇒ stub 一旦有偏差，`SetActive` 对**所有人**
-//   失效 ⇒ 实机表现为"回读那个字段始终是 1（写没落地）" ⇒ **UID 藏不住** ✓
-//
-// 正确的做法（见文件上方说明）：**直接调原函数，每 2 秒重贴一次** ✓
-//   —— 与参照实现 `FufuLauncher.UnlockerIsland/HideUI` 一致，那个实现**不 patch 任何函数** ✓
-//
-// 保留代码只为留档（它记录了"写入器怎么解出来"的方法，将来若真要 patch 别的东西可参考）；
-// **它不参与任何执行路径**，链接器会把未引用的部分消除掉 ✓
-// 待办：确认无其他用途后，可整块删除 ✓
-//
-// 安装过滤：解出写入者 → 造 stub → 用 6 字节跳转替换原写入指令
-[[maybe_unused]] bool install_active_filter_hook(std::uint8_t *object_active)
-{
-    std::uint32_t offset = 0;
-    std::uint8_t *writer = nullptr;
-    if (!resolve_written_field(object_active, &offset, &writer) || writer == nullptr)
-    {
-        log_line("HideUID active-filter: cannot resolve written field; skipped");
-        return false;
-    }
-    g_hide_uid_active_offset = offset;
-    g_hide_uid_active_writer = writer;
-
-    std::uint8_t body[64] {};
-    if (!safe_read_code(writer, body, sizeof(body)))
-        return false;
-    std::size_t write_at = 0;
-    std::uint32_t check = 0;
-    if (!find_byte_write(body, sizeof(body), &check, &write_at))
-        return false;
-
-    void *stub = build_active_filter_stub(writer, write_at);
-    if (stub == nullptr)
-        return false;
-
-    if (!patch_rel32_jump_n(writer + write_at, reinterpret_cast<std::uintptr_t>(stub), 6))
-    {
-        log_line("HideUID active-filter: patch failed");
-        return false;
-    }
-
-    const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-    char message[192] {};
-    std::snprintf(message, sizeof(message),
-        "HideUID active-filter installed: writer=+0x%llX field=+0x%X (forces active=false for uid targets)",
-        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(writer) - base),
-        static_cast<unsigned>(offset));
-    log_line(message);
-    return true;
-}
 
 void *build_player_perspective_stub(std::uint8_t *player_perspective)
 {
@@ -981,9 +610,8 @@ std::uint8_t *scan_unique_signature(
         return nullptr;
 
     const auto pattern = pattern_scanner::parse_pattern(signature.text);
-    // 模式解析不完整 → 显式失败（2026-09-19 审核报告：原为静默截断）。
-    // 这条是主扫描路径：静默截断会产出"部分模式"→ 扫描不到 → 只表现为
-    // "签名未找到"，无法区分是"游戏版本变了"还是"签名文本被改坏"。
+    // 模式解析不完整 → 显式失败（而非静默截断）。静默截断会产出"部分模式"，
+    // 只表现为"签名未找到"，无法区分是游戏版本变了还是签名文本被改坏。
     if (!pattern.valid)
     {
         log_line(std::string(signature.name) + " pattern parse failed at offset=" +
@@ -993,12 +621,9 @@ std::uint8_t *scan_unique_signature(
     const auto *sections = IMAGE_FIRST_SECTION(nt);
     std::array<std::uint8_t *, 2> matches {};
     std::size_t match_count = 0;
-    // 2026-09-19（审核报告）：独立统计**真实**匹配数。
-    // 原先只报 match_count，而它在 matches 满 2 后就不再增长 ——
-    // 实际有 50 处匹配时日志也写 "matches=2"，诊断时**信息失真**
-    // （看不出是"2 处"还是"到处都是"）。
-    // 保留 matches 容量 2 是**有意的**：只需区分 0 / 1 / ≥2 三种情况
-    //（1 才可用），提前停止扫描可省下其余匹配的成本。
+    // `total_matches` 与 `match_count` 是两个量：前者是**真实**匹配数，后者受
+    // `matches` 容量（2）封顶。只报后者会把"50 处匹配"写成 "matches=2"，诊断时失真。
+    // 容量 2 是有意的 —— 只需区分 0 / 1 / ≥2（1 才可用），提前停止可省扫描成本。
     std::size_t total_matches = 0;
 
     for (unsigned section_index = 0; section_index < nt->FileHeader.NumberOfSections && match_count < matches.size(); ++section_index)
@@ -1037,13 +662,10 @@ std::uint8_t *scan_unique_signature(
     return matches[0];
 }
 
-// 有界等待主模块代码段可读（替代固定 Sleep(3000)，2026-09-19 审核报告）。
+// 有界等待主模块代码段可读（替代固定 `Sleep(3000)`）。
 //
-// 判定依据：主模块映像的**首个页面**可读且已提交。这不足以证明游戏已完成所有
-// 运行时初始化，但比"固定睡 3 秒"更贴近真实条件：
-//   - 就绪早 → 立刻继续（不再白等）
-//   - 就绪晚 → 继续轮询到上限（不再过早扫描导致静默失效）
-// 返回实际等待的毫秒数，供日志记录（便于诊断"启动慢"导致的失败）。
+// 判定依据：主模块映像的**首个页面**可读且已提交。就绪即继续（不白等），未就绪则
+// 轮询到上限（不过早扫描导致静默失效）。返回实际等待毫秒数，供日志诊断"启动慢"。
 constexpr ULONGLONG k_init_wait_timeout_ms = 30000; // 上限 30s（与旧行为同数量级，但可提前退出）
 constexpr DWORD k_init_poll_interval_ms = 25;       // 轮询间隔：足够细，且不烧 CPU
 
@@ -1081,11 +703,8 @@ ULONGLONG wait_for_main_module_ready()
 
 DWORD WINAPI worker_thread(void *parameter)
 {
-    // 2026-09-19（审核报告）：日志路径改在**本线程**计算。
-    // 原先在 DllMain 里调用 module_dir()（内部 GetModuleFileNameW +
-    // std::filesystem 构造）—— 那是在 **loader lock 持有期间**执行，
-    // 是官方明确不建议的反模式（可能死锁/在锁内分配）。
-    // 现在 DllMain 只做 pin + CreateThread，模块句柄经参数传入本线程。
+    // 日志路径在**本线程**计算：DllMain 只做 pin + CreateThread，模块句柄经参数传入，
+    // 以免在持有 loader lock 期间做 `GetModuleFileNameW` / `std::filesystem` 构造。
     const auto self_module = static_cast<HMODULE>(parameter);
     if (self_module != nullptr)
         g_log_path = module_dir(self_module) / "AntiPlayerMosaic.log";
@@ -1093,10 +712,8 @@ DWORD WINAPI worker_thread(void *parameter)
     reset_release_log();
     log_line("AntiPlayerMosaic loaded (dynamic scan)");
 
-    // 2026-09-19（审核报告）：原为固定 `Sleep(3000)` 等待游戏初始化 ——
-    // 游戏启动慢于 3 秒时会**过早扫描**（签名找不到 → 功能静默失效），
-    // 启动快时又白白浪费 3 秒。改为**有界轮询**：轮询主模块代码段可读性，
-    // 就绪即继续，最长仍等 k_init_wait_timeout_ms。
+    // 有界轮询代替固定等待：游戏启动慢时过早扫描会导致签名找不到（功能静默失效），
+    // 启动快时固定等待又是白等。就绪即继续，最长等 `k_init_wait_timeout_ms`。
     wait_for_main_module_ready();
 
     HMODULE main_module = GetModuleHandleW(nullptr);
@@ -1121,18 +738,12 @@ DWORD WINAPI worker_thread(void *parameter)
     ModuleFingerprint fingerprint {};
     std::array<std::uint32_t, 5> cached_rvas {};
 
-    // ① **首选 RVA 优先**（2026-09-26 第六次修正）
+    // ① **首选 RVA 优先**：`ObjectActive` 这类无法用纯字节模式唯一定位的函数，记下地址
+    //    后仍必须用全掩码模式在该地址处**运行时校验** —— 地址随版本漂移会被发现，
+    //    绝不静默拿错函数（详见 `PatternScanner.hpp` 的 `preferred_rva`）。
     //
-    // 有些函数**无法用纯字节模式唯一定位** —— `ObjectActive`（`GameObject::SetActive`）
-    // 在本镜像里有 **45 个逐字节同形的 IL2CPP 包装器**，差别只在 `E8`/`E9` 位移里，
-    // 而位移是由调用者地址派生的 ⇒ 掩掉则全中、保留则等于选错。详见
-    // `PatternScanner.hpp` 里 `Signature::preferred_rva` 的说明。
-    //
-    // ⇒ 采用"记录地址 + **运行时校验**"：校验用**全掩码**模式，
-    //   地址一旦随版本漂移就会被发现 ✓（绝不静默拿错函数）。
-    //
-    // ⚠️ **必须放在缓存之前**：旧缓存里可能存着**错误孪生**的 RVA
-    //   （`0x00C53D10` 同样能通过全掩码校验 ⇒ 缓存那道校验**挡不住它** ✗）。
+    // ⚠️ **必须排在缓存之前**：旧缓存里可能存着**错误孪生**的 RVA，
+    //    而它同样能通过全掩码校验 ⇒ 缓存那道校验挡不住它。
     for (std::size_t index = 0; index < targets.size(); ++index)
     {
         const auto &signature = pattern_scanner::k_signatures[index];
@@ -1195,25 +806,7 @@ DWORD WINAPI worker_thread(void *parameter)
     if (g_hide_uid_find_string == nullptr || g_hide_uid_find_object == nullptr || g_hide_uid_object_active == nullptr)
         g_hide_uid_enabled.store(false);
 
-    // ⚠️ 2026-09-26（第四次修正）：**不再 patch `object_active`** —— 直接调原函数 ✓
-    //
-    // 此前装过一个"活动标志过滤 stub"：接管 `object_active` 内部真正写字段的那个
-    // 函数（`mov [rcx+0x148], dl; ret`），强制把"重新激活"改成 false。
-    //
-    // **实机证明它无效** ✗：装上之后回读那个字段**始终是 1**（写没落地）——
-    // 因为 stub 取代了原函数 ⇒ 连**我们自己**那句 `object_active(object, false)`
-    // 也走了 stub ⇒ `SetActive` 对**所有人**都失效 ✗
-    //
-    // **参照实现**（用户提供，已确认可用 ✓）：`FufuLauncher.UnlockerIsland/HideUI`
-    // **不 patch 任何函数**，只是每 2 秒重新执行一次：
-    //
-    //     FindString(路径) → FindGameObject(str) → SetActive(go, false)
-    //
-    // —— 就足以压住游戏的重新激活 ✓（其 `HideUI.cpp` 里没有任何 hook/stub ✓）
-    //
-    // **⇒ 本模块改为同一策略：删掉 stub，让 `object_active` 保持原样 ✓**
-    //    （stub 的构造函数仍保留在文件中，但**不再被调用** ⇒ 不影响功能；
-    //      若编译器报未使用函数，再加 `[[maybe_unused]]` 即可 ✓）
+    // 让 `object_active` 保持原样：**不要 patch 它** —— 原因见文件上方那段说明。
 
     const bool perspective_patched = player_perspective != nullptr && patch_player_perspective(player_perspective);
     if (!perspective_patched)
@@ -1247,16 +840,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
             reinterpret_cast<LPCWSTR>(hModule),
             &pinned);
-        // 2026-09-19（审核报告）：**不在 DllMain 内做任何需要 loader lock 的工作**。
-        // 原先此处还调用 module_dir(hModule)（GetModuleFileNameW + std::filesystem）
-        // 设置日志路径 —— 属官方不建议的 loader lock 内操作。
-        // 现在只做 pin + 启动工作线程，模块句柄作为参数传给线程，
-        // 路径计算与后续全部初始化都在**loader lock 之外**完成。
-        //
-        // 说明：在 DllMain 内 CreateThread 本身仍是已知反模式；彻底消除需要
-        // 宿主显式调用导出函数触发初始化（本项目为注入式，无此入口）。
-        // 这里通过"线程内不做任何依赖 loader lock 的事"把风险降到实际可接受：
-        // 线程不会与 DllMain 争用加载器锁，也就不会死锁。
+        // **不在 DllMain 内做任何需要 loader lock 的工作**：日志路径的计算与后续
+        // 全部初始化都放到工作线程里做。在 DllMain 内 CreateThread 本身仍是已知
+        // 反模式，但线程内不碰加载器锁，也就不会与 DllMain 争锁而死锁。
         HANDLE thread = CreateThread(nullptr, 0, worker_thread, hModule, 0, nullptr);
         if (thread)
             CloseHandle(thread);
