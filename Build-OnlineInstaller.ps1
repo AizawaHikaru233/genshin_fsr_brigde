@@ -233,7 +233,7 @@ function Prepare-FpsStage {
     Copy-Item -LiteralPath (Join-Path $installerSource 'Configure-Launcher.en.bat') -Destination (Join-Path $Stage 'GenshinFSRBridgeTools.bat') -Force
     $stageScripts = Join-Path $Stage 'scripts'
     New-Item -ItemType Directory -Path $stageScripts -Force | Out-Null
-    foreach ($scriptName in @('Configure.ps1', 'Localization.ps1', 'ReShadeResources.ps1', 'Apply-PackageUpdate.ps1')) {
+    foreach ($scriptName in @('Configure.ps1', 'Localization.ps1', 'InstallerCommon.ps1', 'ReShadeResources.ps1', 'Apply-PackageUpdate.ps1')) {
         Copy-Item -LiteralPath (Join-Path $installerSource $scriptName) -Destination (Join-Path $stageScripts $scriptName) -Force
     }
     Copy-Item -LiteralPath (Join-Path $packageAssets 'Feedback.txt') -Destination $Stage -Force
@@ -369,7 +369,7 @@ function Build-FpsPackage {
     try {
         $required = @(
             '一键配置.bat', 'GenshinFSRBridgeTools.bat', 'scripts\Configure.ps1', 'scripts\ReShadeResources.ps1',
-            'scripts\Apply-PackageUpdate.ps1', 'scripts\Localization.ps1',
+            'scripts\Apply-PackageUpdate.ps1', 'scripts\Localization.ps1', 'scripts\InstallerCommon.ps1',
             'Feedback.txt', 'Package-Version.txt', 'NonFrameGeneration.edition', 'upstream-versions.json',
             'unlockfps_nc.exe',
             'license\OptiScaler-LICENSE.txt', 'license\FPSUnlocker-LICENSE.txt', 'license\ReShade-LICENSE.txt',

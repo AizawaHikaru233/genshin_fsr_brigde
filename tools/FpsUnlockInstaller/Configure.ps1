@@ -178,6 +178,7 @@ else {
 }
 
 . (Join-Path $scriptDirectory 'Localization.ps1')
+. (Join-Path $scriptDirectory 'InstallerCommon.ps1')
 . $reShadeResourcesScript
 $script:Language = Get-InstallerLanguage -RequestedLanguage $Language
 Initialize-InstallerLocalization -Language $script:Language
@@ -194,21 +195,6 @@ function Assert-Directory {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
         throw (Convert-InstallerText -Value "缺少目录: $Path")
-    }
-}
-
-function Set-JsonProperty {
-    param(
-        [object]$Object,
-        [string]$Name,
-        [object]$Value
-    )
-    $property = $Object.PSObject.Properties[$Name]
-    if ($null -eq $property) {
-        $Object | Add-Member -MemberType NoteProperty -Name $Name -Value $Value
-    }
-    else {
-        $property.Value = $Value
     }
 }
 
@@ -258,33 +244,6 @@ function Get-ManualPath {
 }
 
 $script:GitHubProxyLatency = @{}
-
-function Get-GitHubEndpointLatency {
-    param([string]$HostName)
-    if ($script:GitHubProxyLatency.ContainsKey($HostName)) { return [double]$script:GitHubProxyLatency[$HostName] }
-    $latency = [double]::PositiveInfinity
-    try {
-        $ping = Test-Connection -ComputerName $HostName -Count 1 -ErrorAction Stop | Select-Object -First 1
-        if ($null -ne $ping -and $ping.ResponseTime -ge 0) { $latency = [double]$ping.ResponseTime }
-    }
-    catch { }
-    $script:GitHubProxyLatency[$HostName] = $latency
-    return $latency
-}
-
-function Get-GitHubFallbackUrls {
-    param([string]$Url)
-    if ($Url -notmatch '^https://(api\.)?github\.com/') { return @($Url) }
-    $proxies = @(
-        [pscustomobject]@{ Host = 'ghfast.top'; Prefix = 'https://ghfast.top/' },
-        [pscustomobject]@{ Host = 'gh-proxy.com'; Prefix = 'https://gh-proxy.com/' },
-        [pscustomobject]@{ Host = 'ghproxy.net'; Prefix = 'https://ghproxy.net/' }
-    ) | ForEach-Object {
-        [pscustomobject]@{ Host = $_.Host; Prefix = $_.Prefix; Latency = (Get-GitHubEndpointLatency -HostName $_.Host) }
-    } | Sort-Object Latency, Host
-    $proxyUrls = @($proxies | ForEach-Object { $_.Prefix + $Url })
-    return @($proxyUrls + @($Url))
-}
 
 function Get-GitHubLatestAsset {
     param([string]$Repository, [scriptblock]$AssetFilter, [string]$Tag)
@@ -336,28 +295,6 @@ function Invoke-OfficialDownload {
         }
     }
     throw (Convert-InstallerText -Value "下载失败：直连与全部备用下载路线均不可用。$([Environment]::NewLine)$($failures -join [Environment]::NewLine)")
-}
-
-function Get-VideoControllersOnce {
-    # 每安装会话只查询一次 Win32_VideoController（CIM/WMI 查询 ~100-500ms）
-    if ($null -eq $script:CachedVideoControllers) {
-        try {
-            $script:CachedVideoControllers = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
-        }
-        catch {
-            try { $script:CachedVideoControllers = @(Get-WmiObject -Class Win32_VideoController -ErrorAction Stop) } catch { $script:CachedVideoControllers = @() }
-        }
-    }
-    return @($script:CachedVideoControllers)
-}
-
-function Get-NvidiaVideoControllers {
-    $controllers = @(Get-VideoControllersOnce)
-    return @($controllers | Where-Object {
-        ([string]$_.PNPDeviceID -match '(?i)VEN_10DE') -or
-        ([string]$_.AdapterCompatibility -match '(?i)NVIDIA') -or
-        ([string]$_.Name -match '(?i)NVIDIA')
-    })
 }
 
 # AMD RDNA2（RX 6000 系，Navi 21/22/23/24 + RDNA2 核显）Device ID。
@@ -1099,108 +1036,12 @@ function Remove-ManagedPath {
     }
 }
 
-function Test-PathCompatibilityRisk {
-    param([string]$Path)
-    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
-    foreach ($character in $Path.ToCharArray()) {
-        if ([int]$character -gt 127) { return $true }
-    }
-    return ($Path -match '[^A-Za-z0-9 _:\.\\/\-]')
-}
-
-function Show-PathCompatibilityWarning {
-    param([string]$GameExePath)
-    $gameDirectory = if ([string]::IsNullOrWhiteSpace($GameExePath)) { $null } else { Split-Path -Parent $GameExePath }
-    $riskyPaths = [System.Collections.Generic.List[string]]::new()
-    if (Test-PathCompatibilityRisk -Path $gameDirectory) { $riskyPaths.Add("游戏目录: $gameDirectory") }
-    if (Test-PathCompatibilityRisk -Path $root) { $riskyPaths.Add("插件目录: $root") }
-    if ($riskyPaths.Count -eq 0) { return }
-
-    Write-Host ''
-    Write-Host '路径兼容性提醒：检测到游戏或插件路径包含中文或特殊符号。' -ForegroundColor Yellow
-    foreach ($entry in $riskyPaths) {
-        Write-Host "  $entry" -ForegroundColor DarkYellow
-    }
-    Write-Host '若遇到无法注入、插件不加载或日志目录乱码，建议将游戏和插件移动到仅包含英文、数字、下划线和短横线的路径。' -ForegroundColor DarkGray
-}
-
 function Add-UniquePath {
     param([System.Collections.Generic.List[string]]$List, [string]$Path)
     foreach ($entry in $List) {
         if ([string]::Equals([System.IO.Path]::GetFullPath($entry), [System.IO.Path]::GetFullPath($Path), [StringComparison]::OrdinalIgnoreCase)) { return }
     }
     $List.Add($Path)
-}
-
-function Set-IniValue {
-    param(
-        [string]$Path,
-        [string]$Section,
-        [string]$Key,
-        [string]$Value
-    )
-    $lines = [System.Collections.Generic.List[string]]::new()
-    if (Test-Path -LiteralPath $Path) {
-        foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
-            $lines.Add($line)
-        }
-    }
-    $sectionStart = -1
-    $sectionEnd = $lines.Count
-    for ($index = 0; $index -lt $lines.Count; $index++) {
-        if ($lines[$index] -match '^\s*\[(.+)\]\s*$') {
-            if ($sectionStart -ge 0) {
-                $sectionEnd = $index
-                break
-            }
-            if ($matches[1] -eq $Section) {
-                $sectionStart = $index
-            }
-        }
-    }
-    if ($sectionStart -lt 0) {
-        if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -ne '') {
-            $lines.Add('')
-        }
-        $lines.Add("[$Section]")
-        $lines.Add("$Key = $Value")
-    }
-    else {
-        $keyIndex = -1
-        for ($index = $sectionStart + 1; $index -lt $sectionEnd; $index++) {
-            if ($lines[$index] -match ('^\s*' + [regex]::Escape($Key) + '\s*=')) {
-                $keyIndex = $index
-                break
-            }
-        }
-        if ($keyIndex -ge 0) {
-            $lines[$keyIndex] = "$Key = $Value"
-        }
-        else {
-            $lines.Insert($sectionEnd, "$Key = $Value")
-        }
-    }
-    [IO.File]::WriteAllLines($Path, $lines, [Text.UTF8Encoding]::new($false))
-}
-
-function Get-IniValue {
-    param(
-        [string]$Path,
-        [string]$Section,
-        [string]$Key
-    )
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
-    $inSection = $false
-    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
-        if ($line -match '^\s*\[(.+)\]\s*$') {
-            $inSection = $matches[1] -ieq $Section
-            continue
-        }
-        if ($inSection -and $line -match ('^\s*' + [regex]::Escape($Key) + '\s*=\s*(.*)$')) {
-            return $matches[1].Trim()
-        }
-    }
-    return $null
 }
 
 function Test-ReShadeIniHasEffectFiles {
@@ -1665,10 +1506,10 @@ if ($null -eq $config) {
         DllList = @($dllList)
     }
 }
-Set-JsonProperty -Object $config -Name 'GamePath' -Value $gameExe
-Set-JsonProperty -Object $config -Name 'FPSTarget' -Value $FpsTarget
-Set-JsonProperty -Object $config -Name 'DllList' -Value @($dllList)
-Set-JsonProperty -Object $config -Name 'UseHDR' -Value (-not [bool]$DisableHDR)
+Set-JsonPropertyValue -Object $config -Name 'GamePath' -Value $gameExe
+Set-JsonPropertyValue -Object $config -Name 'FPSTarget' -Value $FpsTarget
+Set-JsonPropertyValue -Object $config -Name 'DllList' -Value @($dllList)
+Set-JsonPropertyValue -Object $config -Name 'UseHDR' -Value (-not [bool]$DisableHDR)
 $config | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $fpsConfig -Encoding UTF8
 
 if (-not $DisableHDR) {
@@ -1705,3 +1546,4 @@ Write-Host 'DLL 加载顺序:'
 for ($index = 0; $index -lt $dllList.Count; $index++) {
     Write-Host ("  {0}. {1}" -f ($index + 1), $dllList[$index])
 }
+

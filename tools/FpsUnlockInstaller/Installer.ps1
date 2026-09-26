@@ -71,6 +71,7 @@ $shortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) '原神.lnk'
 $legacyShortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) '原神整合版.lnk'
 
 . (Join-Path $scriptsDirectory 'Localization.ps1')
+. (Join-Path $scriptsDirectory 'InstallerCommon.ps1')
 $script:Language = Get-InstallerLanguage -RequestedLanguage $Language
 Initialize-InstallerLocalization -Language $script:Language
 
@@ -183,119 +184,11 @@ function Get-FpsConfig {
     try { return Get-Content -LiteralPath $fpsConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
 }
 
-function Set-JsonPropertyValue {
-    param(
-        [object]$Object,
-        [string]$Name,
-        [object]$Value
-    )
-    $property = $Object.PSObject.Properties[$Name]
-    if ($null -eq $property) {
-        $Object | Add-Member -MemberType NoteProperty -Name $Name -Value $Value
-        return $true
-    }
-    if ($property.Value -ne $Value) {
-        $property.Value = $Value
-        return $true
-    }
-    return $false
-}
-
-function Set-IniPathValue {
-    param(
-        [string]$Path,
-        [string]$Section,
-        [string]$Key,
-        [string]$Value
-    )
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
-    $lines = [Collections.Generic.List[string]]::new()
-    foreach ($line in @(Get-Content -LiteralPath $Path -Encoding UTF8)) { $lines.Add([string]$line) }
-    $sectionStart = -1
-    $sectionEnd = $lines.Count
-    for ($index = 0; $index -lt $lines.Count; $index++) {
-        if ($lines[$index].Trim() -ieq "[$Section]") {
-            $sectionStart = $index
-            for ($next = $index + 1; $next -lt $lines.Count; $next++) {
-                if ($lines[$next].Trim() -match '^\[.+\]$') { $sectionEnd = $next; break }
-            }
-            break
-        }
-    }
-    if ($sectionStart -lt 0) {
-        if ($lines.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($lines[$lines.Count - 1])) { $lines.Add('') }
-        $lines.Add("[$Section]")
-        $lines.Add("$Key = $Value")
-        [IO.File]::WriteAllLines($Path, $lines, [Text.UTF8Encoding]::new($false))
-        return $true
-    }
-    for ($index = $sectionStart + 1; $index -lt $sectionEnd; $index++) {
-        if ($lines[$index] -match ('^\s*' + [regex]::Escape($Key) + '\s*=')) {
-            $expected = "$Key = $Value"
-            if ($lines[$index] -ceq $expected) { return $false }
-            $lines[$index] = $expected
-            [IO.File]::WriteAllLines($Path, $lines, [Text.UTF8Encoding]::new($false))
-            return $true
-        }
-    }
-    $lines.Insert($sectionEnd, "$Key = $Value")
-    [IO.File]::WriteAllLines($Path, $lines, [Text.UTF8Encoding]::new($false))
-    return $true
-}
-
 # 读取 ini 键的值（供"是否为空"判断用）。键不存在、段不存在、文件不存在 ⇒ 返回空串。
 #
 # ⚠️ 2026-09-23：`Repair-RuntimePaths` 需要区分"键在但值为空"与"已配置" ——
 # 只判断键是否存在是不够的（`PresetPath=` 也是"存在"）。
 # 注意 `Configure.ps1` 是**独立进程**调用（`-File`），故无法复用它的 `Get-IniValue`。
-function Get-IniPathValue {
-    param(
-        [string]$Path,
-        [string]$Section,
-        [string]$Key
-    )
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
-    $inSection = $false
-    foreach ($line in @(Get-Content -LiteralPath $Path -Encoding UTF8)) {
-        $text = [string]$line
-        if ($text.Trim() -match '^\[(.+)\]$') {
-            $inSection = $matches[1].Trim() -ieq $Section
-            continue
-        }
-        if (-not $inSection) { continue }
-        if ($text -match ('^\s*' + [regex]::Escape($Key) + '\s*=\s*(.*)$')) {
-            return $matches[1].Trim()
-        }
-    }
-    return ''
-}
-
-function Test-PathCompatibilityRisk {
-    param([string]$Path)
-    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
-    foreach ($character in $Path.ToCharArray()) {
-        if ([int]$character -gt 127) { return $true }
-    }
-    return ($Path -match '[^A-Za-z0-9 _:\.\\/\-]')
-}
-
-function Show-PathCompatibilityWarning {
-    param([string]$GameExePath)
-    $gameDirectory = if ([string]::IsNullOrWhiteSpace($GameExePath)) { $null } else { Split-Path -Parent $GameExePath }
-    $riskyPaths = [Collections.Generic.List[string]]::new()
-    if (Test-PathCompatibilityRisk -Path $gameDirectory) { $riskyPaths.Add("游戏目录: $gameDirectory") }
-    if (Test-PathCompatibilityRisk -Path $root) { $riskyPaths.Add("插件目录: $root") }
-    if ($riskyPaths.Count -eq 0) { return $false }
-
-    Write-Host ''
-    Write-Host '路径兼容性提醒：检测到游戏或插件路径包含中文或特殊符号。' -ForegroundColor Yellow
-    foreach ($entry in $riskyPaths) {
-        Write-Host "  $entry" -ForegroundColor DarkYellow
-    }
-    Write-Host '若遇到无法注入、插件不加载或日志目录乱码，建议将游戏和插件移动到仅包含英文、数字、下划线和短横线的路径。' -ForegroundColor DarkGray
-    return $true
-}
-
 function Repair-RuntimePaths {
     param([string]$SelectedGamePath)
     $defaultConfigDirectory = Join-Path $payloadDirectory 'default_config'
@@ -492,28 +385,6 @@ function Test-ConfiguredDll {
         if ([string]::Equals([IO.Path]::GetFullPath([string]$configuredPath), [IO.Path]::GetFullPath($Path), [StringComparison]::OrdinalIgnoreCase)) { return $true }
     }
     return $false
-}
-
-function Get-VideoControllersOnce {
-    # 每会话只查询一次 Win32_VideoController（CIM/WMI 查询 ~100-500ms）
-    if ($null -eq $script:CachedVideoControllers) {
-        try {
-            $script:CachedVideoControllers = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
-        }
-        catch {
-            try { $script:CachedVideoControllers = @(Get-WmiObject -Class Win32_VideoController -ErrorAction Stop) } catch { $script:CachedVideoControllers = @() }
-        }
-    }
-    return @($script:CachedVideoControllers)
-}
-
-function Get-NvidiaVideoControllers {
-    $controllers = @(Get-VideoControllersOnce)
-    return @($controllers | Where-Object {
-        ([string]$_.PNPDeviceID -match '(?i)VEN_10DE') -or
-        ([string]$_.AdapterCompatibility -match '(?i)NVIDIA') -or
-        ([string]$_.Name -match '(?i)NVIDIA')
-    })
 }
 
 function Get-ModuleState {
@@ -721,51 +592,6 @@ function Select-LocalInstallPath {
 
 $script:GitHubProxyLatency = @{}
 
-function Get-GitHubEndpointLatency {
-    param([string]$HostName)
-    if ($script:GitHubProxyLatency.ContainsKey($HostName)) { return [double]$script:GitHubProxyLatency[$HostName] }
-    $latency = [double]::PositiveInfinity
-    try {
-        $ping = Test-Connection -ComputerName $HostName -Count 1 -ErrorAction Stop | Select-Object -First 1
-        if ($null -ne $ping -and $ping.ResponseTime -ge 0) { $latency = [double]$ping.ResponseTime }
-    }
-    catch { }
-    $script:GitHubProxyLatency[$HostName] = $latency
-    return $latency
-}
-
-function Get-GitHubFallbackUrls {
-    param([string]$Url)
-    if ($Url -notmatch '^https://(api\.)?github\.com/') { return @($Url) }
-    $proxies = @(
-        [pscustomobject]@{ Host = 'ghfast.top'; Prefix = 'https://ghfast.top/' },
-        [pscustomobject]@{ Host = 'gh-proxy.com'; Prefix = 'https://gh-proxy.com/' },
-        [pscustomobject]@{ Host = 'ghproxy.net'; Prefix = 'https://ghproxy.net/' }
-    ) | ForEach-Object {
-        [pscustomobject]@{ Host = $_.Host; Prefix = $_.Prefix; Latency = (Get-GitHubEndpointLatency -HostName $_.Host) }
-    } | Sort-Object Latency, Host
-    $proxyUrls = @($proxies | ForEach-Object { $_.Prefix + $Url })
-    return @($proxyUrls + @($Url))
-}
-
-function Invoke-GitHubRestMethodWithFallback {
-    param([string]$Url, [string]$UserAgent, [string]$RequiredProperty)
-    $failures = [Collections.Generic.List[string]]::new()
-    foreach ($candidateUrl in @(Get-GitHubFallbackUrls -Url $Url)) {
-        try {
-            $result = Invoke-RestMethod -Headers @{ 'User-Agent' = $UserAgent } -Uri $candidateUrl -TimeoutSec 20
-            if (-not [string]::IsNullOrWhiteSpace($RequiredProperty) -and $null -eq $result.PSObject.Properties[$RequiredProperty]) {
-                throw "响应缺少需要的字段: $RequiredProperty"
-            }
-            return $result
-        }
-        catch {
-            $failures.Add("$candidateUrl : $($_.Exception.Message)")
-        }
-    }
-    throw "GitHub API failed through all routes.$([Environment]::NewLine)$($failures -join [Environment]::NewLine)"
-}
-
 function Invoke-GitHubDownloadWithFallback {
     param([string]$Url, [string]$Destination, [string]$UserAgent, [string]$ExpectedSha256)
     $failures = [Collections.Generic.List[string]]::new()
@@ -869,7 +695,7 @@ function Start-PackageSelfUpdate {
         $expanded = Join-Path $temporaryDirectory 'expanded'
         Expand-Archive -LiteralPath $packagePath -DestinationPath $expanded -Force
         foreach ($required in @(
-            'Installer.ps1', 'scripts\Configure.ps1', 'scripts\Localization.ps1', 'scripts\ReShadeResources.ps1', 'scripts\Apply-PackageUpdate.ps1',
+            'Installer.ps1', 'scripts\Configure.ps1', 'scripts\Localization.ps1', 'scripts\InstallerCommon.ps1', 'scripts\ReShadeResources.ps1', 'scripts\Apply-PackageUpdate.ps1',
             'payload\default_config\OptiScaler.ini', 'payload\default_config\OptiScaler-UpscalingFiles.json',
             'payload\default_config\ReShade.ini', 'payload\default_config\ReShadePreset.ini',
             'payload\Bridge\Dx11FsrBridge.dll'
@@ -1474,3 +1300,4 @@ while ($true) {
     }
     if ($choice -eq '0' -or $script:SelfUpdateStarted) { break }
 }
+

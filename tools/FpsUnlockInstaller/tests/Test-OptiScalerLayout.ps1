@@ -10,16 +10,31 @@
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
-$src = Join-Path $repoRoot 'tools\FpsUnlockInstaller\Configure.ps1'
-$ast = [System.Management.Automation.Language.Parser]::ParseFile($src, [ref]$null, [ref]$null)
-foreach ($fn in @('Get-OptiScalerLayout', 'Get-IniValue', 'Set-IniValue')) {
-    $def = $ast.FindAll({
-        param($n)
-        $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn
-    }, $true) | Select-Object -First 1
-    if (-not $def) { throw "找不到 $fn" }
-    Invoke-Expression $def.Extent.Text
+$installerDir = Join-Path $repoRoot 'tools\FpsUnlockInstaller'
+# ⚠️ 2026-09-24：INI 工具已搬到公共模块 `InstallerCommon.ps1`（审核报告「去重 8 条」）。
+# 本测试原先只解析 Configure.ps1，搬家后会「找不到 Set-IniValue」而失败 ——
+# 故按来源分别解析：Get-OptiScalerLayout 仍在 Configure.ps1，
+# Get-IniValue / Set-IniValue 现由 InstallerCommon.ps1 提供。
+$sources = @(
+    @{ File = (Join-Path $installerDir 'Configure.ps1');       Functions = @('Get-OptiScalerLayout') },
+    @{ File = (Join-Path $installerDir 'InstallerCommon.ps1'); Functions = @('Get-IniValue', 'Set-IniValue') }
+)
+foreach ($entry in $sources) {
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($entry.File, [ref]$null, [ref]$null)
+    foreach ($fn in $entry.Functions) {
+        $def = $ast.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn
+        }, $true) | Select-Object -First 1
+        if (-not $def) { throw "在 $($entry.File) 中找不到 $fn" }
+        Invoke-Expression $def.Extent.Text
+    }
 }
+# Get-IniValue 依赖模块内部的扫描函数，一并注入
+$a = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $installerDir 'InstallerCommon.ps1'), [ref]$null, [ref]$null)
+$core = $a.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-IniValueCore' }, $true) | Select-Object -First 1
+if (-not $core) { throw '找不到 Get-IniValueCore' }
+Invoke-Expression $core.Extent.Text
 
 $ok = 0; $bad = 0
 function Chk($cond, $msg) {
