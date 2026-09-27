@@ -222,6 +222,31 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 
 需要先更新组件再打包时可合并为 `-FetchUpstream`。四个自有 DLL（Bridge / AntiPlayerMosaic / TextureLoader / FufuGraphicsPlugin）由构建脚本以 Ninja 生成器自动编译，无需手动执行 cmake。
 
+### 打包产物清理与已部署目录
+
+**① 打包产物每次编译都先清理再重建，不需要手工删旧包。** 构建脚本
+`Build-OnlineInstaller.ps1` 在**编译之前**按**名称模式**清理 `dist\` 下本流程产生的全部产物与中间目录：
+
+| 清理模式（`dist\` 下） | 覆盖的产物 |
+|---|---|
+| `原神解帧FSR插件包_v*` | 本地/国内完整包 `.7z`（历史版本的 `.zip` 一并覆盖） |
+| `原神解帧FSR插件包Lite_*` / `Full_*`、`芙芙启动器插件包Lite_*` / `Full_*` | 历史命名（兼容保留） |
+| `FSR-Bridge-Plugin.v*` | 芙芙启动器商城包 |
+| `GenshinFSRBridge_v*` | GitHub 合规包 `.zip`，**以及**手工解压出来的同名目录 |
+| `github-release\` | GitHub 发布目录（整目录由本流程重建） |
+| `*.stage` / `*-stage` | 各种中间 stage 目录（`.fps-full-stage`、`.fps-github-stage`、`.fufu-marketplace-stage` 等） |
+
+用模式而不是写死版本号文件名，是为了避免"换了版本号就漏清"。只清上面这些模式，**不删整个 `dist\`**：
+`dist\` 下的其它内容（人工放入的调试包、发布笔记、验证目录）会原样保留。清理失败（例如旧包正被解压
+工具、启动器或资源管理器预览占用）会**直接报错中止并列出失败项**，不会静默跳过 —— 静默跳过会让人误以为
+"已经清了"。
+
+**② 已解压、已部署的安装目录不清理，升级用"手动增量替换"。** 例如 Starward 的
+`D:\miHoYo Games\Starward\原神解帧FSR插件包\`、芙芙启动器的插件目录，都不在打包清理范围内，也不会被
+任何脚本整目录清空。升级时把新包解压到**另一个**目录，再把需要更新的文件**逐个同名覆盖**到已部署目录
+（保留用户配置与用户新增的着色器 / 纹理 Mod；详见 `tools/FpsUnlockInstaller/README.md`）。
+**不要删除已部署目录本身** —— 清掉会毁掉一个正在用的安装。
+
 ## 日志与问题反馈
 
 Bridge 和反虚化组件默认会保留错误日志（接入 OptiScaler/ReShade 时它们也会保留各自日志）。每次重新运行会覆盖上一轮日志。

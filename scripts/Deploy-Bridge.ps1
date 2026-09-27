@@ -27,55 +27,75 @@ $routes = @(
     @{ Name = 'FufuLauncher'; Dir = 'D:\Program Files\FufuLauncher\Plugins\FSR-Bridge-Plugin\payload\Bridge' }
 )
 
-# 采集期需要的配置（探针 + 新日志器）
+# 必须显式写入的功能键 —— **与 `Dx11FsrBridge\Dx11FsrBridge.package.ini` 的
+# [Dx11FsrBridge] 段逐键一致**（改模板时同步改这里）。
+#
+# 为什么"全量写"而不是只挑几个关键键：本项目踩过多次"键不存在 ⇒ 依赖代码内建
+# 缺省 ⇒ 缺省值一变无人察觉"的坑（RenderScaleMenu 曾整段消失、TransparentJitter
+# 的旧键曾让修复静默失效）。逐键显式写入后，部署结果与发布模板逐字对齐。
+#
+# ⚠️ 诊断键（性能探针 / FSR2 输入纹理转储 / 逐 draw 与纹理追踪 / 着色器 dump 等）
+#    已从发布版整块剔除：本清单与发布模板都不再包含它们；需要诊断请用开发构建。
+#    Diagnostic keys are excluded from the release build - do not add them back here.
+#
+# ⚠️ 两个**故意不写**的例外：
+#    · Ffx12AsyncUpscale —— 由安装器 / 芙芙启动器按显卡自动写入（RDNA2→0、其他→1），
+#      本脚本写死 1 会与它的按显卡判定打架；
+#    · Ffx12DllPath     —— 路径键：留空即"随包 payload\AMD 的 SDK"，本脚本不覆盖
+#      用户自定义路径。
 $configValues = [ordered]@{
-    'LogLevel'             = '1'      # 旧键：保留兼容（新日志器由 [Log] level 控制）
+    # ---- 1. 核心功能 / Core features ----
+    'Enabled'                   = '1'
+    'Ffx12'                     = '1'   # 代码内建缺省是 0 ⇒ 必须显式写 1（删掉 = 静默关闭）
+    'Ffx12Version'              = 'ffx12-fsr4.x'
+    'RenderScaleMenu'           = '1'   # 渲染精度 hook 总开关；显式写入避免"键不存在→依赖缺省"
+    # ---- 2. 透明队列抖动修复（正式功能，默认开）/ TransparentJitter ----
+    # 旧键 JitterFlag* 系列（Probe / Force / ProbeFrames / Hotkey）**已从源码移除**：
+    # 正式版 DLL 里连键名都不存在，写进 ini **没有任何效果**，也不会再打印迁移告警。
+    # 移除原因：命名像"只读诊断探针"，实际承担修复（用户为了关诊断写 Probe=0 会让修复
+    # **静默失效**），且其热键在游戏里被吃掉。迁移目标就是下面的 TransparentJitter。
+    'TransparentJitter'         = '1'   # 1 = 修复生效（默认，实机已验证）；0 = 回退游戏原行为
+    # ---- 3. 绘制入口过滤（正式功能，默认开）/ Draw-entry filter ----
+    'DrawEntryFilter'           = '1'   # 1 = 用 element_count==3 在调用入口早退（默认）
+    'DrawEntryFilterCanary'     = '64'  # 保险抽样：每 64 个非 3 绘制放行 1 个（默认）
+    # ---- 4. 传输与性能 / Transport & performance ----
+    'Ffx12GpuInterop'           = '1'
+    'Fsr2FastStateTracking'     = '1'   # 学到目标 PS hash 后旁路状态镜像钩子（必须为 1）
+    # ---- 5. 画面参数（已按本游戏调优，勿改）/ Frame parameters ----
     # 运动解码：**必须为 1**。2026-09-18 实测 Ffx12MotionDecode=0（raw 变体）会**大幅加剧闪烁**
     # （所有切线明显的线条都闪）——游戏 motion 确为 R10G10B10A2 平方编码，raw 变体量纲错误。
-    # 该变体保留仅供诊断，不要在生产配置里使用。
-    'Ffx12MotionDecode'    = '1'
-    'TraceTextureCreates'  = '0'      # 纹理/目标清单诊断（探针不依赖它）
-    # 抖动模式 3 = 零中心（-(norm*width)+0.5）。模式 4 的值域是 [-1,0]、
-    # 恒定带 -0.5px 偏置 → 时域历史朝错误方向累积（DLSS M/L 上表现为网格黑线，
-    # 其他模型上表现为高对比边缘闪烁）。这是 v2.0.0 起的已知缺陷，勿改回 4。
-    'Ffx12JitterMode'      = '3'
+    'Ffx12MotionDecode'         = '1'
+    # 抖动模式 3 = 零中心（-(norm*width)+0.5）。模式 4 的值域是 [-1,0]、恒定带 -0.5px
+    # 偏置 → 时域历史朝错误方向累积（DLSS M/L 上表现为网格黑线，其他模型上表现为
+    # 高对比边缘闪烁）。这是 v2.0.0 起的已知缺陷，勿改回 4。
+    'Ffx12JitterMode'           = '3'
     # 抖动延迟：**退回 0（当前帧 jitter）**。2026-09-18 改为 1 后用户实测"画面整体变糊"
-    # 且闪烁仍在；单独退回 NonLinear 无效 ⇒ 变糊来源是这一项（预录滞后判断在本游戏不成立）。
-    'Ffx12JitterDelay'     = '0'
-    # 色彩空间：保持 0（线性）。
-    'Ffx12NonLinear'       = '0'
-    # 渲染精度 hook 总开关：1=开启（默认行为）。此键曾被死代码清理整段删除，导致
-    # 渲染精度接管**无条件常开、无法隔离**；显式写入可避免它再次因"键不存在"而
-    # 依赖代码默认值（那样一旦默认值变动就无人察觉）。
-    'RenderScaleMenu'      = '1'
-    # 异步写队列深度。必须在这里写：Add-LogSection 只在**没有** [Log] 段时才补整段，
+    # 且闪烁仍在 ⇒ 变糊来源是这一项（"预录滞后一帧"的判断在本游戏不成立）。
+    'Ffx12JitterDelay'          = '0'
+    'Ffx12NonLinear'            = '0'   # 色彩空间：保持 0（线性）；代码内建缺省是 1
+    'Ffx12PqChain'              = '0'   # 1 会白屏，勿改
+    'Ffx12Hdr'                  = '0'   # 代码内建缺省是 1
+    'Ffx12AutoExposure'         = '1'
+    'Ffx12MotionScale'          = '1.0'
+    'Ffx12VelocityFactor'       = '50'
+    'Ffx12DepthInverted'        = '1'
+    'Ffx12FovScale'             = '1.0'
+    'Ffx12CameraNear'           = '0.5' # 代码内建缺省是 0.25 —— 两者不同，勿删行
+    'Ffx12CameraFar'            = '6000.0'
+    # ---- 6. FSR2 输入 / 蒙版 / 合成族 / FSR2 input, masks, compositing ----
+    'Fsr2MotionVectorScaleMode' = '1'
+    'Fsr2MotionVectorsJittered' = '0'
+    'Fsr2JitterMode'            = '3'
+    'Fsr2UseReactiveMask'       = '0'   # 代码内建缺省是 1
+    'Fsr2UseTransparencyMask'   = '0'
+    'Fsr2FamilySkip'            = '1'   # 代码内建缺省是 0 ⇒ 删行会失去该优化
+    'Fsr2Il2CppHook'            = '1'   # 代码内建缺省是 0 ⇒ 删行会让桥接失效
+    'Ffx12ReuseSameGeneration'  = '0'   # 开启会产生残像
+    'Ffx12FeatureFallback'      = '1'
+    # ---- 日志（[Log] 段）/ Logging ----
+    # 必须在这里写：Add-LogSection 只在**没有** [Log] 段时才补整段，
     # 而已部署的 ini 都已有 [Log] 段 → 段内的新键永远不会被补上（实测 queue_capacity 缺失）。
-    'queue_capacity'       = '8192'
-    # 透明队列抖动修复（**正式功能，默认开**）：强制 il2cpp setter
-    # Camera.set_useJitteredProjectionMatrixForTransparentRendering 的实参为 true，
-    # 让透明队列物件参与超分的时间重建（修翅膀水晶羽片 / 月环边缘硬阶梯）。
-    # 放在这里是为了避免"键不存在 ⇒ 依赖代码默认值 ⇒ 默认值一变无人察觉"（同 RenderScaleMenu 的教训）。
-    # ⚠️ 旧键 JitterFlagProbe / JitterFlagProbeFrames / JitterFlagForce / JitterFlagHotkey
-    # 已废弃：命名像"只读诊断探针"，实际承担修复（用户为了关诊断写 Probe=0 会让修复**静默失效**），
-    # 且其热键在游戏里被吃掉。本脚本不再写这 4 个键；DLL 仍兼容读取，但会写一行
-    # legacy/removed_transparent_jitter_keys_* 告警提示迁移。见 TransparentJitterHook.h。
-    'TransparentJitter'    = '1'      # 1 = 修复生效（默认，实机已验证）；0 = 回退游戏原行为
-    # 分段性能探针（**诊断，默认关**）：把每帧按段实测（Present / upscale / il2cpp
-    # 回调 / draw 钩子 / dispatch 钩子 / GPU 查询 / 配置 IO / 互操作与 fence 等待 /
-    # TransparentJitter observer），每个间隔输出一行汇总。见 PerfProbe.h。
-    # ⚠️ 平时保持 0：它是诊断开关，且逐 draw 钩子只**抽样**计时（DrawSample 步长）。
-    'PerfProbe'            = '0'
-    'PerfProbeIntervalMs'  = '1000'
-    'PerfProbeDrawSample'  = '32'
-    # FSR2 输入纹理转储（默认关）。抓帧用热键，**跑完务必改回 0**（每组 3 帧约 130 MB）。
-    'Fsr2InputDump'          = '0'
-    'Fsr2InputDumpFrames'    = '3'
-    'Fsr2InputDumpIntervalMs'= '0'
-    'Fsr2InputDumpHotkey'    = '122'
-    'Fsr2InputDumpAutoStartSec' = '0'
-    'Fsr2InputDumpRaw'       = '1'
-    'Fsr2InputDumpPng'       = '1'
-    'Fsr2InputDumpMaxDim'    = '2048'
+    'queue_capacity'            = '8192'
 }
 $logSection = @(
     '[Log]',

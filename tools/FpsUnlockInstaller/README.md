@@ -42,6 +42,26 @@ OptiScaler 和 ReShade 各自从组件目录读取运行配置。不会随组件
 
 配置器从自身目录动态计算完整路径并写入 FPS Unlock 的 DLL 列表；组件内部配置尽量只使用相对路径。OptiScaler 使用 `OptiDllPath=.` 与 `LogFileName=OptiScaler.log`，ReShade 使用相对于组件目录的着色器、纹理、Preset 和截图路径。只有游戏目录中的 ReShade `[INSTALL] BasePath` 重定向在跨目录或跨盘时使用动态绝对路径。发布包没有写死安装位置；移动整个目录后重新运行配置即可刷新重定向和注入路径。
 
+## 升级与已部署目录（不清理，增量替换）
+
+**已解压、已部署出去的安装目录不会被任何脚本整目录清空。** 升级一律是"同名覆盖"式增量替换：
+
+- **组件文件**：只覆盖包内同名文件（`payload\Bridge\Dx11FsrBridge.dll`、`payload\AntiPlayerMosaic\AntiPlayerMosaic.dll`、
+  `payload\TextureLoader\TextureLoader.dll` 等）。
+- **用户配置保留**：`fps_config.json`、`payload\Bridge\Dx11FsrBridge.ini`、`payload\OptiScaler\OptiScaler.ini` /
+  `fakenvapi.ini`、`payload\ReShade\ReShade.ini` / `ReShadePreset.ini`、`payload\TextureLoader\TextureLoader.ini`
+  在自更新时被显式跳过（见 `scripts\Apply-PackageUpdate.ps1` 的保留清单）。
+- **用户新增文件保留**：ReShade 效果库（`payload\ReShade\reshade-shaders\` 下自行添加的 Shaders / Textures）、
+  `payload\TextureLoader\Mods\` 下的纹理 Mod，以及其它自定义文件都不会被删除——只做增量新增与同名替换。
+- **唯一例外**：执行"安装 / 更新 OptiScaler"时，`payload\OptiScaler\` 目录会被重建后再放入精选组件文件
+  （脚本会先保留 `OptiScaler.ini`、`fakenvapi.ini` 与已有的 `nvngx_dlss*.dll`）。
+  请不要把自定义文件放在该目录；放在 `payload\default_config\` 或游戏目录更安全。
+- **不要清空已部署目录**：手动升级时把新包解压到**另一个**目录，再把需要更新的文件逐个同名覆盖过去即可。
+  清空已部署目录会毁掉一个正在用的安装（用户配置、效果库与 Mod 都会一起丢失）。
+
+安装器自身的自更新（`scripts\Apply-PackageUpdate.ps1`）也遵循同一条规则：新包内容覆盖到安装目录，
+保留上述用户配置，然后删除的只是**下载下来的临时解压目录**，不是安装目录。
+
 ## 渲染精度菜单
 
 Bridge 将原神渲染精度菜单扩展为 `0.2 / 0.3 / 0.4 / 0.5 / 0.6 / 0.7 / 0.8 / 0.9 / 0.999`。比例根据当前输出分辨率动态生效；例如 4K 输出下 `0.5` 为 `1920×1080`，`0.6` 为 `2304×1296`。

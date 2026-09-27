@@ -1,4 +1,26 @@
-﻿[CmdletBinding()]
+﻿# Build-OnlineInstaller.ps1 — 发布包构建入口（本地完整包 / GitHub 合规包 / 芙芙商城包）。
+#
+# ── 打包产物清理规则（每次运行都执行；实现见 Remove-DistArtifacts）────────────
+# ① 打包产物**每次编译都先清理再重建**：本脚本在编译**之前**按**模式**删除 dist 下
+#    所有由本流程产生的产物文件与中间 stage 目录（模式清单见 $script:distArtifactPatterns）。
+#    清理必须按模式做、不能列死文件名 —— 历史缺陷正是清理 glob 漏了 GitHub 包的命名前缀
+#    `GenshinFSRBridge_v*`（含被解压出来的同名目录），于是 2.2.0 的旧包与旧目录在出
+#    2.3.0 时仍留在 dist 里（有误发风险）。
+#    清理失败（产物被解压工具 / 启动器 / 资源管理器预览占用）会**直接报错中止**，
+#    绝不静默跳过 —— 静默跳过会让人以为"清了"其实没清。
+# ② 已解压、已部署的安装目录**不清理**：本脚本只动 dist 下的构建产物，不触碰任何已部署
+#    目录（例如 `D:\miHoYo Games\Starward\原神解帧FSR插件包\`、芙芙启动器插件目录）。
+#    这些目录升级一律走**手动增量替换**（覆盖同名文件、保留用户配置与用户新增文件），
+#    不做整目录清空 —— 清掉会毁掉一个正在用的安装。
+#    安装器侧对应说明见 README.md「构建」与 tools/FpsUnlockInstaller/README.md。
+# ③ 只清 dist 下**本流程自有**的模式，**不删整个 dist**：dist 里可能还有人工放入的调试包、
+#    发布笔记或验证目录，它们不属于本流程。整个删除会牵连这些无关内容。
+#    唯一例外是 $script:distOwnedDirectories：完全由本脚本生成、每轮都会重建的目录。
+#
+# 用法：
+#   powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 [-Configuration Release]
+#   [-GithubOnly] [-FetchUpstream] [-SevenZipPath <7z.exe>]
+[CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release', 'RelWithDebInfo', 'MinSizeRel')]
     [string]$Configuration = 'Release',
@@ -35,6 +57,40 @@ $tloaderConfig = Join-Path $tloaderSource 'TextureLoader.ini'
 $script:bridgeDll = $null
 $script:antiDll = $null
 $script:tloaderDll = $null
+
+# ── 规则①：本流程在 dist 下产生的产物 / 中间目录的清理模式 ──────────────────────
+# 全部按**模式**匹配（而非列死版本号文件名），新增版本号无需改这里。
+# 已知产物清单（脚本内 Join-Path $dist 的全部落点）：
+#   dist\原神解帧FSR插件包_v<ver>.7z                 本地/国内完整包（7z；历史版本曾用 .zip）
+#   dist\原神解帧FSR插件包Lite_* / Full_*.7z|.zip     历史命名（保留兼容）
+#   dist\芙芙启动器插件包Lite_* / Full_*.zip          历史命名（保留兼容）
+#   dist\FSR-Bridge-Plugin.v<ver>.zip                芙芙启动器商城包
+#   dist\GenshinFSRBridge_v<ver>.zip                 GitHub 合规包在 dist 的中间产物
+#                                                    （-GithubOnly 时会留在 dist）
+#   dist\GenshinFSRBridge_v<ver>\                    同名目录：手工解压该包做验证时的遗留
+#   dist\github-release\GenshinFSRBridge_v<ver>.zip  GitHub 发布目录（整目录由本脚本重建）
+#   dist\.fps-full-stage\ .fps-github-stage\ .fufu-marketplace-stage\  中间 stage 目录
+$script:distArtifactPatterns = @(
+    '原神解帧FSR插件包_v*',
+    '原神解帧FSR插件包Lite_*',
+    '原神解帧FSR插件包Full_*',
+    '芙芙启动器插件包Lite_*',
+    '芙芙启动器插件包Full_*',
+    # ⚠️ 这一条是历史缺陷的根因：旧清理 glob 只覆盖 `原神解帧FSR插件包_v*` 与
+    # `FSR-Bridge-Plugin.v*`，漏了 GitHub 包的命名前缀，于是旧包/旧解压目录无限累积。
+    # 该模式同时匹配文件（.zip）与目录（解压出来的同名目录）。
+    'GenshinFSRBridge_v*',
+    'FSR-Bridge-Plugin.v*',
+    # 任意中间 stage：`.fps-full-stage` 以 -stage 结尾，`*.stage` 匹配不到它，
+    # 故两个模式都要有（覆盖 `*.stage` 与 `*-stage` 两种命名习惯）。
+    '*.stage',
+    '*-stage'
+)
+# 完全由本脚本生成、每轮都会重建的目录：连目录本身一起删（含 github-release\GenshinFSRBridge_v*）。
+$script:distOwnedDirectories = @('github-release')
+$script:cleanupFailureHint = '常见原因：该文件正被占用（资源管理器预览、解压工具 / 7-Zip 窗口、' +
+    '启动器或游戏正在读取该包）。请关闭占用程序后重新运行本脚本。清理失败**不会**被静默跳过 —— ' +
+    '否则 dist 会同时留有旧包与新包，存在误发风险。'
 
 function Get-BridgeVersion {
     $version = [string](Get-Item -LiteralPath $bridgeDll).VersionInfo.FileVersion
@@ -110,6 +166,53 @@ function Build-PackageComponents {
     }
 }
 
+function Remove-BuildOutputPath {
+    # 删除一个产物路径（文件或目录）。返回 $null 表示已删除或本就不存在；
+    # 返回错误说明字符串表示删除失败（调用方决定是抛错还是告警）——不静默吞掉失败。
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        return $null
+    }
+    catch {
+        return ("{0} — {1}" -f $Path, $_.Exception.Message)
+    }
+}
+
+function Remove-DistArtifacts {
+    # 规则①：每次运行（编译前）按模式删除 dist 下本流程产生的产物与中间 stage 目录。
+    # 幂等：目录/文件不存在时跳过；连续运行不会报错。
+    # 失败即中止并列出全部失败项 + 可操作提示（绝不静默跳过）。
+    param([Parameter(Mandatory)][string]$DistPath)
+
+    New-Item -ItemType Directory -Path $DistPath -Force | Out-Null
+    $targets = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($pattern in $script:distArtifactPatterns) {
+        foreach ($item in @(Get-ChildItem -LiteralPath $DistPath -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like $pattern })) {
+            $targets[$item.FullName] = $item.FullName
+        }
+    }
+    foreach ($name in $script:distOwnedDirectories) {
+        $owned = Join-Path $DistPath $name
+        if (Test-Path -LiteralPath $owned) { $targets[$owned] = $owned }
+    }
+
+    $failures = [Collections.Generic.List[string]]::new()
+    foreach ($path in @($targets.Values | Sort-Object)) {
+        $removeFailure = Remove-BuildOutputPath -Path $path
+        if ($null -ne $removeFailure) { $failures.Add($removeFailure) }
+        else { Write-Host "  已清理 $path" -ForegroundColor DarkGray }
+    }
+    if ($failures.Count -gt 0) {
+        throw ("打包产物清理失败，共 $($failures.Count) 项（未静默跳过）：" +
+            [Environment]::NewLine + ($failures -join [Environment]::NewLine) +
+            [Environment]::NewLine + $script:cleanupFailureHint)
+    }
+    Write-Host "打包产物清理完成：已删除 $($targets.Count) 项旧产物 / 中间目录。" -ForegroundColor Cyan
+}
+
 function Reset-Stage {
     param([string]$Path)
     $distRoot = [IO.Path]::GetFullPath($dist).TrimEnd('\') + '\'
@@ -117,7 +220,11 @@ function Reset-Stage {
     if (-not $fullPath.StartsWith($distRoot, [StringComparison]::OrdinalIgnoreCase)) {
         throw "构建目录不在 dist 下: $fullPath"
     }
-    if (Test-Path -LiteralPath $fullPath) { Remove-Item -LiteralPath $fullPath -Recurse -Force }
+    # 规则①：重建前必须先删掉旧 stage（幂等：不存在则跳过；删不掉则报错中止）
+    $removeFailure = Remove-BuildOutputPath -Path $fullPath
+    if ($null -ne $removeFailure) {
+        throw ("中间 stage 目录清理失败：$removeFailure" + [Environment]::NewLine + $script:cleanupFailureHint)
+    }
     New-Item -ItemType Directory -Path $fullPath -Force | Out-Null
 }
 
@@ -414,7 +521,11 @@ function Build-FpsPackage {
         return $archive
     }
     finally {
-        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+        # 清理中间 stage：失败时告警而非抛错，避免覆盖 finally 之前真正的打包异常。
+        $removeFailure = Remove-BuildOutputPath -Path $stage
+        if ($null -ne $removeFailure) {
+            Write-Warning ("中间 stage 目录未能删除：$removeFailure" + [Environment]::NewLine + $script:cleanupFailureHint)
+        }
     }
 }
 
@@ -422,7 +533,8 @@ function Build-FufuMarketplacePackage {
 param([Parameter(Mandatory)][string]$Version)
 $version = $Version
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
-Get-ChildItem -LiteralPath $dist -File -Filter 'FSR-Bridge-Plugin.v*.zip' -ErrorAction SilentlyContinue | Remove-Item -Force
+# 旧的 FSR-Bridge-Plugin.v*.zip 已由编译前的 Remove-DistArtifacts 按模式清除（规则①），
+# 这里不再重复清理（同一套模式只保留一个权威实现）。
 
 Invoke-Cmake @('-S', $fufuSource, '-B', $fufuBuild, '-G', 'Ninja', "-DCMAKE_BUILD_TYPE=$Configuration")
 Invoke-Cmake @('--build', $fufuBuild)
@@ -541,7 +653,11 @@ try {
     Write-Host "$($item.Name)  $($item.Length) bytes  SHA256=$((Get-FileHash $archive -Algorithm SHA256).Hash)"
 }
 finally {
-    if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+    # 清理中间 stage：失败时告警而非抛错，避免覆盖 finally 之前真正的打包异常。
+    $removeFailure = Remove-BuildOutputPath -Path $stage
+    if ($null -ne $removeFailure) {
+        Write-Warning ("中间 stage 目录未能删除：$removeFailure" + [Environment]::NewLine + $script:cleanupFailureHint)
+    }
 }
 
 return (Join-Path $dist "FSR-Bridge-Plugin.v$version.zip")
@@ -552,6 +668,11 @@ if ($FetchUpstream) {
     & (Join-Path $root 'tools\Update-UpstreamComponents.ps1') -WorkspaceRoot $root
     if ($LASTEXITCODE -ne 0) { throw '上游组件更新失败。' }
 }
+
+# 规则①：**编译前**先清掉本流程会产生的 dist 产物与中间 stage 目录（按模式，见
+# Remove-DistArtifacts）。放在编译之前有两个好处：清理逻辑不再依赖编译产物的版本号；
+# 产物被占用时会立刻报错，不会先花时间编译再失败。
+Remove-DistArtifacts -DistPath $dist
 
 Build-PackageComponents
 
@@ -567,20 +688,10 @@ if (-not (Test-Path -LiteralPath $tloaderConfig -PathType Leaf)) {
 
 # 上游版本一致性由 tools\Update-UpstreamComponents.ps1 保证（官方包 SHA-256 校验 + versions.json 记录 FileVersion）。
 $version = Get-BridgeVersion
-New-Item -ItemType Directory -Path $dist -Force | Out-Null
-foreach ($pattern in @(
-    '原神解帧FSR插件包_v*.zip',
-    '原神解帧FSR插件包_v*.7z',
-    '原神解帧FSR插件包Lite_*.zip',
-    '原神解帧FSR插件包Lite_*.7z',
-    '原神解帧FSR插件包Full_*.zip',
-    '原神解帧FSR插件包Full_*.7z',
-    '芙芙启动器插件包Lite_*.zip',
-    '芙芙启动器插件包Full_*.zip',
-    'FSR-Bridge-Plugin.v*.zip'
-)) {
-    Get-ChildItem -LiteralPath $dist -File -Filter $pattern -ErrorAction SilentlyContinue | Remove-Item -Force
-}
+# 产物清理已在编译前由 Remove-DistArtifacts 完成（规则①）。旧实现是这里的一段
+# 列死文件名的清理循环：它漏掉了 `dist\GenshinFSRBridge_v*`（GitHub 包及其解压目录）
+# 与 stage 目录模式，导致旧版本包被永久留在 dist 中（有误发风险）。
+# 不要把清理挪回这里：清理放在编译前，不依赖编译产物版本号，且产物被占用时能早失败。
 
 $localArchive = $null
 $fufuArchive = $null
@@ -594,7 +705,8 @@ if (-not $GithubOnly) {
 # DLSS 由 Configure.ps1 从 NVIDIA 官方 Streamline 下载；ReShade 官方指引 "Do NOT share the
 # binaries"，由 Configure.ps1 从 reshade.me 官方下载）。
 $githubReleaseDist = Join-Path $dist 'github-release'
-if (Test-Path -LiteralPath $githubReleaseDist) { Remove-Item -LiteralPath $githubReleaseDist -Recurse -Force }
+# 该目录完全由本脚本生成（$script:distOwnedDirectories），其旧内容已由编译前的
+# Remove-DistArtifacts 整目录清除（含 github-release\GenshinFSRBridge_v*）。这里只保证存在。
 New-Item -ItemType Directory -Path $githubReleaseDist -Force | Out-Null
 $githubArchive = Join-Path $githubReleaseDist "GenshinFSRBridge_v$version.zip"
 $githubSourceArchive = Build-FpsPackage -Version $version -ArchiveFormat Zip

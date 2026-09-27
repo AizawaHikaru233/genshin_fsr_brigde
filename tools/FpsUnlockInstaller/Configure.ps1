@@ -669,6 +669,61 @@ function Get-OptiScalerUpscalingManifest {
     return $script:OptiScalerUpscalingManifestData
 }
 
+function Remove-ManagedOptiScalerFiles {
+    param([string]$RootDirectory)
+    # 按【托管清单】删除已部署的托管运行时文件，**保留一切非托管文件**。
+    #
+    # 清单来源：Get-OptiScalerUpscalingManifest ⇒ 部署包内
+    #   `payload\default_config\OptiScaler-UpscalingFiles.json` 的 `RuntimeFiles`。
+    #   仓库侧唯一权威源是 `SharedResources\OptiScaler\runtime\OptiScaler-UpscalingFiles.json`：
+    #   Build-OnlineInstaller.ps1 把它拷进 `payload\default_config\`，
+    #   tools\Update-UpstreamComponents.ps1 把它列入 preserve（不被上游包覆盖）。
+    #
+    # 为什么必须按清单删：Install-OptiScaler 在"安装 / 更新"时要先清掉**旧的托管文件**，
+    # 否则切换布局（平铺 ⇄ 嵌套）或降级时会残留旧组件。原实现对 $optiRootDir 做
+    # `Remove-Item -Recurse -Force`（整目录清空），代价是把**用户自己放进去的东西**
+    # 一起删掉（自定义 OptiScaler 版本、额外后端 DLL、自建配置、日志）。
+    #
+    # 扫描两个基目录：
+    #   · $RootDirectory              —— 平铺布局的组件目录，以及**永远在根层**的主 DLL
+    #   · $RootDirectory\OptiScaler   —— 嵌套布局的组件目录（含旧布局残留）
+    # 两处都扫：本次安装可能把布局从平铺换成嵌套（或反之），旧布局下的托管文件若不清掉
+    # 就会残留并被 OptiScaler 加载。**只删清单里列出的文件**；目录本身一律不动 ——
+    # 嵌套目录里的非托管文件必须活着，残留的空目录无害。
+    #
+    # fail-safe（清单缺失 / 损坏 / 读不出 RuntimeFiles）：**一个文件都不删**，只打警告。
+    # 绝不回退到"整目录删"——那正是本函数要消灭的行为。
+    $runtimeFiles = @()
+    try {
+        $runtimeFiles = @((Get-OptiScalerUpscalingManifest).RuntimeFiles |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    }
+    catch {
+        Write-Warning (Convert-InstallerText -Value "OptiScaler 超分文件清单不可用，已跳过托管旧文件清理（不会删除任何文件）：$($_.Exception.Message)")
+        return @()
+    }
+    if ($runtimeFiles.Count -eq 0) {
+        Write-Warning (Convert-InstallerText -Value 'OptiScaler 超分文件清单里没有 RuntimeFiles，已跳过托管旧文件清理（不会删除任何文件）。')
+        return @()
+    }
+    $removedFiles = New-Object System.Collections.Generic.List[string]
+    $baseDirectories = @($RootDirectory, (Join-Path $RootDirectory 'OptiScaler')) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+        Select-Object -Unique
+    foreach ($relativePath in $runtimeFiles) {
+        $relative = ([string]$relativePath).TrimStart('\', '/')
+        if ([string]::IsNullOrWhiteSpace($relative)) { continue }
+        foreach ($baseDirectory in $baseDirectories) {
+            $candidate = Join-Path $baseDirectory $relative
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                Remove-Item -LiteralPath $candidate -Force
+                $removedFiles.Add($candidate)
+            }
+        }
+    }
+    return $removedFiles.ToArray()
+}
+
 function Copy-CuratedOptiScaler {
     param([string]$SourceDirectory, [string]$RootDirectory, [string]$ComponentDirectory)
     # 目标分两层，对应 OptiScaler 的两种发行布局：
@@ -907,7 +962,16 @@ function Install-OptiScaler {
                 }
             }
         }
-        if (Test-Path -LiteralPath $optiRootDir) { Remove-Item -LiteralPath $optiRootDir -Recurse -Force }
+        # 按【托管清单】删掉旧的托管运行时文件 —— **不再整目录清空**。
+        # 旧实现是 `Remove-Item $optiRootDir -Recurse -Force`：它会连带删掉用户放进
+        # `payload\OptiScaler` 的一切（自定义 OptiScaler 版本、额外后端 DLL、自建配置、
+        # 日志、旧布局残留目录里的其它文件）。按清单删之后，非托管文件一律保留。
+        # 与打包侧规则②一致：已部署目录不清空、升级走手动增量替换。
+        # 清单不可用时本函数只打警告、一个文件都不删（见其 fail-safe 说明）。
+        $removedManagedFiles = @(Remove-ManagedOptiScalerFiles -RootDirectory $optiRootDir)
+        if ($removedManagedFiles.Count -gt 0) {
+            Write-Host ("已按清单清理 {0} 个托管旧文件（非托管文件保留）。" -f $removedManagedFiles.Count) -ForegroundColor DarkGray
+        }
         Copy-CuratedOptiScaler -SourceDirectory $sourceComponentDirectory `
             -RootDirectory $targetRootDirectory -ComponentDirectory $targetComponentDirectory
         Copy-Item -LiteralPath $stagedConfigTemplate -Destination $optiDefaultIni -Force
