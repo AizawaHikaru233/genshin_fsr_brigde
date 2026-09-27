@@ -259,6 +259,22 @@ struct Config
     bool perf_probe = false;
     std::uint32_t perf_probe_interval_ms = 1000;
     std::uint32_t perf_probe_draw_sample = 32;
+    // 【正式功能】入口级过滤（B109，**默认开**）：`inspect_target_upscaler_draw_on_demand`
+    // 的调用入口处用调用实参淘汰 `element_count != 3` 的绘制（零 COM 调用）。
+    //
+    // 依据（真机 `perf_probe_draw_shape_draw` 第 4 行元素数直方图）：`count == 3` 是
+    // **唯一有 hits 的桶**（`elem_ix 3` / `elem_dr 3`），其余 24 个区间 hits 全 0，
+    // `outside_hits = 0` ⇒ 样本内约 6000 次识别全部满足 `count == 3`；
+    // 每区间约 121,100 次调用里可拒掉约 92.2% ⇒ 省约 `0.45 µs × 490 × 92.2% ≈ 203 µs/帧`。
+    //
+    // ⚠️ 代码层面**两套签名都不检查 `element_count`**（on-demand 路径的注释明说"不硬性
+    // 要求 3"）⇒ 判据只是"样本内的必要条件"、**不是代码级等价** ⇒ 因此带**自我证伪保险**
+    // （识别成功处检查 element_count，出现非 3 就一次性停用过滤器并打告警行，fail-open）
+    // 与 **canary 抽样放行**（让保险可观测，见 PerfProbe.h 的说明）。
+    bool draw_entry_filter = true;
+    // canary 抽样步长：N = 每 N 个非 3 绘制放行 1 个进内省（保险的探针）；
+    // 0 = 不放行（完全信任判据）；1 = 全部放行（等价于不过滤）。
+    std::uint32_t draw_entry_filter_canary = 64;
     // Phase 1：进程内 FSR2 2.3.4 后端（ffxApi → amd_fidelityfx_upscaler_dx12.dll）。
     // 桥直接驱动 AMD SDK（不经 OptiScaler）；Phase 2 的调用点接管会调用它的 dispatch。
     bool ffx12 = false;
@@ -4336,6 +4352,18 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"PerfProbeIntervalMs", 1000, config_path.c_str()));
     g_config.perf_probe_draw_sample = static_cast<std::uint32_t>(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"PerfProbeDrawSample", 32, config_path.c_str()));
+
+    // 【正式功能】入口级过滤（B109）——**段必须是 `[Dx11FsrBridge]`**（放错段读不到，
+    // 本项目踩过这个坑）。⚠️ 它与 `PerfProbe` 总开关**无关**：探针关着它照样生效
+    // （保险的告警行也照样会打出来 —— 它走的是无条件注入的 sink）。
+    //
+    // `DrawEntryFilter=1`（默认）= 在调用入口用 `element_count == 3` 早退；
+    // `=0` = 关闭，一切走原路径（保险触发后用户也可以手动关）。
+    g_config.draw_entry_filter =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"DrawEntryFilter", 1, config_path.c_str()) != 0;
+    // canary 抽样步长（保险的探针，见 PerfProbe.h）：0 = 不放行；1 = 全部放行；N = 每 N 个 1 个。
+    g_config.draw_entry_filter_canary = static_cast<std::uint32_t>(
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"DrawEntryFilterCanary", 64, config_path.c_str()));
 }
 
 bool process_matches()
@@ -4451,6 +4479,19 @@ bool safe_read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo
         out_info = {};
         return false;
     }
+}
+
+// 【诊断】B106：`safe_read_resource_info` 的"内省路径"包装 —— 顺带记工作量
+// （`perf_probe::note_view_read`，用于回答"优化到底少读了多少个视图"）。
+//
+// 等价性：相对 `safe_read_resource_info` 只多做**一次计数器自增**（探针关时是一个可预测的
+// 空分支），读取的视图、SEH 保护、返回语义**一字未改**；空指针一次也不计
+// （`safe_read_resource_info` 对空指针直接返回 false，不做任何 COM 调用）。
+bool safe_read_resource_info_counted(ID3D11View *view, const wchar_t *kind, ResourceInfo &out_info)
+{
+    if (view != nullptr)
+        perf_probe::note_view_read();
+    return safe_read_resource_info(view, kind, out_info);
 }
 
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
@@ -7865,12 +7906,23 @@ std::uint64_t upscaler_path_fingerprint(
 }
 
 // 快速路径：正缓存命中（output 特征匹配 + 按缓存布局读 3 SRV 指纹验证）→ 直接构造 info。
+//
+// ⚠️ 2026-09-27（B106）：新增出参 `out0_info`。理由与等价性：
+//   本函数**本来就必须**先读一次 RTV[0]（output 特征匹配的前提），而调用方在"快路径未命中"
+//   之后**还要**再读**同一个** RTV[0] 作为 `outputs[0]`。同一个视图对象在同一次调用内
+//   读取两次，字段逐位相同（`read_resource_info` 是纯读：视图→资源在创建后不可变，
+//   `kind` 形参本身未被使用；读失败时两次都得到空 info）⇒ 把第一次的结果交回调用方复用，
+//   **不改变任何判定**，只是少付一次 `GetResource+GetType+QI+GetDesc+QI+GetDesc`。
 std::optional<TargetUpscalerDrawInfo> try_upscaler_path_cache_fast(
     ID3D11RenderTargetView *const *render_targets,
-    ID3D11ShaderResourceView *const *shader_resources)
+    ID3D11ShaderResourceView *const *shader_resources,
+    ResourceInfo &out0_info)
 {
     ResourceInfo out0 {};
-    safe_read_resource_info(render_targets[0], L"fsr2_path_out", out0);
+    // ⚠️ B106：用 `safe_read_resource_info_counted`（只多记一次工作量计数）——
+    // 本函数在内省路径上，读的视图数正是"优化到底少做了多少工作"要对比的量。
+    safe_read_resource_info_counted(render_targets[0], L"fsr2_path_out", out0);
+    out0_info = out0; // 交回调用方（见上：等价性论证）
     if (out0.resource_key == 0)
         return std::nullopt;
 
@@ -7883,15 +7935,15 @@ std::optional<TargetUpscalerDrawInfo> try_upscaler_path_cache_fast(
             continue; // output 段不匹配：跳过（避免按旧布局读 SRV）
 
         ResourceInfo color {}, motion {}, depth {};
-        safe_read_resource_info(shader_resources[entry.color_slot], L"fsr2_path_color", color);
-        safe_read_resource_info(shader_resources[entry.motion_slot], L"fsr2_path_motion", motion);
-        safe_read_resource_info(shader_resources[entry.depth_slot], L"fsr2_path_depth", depth);
+        safe_read_resource_info_counted(shader_resources[entry.color_slot], L"fsr2_path_color", color);
+        safe_read_resource_info_counted(shader_resources[entry.motion_slot], L"fsr2_path_motion", motion);
+        safe_read_resource_info_counted(shader_resources[entry.depth_slot], L"fsr2_path_depth", depth);
         if (color.resource_key == 0 || motion.resource_key == 0 || depth.resource_key == 0)
             continue;
 
         ResourceInfo out1 {};
         if (entry.output_rtv_slot < 2)
-            safe_read_resource_info(render_targets[entry.output_rtv_slot], L"fsr2_path_out1", out1);
+            safe_read_resource_info_counted(render_targets[entry.output_rtv_slot], L"fsr2_path_out1", out1);
 
         std::uint64_t h = 14695981039346656037ull;
         const auto mix = [&h](std::uint64_t v) { h ^= v; h *= 1099511628211ull; };
@@ -8174,6 +8226,13 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(UINT element_
     }
 #endif
 
+    // 【B109 保险】识别成功点 ④（g_state 镜像路径）：这条路径**代码上**在本函数第一行就
+    // 拒绝了非 3（`element_count != 3 ⇒ nullopt`）⇒ 检查在此**必然成立**；它与另外三处
+    // 一起构成"所有识别成功路径都检查过"的完整覆盖（将来若有人放宽上面那个判据，
+    // 这里就会立刻把入口过滤器自我证伪掉，而不是静默缩小识别集合）。
+    perf_probe::note_draw_identified_element_count(element_count, perf_probe::DrawEntryKind::mirror,
+                                                   false);
+
     return identified;
 }
 
@@ -8181,13 +8240,73 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(UINT element_
 // mode 2 的按需识别路径：不依赖 Set 钩子维护的 g_state 镜像，在候选 draw 现场直接查询
 // 状态并做完整签名校验。两段式：先用"双 RTV"预筛掉绝大多数 draw（TAAU 签名要求
 // 同时绑定 output_metadata 与 output_color 两个 RTV），再对剩余候选做全量内省。
-// element_count 不硬性要求 3（国际服等 TAAU 可能用 DrawIndexed 非 3 顶点）——
+// ⚠️ **B109 更正（原文：`element_count` 不硬性要求 3）**：本函数体**从头到尾不读**
+// `element_count`（两套签名也不吃它）⇒ 识别结果只取决于当时的 D3D 状态；但真机
+// 元素数直方图证明"`count == 3` 是唯一有 hits 的桶"（`outside_hits = 0`）⇒ 因此
+// **入口处**加了 `element_count != 3` 的早退（见下方入口级过滤那一大段注释）。
+// 它不是代码级等价（上面那句"不硬性要求 3"就是证据）⇒ 配套**自我证伪保险 + canary**。
 // 双 RTV 预筛前置（任意 draw 低成本 2 COM），单 RTV 直接拒绝（安全）。
 // 不做任何 shader hash 过滤，因此技能等使用不同 shader 的 TAAU 路径同样能被识别。
 std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     ID3D11DeviceContext *context,
-    UINT element_count)
+    UINT element_count,
+    const perf_probe::DrawShapeMarkArmed &draw_shape_mark = perf_probe::DrawShapeMarkArmed {})
 {
+    // 【诊断】B106 漏斗（默认关，跟 `PerfProbe` 总开关）：给这条函数的**每一道判定**
+    // 之后"还剩多少"记一个抽样计数 ⇒ 才能回答"哪一道最便宜且最有区分度"。
+    //   - 一次采样的决定在这里定死，之后每个阶段只在这个决定为真时自增
+    //     ⇒ 各阶段必然来自同一批调用，相邻两级相减就是这一道拦下的量；
+    //   - 漏斗的**形状与判定顺序无关**（每个阶段计的是"满足前 k 条纯谓词的 draw 数"）
+    //     ⇒ 本轮的漏斗读数和旧顺序下的漏斗读数**是同一批集合**；
+    //   - 探针关时：构造里只有一次 relaxed 读，`mark()` 是可预测的空分支（不加原子操作）。
+    // 见 `PerfProbe.h` 的 `FunnelStage` / `FunnelScope`。
+    perf_probe::FunnelScope perf_funnel;
+    perf_funnel.mark(perf_probe::FunnelStage::entry);
+
+    // =======================================================================
+    // 【正式功能】B109 入口级过滤：**在进内省之前**用调用实参淘汰。
+    //
+    //   判据：`element_count != 3` ⇒ 直接 `return std::nullopt`（**零 COM 调用**）。
+    //         `element_count` 就是两个钩子入口传进来的实参 —— 索引绘制是 `IndexCount`
+    //         （`hooked_draw_indexed`）、非索引绘制是 `VertexCount`（`hooked_draw`）。
+    //
+    //   真机依据（用户实测 `perf_probe_draw_shape_draw` 第 4 行元素数直方图）：
+    //     `elem_ix 3: 2490/249` 与 `elem_dr 3: 6997/250` 是**唯一有 hits 的两个桶**
+    //     （calls/hits），其余区间（6 / 12 / 17-31 / 32-63 / … / 32768+）hits **全为 0**
+    //     ⇒ 样本内约 6000 次识别**全部**满足 `count == 3`（`outside_hits = 0`）；
+    //     ⇒ 每区间约 121,100 次调用里约 111,613 次可拒（**92.2%**）
+    //     ⇒ 省 `0.45 µs × 490 draws/帧 × 92.2% ≈ 203 µs/帧`（正是那 ~10 fps 的量级）。
+    //
+    //   ⚠️ **等价性（代码级，必须说清）**：`element_count` 在本函数体内**一次都没被读**
+    //      （它只是形参；下面两套签名 `fixed_slot_identify` /
+    //      `identify_target_upscaler_resources` 都**不检查**它，函数上方注释也明说
+    //      "不硬性要求 3"）⇒ 一次绘制的识别结果**只取决于当时的 D3D 状态**
+    //      （RTV/SRV/cb0/视口/正缓存），与它的元素数**无因果关系**。
+    //      ⇒ 本条判据**不是**代码级等价：它拒掉的调用在**代码上不排除**"状态恰好也匹配"
+    //      的可能（真机 `outside_hits = 0` 是唯一的经验支撑）。
+    //      ⇒ 所以它必须带**自我证伪保险**（见下方两处识别成功点的
+    //      `note_draw_identified_element_count`）与 **canary 抽样放行**
+    //      （`DrawEntryFilterCanary`，默认 64 ⇒ 保险可观测）。两者都在 `PerfProbe.h`。
+    //
+    //   ⚠️ 位置刻意在 `FunnelStage::entry` 之后、`context` 判空之前：
+    //      - 漏斗行的 `calls=` / `sampled=` / `entry=` 口径与 B106/B108 **逐位不变**
+    //        （仍 = "钩子调用内省的次数"）⇒ 跨版本 A/B 可比，且 `views_per_call` 会因为
+    //        `views` 少了 92% 而**明显下降**（这正是"少做了工作"的硬证据）；
+    //      - 判据本身只有一次比较，放在最前面没有任何额外代价。
+    //
+    //   状态（是否被自我证伪、拒掉多少、canary 放行多少）由 `perf_probe` 输出：
+    //     汇总行 `… | entry_filter=on|off|disabled`；
+    //     漏斗行 `… | entry_filter=… stride=… skip=… canary=… non3_id=… disable_ec=… disable_entry=…`。
+    // =======================================================================
+    const perf_probe::DrawEntryAdmit entry_admit =
+        perf_probe::draw_entry_filter_admit(element_count);
+    if (!entry_admit.admitted)
+        return std::nullopt;
+    // 【诊断】B107 形状分桶：`hooked_draw_*` 已经在钩子入口用**调用实参**算好了形状
+    // （`DrawShapeMarkArmed`），这里只在识别成功处**再记一笔 hits**
+    // ⇒ 输出里每条形状都有 `calls/hits` 两列，才能看出"目标形状是否高度集中"。
+    // ⚠️ 这里**不读**任何 D3D 状态（拓扑要额外一次 `IAGetPrimitiveTopology` COM 调用）；
+    // 探针关时 `draw_shape_mark.armed == false` ⇒ 整段是可预测的空分支。
     if (context == nullptr)
         return std::nullopt;
 
@@ -8225,6 +8344,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
 
     std::array<ID3D11RenderTargetView *, 2> render_targets {};
     context->OMGetRenderTargets(static_cast<UINT>(render_targets.size()), render_targets.data(), nullptr);
+    perf_funnel.mark(perf_probe::FunnelStage::after_om);
 
     // ⚠️ 双 RTV 预筛必须放在**最前面**——它只是两个指针判空，是整个函数最便宜的检查。
     //
@@ -8262,6 +8382,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         }
         return std::nullopt;
     }
+    perf_funnel.mark(perf_probe::FunnelStage::after_prescreen);
 
     // 低分辨率候选 draw 诊断（TAAU 渲染精度 <1 时应出现低分辨率 rtv0）——
     // 记录其 RTV/SRV 特征判断国际服 TAAU 布局（前 12 次）。
@@ -8323,11 +8444,12 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     ID3D11Buffer *constant_buffer = nullptr;
     context->PSGetShaderResources(0, static_cast<UINT>(shader_resources.size()), shader_resources.data());
     context->PSGetConstantBuffers(0, 1, &constant_buffer);
+    perf_funnel.mark(perf_probe::FunnelStage::after_ps_query);
 
-    // 快速路径：正缓存命中直接构造接管（省 9 视图完整读取——只读 RTV[0] + 布局 3 SRV 验证指纹）
-    if (const auto fast_info = try_upscaler_path_cache_fast(render_targets.data(), shader_resources.data()))
+    // 统一的释放（B106：下面新增了两条早退路径 ⇒ 用一处 lambda 消灭"失败返回漏 Release"
+    // 这一类错，错误清单第 12 条）。释放对象与顺序与旧实现**逐条一致**（SRV → RTV → cb）。
+    const auto release_bound_views = [&]()
     {
-        register_cb0_for_jitter(constant_buffer);
         for (ID3D11ShaderResourceView *view : shader_resources)
         {
             if (view != nullptr)
@@ -8340,35 +8462,107 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         }
         if (constant_buffer != nullptr)
             constant_buffer->Release();
+    };
+
+    // 快速路径：正缓存命中直接构造接管（省 9 视图完整读取——只读 RTV[0] + 布局 3 SRV 验证指纹）
+    //
+    // ⚠️ 2026-09-27（B106）：这个调用**必须留在下面两条便宜判据之前**。
+    // `try_upscaler_path_cache_fast` 的判据里**完全不含 cb0，也不看视口**
+    // （只看 RTV[0] 的 output 尺寸/格式 + 缓存布局上的 3 个 SRV + out1 指纹）。
+    // 若把它挪到便宜判据之后，原本能命中快路径的 draw 会走不到 ⇒ **缩小识别集合** ✗。
+    // `output_metadata_info` 是它已经读过的那份 RTV[0]（见该函数的出参说明）。
+    ResourceInfo output_metadata_info {};
+    if (const auto fast_info = try_upscaler_path_cache_fast(
+            render_targets.data(), shader_resources.data(), output_metadata_info))
+    {
+        perf_funnel.mark(perf_probe::FunnelStage::fast_hit);
+        perf_probe::mark_draw_shape_identified(draw_shape_mark);
+        // 【B109 保险】识别成功点 ①（正缓存快路径命中）：检查本次绘制的 `element_count`。
+        // 正常情形（`== 3`）立即返回、零原子操作；一旦出现非 3 ⇒ 一次性停用入口过滤器
+        // 并打 `draw_entry_filter_disabled …` 告警（fail-open 回原路径）。
+        // ⚠️ **不能**只放在下面那一处：这条快路径是 `return` 出去的另一条识别成功路径。
+        perf_probe::note_draw_identified_element_count(element_count, draw_shape_mark,
+                                                       entry_admit.canary);
+        // B108：漏斗层的**非抽样**识别计数（与形状层那只手交叉核对，见 flush 的自洽断言）
+        perf_probe::note_identified_total();
+        register_cb0_for_jitter(constant_buffer);
+        release_bound_views();
         return fast_info;
     }
+    perf_funnel.mark(perf_probe::FunnelStage::after_fast_path);
 
+    // ---- 便宜判据①（B106 前移）：cb0 为空或 ByteWidth < 464 ⇒ 两套签名都不可能识别 ----
+    //
+    // 等价性（逐条对照代码）：
+    //   - 第一签名 `fixed_slot_identify`：`constant_buffer_description.ByteWidth < 464` ⇒ 直接拒绝；
+    //   - 第二签名 `identify_target_upscaler_resources`：首行
+    //     `if (cb0_bytes < 464 || viewport_width == 0 || viewport_height == 0) return std::nullopt;`
+    //     （调用处传的正是 `constant_buffer_description.ByteWidth`）；
+    //   - `constant_buffer == nullptr` ⇒ desc 保持零初始化 ⇒ ByteWidth = 0 < 464 ⇒ 同上被拒。
+    // ⇒ 不满足本条判据的 draw 在两套签名下**都必被拒** ⇒ 前移不改变任何 draw 的最终结果。
+    // 收益：省掉 `RSGetViewports` + 读 2 个 RTV + 读 7 个 SRV（把 `GetDesc` 提前，总次数不变）。
+    D3D11_BUFFER_DESC constant_buffer_description {};
+    if (constant_buffer != nullptr)
+        constant_buffer->GetDesc(&constant_buffer_description);
+    if (constant_buffer_description.ByteWidth < 464)
+    {
+        release_bound_views();
+        return std::nullopt;
+    }
+    perf_funnel.mark(perf_probe::FunnelStage::after_cb);
+
+    // ---- 便宜判据②（B106 前移）：视口可用 + 存在 RTV 输出候选 ----
+    //
+    // 等价性（本条是"两套签名并集的必要条件"，刻意取更弱的形式）：
+    //   - 第一签名要求 outputs[0](rtv0)/outputs[1](rtv1) 都非空、两者尺寸相等，
+    //     且 `viewport_count != 0 && 视口尺寸 == outputs[1] 尺寸`
+    //     （`resources_present` + `output_dimensions_match`）⇒ 蕴含**第一支**
+    //     （`rtv1 非空 && 尺寸 == 视口`，**不加格式判断**：第一签名刻意不做格式过滤）；
+    //   - 第二签名要求 `viewport_width/height != 0` 且存在 i：`rtv[i] 非空 && 尺寸 == 视口
+    //     && fsr_feature_color(rtv[i])`（调用处把 `viewport_count == 0` 映射成 0）⇒ 覆盖**两支**；
+    //   - 视口尺寸为 0（或 `viewport_count == 0`）同样被两套签名拒绝（真实 Texture2D 尺寸不可能为 0）。
+    // ⇒ 不满足它的 draw 必被拒 ⇒ 前移不改变结果。
+    // 收益：这条拒绝发生在读 7 个 SRV **之前** ⇒ 省 7 次视图读取。
+    // ⚠️ 同样必须在快路径之后（快路径只看 rtv0 的 output 特征，不看视口）✗。
     D3D11_VIEWPORT viewport {};
     UINT viewport_count = 1;
     context->RSGetViewports(&viewport_count, &viewport);
 
-    std::array<ResourceInfo, 7> inputs {};
     std::array<ResourceInfo, 2> outputs {};
-    for (std::size_t index = 0; index < shader_resources.size(); ++index)
-        safe_read_resource_info(shader_resources[index], L"fsr2_on_demand_srv", inputs[index]);
-    for (std::size_t index = 0; index < render_targets.size(); ++index)
-        safe_read_resource_info(render_targets[index], L"fsr2_on_demand_rtv", outputs[index]);
+    outputs[0] = output_metadata_info; // 复用快路径已读的 RTV[0]（同一次调用内同值，见该函数出参）
+    safe_read_resource_info_counted(render_targets[1], L"fsr2_on_demand_rtv", outputs[1]);
 
-    D3D11_BUFFER_DESC constant_buffer_description {};
-    if (constant_buffer != nullptr)
-        constant_buffer->GetDesc(&constant_buffer_description);
+    const bool viewport_usable = viewport_count != 0 && viewport.Width != 0 && viewport.Height != 0;
+    if (!viewport_usable)
+    {
+        release_bound_views();
+        return std::nullopt;
+    }
+    perf_funnel.mark(perf_probe::FunnelStage::after_viewport);
+
+    const auto rtv_matches_viewport = [&](const ResourceInfo &info)
+    {
+        return info.resource_key != 0 && info.width == static_cast<std::uint32_t>(viewport.Width) &&
+            info.height == static_cast<std::uint32_t>(viewport.Height);
+    };
+    const bool output_candidate = rtv_matches_viewport(outputs[1]) ||
+        (rtv_matches_viewport(outputs[0]) && fsr_feature_color(outputs[0]));
+    if (!output_candidate)
+    {
+        release_bound_views();
+        return std::nullopt;
+    }
+    perf_funnel.mark(perf_probe::FunnelStage::after_output);
+
+    std::array<ResourceInfo, 7> inputs {};
+    for (std::size_t index = 0; index < shader_resources.size(); ++index)
+        safe_read_resource_info_counted(shader_resources[index], L"fsr2_on_demand_srv", inputs[index]);
+
     const std::uint64_t constant_buffer_key =
         reinterpret_cast<std::uint64_t>(constant_buffer);
 
-    for (ID3D11ShaderResourceView *view : shader_resources)
-    {
-        if (view != nullptr)
-            view->Release();
-    }
-    for (ID3D11RenderTargetView *render_target : render_targets)
-        render_target->Release();
-    if (constant_buffer != nullptr)
-        constant_buffer->Release();
+    // 与旧实现一致：签名判据只用副本（inputs/outputs）⇒ 读完即可释放。
+    release_bound_views();
 
     // 第一签名：固定槽位（1.1.5/1.2.3 兼容——国际服实测匹配 render=2304x1296
     // output=3840x2160）。inputs[0..6]/outputs[0..1] 固定布局，无格式过滤。
@@ -8441,6 +8635,8 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     };
 
     std::optional<TargetUpscalerDrawInfo> identified = fixed_slot_identify();
+    if (identified)
+        perf_funnel.mark(perf_probe::FunnelStage::fixed_ok);
     if (!identified)
     {
         // 第二签名：动态槽位评分（国服技能等不同 shader 的 TAAU 路径）
@@ -8449,6 +8645,8 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
             viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Width) : 0,
             viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Height) : 0,
             constant_buffer_description.ByteWidth, constant_buffer_key);
+        if (identified)
+            perf_funnel.mark(perf_probe::FunnelStage::dynamic_ok);
     }
     if (!identified)
     {
@@ -8471,6 +8669,15 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         return std::nullopt;
     }
     stage_log("identify_end ok");
+    perf_funnel.mark(perf_probe::FunnelStage::identified);
+    perf_probe::mark_draw_shape_identified(draw_shape_mark);
+    // 【B109 保险】识别成功点 ②（两套签名之一成功）：同 ①，检查 `element_count`。
+    // `entry_admit.canary == true` 说明这次是"非 3 的 canary 抽样放行" ——
+    // 它一旦被识别，就证明 `count == 3` **不是**目标绘制的必要条件 ⇒ 立刻停用过滤器。
+    perf_probe::note_draw_identified_element_count(element_count, draw_shape_mark,
+                                                   entry_admit.canary);
+    // B108：漏斗层的**非抽样**识别计数（与上面那只手成对；缺一个就等不到自洽）
+    perf_probe::note_identified_total();
 
     g_trace_ps_cb0_key.store(constant_buffer_key, std::memory_order_relaxed);
     register_cb0_for_jitter(constant_buffer);
@@ -8516,11 +8723,12 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
 
 std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(
     ID3D11DeviceContext *context,
-    UINT element_count)
+    UINT element_count,
+    const perf_probe::DrawShapeMarkArmed &draw_shape_mark = perf_probe::DrawShapeMarkArmed {})
 {
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
-        return inspect_target_upscaler_draw_on_demand(context, element_count);
+        return inspect_target_upscaler_draw_on_demand(context, element_count, draw_shape_mark);
 #endif
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     const std::uint64_t fast_target_hash = g_mode2_fast_target_ps_hash.load(std::memory_order_relaxed);
@@ -8578,6 +8786,15 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(
             return std::nullopt;
 
         g_trace_ps_cb0_key.store(constant_buffer_key, std::memory_order_relaxed);
+        // 【诊断】B108：这条"快速状态跟踪"路径**也是一次识别成功**，此前漏记 ⇒
+        // 形状行与漏斗行的 `identified` 会与真实识别次数不符（自洽断言会直接报出来）。
+        // 这里只补两笔纯计数（形状层 + 漏斗层），**判定逻辑一行未动**。
+        perf_probe::mark_draw_shape_identified(draw_shape_mark);
+        // 【B109 保险】识别成功点 ③（"快速状态跟踪"路径，B108 补记过的那一条）：
+        // 这条路径**代码上**要求 `element_count == 3`（本分支开头就拒绝非 3）
+        // ⇒ 检查在此**必然成立**，它是"防止将来有人放宽上面那个判据"的护栏。
+        perf_probe::note_draw_identified_element_count(element_count, draw_shape_mark, false);
+        perf_probe::note_identified_total();
         return identified;
     }
 #endif
@@ -12120,6 +12337,15 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
     // 未进入内省的 draw 记 0）⇒ 两槽样本集合一致，"draw_all − draw_inspect" 才有意义。
     // 见 PerfProbe.h 里 DrawInspectScope 的口径说明与 B105。
     perf_probe::DrawInspectScope perf_inspect_scope(perf_scope.sampled());
+    // 【诊断】B107 形状分桶：**调用入口**的实参就是最强的判别式候选
+    // （`IndexCount` / `StartIndexLocation` / `BaseVertexLocation`）。
+    // 这里只做"打包 + 计数"（探针关时只读一次开关，零原子操作）；
+    // `mark_draw_shape_identified` 由内省函数在**识别成功**处调用（calls/hits 两列）。
+    // ⚠️ 刻意**不读拓扑**：那要额外一次 `IAGetPrimitiveTopology` COM 调用，
+    // 本身就要花钱 ⇒ 先用"已经拿在手里的实参"分桶（见 PerfProbe.h 的说明）。
+    const perf_probe::DrawShapeMarkArmed perf_draw_shape = perf_probe::make_draw_shape_mark(
+        perf_probe::DrawShapeSlot::indexed(index_count, start_index_location, base_vertex_location));
+    perf_probe::mark_draw_shape_call(perf_draw_shape);
     // passthrough 机制已整体移除（实测让 OptiScaler 丢失 FFX 输入识别）。
     // 所有显卡统一桥直连；OptiScaler 共存时并行（各自独立链路，实测无冲突；
     // N/Intel 上 OptiScaler 用于提供 DLSS/XeSS，不依赖桥让路）。
@@ -12148,7 +12374,7 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
     // ⚠️ 内省窗口只包住这一次调用（B105）：`perf_inspect_scope` 在出口按情况记
     // "本次耗时"或"未内省 = 0"，两槽样本集合因此恒等。
     perf_inspect_scope.start();
-    const auto target_draw_info = inspect_target_upscaler_draw(context, index_count);
+    const auto target_draw_info = inspect_target_upscaler_draw(context, index_count, perf_draw_shape);
     perf_inspect_scope.stop();
     if (target_draw_info && g_config.fsr2_translation_mode >= 3)
         observe_fsr2_dynamic_color_target(*target_draw_info);
@@ -12223,6 +12449,12 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
     perf_probe::maybe_flush();
     // 【诊断】与 hooked_draw_indexed 同一处置（内省窗口；未内省记 0）。
     perf_probe::DrawInspectScope perf_inspect_scope(perf_scope.sampled());
+    // 【诊断】B107 形状分桶（与 hooked_draw_indexed 同一处置，形状种类 = `dr`）。
+    // 两个入口共用一张形状表 ⇒ 日志里能直接看出"这 490 次调用里有多少走的是
+    // 非索引路径"（`dr` 行）—— 这也是"索引数/顶点数"判别式的一部分。
+    const perf_probe::DrawShapeMarkArmed perf_draw_shape = perf_probe::make_draw_shape_mark(
+        perf_probe::DrawShapeSlot::non_indexed(vertex_count, start_vertex_location));
+    perf_probe::mark_draw_shape_call(perf_draw_shape);
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     capture_runtime_snapshot_if_requested();
 #endif
@@ -12246,7 +12478,7 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
     if (fsr2_family_skip_gate(context, vertex_count, false))
         return;
     perf_inspect_scope.start();
-    const auto target_draw_info = inspect_target_upscaler_draw(context, vertex_count);
+    const auto target_draw_info = inspect_target_upscaler_draw(context, vertex_count, perf_draw_shape);
     perf_inspect_scope.stop();
     if (target_draw_info && g_config.fsr2_translation_mode >= 3)
         observe_fsr2_dynamic_color_target(*target_draw_info);
@@ -13868,6 +14100,15 @@ void initialize()
     perf_probe::set_log_sink(&perf_probe_log);
     perf_probe::configure(g_config.perf_probe, g_config.perf_probe_interval_ms,
                           g_config.perf_probe_draw_sample);
+    // 【正式功能】入口级过滤（B109）：**不跟 `PerfProbe` 开关**（见 PerfProbe.h 的说明）。
+    // 常驻一行说明它是开是关、canary 步长是多少 ⇒ 用户看日志就知道过滤器在不在生效，
+    // 以及保险有没有把它自我证伪（后者另有一行 `draw_entry_filter_disabled …`）。
+    perf_probe::configure_draw_entry_filter(g_config.draw_entry_filter,
+                                            g_config.draw_entry_filter_canary);
+    LOG_INFO(blog::cat::probe, "draw_entry_filter=" +
+        std::string(perf_probe::draw_entry_filter_state_name()) +
+        " canary_stride=" + std::to_string(perf_probe::draw_entry_filter_canary_stride()) +
+        " predicate=element_count==3 entry=ix|dr key=DrawEntryFilter");
     if (g_config.perf_probe)
     {
         LOG_INFO(blog::cat::probe, "perf_probe_enabled interval_ms=" +
