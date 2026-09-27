@@ -398,8 +398,8 @@ function Get-ModuleState {
         OptiScaler = $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $optiPath)
         AntiBlur = $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $antiBlurPath)
         HDR = $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $reShadePath) -and (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $SelectedGamePath) 'ReShade.ini') -PathType Leaf)
-        # NVIDIA 显卡上 TextureLoader 一律视为未安装（隐藏且停用）
-        TextureLoader = (-not $script:nvidiaGpu) -and $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $textureLoaderPath)
+        # TextureLoader 按配置实际判定（N 卡不再强制视为未安装）
+        TextureLoader = $unlockerInstalled -and $gameMatches -and (Test-ConfiguredDll -Config $config -Path $textureLoaderPath)
     }
 }
 
@@ -532,27 +532,30 @@ function Write-InstallCatalog {
     Write-CatalogRow -Id '2.' -Name 'OptiScaler（DLSS/XeSS/FSR4 INT8，需 Bridge）' -Author 'OptiScaler' -Version $optiVersion -Status $optiStatus
     Write-CatalogRow -Id '3.' -Name '反虚化 / 隐藏 UID' -Author 'シリアCelia' -Version $antiVersion -Status $antiStatus
     Write-CatalogRow -Id '4.' -Name 'ReShade + RenoDX HDR' -Author 'crosire / Bilibili UID 3461582765951639' -Version "ReShade $reShadeVersion`nRenoDX $renoDxVersion" -Status $hdrStatus
-    # NVIDIA 显卡上不显示 TextureLoader（模块 5）一行
-    if (-not $script:nvidiaGpu) {
-        Write-CatalogRow -Id '5.' -Name '纹理/Mod 加载器（TextureLoader）' -Author 'シリアCelia' -Version $textureLoaderVersion -Status $textureLoaderStatus
-    }
+    # TextureLoader（模块 5）始终显示：N 卡可手动开启，只是不推荐
+    Write-CatalogRow -Id '5.' -Name '纹理/Mod 加载器（TextureLoader）' -Author 'シリアCelia' -Version $textureLoaderVersion -Status $textureLoaderStatus
 }
 
 function Select-ModuleSet {
-    param([string]$ActionName)
+    param([string]$ActionName, [switch]$ExcludeTextureLoaderFromAll)
     $allowed = [Collections.Generic.List[int]]::new()
-    # NVIDIA 显卡上 TextureLoader（模块 5）不可选
-    $availableIds = if ($script:nvidiaGpu) { @(1, 2, 3, 4) } else { @(1, 2, 3, 4, 5) }
+    # TextureLoader（模块 5）在列表里始终可见、可手动输入选择（含 N 卡）。
+    # 「A. 全部可选模块」是自动批量路径：只有 N 卡把模块 5 排除在外，A 卡仍按旧行为自动包含；
+    # 手动输入 5 不受显卡影响，恒返回 @(5)。
+    $availableIds = @(1, 2, 3, 4, 5)
+    $excludeTextureLoaderFromAll = $ExcludeTextureLoaderFromAll -and $script:nvidiaGpu
+    $allIds = if ($excludeTextureLoaderFromAll) { @(1, 2, 3, 4) } else { @(1, 2, 3, 4, 5) }
+    $allNote = if ($excludeTextureLoaderFromAll) { '；不含 TextureLoader 模块 5' } else { '' }
     foreach ($id in $availableIds) { $allowed.Add($id) }
     while ($true) {
         Write-Host "请输入需要${ActionName}的模块 ID" -ForegroundColor Yellow
         Write-Host ''
         Write-Host "$ActionName 模块："
-        Write-Host '  A. 全部可选模块（默认，直接回车）'
+        Write-Host ("  A. 全部可选模块（默认，直接回车）{0}" -f $allNote)
         Write-Host '  0. 返回上一层'
         $choice = (Read-Host '请输入选项').Trim().ToUpperInvariant()
         if ([string]::IsNullOrWhiteSpace($choice) -or $choice -eq 'A') {
-            return @($allowed)
+            return @($allIds)
         }
         if ($choice -eq '0') { return @() }
         $selectedId = 0
@@ -907,7 +910,8 @@ function Invoke-InstallWizard {
     param([string]$SelectedGamePath, [int]$FpsTarget)
     Write-Header -Title '安装模块'
     Write-InstallCatalog -SelectedGamePath $SelectedGamePath
-    $selection = @(Select-ModuleSet -ActionName '安装')
+    # 一键「全部安装」在 N 卡上不含 TextureLoader（模块 5 需手动输入）；A 卡仍自动包含
+    $selection = @(Select-ModuleSet -ActionName '安装' -ExcludeTextureLoaderFromAll)
     if ($selection.Count -eq 0) { return }
     $state = Get-ModuleState -SelectedGamePath $SelectedGamePath
     $desired = [ordered]@{
@@ -923,9 +927,9 @@ function Invoke-InstallWizard {
         if ($module -eq 3) { $desired.AntiBlur = $true }
         if ($module -eq 4) { $desired.HDR = $true }
         if ($module -eq 5) {
-            # NVIDIA 显卡上不允许启用 TextureLoader
-            if ($script:nvidiaGpu) { Write-Host 'TextureLoader 在 NVIDIA 显卡上不可用，已跳过模块 5。' -ForegroundColor Yellow }
-            else { $desired.TextureLoader = $true }
+            # 手动选中模块 5 一律尊重（含 N 卡）；N 卡只提示不阻止
+            if ($script:nvidiaGpu) { Write-Host '提示：N 卡上 TextureLoader 不推荐，可能加载丢失，请自行确认。' -ForegroundColor Yellow }
+            $desired.TextureLoader = $true
         }
     }
     $unlockerSource = 'Existing'
@@ -960,7 +964,7 @@ function Invoke-InstallWizard {
     if ($desired.OptiScaler) { $arguments += @('-OptiScalerSource', $optiSource) } else { $arguments += '-DisableOptiScaler' }
     if (-not $desired.AntiBlur) { $arguments += '-DisableAntiBlur' }
     if ($desired.HDR) { $arguments += @('-ReShadeSource', $reShadeSource) } else { $arguments += '-DisableHDR' }
-    if ((-not $script:nvidiaGpu) -and $desired.TextureLoader) { $arguments += '-EnableTextureLoader' } else { $arguments += '-DisableTextureLoader' }
+    if ($desired.TextureLoader) { $arguments += '-EnableTextureLoader' } else { $arguments += '-DisableTextureLoader' }
     if ($desired.OptiScaler -and $optiSource -eq 'Manual') { $arguments += @('-OptiScalerPackagePath', $optiPackagePath) }
     $arguments += '-PreserveExistingConfigs'
     if ($NoShortcut) { $arguments += '-NoShortcut' }
@@ -996,11 +1000,8 @@ function Invoke-UpdateWizard {
         @(Select-ModuleSet -ActionName '更新')
     }
     if ($selection.Count -eq 0) { return }
-    # NVIDIA 显卡上 TextureLoader（模块 5）不可用：不进入更新流程
-    if ($script:nvidiaGpu) { $selection = @($selection | Where-Object { $_ -ne 5 }) }
-    if ($selection.Count -eq 0) { return }
-
-    $selectableIds = if ($script:nvidiaGpu) { @(1, 2, 3, 4) } else { @(1, 2, 3, 4, 5) }
+    # 只更新用户选中的模块；不再按显卡剔除 TextureLoader（模块 5）
+    $selectableIds = @(1, 2, 3, 4, 5)
     $isFullUpdateRequested = @($selectableIds | Where-Object { $_ -notin $selection }).Count -eq 0
     $shouldPreserveExistingConfigs = $PreserveExistingConfigs -or $isFullUpdateRequested
     if ($isFullUpdateRequested -and -not $SkipSelfUpdate) {
@@ -1013,8 +1014,8 @@ function Invoke-UpdateWizard {
         2 = [bool]$state.OptiScaler
         3 = [bool]$state.AntiBlur
         4 = [bool]$state.HDR
-        # NVIDIA 显卡上 TextureLoader 一律视为未安装
-        5 = (-not $script:nvidiaGpu) -and [bool]$state.TextureLoader
+        # TextureLoader 按实际安装状态判定（N 卡不再强制视为未安装）
+        5 = [bool]$state.TextureLoader
     }
     $validSelection = [Collections.Generic.List[int]]::new()
     foreach ($module in $selection) {
@@ -1057,9 +1058,9 @@ function Invoke-UpdateWizard {
             if ($module -eq 3) { $desired.AntiBlur = $true }
             if ($module -eq 4) { $desired.HDR = $true }
             if ($module -eq 5) {
-                # NVIDIA 显卡上不允许启用 TextureLoader
-                if ($script:nvidiaGpu) { Write-Host 'TextureLoader 在 NVIDIA 显卡上不可用，已跳过模块 5。' -ForegroundColor Yellow }
-                else { $desired.TextureLoader = $true }
+                # 手动选中模块 5 一律尊重（含 N 卡）；N 卡只提示不阻止
+                if ($script:nvidiaGpu) { Write-Host '提示：N 卡上 TextureLoader 不推荐，可能加载丢失，请自行确认。' -ForegroundColor Yellow }
+                $desired.TextureLoader = $true
             }
         }
         $arguments = @(
@@ -1071,7 +1072,7 @@ function Invoke-UpdateWizard {
         if ($desired.OptiScaler) { $arguments += @('-OptiScalerSource', $optiSource) } else { $arguments += '-DisableOptiScaler' }
         if (-not $desired.AntiBlur) { $arguments += '-DisableAntiBlur' }
         if ($desired.HDR) { $arguments += @('-ReShadeSource', $reShadeSource) } else { $arguments += '-DisableHDR' }
-        if ((-not $script:nvidiaGpu) -and $desired.TextureLoader) { $arguments += '-EnableTextureLoader' } else { $arguments += '-DisableTextureLoader' }
+        if ($desired.TextureLoader) { $arguments += '-EnableTextureLoader' } else { $arguments += '-DisableTextureLoader' }
         if ($shouldPreserveExistingConfigs) { $arguments += '-PreserveExistingConfigs' }
         if ($NoShortcut) { $arguments += '-NoShortcut' }
         Write-Host ''
@@ -1216,13 +1217,14 @@ if ($shouldShowPathWarning -and (Show-PathCompatibilityWarning -GameExePath $sel
 $fpsTarget = [int]$state.FpsTarget
 Repair-RuntimePaths -SelectedGamePath $selectedGamePath
 
-# NVIDIA 显卡检测：启动阶段真实计算一次，供模块列表 / 目录 / 可选集合 / 参数注入各处门控使用。
-# TextureLoader 在 N 卡上存在无法修复的纹理加载严重错误：隐藏并停用。
+# NVIDIA 显卡检测：启动阶段真实计算一次，仅供 N 卡提示语使用。
+# 已解除 N 卡封锁 —— TextureLoader（模块 5）不再隐藏、不再强制停用，用户可手动开启；
+# 但 N 卡上所有自动路径（一键安装不含模块 5 / 恢复出厂 / 还原配置 / 配置缺省）都不主动开启它。
 # 注意：这里必须真的调用检测函数。只在顶部把 $script:nvidiaGpu 初始化为 $false 而不计算，
-# 会让下面所有门控变成死代码（模块 5 仍会显示并可选中）。
+# 会让 N 卡提示失效（用户看不到"不推荐"的警告）。
 $script:nvidiaGpu = @(Get-NvidiaVideoControllers).Count -gt 0
 if ($script:nvidiaGpu) {
-    Write-Host '检测到 NVIDIA 显卡：TextureLoader 在 N 卡上不可用，已隐藏并停用。' -ForegroundColor Yellow
+    Write-Host '检测到 NVIDIA 显卡：TextureLoader 在 N 卡上不推荐，可能加载丢失；如需使用，可在「安装模块」中手动选择模块 5。' -ForegroundColor Yellow
 }
 
 if (-not (Invoke-FoundationSetup -SelectedGamePath $selectedGamePath -FpsTarget ([ref]$fpsTarget))) { exit 1 }
@@ -1241,8 +1243,8 @@ if ($ResumeUpdateAll) {
 
 while ($true) {
     $moduleState = Get-ModuleState -SelectedGamePath $selectedGamePath
-    # NVIDIA 显卡上 TextureLoader（模块 5）不可用：不计入总数、也不列出该行
-    $visibleModuleIds = if ($script:nvidiaGpu) { @(1, 2, 3, 4) } else { @(1, 2, 3, 4, 5) }
+    # TextureLoader（模块 5）始终列出并计入总数（N 卡可手动开启）
+    $visibleModuleIds = @(1, 2, 3, 4, 5)
     $installedCount = @(@($moduleState.Bridge, $moduleState.OptiScaler, $moduleState.AntiBlur, $moduleState.HDR, $moduleState.TextureLoader) | Where-Object { $_ }).Count
     Write-Header -Title '原神插件管理器'
     Write-Host "[√] 游戏目录: $(Split-Path -Parent $selectedGamePath)" -ForegroundColor Green
@@ -1253,9 +1255,7 @@ while ($true) {
     Write-ModuleLine -Number 2 -Name 'OptiScaler（DLSS/XeSS/FSR4 INT8）' -Installed $moduleState.OptiScaler -Path $optiPath
     Write-ModuleLine -Number 3 -Name '反虚化 / 隐藏 UID' -Installed $moduleState.AntiBlur -Path $antiBlurPath
     Write-ModuleLine -Number 4 -Name 'ReShade + RenoDX HDR' -Installed $moduleState.HDR -Path $reShadePath
-    if (-not $script:nvidiaGpu) {
-        Write-ModuleLine -Number 5 -Name '纹理/Mod 加载器（TextureLoader）' -Installed $moduleState.TextureLoader -Path $textureLoaderPath
-    }
+    Write-ModuleLine -Number 5 -Name '纹理/Mod 加载器（TextureLoader）' -Installed $moduleState.TextureLoader -Path $textureLoaderPath
     Write-Host "    FPS Unlocker 与管理脚本为基础组件，自动安装（当前帧率上限 $fpsTarget）" -ForegroundColor DarkGray
     Write-Host ''
     Write-Host '  1. 安装模块' -ForegroundColor Cyan

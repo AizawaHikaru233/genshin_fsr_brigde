@@ -40,8 +40,10 @@ struct BootstrapConfig
     // 但使用点在它之后，故可见。
     bool enable_reshade = true;
     // TextureLoader 为可选组件（opt-in）：config.ini 中**没有该键即视为关闭**。
-    // 这与发布包一致（模板里 Value=0），而且现在是必需语义——模板 config.ini 已移除该项
-    // 以便在 NVIDIA 机器上隐藏该开关，此时键缺失必须落到"关闭"而不是"开启"。
+    // 这与发布包一致（config.ini 模板与两个 Lua 安装器都写 Value=0），键缺失必须落到
+    // "关闭"而不是"开启"；所有自动路径（安装 / 还原配置 / 配置缺省）都不会开启它。
+    // 2026-09-27 解除 NVIDIA 封锁：N 卡上不再强制停用，用户显式打开开关即按显式启用处理
+    //（仅在配置界面标注"不推荐"，见 config.ini 模板的说明）。
     bool enable_texture_loader = false;
     bool reset_configurations = false;
     std::filesystem::path bridge_path;
@@ -789,8 +791,10 @@ static bool is_intel_arc_device(std::uint32_t device_id)
 }
 
 // 本机是否存在 NVIDIA 显示适配器。
-// 用途：TextureLoader 在 NVIDIA 上存在无法修复的纹理加载严重错误（作者无 N 卡，无法定位
-// 根因），故在 NVIDIA 机器上强制停用该组件——不加载 DLL，也不读写其配置。
+// 用途：ReShade 缺键时的默认值按 GPU 厂商解析（`EnableReShade = is_nvidia and "0" or "1"`，
+// 见 configure 的缺键分支）。
+// TextureLoader 自 2026-09-27 起不再据此强制停用：它在 NVIDIA 上只是"不推荐"
+//（可能加载丢失，见 TextureLoader/README.md），用户显式启用时照常加载。
 // 策略取保守方向：只要存在任一非软件 NVIDIA 适配器即判定为真（覆盖核显 + N 卡独显的混合机型）。
 bool has_nvidia_adapter()
 {
@@ -1551,15 +1555,11 @@ BootstrapConfig load_config()
             L"..\\..\\FSRGraphicsPayload\\TextureLoader\\TextureLoader.dll", // 旧 Lite 包布局（末位回退）
         });
     }
-    // TextureLoader 在 NVIDIA 上存在无法修复的纹理加载严重错误（作者无 N 卡，无法定位根因），
-    // 故在 NVIDIA 机器上强制停用：即便 ini 写了 EnableTextureLoader=1 也不生效。
-    // 停用后既不加载 DLL，也不写/重置其 ini（ensure/reset 两处都以该标志为门）。
+    // TextureLoader 自 2026-09-27 起不再在 NVIDIA 机器上强制停用（解除封锁）：
+    // N 卡上该组件只是"不推荐"——极大概率出现替换的贴图纹理 Mod 加载丢失，而不是完全
+    // 不可用；是否加载完全由 config.ini 的 EnableTextureLoader 决定（缺键 = 关闭），
+    // 即【只有用户显式启用时才会加载 DLL】。
     // 说明见 TextureLoader/README.md 与根 README 的 GPU 支持矩阵。
-    if (config.enable_texture_loader && has_nvidia_adapter())
-    {
-        config.enable_texture_loader = false;
-        write_log("texture_loader_disabled reason=nvidia_gpu_unsupported");
-    }
     return config;
 }
 

@@ -1325,8 +1325,8 @@ if ($EnsureNvidiaDlssOnly) {
 $gameExe = Get-GamePath -RequestedPath $GamePath -ConfigPath $fpsConfig
 Show-PathCompatibilityWarning -GameExePath $gameExe
 
-# NVIDIA 显卡上 TextureLoader 存在无法修复的纹理加载严重错误：一律隐藏并停用，
-# 不询问、不允许启用（AMD 机器行为不变）。
+# NVIDIA 显卡检测：仅用于提示。TextureLoader 在 N 卡上不推荐（可能加载丢失），
+# 但不再隐藏、不再强制停用 —— 用户可显式启用；自动路径一律不主动开启它。
 $nvidiaGpu = @(Get-NvidiaVideoControllers).Count -gt 0
 
 if (-not $NonInteractive) {
@@ -1336,14 +1336,10 @@ if (-not $NonInteractive) {
     $DisableAntiBlur = -not (Read-YesNo -Prompt '启用反虚化/隐藏 UID' -Default $true)
     $DisableHDR = -not (Read-YesNo -Prompt '启用 ReShade + RenoDX HDR' -Default $true)
     if ($nvidiaGpu) {
-        # N 卡不询问该项：直接停用并给出醒目说明（AMD 机器保持原询问逻辑）。
-        $DisableTextureLoader = $true
-        Write-Host '检测到 NVIDIA 显卡：TextureLoader 在 N 卡上存在无法修复的纹理加载严重错误，已隐藏并停用。' -ForegroundColor Yellow
-        Write-Host 'N 卡用户如需使用，可自行拉取仓库源码修复后提交合并。' -ForegroundColor Yellow
+        # N 卡只提示不阻止：仍按常规询问（默认否），用户可自行启用。
+        Write-Host '检测到 NVIDIA 显卡：TextureLoader 在 N 卡上不推荐（可能加载丢失，并非完全不可用）。' -ForegroundColor Yellow
     }
-    else {
-        $DisableTextureLoader = -not (Read-YesNo -Prompt '启用纹理/Mod 加载器（TextureLoader）' -Default $false)
-    }
+    $DisableTextureLoader = -not (Read-YesNo -Prompt '启用纹理/Mod 加载器（TextureLoader）' -Default $false)
     while ($FpsTarget -le 0) {
         $fpsInput = (Read-Host '请输入帧率上限（直接回车使用 300）').Trim()
         if ([string]::IsNullOrWhiteSpace($fpsInput)) {
@@ -1368,18 +1364,17 @@ if ($NonInteractive -and [string]::IsNullOrWhiteSpace($OptiScalerSource)) {
 if ([string]::IsNullOrWhiteSpace($ReShadeSource)) {
     $ReShadeSource = if (Test-Path -LiteralPath $reshadeDll -PathType Leaf) { 'Existing' } else { 'Auto' }
 }
-# TextureLoader 默认不安装：交互模式由询问结果决定（默认 No）；
+# TextureLoader 默认不安装（opt-in）：交互模式由询问结果决定（默认 No）；
 # 非交互模式仅当显式 -EnableTextureLoader（且未 -DisableTextureLoader）时启用。
+# 自动路径（恢复出厂 / 还原配置 / 配置缺省）都不会开启它。
 $textureLoaderEnabled = if ($NonInteractive) {
     $EnableTextureLoader -and -not $DisableTextureLoader
 } else {
     -not $DisableTextureLoader
 }
-# NVIDIA 保险：即使以任何方式启用了 TextureLoader（例如显式传入 -EnableTextureLoader），
-# 也在 N 卡上强制停用。
+# N 卡不再强制停用：显式 -EnableTextureLoader 会被尊重，只给出提示。
 if ($nvidiaGpu -and $textureLoaderEnabled) {
-    Write-Host '检测到 NVIDIA 显卡：TextureLoader 在当前显卡上不可用，-EnableTextureLoader 已忽略。' -ForegroundColor Yellow
-    $textureLoaderEnabled = $false
+    Write-Host '提示：N 卡上 TextureLoader 不推荐，可能加载丢失，请自行确认。' -ForegroundColor Yellow
 }
 $unlockerMode = Select-SourceMode -Label 'FPS Unlocker' -RequestedMode $UnlockerSource -ExistingAvailable (Test-Path -LiteralPath $unlocker -PathType Leaf)
 Install-Unlocker -Mode $unlockerMode -ManualPath $UnlockerPackagePath

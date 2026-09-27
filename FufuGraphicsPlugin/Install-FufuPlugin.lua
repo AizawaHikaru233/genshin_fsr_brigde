@@ -70,10 +70,13 @@ end
 install.log("OptiScaler 组件目录: " .. opti_component_dir)
 
 install.set_progress(82, "正在写入插件配置")
+-- 不再按显卡跳过写入：N 卡同样写入 config.ini。TextureLoader 一律 Value = "0"
+-- （默认关闭，需用户在插件配置界面手动开启；N 卡只是不建议开启，见项名提示）。
+-- ReShade 的 GPU 策略保持不变（N 卡默认关闭）。
 if is_nvidia then
-    install.log("检测到 NVIDIA 显卡：跳过写入插件配置，TextureLoader 项由包内 config.ini 模板隐藏")
-else
-    install.write_config(plugin_dir, {
+    install.log("检测到 NVIDIA 显卡：TextureLoader 默认关闭，可在插件配置界面手动开启（N 卡不推荐）")
+end
+install.write_config(plugin_dir, {
     General = {
         Name = "原神FSR2桥接插件",
         Description = "支持把原神的FSR2转换为FSR4（A卡7000/9000）、DLSS/XeSS/FSR4 INT8（其余显卡）",
@@ -97,7 +100,7 @@ else
         Value = is_nvidia and "0" or "1"
     },
     EnableTextureLoader = {
-        Name = "启用纹理/Mod 加载器",
+        Name = "启用纹理/Mod 加载器（N 卡不推荐：可能加载丢失，非完全不可用）",
         Type = "bool",
         Value = "0"
     },
@@ -121,8 +124,7 @@ else
         Type = "bool",
         Value = "1"
     }
-    })
-end
+})
 
 install.set_progress(90, "正在准备组件初始配置")
 if install.file_exists(plugin_dir .. "\\FSR4Policy.ini") then

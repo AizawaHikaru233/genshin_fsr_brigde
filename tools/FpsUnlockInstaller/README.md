@@ -69,7 +69,11 @@ powershell -ExecutionPolicy Bypass -File .\Configure.ps1 `
   -NonInteractive
 ```
 
-可选开关包括 `-DisableOptiScaler`、`-DisableAntiBlur`、`-DisableHDR`、`-DisableTextureLoader` 和 `-NoShortcut`。手动导入可使用 `-UnlockerSource Manual -UnlockerPackagePath <路径>` 与 `-OptiScalerSource Manual -OptiScalerPackagePath <路径>`。
+可选开关包括 `-DisableOptiScaler`、`-DisableAntiBlur`、`-DisableHDR`、`-DisableTextureLoader` 和 `-NoShortcut`。
+
+纹理/Mod 加载器（TextureLoader）是**可选组件（opt-in）**：默认关闭，只有显式传入 `-EnableTextureLoader` 时才启用（N 卡上同样可以启用，只是不推荐——极大概率出现替换的贴图纹理 Mod 加载丢失，见根 README 的「GPU 支持与 N 卡注意事项」）。**在 N 卡上，一键安装全部模块（不含模块 5）、恢复出厂设置、还原配置 / 应用配置模板、配置缺失或配置损坏时的默认值都不会开启它；A 卡的「一键安装全部模块」会自动包含它（模块 5）**；交互式安装会询问是否启用，默认否。
+
+手动导入可使用 `-UnlockerSource Manual -UnlockerPackagePath <路径>` 与 `-OptiScalerSource Manual -OptiScalerPackagePath <路径>`。
 
 ## 日志与问题反馈
 

@@ -58,7 +58,7 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 - 按显卡能力自动匹配 FSR 系列（FSR4/FSR3/FSR2），支持显卡上无需外部插件即可超分。
 - 将游戏渲染精度菜单扩展为 `0.2–0.999`。
 - 运行时日志默认写入 DLL 同目录的 `Dx11FsrBridge.log`，用于排查加载与 Hook 状态。
-- **TextureLoader**（纹理/Mod 加载器，**仅推荐 A 卡**）：3DMigoto 兼容的 `[TextureOverride]` Mod 加载（DDS 替换 + GDDS DirectStorage GPU 解压），默认从插件包内 `Mods` 目录加载。**当前只支持纯纹理贴图类 Mod，不支持模型类 Mod**，见下方「TextureLoader 支持范围」。**该组件在 NVIDIA 显卡上存在无法修复的纹理加载严重错误**，见下方「GPU 支持与 N 卡注意事项」。
+- **TextureLoader**（纹理/Mod 加载器）：3DMigoto 兼容的 `[TextureOverride]` Mod 加载（DDS 替换 + GDDS DirectStorage GPU 解压），默认从插件包内 `Mods` 目录加载。**当前只支持纯纹理贴图类 Mod，不支持模型类 Mod**，见下方「TextureLoader 支持范围」。**该组件在 N 卡上不推荐**（极大概率出现替换贴图 Mod 加载丢失，但不是完全不可用，仍可手动开启），见下方「GPU 支持与 N 卡注意事项」。
 
 ## GPU 支持与 N 卡注意事项
 
@@ -68,7 +68,7 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 | OptiScaler（DLSS/XeSS/FSR4 INT8） | ✅ | ✅ | ✅ |
 | 反虚化 / 隐藏 UID、ReShade + RenoDX | ✅ | ✅ | ✅ |
 | **OptiScaler + ReShade 同时启用** | ✅ | ⚠️ **可能不稳定** | ✅ |
-| **TextureLoader（纹理/Mod 加载器）** | ✅ 支持 | ❌ **不可用** | ⚠️ 未验证 |
+| **TextureLoader（纹理/Mod 加载器）** | ✅ 支持 | ⚠️ **不推荐（可能加载丢失，可手动开启）** | ⚠️ 未验证 |
 
 ### ⚠️ N 卡上 OptiScaler 与 ReShade 同时启用可能不稳定
 
@@ -80,19 +80,22 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 - 到 [OptiScaler 官方仓库](https://github.com/optiscaler/OptiScaler) 或本项目 [Issues](https://github.com/AizawaHikaru233/genshin_fsr_brigde/issues) 反馈，并附上游戏目录下的 `OptiScaler.log` 与 `ReShade.log`；
 - 若仍不稳定，建议**二者只保留一个**：FSR Bridge 自身的 FSR4/FSR3/FSR2 不依赖它们——需要 DLSS/XeSS/FSR4 INT8 时启用 OptiScaler，需要 HDR 时启用 ReShade。
 
-### TextureLoader 在 N 卡上不可用
+### TextureLoader 在 N 卡上不推荐（可能丢失贴图 Mod）
 
-**TextureLoader 仅推荐 A 卡用户使用，且默认仅对 A 卡开放启用。**
+**TextureLoader 在 N 卡上不推荐使用，但没有被封锁：仍然可以手动开启。**
 
-本组件在 NVIDIA 显卡上会出现**无法修复的纹理加载严重错误**。项目作者没有 N 卡，只能依靠 QQ 群群友协助反复测试，始终无法定位根因——已排除 mod 贴图文件本身（3139 个 DDS 全量校验均为合法 BC3）、格式与 SRV 视图处理（N 卡日志字段与 A 卡逐项一致且 `hr=0`）、哈希匹配与 ini 覆盖、线程路径（两机同构）、跨机文件差异（FNV 指纹逐位一致）、alpha 通道内容，以及初始数据缓冲被后继加载复用（该缺陷已修复，但 N 卡画面仍异常）。唯一无法在本地复现的环节是 **N 卡驱动的纹理创建 / 上载时机**。
+**N 卡极大概率会出现替换的贴图纹理 mod 加载丢失的问题，而不是完全不可用；但不推荐用，运气好的时候可以正常使用，没有找到特定条件。**
+
+项目作者没有 N 卡，只能依靠 QQ 群群友协助反复测试，始终无法定位根因——已排除 mod 贴图文件本身（3139 个 DDS 全量校验均为合法 BC3）、格式与 SRV 视图处理（N 卡日志字段与 A 卡逐项一致且 `hr=0`）、哈希匹配与 ini 覆盖、线程路径（两机同构）、跨机文件差异（FNV 指纹逐位一致）、alpha 通道内容，以及初始数据缓冲被后继加载复用（该缺陷已修复，但 N 卡画面仍异常）。唯一无法在本地复现的环节是 **N 卡驱动的纹理创建 / 上载时机**。
 
 因此发布渠道一律按下列方式处理：
 
-- **芙芙启动器插件包**与 **GitHub 发布包**在检测到 NVIDIA 显卡时，会**直接隐藏并停用 TextureLoader 的配置项与安装项**：不显示开关、不询问、不允许启用；即使手动在 ini 中写入 `EnableTextureLoader=1`，插件也不会加载该 DLL。
-- **N 卡用户如果想用**：欢迎自行拉取本仓库源码修复，然后提交合并请求（Pull Request）。
+- **TextureLoader 的配置项与安装项始终可见、可手动开启**：芙芙启动器插件包与 GitHub 发布包不再按显卡隐藏或强制停用该组件；在 N 卡上选择/打开它时会给出「不推荐」的提示，仅此而已。
+- **在 N 卡上所有自动路径都不会主动开启它**：N 卡的「一键安装全部模块」不含 TextureLoader（必须手动输入 5 才会装上）、恢复出厂设置、还原配置 / 应用配置模板、配置缺失或配置损坏时的默认值都不会开启它——你没手动启用过时它保持**关闭**，已手动启用的也不会被这些路径替你关掉。只有你显式启用（安装时手动选择模块 5、在插件配置界面打开开关，或命令行传入 `-EnableTextureLoader`）才会加载该 DLL。
+- **想彻底修复的 N 卡用户**：欢迎自行拉取本仓库源码修复，然后提交合并请求（Pull Request）。
 - **也可以赞助作者一张 NVIDIA 显卡**，作者会尝试定位并修复该问题。
 
-> A 卡用户不受影响：交互式安装仍会询问是否启用（默认否），之后可在插件配置界面随时开关。
+> A 卡用户不受影响：交互式安装仍会询问是否启用（默认否），之后可在插件配置界面随时开关。「一键安装全部模块」会自动包含它（N 卡除外——N 卡上需手动选择模块 5）。
 
 ### TextureLoader 支持范围
 
