@@ -54,13 +54,6 @@ else
 end
 install.log("OptiScaler 运行目录: " .. opti_dir)
 
--- OptiScaler 超分组件目录（2026-09-20）
--- 上游有且仅有两种布局，两者都必须支持：
---   平铺：payload\OptiScaler\{OptiScaler.dll, amd_fidelityfx_upscaler_dx12.dll, ...}
---   嵌套：payload\OptiScaler\{OptiScaler.dll, OptiScaler.ini}
---         payload\OptiScaler\OptiScaler\{amd_fidelityfx_upscaler_dx12.dll, ...}
--- 主 DLL 与 ini 恒在根层；组件目录随布局变化。nvngx_dlss.dll 属"库"，
--- OptiScaler 按 OptiDllPath（组件目录）解析 NvngxDlssPath=auto，故必须放进组件目录。
 local opti_component_dir = opti_root_dir
 if not install.file_exists(opti_root_dir .. "\\amd_fidelityfx_upscaler_dx12.dll") then
     if install.file_exists(opti_root_dir .. "\\OptiScaler\\amd_fidelityfx_upscaler_dx12.dll") then
@@ -70,9 +63,6 @@ end
 install.log("OptiScaler 组件目录: " .. opti_component_dir)
 
 install.set_progress(82, "正在写入插件配置")
--- 不再按显卡跳过写入：N 卡同样写入 config.ini。TextureLoader 一律 Value = "0"
--- （默认关闭，需用户在插件配置界面手动开启；N 卡只是不建议开启，见项名提示）。
--- ReShade 的 GPU 策略保持不变（N 卡默认关闭）。
 if is_nvidia then
     install.log("检测到 NVIDIA 显卡：TextureLoader 默认关闭，可在插件配置界面手动开启（N 卡不推荐）")
 end
@@ -82,8 +72,6 @@ install.write_config(plugin_dir, {
         Description = "支持把原神的FSR2转换为FSR4（A卡7000/9000）、DLSS/XeSS/FSR4 INT8（其余显卡）",
         Developer = "シリアCelia",
         File = "FSR-Bridge-Plugin.dll",
-        -- ⚠️ 必须与**仓库根** Version.cmake 的 FSR_SUITE_VERSION 同步（3 段式 x.y.z）。
-        --    本表由 install.write_config 写进 config.ini，打包脚本**不**自动改写这里。
         Version = "2.3.0"
     },
     EnableBridge = {
@@ -135,7 +123,6 @@ end
 if install.file_exists(opti_dir .. "\\OptiScaler.ini") then
     install.delete(opti_dir .. "\\OptiScaler.ini")
 end
--- 删除后从 default_config 恢复模板（含 [Spoofing] Dxgi=false——原神无 DLSS 场景禁用显卡伪装）
 local opti_default = payload_dir .. "\\default_config\\OptiScaler.ini"
 if install.file_exists(opti_default) then
     install.copy_file(opti_default, opti_dir .. "\\OptiScaler.ini")
