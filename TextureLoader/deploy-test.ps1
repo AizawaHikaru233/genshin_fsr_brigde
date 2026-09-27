@@ -7,9 +7,9 @@
 #
 # 前提：已运行 build.ps1，产物为 <root>\build\TextureLoader.dll
 #
-# ⚠️ 2026-09-19 修正（审核报告高严重度）：
+# ⚠️ 2026-09-19 修正（原为高严重度缺陷）：
 #   旧版本脚本的前提与产物**完全不符**，按现状无法部署：
-#     - 旧前提：build-ninja-tloader\d3d11.dll
+#     - 旧前提：<本地 ninja 构建目录>\d3d11.dll
 #     - 实际产物：build\TextureLoader.dll（CMakeLists 第 47-48 行
 #       `set_target_properties(... OUTPUT_NAME "TextureLoader")`，并注明
 #       "作为普通 DLL 由宿主插件加载器（如 Starward DllList）加载"）

@@ -300,7 +300,7 @@ static uint32_t hash_tex2d_data(uint32_t hash, const void *data, size_t length,
                                 const D3D11_TEXTURE2D_DESC *pDesc, bool zero_padding,
                                 bool skip_padding, UINT mapped_row_pitch)
 {
-    // 显式初始化（2026-09-19 审核报告）：GetSurfaceInfo 在**不支持的格式**
+    // 显式初始化（2026-09-19）：GetSurfaceInfo 在**不支持的格式**
     // （BitsPerPixel==0）或 planar 格式奇数高度时返回 E_INVALIDARG 并**提前 return，
     // 不写任何输出参数** —— 此前忽略返回值，导致下面的 row_pitch/row_count
     // 用**未初始化**的栈值参与寻址与循环控制（未定义行为，可能越界读）。
@@ -352,7 +352,7 @@ uint32_t CalcTexture2DDataHash(const D3D11_TEXTURE2D_DESC *pDesc,
         return 0;
 
     // texture_hash_version == 0 (GIMI default): 3DMigoto v1.2.1-compatible.
-    // ⚠️ 2026-09-19（审核报告）：原为 `pDesc->Width * pDesc->Height * pDesc->ArraySize`，
+    // ⚠️ 2026-09-19：原为 `pDesc->Width * pDesc->Height * pDesc->ArraySize`，
     // 三个 UINT 相乘在 **32 位**下计算后才赋给 size_t —— 大纹理（如 8192×8192×2）
     // 会**回绕**成一个很小的值，使下方 `length_v12 <= length` 判断走错分支、
     // 并让整块 CRC 只覆盖回绕后的长度。改为先提升到 size_t 再乘（64 位）。

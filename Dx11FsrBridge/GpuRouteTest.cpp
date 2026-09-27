@@ -4,7 +4,7 @@
 // ASCII-only source.
 //
 // ============================================================================
-// ⚠️ OBSOLETE / 已废弃（2026-09-19 标注，审核报告）
+// ⚠️ OBSOLETE / 已废弃（2026-09-19 标注）
 //
 // 本文件测试的 `classify_gpu_arch` **在生产代码中已不存在**。
 // 移除它的提交：`3894f22 feat(bridge): drop GPU classification and 402c dual-path

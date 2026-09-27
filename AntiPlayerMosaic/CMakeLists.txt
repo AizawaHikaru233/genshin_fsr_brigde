@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-# 版本号**单一事实源**（2026-09-19 审核报告）。
+# 版本号**单一事实源**（2026-09-19）。
 # 改版本只改这里；`.rc` 通过下面生成的头读取，不再手写。
 project(AntiPlayerMosaic VERSION 1.1.0.0 LANGUAGES CXX RC)
 
@@ -26,7 +26,7 @@ target_compile_definitions(AntiPlayerMosaic PRIVATE
 # Psapi 函数自 Windows 7 起位于 kernel32（Psapi.lib 仅为兼容转发库，VS18/新 SDK 已移除
 # 该 .lib）—— 直接链 kernel32。
 #
-# ⚠️ 2026-09-19（审核报告）修正注释：原文写 "EnumProcessModules 等"，但源码实际**只用**
+# ⚠️ 2026-09-19 修正注释：原文写 "EnumProcessModules 等"，但源码实际**只用**
 # `K32GetModuleInformation`（见 AntiPlayerMosaic.cpp 中 `K32GetModuleInformation(
 # GetCurrentProcess(), main_module, &module_info, ...)`）；本文件并未调用
 # `EnumProcessModules` / `K32EnumProcessModules`。

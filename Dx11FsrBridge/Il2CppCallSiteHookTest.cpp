@@ -231,7 +231,7 @@ void run_per_instance_test()
     CHECK(!il2cpp_callsite::active(), "per-instance: inactive after shutdown");
 }
 
-// 2026-09-23（审核项）新增：验证两条新行为。
+// 2026-09-23 新增：验证两条新行为。
 // 此前 install 失败只返回 false（调用点无法区分原因），shutdown 盲目还原
 // （会把别人的补丁抹掉）—— 两者都需要测试守住。
 void run_install_reason_test()

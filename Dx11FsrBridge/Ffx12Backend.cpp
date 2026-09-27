@@ -347,7 +347,7 @@ std::uint64_t g_shared_fence_value = 0;   // 单调（D3D11/D3D12 共用）
 ComPtr<ID3D11ComputeShader> g_depth_extract_cs;
 // D3D11 侧 motion 解码（金丝雀证实原 D3D12 decode pass 从不写 cvt）
 ComPtr<ID3D11ComputeShader> g_motion_decode_cs;   // D3D11 decode compute
-ComPtr<ID3D11ComputeShader> g_motion_decode_dz_cs; // ：静止死区变体
+ComPtr<ID3D11ComputeShader> g_motion_decode_dz_cs; // 静止死区变体
 ComPtr<ID3D11ComputeShader> g_motion_raw_cs;       // 不解码变体（Ffx12MotionDecode=0 时选用）
 bool g_motion_deadzone = false;                  // =true 用死区变体（微小 motion 归零）
 // P2 诊断（**默认关**，由桥的 Ffx12SingleInstanceDiag 打开）：池重建 / context 重建留痕。
@@ -364,8 +364,8 @@ bool instance_diag_note_allowed()
 bool g_depth_inverted = true;   // 游戏深度逆方向（0=far）—— 2026-08-23 采样验证
 bool g_decode_motion = true;    // 游戏 motion 为 R10G10B10A2 平方编码
 std::uint32_t g_create_flags = 0; // 实际创建 flags（日志按真值输出，勿硬编码）
-float g_motion_flip = 1.0f;     // ：XeSS/DLSS 定向——motion 方向翻转（默认 +1 = FSR 方向）
-float g_depth_scale = 1.0f;     // ：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
+float g_motion_flip = 1.0f;     // XeSS/DLSS 定向——motion 方向翻转（默认 +1 = FSR 方向）
+float g_depth_scale = 1.0f;     // XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
 // b0 常数缓冲（g_motion_cb）与其"已上传值"缓存已搬进 InstanceRes（P2：按实例隔离）。
 bool g_motion_vectors_jittered = false; // 游戏配置：motion 是否已包含投影 jitter
 bool g_hdr_input = true;        // 游戏 10-bit HDR 管线（useRealType）
@@ -478,7 +478,7 @@ void main(uint3 id : SV_DispatchThreadID)
 static const char *g_motion_decode_d11_hlsl = R"(
 cbuffer MotionParams : register(b0)
 {
-    float g_flip; // ：XeSS/DLSS 定向——motion 方向翻转（XeSS-SR 约定 prev→curr，与 FSR 相反）
+    float g_flip; // XeSS/DLSS 定向——motion 方向翻转（XeSS-SR 约定 prev→curr，与 FSR 相反）
     float3 g_pad;
 };
 Texture2D<float4> in_mv : register(t0);
@@ -515,7 +515,7 @@ void *g_up_motion_cvt_ptr = nullptr;
 UINT g_up_motion_cvt_pitch = 0;
 ComPtr<ID3D12DescriptorHeap> g_mv_heap;         // [SRV(motion源), UAV(cvt)]，shader-visible
 UINT g_mv_heap_inc = 0;
-// 2026-09-19（审核报告）：删除 g_mv_rs —— 声明后从未创建或使用，
+// 2026-09-19：删除 g_mv_rs —— 声明后从未创建或使用，
 // 仅在两行注释里被当作"布局参考"提及。该 heap 的实际布局在创建处（下方）明确指定。
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 bool g_motion_decode_test = false;
@@ -528,7 +528,7 @@ ComPtr<ID3D12Resource> g_tex_color_linear;     // R16G16B16A16_FLOAT render 尺�
 ComPtr<ID3D12Resource> g_tex_output_linear;    // R16G16B16A16_FLOAT display 尺寸（FSR2 线性输出）
 ComPtr<ID3D12DescriptorHeap> g_pq_in_heap;     // [SRV(color源), UAV(color_linear)]
 ComPtr<ID3D12DescriptorHeap> g_pq_out_heap;    // [SRV(output_linear), UAV(输出共享)]
-// 2026-09-19（审核报告）：删除 g_pq_rs（声明后从未创建/使用）与 g_pq_encode_pso
+// 2026-09-19：删除 g_pq_rs（声明后从未创建/使用）与 g_pq_encode_pso
 // （仅声明 + 在 shutdown 里 Reset，从未创建）。PQ 编解码已改为不使用独立根签名/PSO。
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 bool g_output_mark = false;                    // 输出标记开关（诊断）
@@ -596,7 +596,7 @@ UINT g_rb_motion_own_pitch = 0;
 // 标记目标纹理的 D3D12 侧（enc）状态跟踪。原版本标记 PSO/HLSL 已移除
 // （它们从未被创建，marker_pso_for_version 也无调用点），但**堆仍在用**：
 // ensure_marker_heap_for 会为 enc 建 shader-visible 描述符堆。
-// 2026-09-19（审核报告）：删除 g_marker_enc_state —— 只有赋值、**从未被读取**，
+// 2026-09-19：删除 g_marker_enc_state —— 只有赋值、**从未被读取**，
 // 是随 PSO/HLSL 一并移除后的残留状态跟踪。
 ComPtr<ID3D12DescriptorHeap> g_marker_heap;
 
@@ -680,7 +680,7 @@ static void sdk_note(const wchar_t *fmt, ...)
 
 // 本 DLL 所在目录（含尾部反斜杠）。
 //
-// ⚠️ 2026-09-19（审核报告）：步进日志此前用**相对路径** `"sdk234_steps.log"` ——
+// ⚠️ 2026-09-19：步进日志此前用**相对路径** `"sdk234_steps.log"` ——
 // 落盘位置取决于进程当前工作目录（游戏启动方式不同则位置不同，甚至可能不可写），
 // 排查时找不到文件。改为与本 DLL 同目录的绝对路径（与主日志 `Dx11FsrBridge.log`
 // 的约定一致）。
@@ -2879,7 +2879,7 @@ bool active()
     return g_active.load(std::memory_order_relaxed);
 }
 
-// 设备移除恢复（）：放弃当前 D3D12/互操作后端并复位活动标志，
+// 设备移除恢复（recover_device_removed_locked）：放弃当前 D3D12/互操作后端并复位活动标志，
 // 下一次 dispatch 惰性重建（新设备/队列/共享纹理/FFX context）。
 // 坏设备上不调用 runtime.destroy（可能 AV）；旧 context 随进程回收（一次事故级泄漏可接受）。
 // 调用方必须已持有 g_mutex（dispatch 路径）。
@@ -3003,7 +3003,7 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
         {
             sdk_note(L"dispatch device-removed d3d12 reason=0x%08X stage=entry",
                      static_cast<unsigned>(drr));
-            recover_device_removed_locked(); // ：放弃后端，下次 dispatch 惰性重建
+            recover_device_removed_locked(); // 放弃后端，下次 dispatch 惰性重建
             return false;
         }
     }
@@ -3218,7 +3218,7 @@ bool decode_motion_wired()
 // 出厂 ini（Ffx12Hdr=0/Ffx12NonLinear=0）下会让人误以为 HDR 已启用。
 const char *create_flags_text()
 {
-    // ⚠️ 必须 thread_local（2026-09-19，审核报告）：此前是普通 `static std::string`，
+    // ⚠️ 必须 thread_local（2026-09-19）：此前是普通 `static std::string`，
     // 注释假设"单线程（dispatch 日志路径）使用"——但该假设**不成立**：
     // 函数可能被渲染线程与其它线程同时调用，而 `clear()` + 逐段 `+=` 会让
     // 另一线程读到**半构造**的字符串（撕裂读）。
@@ -3255,12 +3255,12 @@ const char *create_flags_hex()
     return buffer;
 }
 
-void set_motion_flip(float flip) // ：XeSS/DLSS 定向——motion 方向翻转（±1）
+void set_motion_flip(float flip) // XeSS/DLSS 定向——motion 方向翻转（±1）
 {
     g_motion_flip = flip;
 }
 
-void set_depth_scale(float scale) // ：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
+void set_depth_scale(float scale) // XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
 {
     g_depth_scale = scale;
 }
@@ -3315,7 +3315,7 @@ void set_sdk_version(const char *name)
         g_sdk_version_prefix = std::string(1, input[0]) + ".";
     else
         g_sdk_version_prefix.clear();
-    // 显示名统一为 ffx12 品牌（4.0.2c 为 RDNA2 专用 FSR4 模型，）
+    // 显示名统一为 ffx12 品牌（4.0.2c 为 RDNA2 专用 FSR4 模型）
     if (g_sdk_version_prefix == "4.")
         g_version_name = "ffx12/FSR4";
     else if (g_sdk_version_prefix == "3.")

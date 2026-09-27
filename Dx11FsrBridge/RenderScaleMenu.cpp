@@ -99,7 +99,7 @@ std::mutex g_recent_object_snapshot_mutex;
 std::mutex g_writable_cache_mutex;
 // 实例字段可写性缓存（跨帧稳定；上限防实例重建残留）。
 //
-// ⚠️ 缓存键必须**同时含地址与长度**（2026-09-19，审核报告）：
+// ⚠️ 缓存键必须**同时含地址与长度**（2026-09-19）：
 // 可写性判定里 `result` 的最后一项是"length 是否落在该内存区域内"
 // （见 is_writable_address 末尾的区间检查），即结果**依赖 length**。
 // 旧实现只用地址作键 → 同一地址先以 length=4 查询得到 true 后，
@@ -383,7 +383,7 @@ std::int32_t label_index(const Il2CppStringSnapshot &snapshot)
 
 // 构造 il2cpp String 的替身（托管堆外的裸内存，布局与 il2cpp 期望一致）。
 //
-// ⚠️ **这是有意的进程内泄漏**（2026-09-19，审核报告要求明确）：
+// ⚠️ **这是有意的进程内泄漏**（2026-09-19 明确标注）：
 // 返回的 `memory` **从不 Free**。原因是该指针会被交给**游戏 il2cpp 运行时**当作
 // 合法 String 对象持有——我们无法得知运行时何时（或是否）还会读它，
 // 提前 VirtualFree 会造成 use-after-free（游戏侧读取已释放页 → 崩溃）。

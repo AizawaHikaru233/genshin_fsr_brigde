@@ -7,7 +7,7 @@
 // 对每个可用版本（2.3.4/3.1.5/4.1.1）各跑一遍。
 //
 // 编译：cl /nologo /EHsc /std:c++17 Ffx12AccumTest.cpp ^
-//        /I"D:\DLSSG2FSR4\dependencies\FidelityFX-SDK\ffx-api\include\ffx_api" ^
+//        /I"<FidelityFX-SDK>\ffx-api\include\ffx_api" ^
 //        d3d12.lib dxgi.lib /Fe:Ffx12AccumTest.exe
 
 #include <Windows.h>
@@ -618,7 +618,7 @@ static void run_version(const char* version_name, std::uint64_t version_id,
 // 单版本安全运行（SEH 捕获崩溃；无 C++ 对象，允许 __try）
 // 返回 true = 本次运行正常完成；false = 崩溃（SEH 捕获）或运行失败。
 //
-// 2026-09-19（审核报告高严重度）：旧签名是 `void` —— SEH 捕获到崩溃后**只打印
+// 2026-09-19（高严重度）：旧签名是 `void` —— SEH 捕获到崩溃后**只打印
 // "!!! CRASHED !!!" 而不告知调用方**，`main` 无从累计失败，于是**崩溃的测试
 // 也算"通过"**（恒 return 0）。现在把结果返回给调用方，由 main 汇总为退出码。
 static bool safe_run_version(const char* name, std::uint64_t id, ID3D12Device* dev, ID3D12CommandQueue* queue,
@@ -981,7 +981,7 @@ int main(int argc, char** argv)
         break;
     }
 
-    // 2026-09-19（审核报告高严重度）：退出码必须反映实际结果。
+    // 2026-09-19（高严重度）：退出码必须反映实际结果。
     // 旧实现恒 `return 0` → 崩溃的版本也报"成功"，测试等于空转。
     // 判定口径：**任一版本运行崩溃（SEH）即失败**。
     // 注意：这里**不**对累积/收敛统计设阈值——那些数值随版本与 flag 组合而变，

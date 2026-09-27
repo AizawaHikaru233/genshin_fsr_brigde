@@ -270,7 +270,7 @@ bool CreateReplacementTexture(const GddsInfo &info, ComPtr<ID3D11Texture2D> &d11
     if (FAILED(d11.As(&r1)))
         return false;
     HANDLE h = nullptr;
-    // 权限说明（审核报告曾建议收窄为最小权限）：此处保留 GENERIC_ALL 是**有意为之**。
+    // 权限说明（曾有建议收窄为最小权限）：此处保留 GENERIC_ALL 是**有意为之**。
     // 该句柄只在同一进程内被紧接着的 OpenSharedHandle 消费，随即 CloseHandle，
     // 不跨进程、不落盘，因此不构成权限放大面；而 D3D12 侧对 NT 共享纹理的实际
     // 需求权限依驱动与资源用途而定，收窄到 D3D12_RESOURCE_STATE_* 对应位需要

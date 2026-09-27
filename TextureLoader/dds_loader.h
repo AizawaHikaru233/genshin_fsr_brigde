@@ -49,7 +49,7 @@ const TextureLoaderEntry *SelectTextureLoader(const wchar_t *path,
 // CPU DDS 加载器（实现见 dds_loader.cpp）。
 HRESULT LoadDdsTexture(ID3D11Device *device, const wchar_t *path, TextureLoadResult *out);
 
-// 2026-09-19（审核报告）：删除死代码 `IsDdsMagic()`。
+// 2026-09-19：删除死代码 `IsDdsMagic()`。
 // 全仓库搜索确认**无任何调用点**；而 `dds_loader.cpp` 自己用 `DDS_MAGIC`
 //（0x20534444，第 12 行）做同样的判断。留着它会形成"两个 DDS 魔数判断"
 // 的假象，实际只有一个在用。

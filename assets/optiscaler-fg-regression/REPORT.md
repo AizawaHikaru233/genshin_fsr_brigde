@@ -28,7 +28,7 @@ fails with `0x80004004` (`E_ABORT`), and `NVSDK_NGX_D3D12_EvaluateFeature`
 | Runtime files | `nvngx_dlss.dll`, `nvngx_dlssg.dll`, `sl.dlss_g.dll` (Streamline), `amd_fidelityfx_framegeneration_dx12.dll`, `libxess_fg.dll` — all present and loaded in both runs |
 
 Both logs were captured with identical configuration and identical payload
-layout (`D:\FSR\dist\原神解帧FSR插件包_v2.1.0\payload\OptiScaler`).
+layout (`<unpacked package>\payload\OptiScaler`).
 
 ## Key Metrics
 

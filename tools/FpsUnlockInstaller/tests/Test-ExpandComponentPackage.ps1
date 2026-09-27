@@ -1,6 +1,6 @@
 ﻿# Expand-ComponentPackage 真实解压测试（2026-09-23）
 #
-# 审核项 ④ 标注为"需跑一次手动选 .7z 的安装"才能验证 —— 但该函数的风险点
+# 原先被标注为"需跑一次手动选 .7z 的安装"才能验证 —— 但该函数的风险点
 # （7z 解压、退出码、静默失败防护）**可以直接测**，不必跑整个安装器。
 #
 # 做法：AST 只抽取 `Expand-ComponentPackage`，用真实 7z.exe 造包后实跑。
@@ -53,7 +53,7 @@ Expand-ComponentPackage -PackagePath $zip -Destination $d1
 Chk (Test-Path -LiteralPath (Join-Path $d1 'Bridge\Dx11FsrBridge.dll')) 'zip：解出 Bridge\Dx11FsrBridge.dll'
 Chk (Test-Path -LiteralPath (Join-Path $d1 'readme.txt')) 'zip：解出 readme.txt'
 
-# ---- 2) .7z（审核项的核心）----
+# ---- 2) .7z（本测试的核心）----
 $d2 = Join-Path $sandbox 'out_7z'
 Expand-ComponentPackage -PackagePath $sevenZip -Destination $d2
 Chk (Test-Path -LiteralPath (Join-Path $d2 'Bridge\Dx11FsrBridge.dll')) '7z：解出 Bridge\Dx11FsrBridge.dll'

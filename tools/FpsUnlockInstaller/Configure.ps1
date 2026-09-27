@@ -124,7 +124,7 @@ $optiDll = Join-Path $optiDir 'OptiScaler.dll'
 $optiIni = Join-Path $optiDir 'OptiScaler.ini'
 $optiDefaultIni = Join-Path $optiDir 'OptiScaler.default.ini'
 $packagedDefaultConfigDir = Join-Path $payload 'default_config'
-# ⚠️ 2026-09-23（审核项）：原先还各有一个 `$packagedOptiTemplateDir` /
+# ⚠️ 2026-09-23：原先还各有一个 `$packagedOptiTemplateDir` /
 # `$packagedReShadeTemplateDir`，但两者的值**都等于** `$packagedDefaultConfigDir`
 # （纯别名，各只用一次）—— 已删除，直接用本变量，少两个易漂移的名字。
 $sharedOptiTemplateDir = Join-Path (Split-Path -Parent $root) 'SharedResources\OptiScaler\default_config'
@@ -213,7 +213,7 @@ function Read-YesNo {
 function Select-SourceMode {
     param([string]$Label, [string]$RequestedMode, [bool]$ExistingAvailable)
     if (-not [string]::IsNullOrWhiteSpace($RequestedMode)) { return $RequestedMode }
-    # ⚠️ 2026-09-23（审核项）：本地已有版本时**直接采用**，不再询问。
+    # ⚠️ 2026-09-23：本地已有版本时**直接采用**，不再询问。
     #
     # 这使下面的"3. 使用当前目录中已有的版本"分支**永不可达** —— 原先的菜单代码
     # 显然期望把它作为可选项列出，与这里的提前返回自相矛盾。本次采取**行为不变**的
@@ -572,7 +572,7 @@ function Expand-ComponentPackage {
         return
     }
     if ($extension -eq '.7z') {
-        # 2026-09-19 修正（审核报告高严重度）：此前用 `tar.exe -xf` 解 7z。
+        # 2026-09-19 修正（原为高严重度缺陷）：此前用 `tar.exe -xf` 解 7z。
         # Windows 自带的是 libarchive 的 bsdtar，**通常不支持 7z** ——
         # 手动选择 .7z 包时会解压失败（甚至可能"成功"退出但没解出内容，
         # 表现为静默失败）。改用 7-Zip，与 tools\Update-UpstreamComponents.ps1

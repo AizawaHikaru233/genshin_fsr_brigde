@@ -47,7 +47,7 @@ struct RenderToken
 
 // 安装钩子。失败时原代码未改动（调用方应回退到 draw 层家族跳过）。
 //
-// ⚠️ 2026-09-23（审核项）：**失败原因通过 `out_reason` 如实报出**。
+// ⚠️ 2026-09-23：**失败原因通过 `out_reason` 如实报出**。
 // 此前 6 条失败路径一律静默 `return false`，调用点只知道"失败了"，
 // **分不清是 RVA 为 0、序言不匹配（游戏更新）还是 VirtualAlloc 失败** ——
 // 而这三者的处置完全不同（前者是配置问题、中者是版本问题、后者是资源问题）。
@@ -79,7 +79,7 @@ bool latest_pending_render_token_for(std::uint64_t instance,
                                      std::uint32_t render_w, std::uint32_t render_h,
                                      RenderToken &out);
 bool consume_render_token_for(std::uint64_t instance, std::uint64_t generation);
-// 2026-09-19（审核报告）：pending 环形槽每实例只有 4 个，写满时**覆盖最旧** token。
+// 2026-09-19：pending 环形槽每实例只有 4 个，写满时**覆盖最旧** token。
 // 旧实现是静默的——桥侧只会看到"某个 Render 代次永远等不到 token"，
 // 却无从判断是识别失败还是被环形覆盖。此计数让该情形**可观测**：
 // 非零即说明 4 槽不足（同一实例在 4 次 Render 内未被消费），应扩大环形或查消费路径。

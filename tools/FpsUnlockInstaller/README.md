@@ -50,7 +50,7 @@ OptiScaler 和 ReShade 各自从组件目录读取运行配置。不会随组件
   `payload\TextureLoader\TextureLoader.dll` 等）。
 - **用户配置保留**：`fps_config.json`、`payload\Bridge\Dx11FsrBridge.ini`、`payload\OptiScaler\OptiScaler.ini` /
   `fakenvapi.ini`、`payload\ReShade\ReShade.ini` / `ReShadePreset.ini`、`payload\TextureLoader\TextureLoader.ini`
-  在自更新时被显式跳过（见 `scripts\Apply-PackageUpdate.ps1` 的保留清单）。
+  在自更新时被显式跳过（见 `tools\FpsUnlockInstaller\Apply-PackageUpdate.ps1` 的保留清单）。
 - **用户新增文件保留**：ReShade 效果库（`payload\ReShade\reshade-shaders\` 下自行添加的 Shaders / Textures）、
   `payload\TextureLoader\Mods\` 下的纹理 Mod，以及其它自定义文件都不会被删除——只做增量新增与同名替换。
 - **唯一例外**：执行"安装 / 更新 OptiScaler"时，`payload\OptiScaler\` 目录会被重建后再放入精选组件文件

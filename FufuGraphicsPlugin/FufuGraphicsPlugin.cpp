@@ -25,7 +25,7 @@ struct BootstrapConfig
 {
     bool enable_bridge = true;
     bool enable_optiscaler = true;
-    // ReShade 缺键时的默认值必须与**安装器的 GPU 策略**一致（2026-09-19 审核报告）。
+    // ReShade 缺键时的默认值必须与**安装器的 GPU 策略**一致（2026-09-19）。
     //
     // 三方原本不一致：
     //   - Lua 安装器：**N 卡不写 config**（Install-FufuPlugin.lua 第 58-59 行），
@@ -58,7 +58,7 @@ struct BootstrapConfig
     std::wstring texture_loader_mod_path; // 自定义 Mod 加载路径（空 = DLL 同目录 Mods）
     std::wstring trigger_module = L"WINTRUST.dll";
     DWORD timeout_ms = 30000;
-    // 轮询间隔（2026-09-19 审核报告）：原为 **2ms** —— 配合 30s 超时意味着最多
+    // 轮询间隔（2026-09-19）：原为 **2ms** —— 配合 30s 超时意味着最多
     // **15000 次** `GetModuleHandleW` 轮询，纯烧 CPU。
     //
     // 而被等待的事件是"游戏加载 WINTRUST.dll"，属**毫秒级以上的模块加载**，
@@ -115,7 +115,7 @@ std::wstring lower(std::wstring value)
     return value;
 }
 
-// 日志文件句柄（2026-09-19 审核报告：原先它是 `write_log` 内的**函数局部 static**，
+// 日志文件句柄（2026-09-19：原先它是 `write_log` 内的**函数局部 static**，
 // 导致两个真实缺陷）：
 //   1. **永不关闭** —— 进程生命周期内一直持有该文件句柄；
 //   2. `reset_log()` 用 CREATE_ALWAYS 截断文件后**无法使其失效** —— 缓存的句柄
@@ -221,7 +221,7 @@ void reset_log()
 
 std::filesystem::path module_path(const HMODULE module)
 {
-    // 动态缓冲（2026-09-19 审核报告）：原为 `wchar_t buffer[32768]`（**64KB 栈**）。
+    // 动态缓冲（2026-09-19）：原为 `wchar_t buffer[32768]`（**64KB 栈**）。
     // `module_path` 在启动路径上被多次调用（`is_target_process`、`absolute_from`、
     // 各路径解析），每次压 64KB 栈既浪费又逼近默认 1MB 栈上限。
     // 用 `std::wstring` 按需分配，语义不变（仍按 length 构造，失败返回空路径）。
@@ -233,7 +233,7 @@ std::filesystem::path module_path(const HMODULE module)
     return std::filesystem::path(buffer);
 }
 
-// 从**本模块自身的版本资源**读取版本串（2026-09-19 审核报告）。
+// 从**本模块自身的版本资源**读取版本串（2026-09-19）。
 //
 // 为什么需要：日志原硬编码 `version=2.0.0`，而 `.rc` 已是 `2.2.0.0`
 // （`config.ini` 与 Lua 也写 `2.2.0`）—— 版本号多处硬编码、日志与实际不符。
@@ -287,7 +287,7 @@ bool file_exists(const std::filesystem::path &path)
 std::filesystem::path absolute_from(const std::filesystem::path &base, const std::filesystem::path &path)
 {
     const std::filesystem::path candidate = path.is_absolute() ? path : base / path;
-    // 动态缓冲（2026-09-19 审核报告）：原为 `wchar_t buffer[32768]`（**64KB 栈**）。
+    // 动态缓冲（2026-09-19）：原为 `wchar_t buffer[32768]`（**64KB 栈**）。
     // 语义不变：失败（含过长）时返回未规范化的 candidate，与旧行为一致。
     std::wstring buffer(32768, L'\0');
     const DWORD length = GetFullPathNameW(candidate.c_str(), static_cast<DWORD>(buffer.size()),
@@ -829,7 +829,7 @@ bool has_nvidia_adapter()
 
 DetectedFsr4Policy detect_fsr4_gpu_policy()
 {
-    // 进程内缓存（2026-09-19 审核报告）：本函数被调用 **3 次**
+    // 进程内缓存（2026-09-19）：本函数被调用 **3 次**
     //（`apply_optiscaler_managed_settings`、配置初始化、配置 reset），
     // 每次都会 `CreateDXGIFactory1` + 逐个 `EnumAdapters1` —— 纯重复开销。
     //
@@ -1100,8 +1100,8 @@ bool ensure_missing_component_configurations(const BootstrapConfig &config)
         // ⚠️ 2026-09-19（用户澄清设计意图）：配置**只在首次运行时写入**，
         // 之后仅由用户手动重置（`ResetConfigurations`）才改动。
         //
-        // 本处曾按审核报告改为"托管项每次都写"，但那是**误判**：
-        // 审核把"已有安装永不收敛"当作缺陷，而按设计意图，配置一旦写入
+        // 本处曾改为"托管项每次都写"，但那是**误判**：
+        // 曾把"已有安装永不收敛"当作缺陷，而按设计意图，配置一旦写入
         // 即归**用户所有** —— 每次启动覆盖会让用户手改的值被静默改回。
         // 现回退为首次运行才写。
         //
@@ -1268,7 +1268,7 @@ bool reset_all_configurations(const BootstrapConfig &config)
     return success;
 }
 
-// 读取 UTF-8 文本文件为宽字符串（2026-09-19 审核报告：消除 read_paths_file 与
+// 读取 UTF-8 文本文件为宽字符串（2026-09-19：消除 read_paths_file 与
 // read_fufu_settings 约 30 行的完全重复）。
 //
 // 两者此前各自抄了一份：CreateFileW → GetFileSizeEx（含 1MB 上限）→ ReadFile →
@@ -1447,7 +1447,7 @@ BootstrapConfig load_config()
         // 键缺失时的默认值：与 Lua 安装器的 GPU 策略一致
         //（`EnableReShade = is_nvidia and "0" or "1"`）。
         // 原实现恒为 true，导致 N 卡用户在 config.ini 缺失/损坏时**开启本应关闭的
-        // ReShade**，与安装器策略相反（2026-09-19 审核报告）。
+        // ReShade**，与安装器策略相反（2026-09-19）。
         config.enable_reshade = !has_nvidia_adapter();
         write_log("config_reshade_default_missing_key reshade=" +
                   std::string(config.enable_reshade ? "1" : "0") +
@@ -1652,7 +1652,7 @@ DWORD WINAPI bootstrap_thread(void *)
     g_module_directory = self_path.parent_path();
     g_log_path = g_module_directory / L"FSR-Bridge-Plugin.log";
     reset_log();
-    // 版本从自身 `.rc` 资源读取（2026-09-19 审核报告）：原硬编码 `2.0.0`，
+    // 版本从自身 `.rc` 资源读取（2026-09-19）：原硬编码 `2.0.0`，
     // 而 rc/config.ini/Lua 均为 `2.2.0` —— 日志版本与实际不符。
     // 现 `.rc` 是唯一事实源；查询失败时写 "unknown" 而不是伪造一个版本号。
     {

@@ -116,7 +116,7 @@ void ParseOneFile(const std::wstring &path,
         uint32_t hash = 0;
         bool have_hash = false;
         std::wstring this_res;
-        // 提交当前 override 段（抽出共用，2026-09-19 审核报告）：
+        // 提交当前 override 段（抽出共用，2026-09-19）：
         // 此前"遇到新段头"与"文件末尾"两处**各抄了一份**，且其中一份含
         // if/else 两分支体完全相同的死条件。统一到本 lambda。
         auto flush_override = [&]() {
@@ -160,7 +160,7 @@ void ParseOneFile(const std::wstring &path,
                 continue;
             std::wstring key = Trim(line.substr(0, eq));
             std::wstring val = Trim(line.substr(eq + 1));
-            // 大小写不敏感（2026-09-19 审核报告）：3DMigoto 生态里
+            // 大小写不敏感（2026-09-19）：3DMigoto 生态里
             // `Hash=` / `This=` 等写法常见，原实现只认全小写 → 这类 mod 会**漏解析**。
             if (_wcsicmp(key.c_str(), L"hash") == 0) {
                 have_hash = ParseHash(val, &hash);
@@ -184,7 +184,7 @@ void CollectInis(const std::wstring &dir, std::vector<std::wstring> &out)
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             // 跳过 . / .. 与 DISABLED（3DMigoto 约定：整目录改名以禁用）。
-            // ⚠️ 2026-09-19（审核报告）：原实现还多了一句
+            // ⚠️ 2026-09-19：原实现还多了一句
             //   `if (sub.rfind(L"DISABLED") == npos) CollectInis(sub, out);`
             // —— 它搜的是**整条路径**，若任一父目录名含 "DISABLED"
             //（例如根目录叫 `D:\MyDISABLEDMods\`），会**误跳过整个子树**。
@@ -209,7 +209,7 @@ void CollectInis(const std::wstring &dir, std::vector<std::wstring> &out)
 size_t LoadModInis(const std::wstring &root_dir,
                    std::unordered_map<uint32_t, TextureOverrideEntry> &out_map)
 {
-    // 显式清空（2026-09-19 审核报告）：此前依赖调用方传入空 map；若复用同一个 map
+    // 显式清空（2026-09-19）：此前依赖调用方传入空 map；若复用同一个 map
     // 再次调用，旧条目会残留 —— 且下方 `map[hash] = e` 是"后写覆盖"，
     // 叠加 FindFirstFile 的**未排序**枚举顺序，结果**不确定**。
     // 这里明确契约：本函数从零开始填充 out_map。

@@ -1,6 +1,6 @@
 ﻿# OptiScaler 双布局判定测试（2026-09-23）
 #
-# 审核项 ①「Fufu 双布局」原标注为"两条路线各跑一次确认"。但该风险的**判定核心**
+# 「Fufu 双布局」原被认为只能靠"两条路线各跑一次确认"。但该风险的**判定核心**
 # 是 `Get-OptiScalerLayout`（安装器侧）与插件侧的 `optiscaler_component_directory`，
 # 两者都可直接测 —— 不必跑两次真实部署。
 #
@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 $installerDir = Join-Path $repoRoot 'tools\FpsUnlockInstaller'
-# ⚠️ 2026-09-24：INI 工具已搬到公共模块 `InstallerCommon.ps1`（审核报告「去重 8 条」）。
+# ⚠️ 2026-09-24：INI 工具已搬到公共模块 `InstallerCommon.ps1`（代码去重）。
 # 本测试原先只解析 Configure.ps1，搬家后会「找不到 Set-IniValue」而失败 ——
 # 故按来源分别解析：Get-OptiScalerLayout 仍在 Configure.ps1，
 # Get-IniValue / Set-IniValue 现由 InstallerCommon.ps1 提供。

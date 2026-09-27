@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-# 版本号**单一事实源**（2026-09-19 审核报告）。
+# 版本号**单一事实源**（2026-09-19）。
 # 改版本只改这里；`.rc` 通过下面生成的头读取，不再手写。
 project(Dx11FsrBridge VERSION 2.3.0.0 LANGUAGES C CXX RC)
 
@@ -23,7 +23,7 @@ option(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL "Build the standard FS
 #        更不要在发布构建里关掉它。如需改名请当作"改构建接口"单独评审（本轮刻意不改名）。
 option(DX11FSRBRIDGE_RELEASE_RUNTIME "Build the release runtime" ON)
 option(DX11FSRBRIDGE_BUILD_FAMILY_TEST "Build the Fsr2FamilyTakeover state-machine test" OFF)
-# 统一测试开关（2026-09-19 审核报告）。
+# 统一测试开关（2026-09-19）。
 #
 # 背景：仓库有 7 个 `*Test.cpp`，但此前**只有** `Fsr2FamilyTakeoverTest` 接了 CMake
 # （且需单独开 `DX11FSRBRIDGE_BUILD_FAMILY_TEST`）。其余 6 个被 git 跟踪却**从不编译**
@@ -154,7 +154,7 @@ if(DX11FSRBRIDGE_RELEASE_RUNTIME)
     # Debug 配置（--config Debug）**不**定义正式版过滤宏 → 日志全量输出。
     # Release 定义 DX11FSRBRIDGE_RELEASE_RUNTIME=1 → 由 BridgeLogger 按**显式等级**裁剪。
     #
-    # ⚠️ 2026-09-19（审核报告）修正过时注释：此处原写"Release 保持白名单精简
+    # ⚠️ 2026-09-19 修正过时注释：此处原写"Release 保持白名单精简
     # （error_terms + basic_terms）"——那是**旧日志方案**的描述，已不适用：
     #   - 新 BridgeLogger 用显式 `LOG_DEBUG/INFO/WARN/ERROR` + 每分类等级，
     #     不再按消息内容猜等级（见 BridgeLogger.h 的设计目标说明）。
@@ -224,7 +224,7 @@ if(DX11FSRBRIDGE_BUILD_FAMILY_TEST)
     )
 endif()
 
-# ---- 单元测试接入（2026-09-19 审核报告：此前被跟踪但从不编译）----
+# ---- 单元测试接入（2026-09-19：此前被跟踪但从不编译）----
 #
 # 背景：仓库有 7 个 `*Test.cpp`，此前**只有** `Fsr2FamilyTakeoverTest` 接了 CMake
 # （且需单独开 `DX11FSRBRIDGE_BUILD_FAMILY_TEST`）。其余 6 个被 git 跟踪却**从不编译**

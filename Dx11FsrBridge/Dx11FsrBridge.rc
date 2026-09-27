@@ -2,7 +2,7 @@
 
 #include <windows.h>
 // 版本号来自 CMake 生成的头（单一事实源 = CMakeLists 的 project(... VERSION ...)）。
-// 2026-09-19 审核报告：此前 FILEVERSION / FileVersion 等为**手写**，改版本需多处同步。
+// 2026-09-19：此前 FILEVERSION / FileVersion 等为**手写**，改版本需多处同步。
 #include "Version.h"
 
 VS_VERSION_INFO VERSIONINFO

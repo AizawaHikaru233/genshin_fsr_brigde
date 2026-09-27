@@ -266,7 +266,7 @@ int main()
     fence->SetEventOnCompletion(fv, ev);
     WaitForSingleObject(ev, INFINITE);
 
-    // ---- 断言（2026-09-19，审核报告高严重度：此前只 printf 期望值、无 CHECK、
+    // ---- 断言（2026-09-19，高严重度：此前只 printf 期望值、无 CHECK、
     //      main 恒 return 0 → 无论结果对错都"通过"，等于空转）----
     int failures = 0;
     {

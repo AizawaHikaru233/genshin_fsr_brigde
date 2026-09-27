@@ -1,6 +1,6 @@
 ﻿# build.ps1 — 构建 TextureLoader.dll
 #
-# ⚠️ 2026-09-19（审核报告）：原先这里写"自包含，不依赖仓库其他目录"，**是错的**。
+# ⚠️ 2026-09-19：原先这里写"自包含，不依赖仓库其他目录"，**是错的**。
 # 本模块的 hook 依赖 Detours，而 Detours **只存在于 `Dx11FsrBridge/third_party/detours`**
 #（本目录内没有副本）。故构建**必须**在完整仓库检出中进行，或显式传
 # `-DDETOURS_ROOT=<...>`（见 CMakeLists 的 TEXTURELOADER_DETOURS_ROOT）。
@@ -48,7 +48,7 @@ if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
 if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
 
 $dll = Join-Path $buildDir "TextureLoader.dll"
-# 2026-09-19（审核报告）：显式校验产物存在。此前只打印路径不检查，
+# 2026-09-19：显式校验产物存在。此前只打印路径不检查，
 # 产物缺失时脚本仍"成功"退出（调用方以为可以部署，实际 deploy 才报错）。
 if (-not (Test-Path -LiteralPath $dll)) {
     throw "构建报告成功但未找到产物: $dll"

@@ -9,7 +9,7 @@
 #   .\Deploy-Bridge.ps1 -SkipConfig          # 只铺 DLL，不动 ini
 #   .\Deploy-Bridge.ps1 -Rollback            # 回滚到最近一次备份
 #
-# 只依赖构建产物 D:\FSR\build-package-bridge\Dx11FsrBridge.dll。
+# 只依赖构建产物（默认 $BuildDll = <仓库>\build-package-bridge\Dx11FsrBridge.dll，可用 -BuildDll 覆盖）。
 
 [CmdletBinding()]
 param(
@@ -99,7 +99,7 @@ $configValues = [ordered]@{
 }
 $logSection = @(
     '[Log]',
-    '; level: error / warn / info / debug / trace（或 0..5）。详见 docs/logging-design.md',
+    '; level: off / error / warn / info / debug / trace（或 0..5：0=off）；越靠后越详细，只写该级及更严重的行；可用下方 [Log.Categories] 按子系统单独覆盖',
     'level=debug',
     'to_file=1',
     'to_debugger=0',

@@ -14,7 +14,7 @@ namespace
 std::mutex g_mutex;
 FILE *g_file = nullptr;
 bool g_init_done = false;
-// ⚠️ 2026-09-23（审核报告）：崩溃路径要用的两条**预先算好**的绝对路径。
+// ⚠️ 2026-09-23：崩溃路径要用的两条**预先算好**的绝对路径。
 // 必须预先算好 —— 崩溃处理器内做 `std::wstring` 拼接会碰堆，
 // 而堆可能正是被损坏的那块。
 std::wstring g_main_path;  // <dir>\TextureLoader.log
@@ -42,7 +42,7 @@ static void open_locked()
 
 // 记录日志目录，但**不**在这里打开文件。
 //
-// ⚠️ 2026-09-19（审核报告）：原实现在本函数内直接 `_wfopen_s`，而它由
+// ⚠️ 2026-09-19：原实现在本函数内直接 `_wfopen_s`，而它由
 // `DllMain(DLL_PROCESS_ATTACH)` 调用 —— 即**在 loader lock 持有期间做文件 I/O**。
 // 那是 Windows 上著名的死锁模式：CRT 的 `fopen` 需要初始化 CRT 内部状态/堆，
 // 若此时另一个线程正卡在 loader lock 上等待（或 CRT 内部锁与 loader lock 形成环），
@@ -75,7 +75,7 @@ void log_shutdown()
     g_init_done = false;
 }
 
-// 崩溃路径写入（2026-09-23，审核报告）：**绝不阻塞在 g_mutex 上**。
+// 崩溃路径写入（2026-09-23）：**绝不阻塞在 g_mutex 上**。
 // 详细理由见 log.h 的声明处。要点：
 //   崩溃可能发生在持有 g_mutex 的代码里（fwprintf/fflush 内部违例、堆损坏），
 //   此时取同一把非递归锁 = 自死锁 ⇒ 崩溃报告永远写不出来，进程还挂着。
@@ -168,7 +168,7 @@ void log_write(const wchar_t *fmt, ...)
     fwprintf(g_file, L"%04d-%02d-%02d %02d:%02d:%02d.%03d  %s\n",
              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
              buf);
-    // ⚠️ 2026-09-23（审核报告「每行 fflush 且持全锁」）—— **评估后刻意保留**：
+    // ⚠️ 2026-09-23（对「每行 fflush 且持全锁」的质疑）—— **评估后刻意保留**：
     //
     // 每行 fflush 换到的是**崩溃尾完整性**：进程异常终止时，最后几行已在盘上。
     // 本项目**多次依赖**这一点定位问题（VEH 记录的崩溃现场、IAT 写违例的诊断行

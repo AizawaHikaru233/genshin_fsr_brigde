@@ -124,7 +124,7 @@ std::atomic<ID3D11Resource *> g_activeArr[kMaxActiveResources] = {};
 std::atomic<long> g_activeCount{0}; // 存活条目数（写方持锁更新；读方 acquire 读）
 std::mutex g_activeMutex;           // 写互斥（低频）；读方不取锁
 
-// 满员丢弃计数（2026-09-22，审核报告）：原实现在写满时**静默 return** ——
+// 满员丢弃计数（2026-09-22）：原实现在写满时**静默 return** ——
 // 一旦真的写满，新资源再也无法登记，替换会**静默失效而日志毫无痕迹**。
 // 这是最难查的一类故障，必须留下证据。
 std::atomic<long> g_activeOverflow{0};
@@ -271,7 +271,7 @@ static const TextureLoaderEntry g_loaders[] = {
     {nullptr, LoadDdsTexture}, // 默认兜底：未注册扩展名走 CPU DDS
 };
 
-// ⚠️ 2026-09-22（审核报告）：判断"是不是 GDDS 加载器"必须按**加载器函数**，
+// ⚠️ 2026-09-22：判断"是不是 GDDS 加载器"必须按**加载器函数**，
 // 不能按 `&g_loaders[0]` 下标。
 //
 // 原实现两处都用下标 0 认 GDDS。一旦调整注册表顺序、或在 GDDS 之前插入
@@ -298,7 +298,7 @@ static void EnqueueLoad(uint32_t hash, std::wstring path)
     // GDDS 失败终态隔离：DirectStorage 不可用时 GDDS 任务不再入队，
     // 避免队列堆积与 [fail] 刷屏——DDS 路径完全不受影响。
     // gdds_enabled=0：配置禁用 GDDS（N 卡驱动缺陷规避等场景），.gdds 直接跳过。
-    // 2026-09-22（审核报告）：改用 IsGddsLoader 判定，不再依赖注册表下标。
+    // 2026-09-22：改用 IsGddsLoader 判定，不再依赖注册表下标。
     const bool is_gdds = IsGddsLoader(lt.loader);
     if (is_gdds &&
         (!::tloader::g_gdds_enabled || ::tloader_gdds::Failed()))
@@ -413,7 +413,7 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return ++ref; }
     ULONG STDMETHODCALLTYPE Release() override
     {
-        // ⚠️ 2026-09-23（审核报告）：下溢防护。
+        // ⚠️ 2026-09-23：下溢防护。
         //
         // `ref` 初值为 0，本对象能否正确触发**完全依赖** `SetPrivateDataInterface`
         // 按 COM 约定 AddRef。若它没有 AddRef（或 D3D 内部多调一次 Release），
@@ -503,7 +503,7 @@ volatile long g_stats_created = 0;   // 已哈希的纹理数（**所有**带初
 volatile long g_stats_matched = 0;   // 命中的替换数（g_stats_created 的子集）
 volatile long g_stats_bound = 0;     // 替换 SRV 被绑定次数
 volatile bool g_observe_only = true; // 1=只记录匹配，0=真正替换
-// ⚠️ 2026-09-22（审核报告）：`g_stats_created` 原在 matched 分支内自增，
+// ⚠️ 2026-09-22：`g_stats_created` 原在 matched 分支内自增，
 // 与 `g_stats_matched` **恒等** —— 是日志说谎（"created" 从未反映哈希量）。
 // 已移到哈希之后、判定之前。`created - matched` = 哈希了但未命中。
 
@@ -728,7 +728,7 @@ ID3D11ShaderResourceView *CreateReplacementSRV(uint32_t hash,
 // 重入保护：LoadDdsTexture 创建替换纹理时直接转发，不再进入哈希/替换逻辑
 static thread_local bool t_in_create_texture = false;
 
-// ⚠️ 2026-09-22（审核报告）：重入标志必须用 RAII 管理。
+// ⚠️ 2026-09-22：重入标志必须用 RAII 管理。
 //
 // 原实现是手工 `t_in_create_texture = true;` / `= false;` 夹住 loader->load()。
 // 只要 load() 以**异常**离开（其内部用到 std::vector/std::wstring 等会分配的
@@ -763,7 +763,7 @@ static HRESULT STDMETHODCALLTYPE HookCreateTexture2D(
     if (pInitialData && pInitialData->pSysMem) {
         uint32_t data_hash = CalcTexture2DDataHash(pDesc, pInitialData);
         uint32_t hash = CalcTexture2DDescHash(data_hash, pDesc);
-        // ⚠️ 2026-09-22（审核报告）：`g_stats_created` 必须在这里自增。
+        // ⚠️ 2026-09-22：`g_stats_created` 必须在这里自增。
         //
         // 原实现把它放在下面的 `if (matched && ov)` 分支**内**，紧邻
         // `g_stats_matched` —— 于是两个计数**恒等**，`[stat]` 行里的
@@ -840,7 +840,7 @@ static void ExecuteLoadTask(const AsyncLoadTask &task)
     TextureLoadResult res;
     HRESULT lhr;
     {
-        // 2026-09-22（审核报告）：原为手工置位/复位，load() 抛异常会让该线程
+        // 2026-09-22：原为手工置位/复位，load() 抛异常会让该线程
         // 永久处于重入态 → 之后所有纹理创建都绕过替换（静默失效）。改 RAII。
         CreateTextureReentryGuard reentry_guard; // 防止加载内部重入（建纹理）
         lhr = task.loader->load(dev, task.path.c_str(), &res);
@@ -994,7 +994,7 @@ static void STDMETHODCALLTYPE HookSetShaderResourcesCommon(
                 if (rep) {
                     views[i] = rep;
                     InterlockedIncrement(&g_stats_bound);
-                    // 2026-09-22（审核报告）：`stageIdx` 形参与 `g_stage_name[]`
+                    // 2026-09-22：`stageIdx` 形参与 `g_stage_name[]`
                     // 此前都是**死代码**（形参从未使用、名字表从未被引用）。
                     // 这里把它们用于**等级 2** 的绑定诊断。
                     //
@@ -1094,7 +1094,7 @@ static void STDMETHODCALLTYPE HookUpdateSubresource(
 // Hook: CopyResource — 与 UpdateSubresource 同理标记动态纹理
 // ---------------------------------------------------------------------------
 //
-// ⚠️ 2026-09-23（审核报告）：原实现**只** hook 了 `UpdateSubresource`，
+// ⚠️ 2026-09-23：原实现**只** hook 了 `UpdateSubresource`，
 // 于是"创建时带初始数据（被我们哈希并替换）、之后由游戏用 `CopyResource`
 // 覆写内容"的纹理不会被标记为动态 ⇒ 替换纹理**过期**（画面与游戏状态不一致），
 // 且这种不一致只在特定角色/特效上出现，很难归因。
@@ -1103,7 +1103,7 @@ static void STDMETHODCALLTYPE HookUpdateSubresource(
 // `D3D11_USAGE_DYNAMIC`/`STAGING`，而 `HookCreateTexture2D` 只对**带初始数据**
 // 的纹理算哈希 —— 这类纹理极少同时满足；反观 `Map`/`Unmap` 是**极热路径**
 // （每帧大量常量缓冲/顶点缓冲都走它），为覆盖罕见情形而给它加一次线性扫描不划算。
-// 该限制在此显式记录（审核报告给出的"补 hook 或文档明确限制"两条路，此处各取一半）。
+// 该限制在此显式记录（"补 hook 或文档明确限制"两条路，此处各取一半）。
 
 typedef void(STDMETHODCALLTYPE *CopyResource_t)(ID3D11DeviceContext *,
     ID3D11Resource *, ID3D11Resource *);
@@ -1637,7 +1637,7 @@ DWORD WINAPI VramMonitorThread(LPVOID)
 // 轻量配置读取：DLL 同目录 TextureLoader.ini（key = value，支持 ; 注释）
 // ---------------------------------------------------------------------------
 
-// ⚠️ 2026-09-23（审核报告）：ini **只读一次**，不再每个键都把整个文件重读一遍。
+// ⚠️ 2026-09-23：ini **只读一次**，不再每个键都把整个文件重读一遍。
 //
 // 原实现每次 `GetIniValue` 都走 `CreateFileW` + 整文件 `ReadFile` + UTF-8 转码
 // + 逐行解析。而 `DllMain` 的初始化块里有 **8 次**读取
@@ -2030,7 +2030,7 @@ static void UninstallHooks()
 
 static LONG WINAPI CrashHandler(PEXCEPTION_POINTERS ep)
 {
-    // ⚠️ 2026-09-23（审核报告）：重入防护。
+    // ⚠️ 2026-09-23：重入防护。
     //
     // 处理器自身也会访问内存（CaptureStackBackTrace 走栈、VirtualQuery、
     // memcpy、GetModuleFileNameW）。若它**自己**再触发异常（栈已损坏、
@@ -2201,7 +2201,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         // 避免渲染线程被磁盘 IO/纹理创建阻塞导致 GPU 空转），N 卡在
         // AttachToDevice（已知 GPU 厂商）时自动切同步规避驱动缺陷。
         {
-            // ⚠️ 2026-09-22（审核报告）：改用 IniBool，与其它布尔键语义一致。
+            // ⚠️ 2026-09-22：改用 IniBool，与其它布尔键语义一致。
             //
             // 原实现是 `(av == L"1") ? 1 : 0` —— **只认字面量 "1"**。于是
             // `async_load = true` / `= yes` / `= on` 全部被当成 **0（同步）**，

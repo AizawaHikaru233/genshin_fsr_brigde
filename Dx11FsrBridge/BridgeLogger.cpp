@@ -151,7 +151,7 @@ void rotate_locked()
 void debugger_sink(const std::string &line)
 {
     const std::uint64_t now = GetTickCount64();
-    // 窗口翻转用 CAS（2026-09-19 审核报告）：原实现是
+    // 窗口翻转用 CAS（2026-09-19）：原实现是
     //   load(window) → if (now-window >= 1000) { store(now); store(0); }
     // 多个线程可同时通过 `now - window >= 1000` 判断，于是**都**执行
     // `g_debugger_in_window.store(0)` —— 后到者把先到者刚累加的计数清零，

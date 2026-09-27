@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-# 版本号**单一事实源**（2026-09-19 审核报告）。
+# 版本号**单一事实源**（2026-09-19）。
 # 改版本只改这里；`.rc` 通过下面生成的头读取，不再手写。
 project(FufuGraphicsPlugin VERSION 2.3.0.0 LANGUAGES CXX RC)
 
@@ -29,7 +29,7 @@ target_compile_definitions(FufuGraphicsPlugin PRIVATE
 )
 target_compile_options(FufuGraphicsPlugin PRIVATE /utf-8)
 # version：日志用 GetFileVersionInfoW/VerQueryValueW 读**自身 .rc 的版本资源**
-# （2026-09-19 审核报告：原硬编码 version=2.0.0，而 rc/config.ini/Lua 均为 2.2.0）。
+# （2026-09-19：原硬编码 version=2.0.0，而 rc/config.ini/Lua 均为 2.2.0）。
 # 加它使 `.rc` 成为版本号的唯一事实源。
 target_link_libraries(FufuGraphicsPlugin PRIVATE dxgi version)
 set_property(TARGET FufuGraphicsPlugin PROPERTY

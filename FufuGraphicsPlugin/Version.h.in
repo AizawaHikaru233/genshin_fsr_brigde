@@ -2,7 +2,7 @@
 //
 // 单一版本源在 CMakeLists.txt 的 `project(FufuGraphicsPlugin VERSION x.y.z)`。
 //
-// 为什么需要（2026-09-19 审核报告）：`.rc` 里的 FILEVERSION / FileVersion 等
+// 为什么需要（2026-09-19）：`.rc` 里的 FILEVERSION / FileVersion 等
 // 此前是**手写**的 `2,2,0,0` / `"2.2.0.0"`，与构建版本源无同步机制 ——
 // 改版本要记得同时改多处，漏一处就会出现"文件属性与实际版本不符"
 //（历史上已出现过：插件日志写 `version=2.0.0` 而 `.rc` 是 `2.2.0.0`）。

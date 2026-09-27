@@ -34,7 +34,7 @@ function Convert-InstallerText {
     if ($null -eq $Value -or $script:InstallerLanguage -ne 'en-US' -or $Value -isnot [string]) { return $Value }
 
     $text = [string]$Value
-    # ⚠️ 2026-09-19（审核报告）：本表与下面的 $replacements **不再有重复键**。
+    # ⚠️ 2026-09-19：本表与下面的 $replacements **不再有重复键**。
     #
     # 原先两表有 16 个键值完全相同的条目（已安装/未安装/模块 ID/插件名/作者/当前版本/
     # 安装状态/反虚化 / 隐藏 UID/OptiScaler 三条报错前缀/安装/更新/停止加载/

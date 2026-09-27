@@ -27,7 +27,7 @@ function Get-ReShadeResourceSpec {
             SweetFxSha256    = if ($null -ne $sfx) { [string]$sfx.sha256 } else { '7901037254B06B85E564F5B8774F2F59BF2503143CE1562F9AC704A3F3D74EC6' }
         }
     }
-    # ⚠️ 2026-09-23（审核项）：内置回退此前停在 ReShade **6.7.3**，而基线 JSON 已是
+    # ⚠️ 2026-09-23：内置回退此前停在 ReShade **6.7.3**，而基线 JSON 已是
     # **6.8.0** —— 两者不一致。回退只在"旧包没有 upstream-versions.json"时生效
     # （当前打包脚本**始终**会带上该文件，见 Build-OnlineInstaller.ps1:245），
     # 但一旦生效就会去下载**旧版本**，与基线声明的版本/哈希矛盾。

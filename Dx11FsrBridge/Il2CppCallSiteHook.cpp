@@ -77,7 +77,7 @@ struct PerInstanceParams
 PerInstanceParams g_inst_params[8] {};
 std::size_t g_inst_count = 0;
 std::mutex g_inst_mutex;
-// pending 环形槽溢出计数（审核报告：4 槽满时覆盖最旧 token 是静默的）。
+// pending 环形槽溢出计数（4 槽满时覆盖最旧 token 是静默的）。
 // 每次"该槽位已有未消费 token 却被覆盖"时 +1；桥侧可据此判断环形是否不足。
 std::atomic_uint64_t g_pending_overflow { 0 };
 
@@ -106,7 +106,7 @@ __declspec(noinline) void on_render_enter(void *this_ptr, void *context_ptr)
         std::memcpy(&cp.jitter_y, p + 0x28, 4);
         // 按实例记录（保持全局兼容 + 每实例代次）
         //
-        // ⚠️ 数据竞争修复（2026-09-19，审核报告）：
+        // ⚠️ 数据竞争修复（2026-09-19）：
         // 旧实现把 `g_params = cp` 与代次自增放在**锁外**（本行之前），而读方
         // last_params() / last_params_for() 在锁外读 `g_params` → 撕裂读
         // （读到一半新一半旧的 CapturedParams，导致 render/display 尺寸与
@@ -151,7 +151,7 @@ __declspec(noinline) void on_render_enter(void *this_ptr, void *context_ptr)
             entry.generation = generation;
             entry.params = cp;
             RenderToken &token = entry.pending[entry.next_pending];
-            // 溢出可观测（审核报告）：该槽位若已存在未消费的 token（generation != 0
+            // 溢出可观测：该槽位若已存在未消费的 token（generation != 0
             // 且非本次），说明 4 槽环形不足，旧实现会静默覆盖 → 桥侧表现为
             // "某代次永远等不到 token"。这里计数，让情形可诊断而非静默。
             if (token.generation != 0 && token.generation != generation)
@@ -171,7 +171,7 @@ void write_u64(std::uint8_t *dst, std::uint64_t value)
 
 // 构建 observe/skip 两种 stub。
 //
-// 2026-09-19（审核报告）：旧签名 `bool build_stub(...)` **恒 return true** ——
+// 2026-09-19：旧签名 `bool build_stub(...)` **恒 return true** ——
 // 唯一的调用点也忽略返回值，失败分支不可达。但"恒成功"并非事实：stub 长度是
 // 按序言长度算出来的，若 k_patch_len 或指令序列变化而 k_stub_len 未同步，
 // 下面的 `while (p < k_stub_len)` 填充循环**不会**报错，反而会静默写出界。
@@ -270,7 +270,7 @@ std::vector<std::uint32_t> scan_render_candidates(std::uint64_t exe_base,
     return candidates;
 }
 
-// 失败路径统一出口（2026-09-23，审核项）：
+// 失败路径统一出口（2026-09-23）：
 // 记录原因供调用点如实上报，并保证 `false` 的语义不变。
 // 本 TU 不依赖 BridgeLogger（测试目标只编译本 cpp），故只写 out 参数、不记日志。
 namespace
@@ -355,7 +355,7 @@ void shutdown()
         return;
 
     // ---------------------------------------------------------------------
-    // ⚠️ 2026-09-23（审核项）：**校验后还原**，不再盲目 `memcpy(g_saved)`。
+    // ⚠️ 2026-09-23：**校验后还原**，不再盲目 `memcpy(g_saved)`。
     //
     // 为什么：若期间有别的插件在我们的跳转**之上**又写了补丁（典型：OptiScaler
     // 也 hook 同一个函数），盲目还原会**把对方的补丁抹掉** —— 对方的钩子静默失效，
@@ -400,7 +400,7 @@ void shutdown()
     }
 
     // ---------------------------------------------------------------------
-    // ⚠️ 2026-09-23（审核项）：**刻意不 `VirtualFree` 三个 stub**。
+    // ⚠️ 2026-09-23：**刻意不 `VirtualFree` 三个 stub**。
     //
     // 原实现无条件释放。但还原原字节只能阻止**新的**跳入，**无法排除此刻已有线程
     // 正执行在 stub 内** —— `FreeLibrary` 并不终止其他线程（只有 `TerminateProcess` 会），
@@ -696,7 +696,7 @@ bool install_camera(std::uint64_t exe_base, const Config &cfg)
         VirtualAlloc(nullptr, k_camera_stub_len, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     if (g_camera_stub == nullptr)
     {
-        // 2026-09-19（审核报告）：此处**不再**回写 g_camera_saved。
+        // 2026-09-19：此处**不再**回写 g_camera_saved。
         // 目标字节要到下面 `std::memcpy(target, patch, ...)` 才被修改，走到这里时
         // target 仍是原始内容 → 旧实现的 memcpy 是**无效操作**（把读到的原字节
         // 又写回去）。真正需要恢复的只有内存保护属性。

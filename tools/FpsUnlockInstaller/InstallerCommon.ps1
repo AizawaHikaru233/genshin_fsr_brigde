@@ -7,21 +7,23 @@
 # 与 `ReShadeResources.ps1` 同源做法（它是本仓库已有的共享模块先例）。
 #
 # ============================================================================
-# 为什么有这份文件（2026-09-24，审核报告「去重 8 条」）
+# 为什么有这份文件（2026-09-24，代码去重）
 # ============================================================================
-# 审核报告指出 Configure.ps1 与 Installer.ps1（及 Update-UpstreamComponents.ps1）
-# 之间有十余函数整段复制，且**已出现键集合漂移**（B71/B73 修的 ReShade 路径键
-# 漂移就是这类问题的实例）。
+# Configure.ps1 与 Installer.ps1（及 Update-UpstreamComponents.ps1）之间有十余函数
+# 整段复制，且**已出现键集合漂移**：同一处 ReShade 路径键写入策略在三处各有一份
+# 实现（`Configure.ps1` 的 `Initialize-ReShadeConfiguration`、`Installer.ps1` 的
+# `Repair-RuntimePaths`、插件侧 `prepare_reshade_game_configuration`）—— 改一处时
+# 另外两处不会自动跟着改，复制粘贴的双份实现就是这样漂移的。
 #
-# ⚠️ 审核报告的行号已失效多次（本项目已遇到三次）⇒ 本模块的搬迁**全部按函数名
-#    与内容重核**，并逐对比对过实现。核对结论：
+# ⚠️ 搬迁**全部按函数名与内容重核**，不依赖任何行号：行号在历次改动后已失效多次
+# （本项目已遇到三次）。逐对比对过实现，核对结论：
 #
 #   真正逐字相同、可安全共享的：
 #     Get-GitHubEndpointLatency / Get-GitHubFallbackUrls
 #     Get-VideoControllersOnce / Get-NvidiaVideoControllers
 #     Test-PathCompatibilityRisk / Show-PathCompatibilityWarning
 #
-#   审核报告的偏差（如实记录）：
+#   与「完全重复、可直接合并」这一预期的偏差（如实记录）：
 #     * Invoke-GitHubRestMethodWithFallback **只在 Installer.ps1 里**，
 #       并非"逐行重复" —— 但仍放进本模块（它与 Get-GitHubFallbackUrls 是一组）。
 #     * Set-JsonProperty（Configure）与 Set-JsonPropertyValue（Installer）
@@ -94,7 +96,7 @@ function Get-GitHubFallbackUrls {
     return @($proxyUrls + @($Url))
 }
 
-# 原仅在 Installer.ps1 中（审核报告称"逐行重复"，实为单一实现）。
+# 原仅在 Installer.ps1 中（曾按"逐行重复"，实为单一实现）。
 # ReShadeResources.ps1 通过 Get-Command 守卫调用 Get-GitHubFallbackUrls，
 # 因此它依赖宿主脚本已加载本模块 —— Configure.ps1 / Installer.ps1 都会加载。
 function Invoke-GitHubRestMethodWithFallback {
@@ -189,7 +191,7 @@ function Show-PathCompatibilityWarning {
 # ---------------------------------------------------------------------------
 # ⚠️ 取舍：Configure 的 `Set-JsonProperty` 无返回值，Installer 的
 # `Set-JsonPropertyValue` 返回"是否发生了变化"的布尔 —— **语义不同**，
-# 审核报告说的"几乎相同"不准确。已核实调用点：
+# 两者并非"几乎相同"，这个说法不准确。已核实调用点：
 #   Installer 三处**使用**返回值（`if (Set-... ) { $changed = $true }`）
 #   Configure 四处**在语句位置、忽略返回值**
 # ⇒ **只保留布尔版**（下方），Configure 的四处调用点已改为调用本函数。
@@ -250,7 +252,7 @@ function Test-JsonPropertyValueEqual {
 # ---------------------------------------------------------------------------
 # INI 工具
 # ---------------------------------------------------------------------------
-# ⚠️ 审核报告说"两套实现应合并"，但**逐对比对后不是等价的**，如实记录：
+# ⚠️ 曾登记为"两套实现应合并"，但**逐对比对后不是等价的**，如实记录：
 #
 #   Set-IniValue（Configure）    Set-IniPathValue（Installer）
 #   --------------------------   ----------------------------
@@ -261,7 +263,7 @@ function Test-JsonPropertyValueEqual {
 #
 # 已核实 Installer 的全部 15 处调用点**都不使用返回值**（`| Out-Null` 或语句位置），
 # 因此"返回布尔"不构成差异；但**"文件不存在时是否创建"与"段头匹配宽容度"是
-# 可观察的行为差异** ⇒ 强行统一会改变行为。按任务要求"行为必须完全不变"，
+# 可观察的行为差异** ⇒ 强行统一会改变行为。为保持现有行为完全不变，
 # **两个 setter 均原样保留**（仅位置搬到本模块），差异写在上面这张表里。
 #
 # getter 则只差"未找到时的返回值"（Configure 返回 $null / Installer 返回 ''），

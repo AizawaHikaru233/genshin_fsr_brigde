@@ -4,7 +4,7 @@
 #   powershell -ExecutionPolicy Bypass -File .\undeploy-test.ps1
 #   powershell -ExecutionPolicy Bypass -File .\undeploy-test.ps1 -Route Starward
 #
-# ⚠️ 2026-09-19 修正（审核报告）：与 deploy-test.ps1 同步改为宿主 payload 路线。
+# ⚠️ 2026-09-19 修正：与 deploy-test.ps1 同步改为宿主 payload 路线。
 #   旧版本从游戏目录移除 d3d11.dll / TextureLoader.ini / TextureLoader.log，
 #   那是**已废弃的 d3d11 代理方案**的残留（当前产物为 TextureLoader.dll，
 #   由宿主插件加载器加载，见 TextureLoader/CMakeLists.txt 第 47-48 行）。

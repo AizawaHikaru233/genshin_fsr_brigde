@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-# 版本号**单一事实源**（2026-09-19 审核报告）。改版本只改这里；`.rc` 读生成的头。
+# 版本号**单一事实源**（2026-09-19）。改版本只改这里；`.rc` 读生成的头。
 # 注意：此前 `.rc` 手写 `0,1,0,0` / `"0.1.0"` —— 与其它三个组件的版本管理方式不一致。
 project(TextureLoader VERSION 0.1.0.0 LANGUAGES C CXX RC)
 
@@ -13,7 +13,7 @@ configure_file(
 # GDDS（DirectStorage GPU 解压）依赖——SDK 已 vendor 到本目录 third_party/（MIT + MS 条款，见其 LICENSE*）
 set(DSTORAGE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dstorage")
 
-# Detours（hook 用）**不在本目录**，而是复用 Bridge 的副本（2026-09-19 审核报告）。
+# Detours（hook 用）**不在本目录**，而是复用 Bridge 的副本（2026-09-19）。
 #
 # ⚠️ 这与 `build.ps1` 原先宣称的"自包含，不依赖仓库其他目录"**矛盾**：
 # 单独拷出 `TextureLoader/` 目录构建会在这里失败。既然本目录内**没有** detours 副本，
@@ -57,7 +57,7 @@ target_compile_definitions(TextureLoader PRIVATE
     _UNICODE
     CRC32C_STATIC=1
 )
-# 2026-09-19（审核报告）：删除死定义 `TEXTURELOADER_RELEASE_RUNTIME=1`。
+# 2026-09-19：删除死定义 `TEXTURELOADER_RELEASE_RUNTIME=1`。
 # 全仓库搜索确认**无任何代码引用**该宏（唯一命中就是它自己的定义行），
 # 属死定义 —— 删掉后 Release 构建的 DEFINES 变化不影响任何行为。
 target_include_directories(TextureLoader PRIVATE
