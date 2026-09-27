@@ -1,4 +1,5 @@
 #include "Ffx12Backend.h"
+#include "PerfProbe.h"
 
 #include <Windows.h>
 #include <d3d11.h>
@@ -1605,7 +1606,9 @@ void wait_gpu()
     if (g_fence->GetCompletedValue() < g_fence_value)
     {
         g_fence->SetEventOnCompletion(g_fence_value, g_fence_event);
-        WaitForSingleObject(g_fence_event, INFINITE);
+        // 【诊断】PerfProbe：无限等待只出现在初始化/停机路径；计数出来即可确认
+        // 它**不在**每帧路径上（若 waitobj 每秒有值 ⇒ 才需要继续查）。
+        perf_probe::wait_single_object_counted(g_fence_event, INFINITE);
     }
 }
 
@@ -1786,6 +1789,8 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
         FAILED(g_game_ctx4->Wait(g_shared_fence11.Get(), g_shared_fence_value)))
         return false;
     g_timing.prep_wait_us.fetch_add(qpc_us() - t_prep_wait_start, std::memory_order_relaxed);
+    // 【诊断】PerfProbe：复用上面已有的 qpc_us 测量（**不额外取时间**）。
+    perf_probe::add_span_us(perf_probe::Segment::interop_queue_wait, qpc_us() - t_prep_wait_start);
     const std::uint64_t t_prep_start = qpc_us();
 
     // ---- ① D3D11 侧：深度提取（CS）＋ 输入 GPU 拷贝 ----
@@ -1915,23 +1920,27 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     // 解码结果（共享 R16G16）才是 FFX 的 motion 输入。
     const std::uint64_t t_cs_end = qpc_us();
     g_timing.prep_cs_us.fetch_add(t_cs_end - t_prep_start, std::memory_order_relaxed);
+    perf_probe::add_span_us(perf_probe::Segment::interop_prep, t_cs_end - t_prep_start);
     // 实验：不显式 Flush——测试 ctx4->Signal(v1) 是否隐含提交排队命令
     // （D3D11 输入 CS + 拷贝）。若驱动在 Signal 时提交，pflush 222us 归零。
     // 风险：Signal 不隐含提交 → D3D12 Wait(v1) 超时（1s 保护）→ dispatch 失败
     // fail-open 回退原生 FSR（不崩游戏）。有异常立即恢复 Flush。
     const std::uint64_t t_prep_end = qpc_us();
     g_timing.prep_flush_us.fetch_add(t_prep_end - t_cs_end, std::memory_order_relaxed);
+    perf_probe::add_span_us(perf_probe::Segment::interop_prep, t_prep_end - t_cs_end);
     g_timing.prep_us.fetch_add(t_prep_end - t_prep_start, std::memory_order_relaxed);
     const std::uint64_t v1 = g_shared_fence_value + 1;
     const std::uint64_t t_sig_start = qpc_us();
     if (FAILED(g_game_ctx4->Signal(g_shared_fence11.Get(), v1)))
         return false;
     g_timing.signal_us.fetch_add(qpc_us() - t_sig_start, std::memory_order_relaxed);
+    perf_probe::add_span_us(perf_probe::Segment::interop_signal, qpc_us() - t_sig_start);
     g_shared_fence_value = v1;
     const std::uint64_t t_w12_start = qpc_us();
     if (FAILED(g_queue->Wait(g_shared_fence.Get(), v1)))
         return false;
     g_timing.wait12_us.fetch_add(qpc_us() - t_w12_start, std::memory_order_relaxed);
+    perf_probe::add_span_us(perf_probe::Segment::interop_queue_wait, qpc_us() - t_w12_start);
 
     // ---- ② D3D12 侧：motion 解码 + FFX（共享纹理直读） ----
     const std::uint64_t t_submit_start = qpc_us();
@@ -1942,8 +1951,10 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     if (slot.fence_value != 0 && g_fence->GetCompletedValue() < slot.fence_value)
     {
         // 超时保护：GPU 卡死时不再无限挂起（1s 后失败返回，上层 fail-open）。
+        // 【诊断】PerfProbe：这是**唯一一处会真正阻塞 CPU** 的 fence 等待
+        // （ring 槽位被上一轮占用）。计数器 `waitobj` 与 `wso_max_us` 就是它的实测。
         if (FAILED(g_fence->SetEventOnCompletion(slot.fence_value, g_fence_event)) ||
-            WaitForSingleObject(g_fence_event, 1000) != WAIT_OBJECT_0)
+            perf_probe::wait_single_object_counted(g_fence_event, 1000) != WAIT_OBJECT_0)
             return false;
     }
     if (FAILED(slot.allocator->Reset()) || FAILED(slot.list->Reset(slot.allocator.Get(), nullptr)))
@@ -2032,6 +2043,9 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     slot.fence_value = ring_signal;
     g_shared_fence_value = v2;
     g_timing.submit_us.fetch_add(qpc_us() - t_submit_start, std::memory_order_relaxed);
+    // 【诊断】PerfProbe：submit 段**包含 ring 槽位阻塞等待**（见下方
+    // `wait_single_object_counted`）⇒ 若它偏大且 waitobj 计数 > 0，就是"每帧在等"。
+    perf_probe::add_span_us(perf_probe::Segment::interop_submit, qpc_us() - t_submit_start);
     // （submit = D3D12 侧：Wait(v1) + allocator/list Reset + barrier + FFX dispatch + Execute + 双 Signal）
 
     // ---- ③ 输出交接：同步模式立即等待+拷贝；异步模式记 pending，Present 前 finish ----
@@ -2089,6 +2103,7 @@ static bool finish_gpu_shared()
         return false;
     }
     g_timing.wait_us.fetch_add(qpc_us() - t_wait_start, std::memory_order_relaxed);
+    perf_probe::add_span_us(perf_probe::Segment::finish_wait, qpc_us() - t_wait_start);
     ID3D11Texture2D *output = g_pending_output_target.Get();
     const std::uint64_t t_copy_start = qpc_us();
     if (output)
@@ -2098,6 +2113,7 @@ static bool finish_gpu_shared()
     // 正确性：DXGI Present 会确保 backbuffer 内容就绪（隐含提交排队命令）；
     // 若游戏在拷贝后不再提交任何命令，Present 仍会带走它。
     g_timing.copy_us.fetch_add(qpc_us() - t_copy_start, std::memory_order_relaxed);
+    perf_probe::add_span_us(perf_probe::Segment::finish_copy, qpc_us() - t_copy_start);
     g_pending_ffx = false;
     g_pending_output_target.Reset();
     g_pending_context.Reset();
@@ -2687,6 +2703,11 @@ void recover_device_removed_locked()
 
 bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::uint64_t instance_key)
 {
+    // 【诊断】PerfProbe：本函数 = 每游戏帧一次的 upscale 调用 ⇒ 它就是**帧边界**
+    // （Present 钩子在本机直连模式下默认不装，见 swapchain_present_hook_needed()）。
+    perf_probe::Scope perf_scope(perf_probe::Segment::upscale_dispatch);
+    perf_probe::note_frame(perf_probe::FrameSource::upscale);
+    perf_probe::maybe_flush();
     // 停机中：立即返回，不取 g_mutex、不碰 D3D12 资源。
     // 在取锁**之前**判定是必须的——shutdown() 可能已持锁在释放资源，此时再进来等锁
     // 只会白等，拿到锁之后用的还是已被 Reset 的 ComPtr。

@@ -20,6 +20,7 @@
 
 #include "detours.h"
 #include "RenderScaleMenu.h"
+#include "PerfProbe.h"
 
 namespace
 {
@@ -747,6 +748,10 @@ bool apply_selected_render_scale(void *instance, const char *source)
 
 void __fastcall hooked_update_inner_target(void *instance)
 {
+    // 【诊断】PerfProbe：本钩子**每次被游戏调用**都会 `apply_selected_render_scale`
+    // （内含一次 `VirtualQuery` + 一个 float 写）。日志只在 index 变化时打，
+    // 所以"日志很少"**不能**证明"调用很少" ⇒ 这一段就是用来实测调用频率的。
+    perf_probe::Scope perf_scope(perf_probe::Segment::render_scale);
     apply_selected_render_scale(instance, "update_inner_target");
     if (g_original_update_inner_target != nullptr)
         g_original_update_inner_target(instance);
@@ -754,6 +759,8 @@ void __fastcall hooked_update_inner_target(void *instance)
 
 void __fastcall hooked_build_cmd_buffers(void *instance)
 {
+    // 【诊断】PerfProbe：同上（build_cmd_buffers 路径同样每次调用都写一次精度）。
+    perf_probe::Scope perf_scope(perf_probe::Segment::render_scale);
     apply_selected_render_scale(instance, "build_cmd_buffers");
     if (g_original_build_cmd_buffers != nullptr)
         g_original_build_cmd_buffers(instance);

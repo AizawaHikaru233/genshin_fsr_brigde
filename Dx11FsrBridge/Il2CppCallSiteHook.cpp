@@ -1,4 +1,5 @@
 #include "Il2CppCallSiteHook.h"
+#include "PerfProbe.h"
 
 #include <Windows.h>
 
@@ -85,6 +86,8 @@ std::atomic_uint64_t g_pending_overflow { 0 };
 // m_RenderSize Vector2Int@0x58, m_DisplaySize Vector2Int@0x68。
 __declspec(noinline) void on_render_enter(void *this_ptr, void *context_ptr)
 {
+    // 【诊断】PerfProbe：il2cpp render 入口观察者整体（每帧级，2×QPC 可忽略）。
+    perf_probe::Scope perf_scope(perf_probe::Segment::il2cpp_observer);
     g_render_calls.fetch_add(1, std::memory_order_relaxed);
     if (this_ptr != nullptr)
     {
@@ -315,7 +318,7 @@ bool install(std::uint64_t exe_base, const Config &cfg, const char **out_reason)
 
     // 保存原字节
     DWORD old_protect = 0;
-    if (!VirtualProtect(render, k_patch_len, PAGE_EXECUTE_READWRITE, &old_protect))
+    if (!perf_probe::virtual_protect_counted(render, k_patch_len, PAGE_EXECUTE_READWRITE, &old_protect))
         return fail_install("protect_failed", out_reason);
     std::memcpy(g_saved, render, k_patch_len);
 
@@ -324,7 +327,7 @@ bool install(std::uint64_t exe_base, const Config &cfg, const char **out_reason)
         VirtualAlloc(nullptr, k_stub_len, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     if (g_stub == nullptr)
     {
-        VirtualProtect(render, k_patch_len, old_protect, &old_protect);
+        perf_probe::virtual_protect_counted(render, k_patch_len, old_protect, &old_protect);
         return fail_install("alloc_failed", out_reason);
     }
     build_stub(cfg.skip_render, render, g_stub);
@@ -333,8 +336,8 @@ bool install(std::uint64_t exe_base, const Config &cfg, const char **out_reason)
     std::uint8_t patch[k_patch_len] {};
     build_jmp_patch(patch, k_patch_len, g_stub);
     std::memcpy(render, patch, k_patch_len);
-    VirtualProtect(render, k_patch_len, old_protect, &old_protect);
-    FlushInstructionCache(GetCurrentProcess(), render, k_patch_len);
+    perf_probe::virtual_protect_counted(render, k_patch_len, old_protect, &old_protect);
+    perf_probe::flush_instruction_cache_counted(GetCurrentProcess(), render, k_patch_len);
 
     g_render = render;
     g_active.store(true, std::memory_order_release);
@@ -370,11 +373,11 @@ void shutdown()
         if (std::memcmp(target, expected, len) != 0)
             return false; // 已被他人改写 → 不动
         DWORD old_protect = 0;
-        if (!VirtualProtect(target, len, PAGE_EXECUTE_READWRITE, &old_protect))
+        if (!perf_probe::virtual_protect_counted(target, len, PAGE_EXECUTE_READWRITE, &old_protect))
             return false;
         std::memcpy(target, saved, len);
-        VirtualProtect(target, len, old_protect, &old_protect);
-        FlushInstructionCache(GetCurrentProcess(), target, len);
+        perf_probe::virtual_protect_counted(target, len, old_protect, &old_protect);
+        perf_probe::flush_instruction_cache_counted(GetCurrentProcess(), target, len);
         return true;
     };
 
@@ -683,7 +686,7 @@ bool install_camera(std::uint64_t exe_base, const Config &cfg)
         return false;
 
     DWORD old_protect = 0;
-    if (!VirtualProtect(target, k_camera_patch_len, PAGE_EXECUTE_READWRITE, &old_protect))
+    if (!perf_probe::virtual_protect_counted(target, k_camera_patch_len, PAGE_EXECUTE_READWRITE, &old_protect))
         return false;
     std::memcpy(g_camera_saved, target, k_camera_patch_len);
 
@@ -696,7 +699,7 @@ bool install_camera(std::uint64_t exe_base, const Config &cfg)
         // target 仍是原始内容 → 旧实现的 memcpy 是**无效操作**（把读到的原字节
         // 又写回去）。真正需要恢复的只有内存保护属性。
         DWORD ignored = 0;
-        VirtualProtect(target, k_camera_patch_len, old_protect, &ignored);
+        perf_probe::virtual_protect_counted(target, k_camera_patch_len, old_protect, &ignored);
         return false;
     }
     build_camera_stub(target, g_camera_stub);
@@ -704,8 +707,8 @@ bool install_camera(std::uint64_t exe_base, const Config &cfg)
     std::uint8_t patch[k_camera_patch_len] {};
     build_jmp_patch(patch, k_camera_patch_len, g_camera_stub);
     std::memcpy(target, patch, k_camera_patch_len);
-    VirtualProtect(target, k_camera_patch_len, old_protect, &old_protect);
-    FlushInstructionCache(GetCurrentProcess(), target, k_camera_patch_len);
+    perf_probe::virtual_protect_counted(target, k_camera_patch_len, old_protect, &old_protect);
+    perf_probe::flush_instruction_cache_counted(GetCurrentProcess(), target, k_camera_patch_len);
 
     g_camera_render = target;
     g_camera_active.store(true, std::memory_order_release);
@@ -764,7 +767,7 @@ bool install_projection_setter(std::uint64_t exe_base, const Config &cfg)
     if (std::memcmp(target, k_projection_head, k_projection_patch_len) != 0)
         return false;
     DWORD old_protect = 0;
-    if (!VirtualProtect(target, k_projection_patch_len, PAGE_EXECUTE_READWRITE, &old_protect))
+    if (!perf_probe::virtual_protect_counted(target, k_projection_patch_len, PAGE_EXECUTE_READWRITE, &old_protect))
         return false;
     std::memcpy(g_projection_saved, target, k_projection_patch_len);
     g_projection_stub = static_cast<std::uint8_t *>(
@@ -772,15 +775,15 @@ bool install_projection_setter(std::uint64_t exe_base, const Config &cfg)
     if (g_projection_stub == nullptr)
     {
         std::memcpy(target, g_projection_saved, k_projection_patch_len);
-        VirtualProtect(target, k_projection_patch_len, old_protect, &old_protect);
+        perf_probe::virtual_protect_counted(target, k_projection_patch_len, old_protect, &old_protect);
         return false;
     }
     build_projection_stub(target, g_projection_stub);
     std::uint8_t patch[k_projection_patch_len] {};
     build_jmp_patch(patch, k_projection_patch_len, g_projection_stub);
     std::memcpy(target, patch, k_projection_patch_len);
-    VirtualProtect(target, k_projection_patch_len, old_protect, &old_protect);
-    FlushInstructionCache(GetCurrentProcess(), target, k_projection_patch_len);
+    perf_probe::virtual_protect_counted(target, k_projection_patch_len, old_protect, &old_protect);
+    perf_probe::flush_instruction_cache_counted(GetCurrentProcess(), target, k_projection_patch_len);
     g_projection_setter = target;
     g_projection_active.store(true, std::memory_order_release);
     return true;

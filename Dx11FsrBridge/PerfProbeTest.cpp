@@ -1,0 +1,412 @@
+// PerfProbeTest.cpp — PerfProbe (header-only segmented frame-time probe) unit test.
+//
+// No game, no GPU, no BridgeLogger: PerfProbe.h is header-only and the log line
+// goes through an injected sink, so this test only needs Windows API + the header.
+//
+// Covered:
+//   1) disabled by default => zero accumulation, zero output (must be free)
+//   2) Scope accumulates calls / total / max
+//   3) add_span_us feeds pre-measured spans without taking its own timestamp
+//   4) SampledScope honours the stride and still counts every call
+//   5) counters increment; count_with_us tracks max
+//   6) frame counters per source; jitter call counter
+//   7) flush_now emits exactly one line and resets everything
+//   8) flush is not re-entrant (a sink that calls flush_now must not recurse)
+//   9) maybe_flush respects the interval
+//  10) the emitted line carries the fields the A/B procedure reads
+//  11) segment name table covers every segment
+//
+// ASCII-only (consistent with the other tests in this directory).
+#include "PerfProbe.h"
+
+#include <Windows.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+
+namespace
+{
+
+int failures = 0;
+int checks = 0;
+#define CHECK(cond, msg)                                    \
+    do                                                      \
+    {                                                       \
+        ++checks;                                           \
+        if (!(cond))                                        \
+        {                                                   \
+            std::printf("FAIL: %s\n", msg);                 \
+            ++failures;                                     \
+        }                                                   \
+        else                                                \
+        {                                                   \
+            std::printf("ok:   %s\n", msg);                 \
+        }                                                   \
+    } while (0)
+
+std::string g_captured;
+int g_sink_calls = 0;
+bool g_sink_reenters = false;
+
+void capture_sink(const char *line)
+{
+    ++g_sink_calls;
+    g_captured = line != nullptr ? line : "";
+    if (g_sink_reenters)
+    {
+        // Re-entrancy guard check: this must return immediately (g_flushing is set).
+        perf_probe::flush_now();
+    }
+}
+
+// A cheap "does some work" body so the measured spans are non-zero.
+//
+// IMPORTANT: the result is stored through a volatile sink. Without a side effect
+// MSVC removes the whole loop, the scope body becomes empty, and the QPC delta
+// can round to 0 at the 100 ns QPC granularity -- which would make this test
+// fail for a reason that has nothing to do with the probe (that is exactly how
+// the first version of this test failed).
+volatile std::uint64_t g_spin_sink = 0;
+
+std::uint64_t spin(std::uint32_t iterations)
+{
+    std::uint64_t accumulator = 1;
+    for (std::uint32_t i = 0; i < iterations; ++i)
+        accumulator = accumulator * 1664525ull + 1013904223ull;
+    g_spin_sink = accumulator;
+    return accumulator;
+}
+
+void test_disabled_is_free()
+{
+    perf_probe::reset_for_test();
+    g_captured.clear();
+    g_sink_calls = 0;
+    perf_probe::set_log_sink(&capture_sink);
+
+    CHECK(!perf_probe::enabled(), "probe is disabled by default");
+
+    {
+        perf_probe::Scope scope(perf_probe::Segment::present);
+        spin(20000);
+    }
+    perf_probe::SampledScope sampled(perf_probe::Segment::draw_hook,
+                                     perf_probe::draw_call_counter(),
+                                     perf_probe::draw_sample_counter(), 1);
+    perf_probe::count(perf_probe::Counter::virtual_protect);
+    perf_probe::add_span_us(perf_probe::Segment::interop_prep, 42);
+    perf_probe::note_frame(perf_probe::FrameSource::upscale);
+    perf_probe::note_jitter_call();
+    perf_probe::flush_now();
+
+    std::uint64_t calls = 0;
+    std::uint64_t total = 0;
+    perf_probe::read_segment(perf_probe::Segment::present, &calls, &total, nullptr);
+    CHECK(calls == 0 && total == 0, "disabled: no scope accumulation");
+    perf_probe::read_segment(perf_probe::Segment::draw_hook, &calls, &total, nullptr);
+    CHECK(calls == 0, "disabled: no sampled accumulation");
+    CHECK(perf_probe::read_counter(perf_probe::Counter::virtual_protect) == 0,
+          "disabled: counters stay at zero");
+    CHECK(perf_probe::read_frames(perf_probe::FrameSource::upscale) == 0,
+          "disabled: frames stay at zero");
+    CHECK(perf_probe::read_jitter_calls() == 0, "disabled: jitter calls stay at zero");
+    CHECK(g_sink_calls == 0, "disabled: flush emits nothing");
+    perf_probe::read_segment(perf_probe::Segment::interop_prep, &calls, &total, nullptr);
+    CHECK(calls == 0 && total == 0, "disabled: add_span_us is ignored");
+}
+
+void test_scope_and_spans()
+{
+    perf_probe::reset_for_test();
+    perf_probe::set_log_sink(&capture_sink);
+    perf_probe::configure(true, 60000, 1);
+    CHECK(perf_probe::enabled(), "configure(true) enables the probe");
+
+    for (int i = 0; i < 8; ++i)
+    {
+        perf_probe::Scope scope(perf_probe::Segment::present);
+        spin(20000);
+    }
+    std::uint64_t calls = 0;
+    std::uint64_t total = 0;
+    std::uint64_t max_ns = 0;
+    perf_probe::read_segment(perf_probe::Segment::present, &calls, &total, &max_ns);
+    CHECK(calls == 8, "Scope: call count is exact");
+    CHECK(total > 0, "Scope: total time accumulated");
+    CHECK(max_ns > 0 && max_ns <= total, "Scope: max is within total");
+
+    perf_probe::add_span_us(perf_probe::Segment::interop_prep, 10);
+    perf_probe::add_span_us(perf_probe::Segment::interop_prep, 50);
+    perf_probe::read_segment(perf_probe::Segment::interop_prep, &calls, &total, &max_ns);
+    CHECK(calls == 2, "add_span_us: counts spans");
+    CHECK(total == 60000, "add_span_us: converts us to ns exactly");
+    CHECK(max_ns == 50000, "add_span_us: max is the largest span");
+}
+
+void test_sampling()
+{
+    perf_probe::reset_for_test();
+    perf_probe::set_log_sink(&capture_sink);
+    perf_probe::configure(true, 60000, 4);
+
+    for (int i = 0; i < 40; ++i)
+    {
+        perf_probe::SampledScope sampled(perf_probe::Segment::draw_hook,
+                                         perf_probe::draw_call_counter(),
+                                         perf_probe::draw_sample_counter(), 4);
+        spin(20000);
+    }
+    std::uint64_t calls = 0;
+    perf_probe::read_segment(perf_probe::Segment::draw_hook, &calls, nullptr, nullptr);
+    CHECK(perf_probe::read_draw_calls() == 40, "SampledScope: every call is counted");
+    CHECK(calls == 10, "SampledScope: only 1/strides calls are timed");
+    // stride 1 => every call is timed
+    perf_probe::reset_for_test();
+    perf_probe::configure(true, 60000, 1);
+    for (int i = 0; i < 5; ++i)
+    {
+        perf_probe::SampledScope sampled(perf_probe::Segment::dispatch_hook,
+                                         perf_probe::dispatch_call_counter(),
+                                         perf_probe::dispatch_sample_counter(), 1);
+        spin(20000);
+    }
+    perf_probe::read_segment(perf_probe::Segment::dispatch_hook, &calls, nullptr, nullptr);
+    CHECK(calls == 5, "SampledScope: stride 1 times every call");
+}
+
+void test_counters_and_frames()
+{
+    perf_probe::reset_for_test();
+    perf_probe::set_log_sink(&capture_sink);
+    perf_probe::configure(true, 60000, 1);
+
+    perf_probe::count(perf_probe::Counter::virtual_protect);
+    perf_probe::count(perf_probe::Counter::virtual_protect);
+    perf_probe::count(perf_probe::Counter::flush_instruction_cache);
+    perf_probe::count_with_us(perf_probe::Counter::wait_single_object, 7);
+    perf_probe::count_with_us(perf_probe::Counter::wait_single_object, 3);
+    CHECK(perf_probe::read_counter(perf_probe::Counter::virtual_protect) == 2,
+          "count(): increments the counter");
+    CHECK(perf_probe::read_counter(perf_probe::Counter::flush_instruction_cache) == 1,
+          "count(): per-counter independence");
+    CHECK(perf_probe::read_counter(perf_probe::Counter::wait_single_object) == 2,
+          "count_with_us(): increments the counter");
+
+    for (int i = 0; i < 3; ++i)
+        perf_probe::note_frame(perf_probe::FrameSource::upscale);
+    perf_probe::note_frame(perf_probe::FrameSource::present);
+    perf_probe::note_jitter_call();
+    perf_probe::note_jitter_call();
+    CHECK(perf_probe::read_frames(perf_probe::FrameSource::upscale) == 3, "note_frame: upscale frames");
+    CHECK(perf_probe::read_frames(perf_probe::FrameSource::present) == 1, "note_frame: present frames");
+    CHECK(perf_probe::read_jitter_calls() == 2, "note_jitter_call: counted");
+}
+
+void test_flush_line_and_reset()
+{
+    perf_probe::reset_for_test();
+    perf_probe::set_log_sink(&capture_sink);
+    perf_probe::configure(true, 60000, 1);
+    g_captured.clear();
+    g_sink_calls = 0;
+
+    for (int i = 0; i < 4; ++i)
+    {
+        perf_probe::Scope scope(perf_probe::Segment::upscale_dispatch);
+        spin(20000);
+        perf_probe::note_frame(perf_probe::FrameSource::upscale);
+    }
+    perf_probe::SampledScope sampled(perf_probe::Segment::draw_hook,
+                                     perf_probe::draw_call_counter(),
+                                     perf_probe::draw_sample_counter(), 1);
+    perf_probe::add_span_us(perf_probe::Segment::interop_signal, 200);
+    perf_probe::flush_now();
+
+    CHECK(g_sink_calls == 1, "flush_now: emits exactly one line");
+    CHECK(g_captured.rfind("perf_probe ", 0) == 0, "flush line starts with perf_probe");
+    const char *needles[] = {
+        "ms=", "fps=", "frames=", "ups=", "present=", "draws=",
+        "budget_us=", "acct_us=", "unacc_us=", "self_est_us=",
+        "per_frame_us", "nested_us", "max_us", "draw_samp=", "disp_samp=",
+        "jitter=", "cnt vprotect=", "flushic=", "sleep=", "waitobj=",
+    };
+    for (const char *needle : needles)
+        CHECK(g_captured.find(needle) != std::string::npos, needle);
+
+    // counters / frames must be reset by the flush
+    CHECK(perf_probe::read_frames(perf_probe::FrameSource::upscale) == 0, "flush resets frames");
+    CHECK(perf_probe::read_draw_calls() == 0, "flush resets draw call counter");
+    CHECK(perf_probe::read_counter(perf_probe::Counter::virtual_protect) == 0,
+          "flush resets counters");
+    std::uint64_t calls = 0;
+    std::uint64_t total = 0;
+    perf_probe::read_segment(perf_probe::Segment::upscale_dispatch, &calls, &total, nullptr);
+    CHECK(calls == 0 && total == 0, "flush resets segment accumulation");
+
+    // frames counted => fps and budget_us must be finite/positive-ish tokens
+    CHECK(g_captured.find("frames=4") != std::string::npos, "flush reports the frame count");
+
+    // Print one real line so the shape of the output is documented (and so the
+    // user's A/B instruction can quote an actual example instead of a mock-up).
+    std::printf("\nexample_flush_line:\n%s\n", g_captured.c_str());
+}
+
+void test_flush_not_reentrant()
+{
+    perf_probe::reset_for_test();
+    perf_probe::set_log_sink(&capture_sink);
+    perf_probe::configure(true, 60000, 1);
+    g_sink_calls = 0;
+    g_sink_reenters = true;
+    perf_probe::note_frame(perf_probe::FrameSource::upscale);
+    perf_probe::flush_now();
+    g_sink_reenters = false;
+    CHECK(g_sink_calls == 1, "flush is not re-entrant (sink calling flush_now does not recurse)");
+}
+
+void test_maybe_flush_interval()
+{
+    perf_probe::reset_for_test();
+    perf_probe::set_log_sink(&capture_sink);
+    perf_probe::configure(true, 60000, 1);
+    g_sink_calls = 0;
+    perf_probe::maybe_flush();
+    CHECK(g_sink_calls == 0, "maybe_flush: silent before the interval elapses");
+
+    perf_probe::reset_for_test();
+    perf_probe::configure(true, 1, 1);
+    g_sink_calls = 0;
+    // NOTE: GetTickCount64 has a ~15.6 ms tick unless the process raises the timer
+    // resolution, and the cheap gate inside maybe_flush is based on it. Sleeping
+    // only 5 ms made this check flaky (the tick had not advanced yet) -- so sleep
+    // well past one tick.
+    Sleep(50);
+    perf_probe::maybe_flush();
+    CHECK(g_sink_calls == 1, "maybe_flush: emits once the interval elapses");
+    perf_probe::maybe_flush();
+    perf_probe::maybe_flush();
+    CHECK(g_sink_calls <= 2, "maybe_flush: does not emit again immediately");
+}
+
+void test_interval_zero_falls_back()
+{
+    perf_probe::reset_for_test();
+    perf_probe::configure(true, 0, 0);
+    // interval 0 => 1000 ms default; stride 0 => 1
+    CHECK(perf_probe::draw_sample_stride() == 1, "stride 0 falls back to 1");
+    g_sink_calls = 0;
+    perf_probe::maybe_flush();
+    CHECK(g_sink_calls == 0, "interval 0 falls back to the default (no immediate flush)");
+}
+
+void test_segment_names()
+{
+    bool all_named = true;
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(perf_probe::Segment::count); ++i)
+    {
+        const char *name = perf_probe::segment_name(static_cast<perf_probe::Segment>(i));
+        if (name == nullptr || name[0] == '\0' || std::strcmp(name, "?") == 0)
+            all_named = false;
+    }
+    CHECK(all_named, "every segment has a name");
+    CHECK(std::strcmp(perf_probe::segment_name(perf_probe::Segment::present), "present") == 0,
+          "segment 0 is present (the flush line and the docs must agree)");
+    CHECK(std::strcmp(perf_probe::segment_name(perf_probe::Segment::render_scale), "rscale") == 0,
+          "render_scale maps to rscale (acct list and flush line must agree)");
+    CHECK(std::strcmp(perf_probe::segment_name(perf_probe::Segment::upscale_dispatch), "ups") == 0,
+          "first nested segment is ups");
+    CHECK(std::strcmp(perf_probe::segment_name(perf_probe::Segment::finish_copy), "finc") == 0,
+          "last segment is finc");
+}
+
+// Measure the probe's OWN cost. This is the "prove the probe is cheap" step the
+// project's hot-path red line demands: without it, every number the probe prints
+// is suspect. Same language, same compiler, same optimisation level as the
+// product (error list #26: never infer a C/C++ cost from another language).
+//
+// It is a measurement, not an assertion: the values are printed so they can be
+// quoted, and only a very generous sanity bound is checked.
+void bench_probe_cost()
+{
+    const int iterations = 200000;
+    LARGE_INTEGER frequency {};
+    LARGE_INTEGER begin {};
+    LARGE_INTEGER end {};
+    QueryPerformanceFrequency(&frequency);
+    const double to_ns = 1.0e9 / static_cast<double>(frequency.QuadPart);
+
+    perf_probe::reset_for_test();
+    perf_probe::set_log_sink(&capture_sink);
+    perf_probe::configure(false, 60000, 32);
+    QueryPerformanceCounter(&begin);
+    for (int i = 0; i < iterations; ++i)
+    {
+        perf_probe::Scope scope(perf_probe::Segment::present);
+    }
+    QueryPerformanceCounter(&end);
+    const double scope_disabled_ns = static_cast<double>(end.QuadPart - begin.QuadPart) * to_ns / iterations;
+
+    perf_probe::reset_for_test();
+    perf_probe::configure(true, 60000, 32);
+    QueryPerformanceCounter(&begin);
+    for (int i = 0; i < iterations; ++i)
+    {
+        perf_probe::Scope scope(perf_probe::Segment::present);
+    }
+    QueryPerformanceCounter(&end);
+    const double scope_enabled_ns = static_cast<double>(end.QuadPart - begin.QuadPart) * to_ns / iterations;
+
+    perf_probe::reset_for_test();
+    perf_probe::configure(true, 60000, 32);
+    QueryPerformanceCounter(&begin);
+    for (int i = 0; i < iterations; ++i)
+    {
+        perf_probe::SampledScope scope(perf_probe::Segment::draw_hook,
+                                       perf_probe::draw_call_counter(),
+                                       perf_probe::draw_sample_counter(), 32);
+    }
+    QueryPerformanceCounter(&end);
+    const double sampled_ns = static_cast<double>(end.QuadPart - begin.QuadPart) * to_ns / iterations;
+
+    // maybe_flush is called from the hot draw hook: its cheap gate must be tiny.
+    perf_probe::reset_for_test();
+    perf_probe::configure(true, 60000, 32);
+    QueryPerformanceCounter(&begin);
+    for (int i = 0; i < iterations; ++i)
+        perf_probe::maybe_flush();
+    QueryPerformanceCounter(&end);
+    const double maybe_flush_ns = static_cast<double>(end.QuadPart - begin.QuadPart) * to_ns / iterations;
+
+    std::printf("\nprobe_self_cost_ns   scope_disabled=%.2f  scope_enabled=%.2f"
+                "  sampled_stride32=%.2f  maybe_flush_gated=%.2f\n",
+                scope_disabled_ns, scope_enabled_ns, sampled_ns, maybe_flush_ns);
+    std::printf("=> per frame (10 timed segments): %.2f ns  == %.5f us\n",
+                scope_enabled_ns * 10.0, scope_enabled_ns * 10.0 / 1000.0);
+    // Sanity bound only: a single scope must stay far below 10 us. A failure here
+    // means the probe itself is broken, not that the machine is slow.
+    CHECK(scope_enabled_ns < 10000.0, "probe self cost: one timed scope stays below 10 us");
+    CHECK(scope_disabled_ns < 1000.0, "probe self cost: disabled scope stays below 1 us");
+}
+
+} // namespace
+
+int main()
+{
+    test_disabled_is_free();
+    test_scope_and_spans();
+    test_sampling();
+    test_counters_and_frames();
+    test_flush_line_and_reset();
+    test_flush_not_reentrant();
+    test_maybe_flush_interval();
+    test_interval_zero_falls_back();
+    test_segment_names();
+    bench_probe_cost();
+
+    std::printf("\n%d checks, %d failures\n", checks, failures);
+    if (failures == 0)
+        std::printf("PerfProbeTest: ALL PASS\n");
+    return failures == 0 ? 0 : 1;
+}

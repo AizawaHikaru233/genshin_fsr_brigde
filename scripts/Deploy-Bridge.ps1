@@ -60,6 +60,13 @@ $configValues = [ordered]@{
     # 且其热键在游戏里被吃掉。本脚本不再写这 4 个键；DLL 仍兼容读取，但会写一行
     # legacy/removed_transparent_jitter_keys_* 告警提示迁移。见 TransparentJitterHook.h。
     'TransparentJitter'    = '1'      # 1 = 修复生效（默认，实机已验证）；0 = 回退游戏原行为
+    # 分段性能探针（**诊断，默认关**）：把每帧按段实测（Present / upscale / il2cpp
+    # 回调 / draw 钩子 / dispatch 钩子 / GPU 查询 / 配置 IO / 互操作与 fence 等待 /
+    # TransparentJitter observer），每个间隔输出一行汇总。见 PerfProbe.h。
+    # ⚠️ 平时保持 0：它是诊断开关，且逐 draw 钩子只**抽样**计时（DrawSample 步长）。
+    'PerfProbe'            = '0'
+    'PerfProbeIntervalMs'  = '1000'
+    'PerfProbeDrawSample'  = '32'
     # FSR2 输入纹理转储（默认关）。抓帧用热键，**跑完务必改回 0**（每组 3 帧约 130 MB）。
     'Fsr2InputDump'          = '0'
     'Fsr2InputDumpFrames'    = '3'

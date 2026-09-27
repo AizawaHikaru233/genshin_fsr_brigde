@@ -235,6 +235,16 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     fsrbridge_configure_test(TransparentJitterHookTest)
     target_include_directories(TransparentJitterHookTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME TransparentJitterHookTest COMMAND TransparentJitterHookTest)
+
+    # 分段性能探针（PerfProbe）：**header-only** ⇒ 本 target 只需这一个 .cpp。
+    # 覆盖：关时零开销 / 段累计与 max / 抽样步长 / 计数器 / 帧计数 /
+    # 汇总行只打一行且复位 / 汇总不可重入 / 间隔语义。
+    add_executable(PerfProbeTest
+        PerfProbeTest.cpp
+    )
+    fsrbridge_configure_test(PerfProbeTest)
+    target_include_directories(PerfProbeTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME PerfProbeTest COMMAND PerfProbeTest)
 endif()
 
 if(DX11FSRBRIDGE_BUILD_BACKEND_TEST)

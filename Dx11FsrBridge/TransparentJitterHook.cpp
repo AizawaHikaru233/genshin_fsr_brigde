@@ -1,4 +1,5 @@
 #include "TransparentJitterHook.h"
+#include "PerfProbe.h"
 
 #include <Windows.h>
 
@@ -141,6 +142,10 @@ int parse_callsite_imm(const std::uint8_t *code, std::size_t call_offset)
 // 任何逐次输出都会把日志淹掉。这里只更新计数/最近值；一行汇总由 shutdown() 给出。
 __declspec(noinline) std::uint64_t on_flag_setter_enter(void *camera_ptr, std::uint64_t value_raw)
 {
+    // 【诊断】PerfProbe：本 observer 的单次成本 × 调用频率 = 钩子机制的总开销。
+    // 这一段就是"用数据回答'钩子每调用开销是否可忽略'"，不再靠推算。
+    perf_probe::Scope perf_scope(perf_probe::Segment::jitter_observer);
+    perf_probe::note_jitter_call();
     // ABI：bool 走 dl；rdx 高位未定义 ⇒ 只取低 8 位（与原函数的 `movzx edi,dl` 一致）。
     const std::uint8_t value = static_cast<std::uint8_t>(value_raw & 0xFFu);
     const bool force = g_force.load(std::memory_order_relaxed) != 0;
@@ -400,7 +405,7 @@ bool install(std::uint64_t exe_base, const Config &cfg, const char **out_reason)
         return fail("flag_setter_prologue_mismatch");
 
     DWORD old_protect = 0;
-    if (!VirtualProtect(target, k_patch_len, PAGE_EXECUTE_READWRITE, &old_protect))
+    if (!perf_probe::virtual_protect_counted(target, k_patch_len, PAGE_EXECUTE_READWRITE, &old_protect))
         return fail("protect_failed");
     std::memcpy(g_saved, target, k_patch_len);
 
@@ -410,7 +415,7 @@ bool install(std::uint64_t exe_base, const Config &cfg, const char **out_reason)
     {
         // 目标字节此刻仍是原始内容（下面才写 patch）⇒ 只需恢复保护属性。
         DWORD ignored = 0;
-        VirtualProtect(target, k_patch_len, old_protect, &ignored);
+        perf_probe::virtual_protect_counted(target, k_patch_len, old_protect, &ignored);
         return fail("alloc_failed");
     }
     build_flag_stub(target, g_stub);
@@ -418,8 +423,8 @@ bool install(std::uint64_t exe_base, const Config &cfg, const char **out_reason)
     std::uint8_t patch[k_patch_len] {};
     build_jmp_patch(patch, k_patch_len, g_stub);
     std::memcpy(target, patch, k_patch_len);
-    VirtualProtect(target, k_patch_len, old_protect, &old_protect);
-    FlushInstructionCache(GetCurrentProcess(), target, k_patch_len);
+    perf_probe::virtual_protect_counted(target, k_patch_len, old_protect, &old_protect);
+    perf_probe::flush_instruction_cache_counted(GetCurrentProcess(), target, k_patch_len);
 
     g_target = target;
     // 修复本体：初值来自 ini（TransparentJitter）。stub 每次调用都重读这个原子量。
@@ -459,11 +464,11 @@ void shutdown()
     if (std::memcmp(g_target, expected, k_patch_len) == 0)
     {
         DWORD old_protect = 0;
-        if (VirtualProtect(g_target, k_patch_len, PAGE_EXECUTE_READWRITE, &old_protect))
+        if (perf_probe::virtual_protect_counted(g_target, k_patch_len, PAGE_EXECUTE_READWRITE, &old_protect))
         {
             std::memcpy(g_target, g_saved, k_patch_len);
-            VirtualProtect(g_target, k_patch_len, old_protect, &old_protect);
-            FlushInstructionCache(GetCurrentProcess(), g_target, k_patch_len);
+            perf_probe::virtual_protect_counted(g_target, k_patch_len, old_protect, &old_protect);
+            perf_probe::flush_instruction_cache_counted(GetCurrentProcess(), g_target, k_patch_len);
         }
     }
 

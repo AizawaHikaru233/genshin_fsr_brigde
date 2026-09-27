@@ -17,6 +17,7 @@
 #include "Ffx12Backend.h"
 #include "Fsr2InputDump.h"
 #include "BridgeLogger.h"
+#include "PerfProbe.h"
 // 旧方案（On12 引导 / FSR2 翻译层）已移除，不再编译。
 
 #include <algorithm>
@@ -251,6 +252,13 @@ struct Config
     // 定位走签名发现（锚点 = 特征识别出的 ConfigureJitteredProjectionMatrix），不写死 RVA。
     // 详见 TransparentJitterHook.h。
     bool transparent_jitter = true;
+    // 【诊断】分段性能探针（PerfProbe，默认**关**）。
+    // 症状"帧率上不去但 GPU 占用低"⇒ 需要知道每帧的时间花在哪一段；
+    // 见 PerfProbe.h。`PerfProbeIntervalMs` = 汇总行间隔（默认 1000 ms），
+    // `PerfProbeDrawSample` = draw/dispatch 钩子的抽样步长（默认 32，避免逐 draw 计时）。
+    bool perf_probe = false;
+    std::uint32_t perf_probe_interval_ms = 1000;
+    std::uint32_t perf_probe_draw_sample = 32;
     // Phase 1：进程内 FSR2 2.3.4 后端（ffxApi → amd_fidelityfx_upscaler_dx12.dll）。
     // 桥直接驱动 AMD SDK（不经 OptiScaler）；Phase 2 的调用点接管会调用它的 dispatch。
     bool ffx12 = false;
@@ -4318,6 +4326,16 @@ void load_config()
     wchar_t label_buffer[128] {};
     GetPrivateProfileStringW(L"Dx11FsrBridge", L"RunLabel", L"", label_buffer, static_cast<DWORD>(std::size(label_buffer)), config_path.c_str());
     g_config.run_label = label_buffer;
+
+    // 【诊断】分段性能探针（默认关）。⚠️ 三个键只在这里读一次（配置读取本身
+    // 就是被怀疑的对象之一：`GetPrivateProfile*` 是文件/注册表 IO，
+    // **绝不允许出现在每帧路径上** —— 本探针会把它计数并证明它不在热路径）。
+    g_config.perf_probe =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"PerfProbe", 0, config_path.c_str()) != 0;
+    g_config.perf_probe_interval_ms = static_cast<std::uint32_t>(
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"PerfProbeIntervalMs", 1000, config_path.c_str()));
+    g_config.perf_probe_draw_sample = static_cast<std::uint32_t>(
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"PerfProbeDrawSample", 32, config_path.c_str()));
 }
 
 bool process_matches()
@@ -5133,7 +5151,7 @@ bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *fun
                 continue;
 
             DWORD old_protect = 0;
-            if (!VirtualProtect(&iat[thunk_index].u1.Function, sizeof(std::uintptr_t), PAGE_READWRITE, &old_protect))
+            if (!perf_probe::virtual_protect_counted(&iat[thunk_index].u1.Function, sizeof(std::uintptr_t), PAGE_READWRITE, &old_protect))
                 return false;
 
             // ⚠️ 2026-09-22（实机崩溃）：**不能只信 VirtualProtect 的返回值**。
@@ -5157,7 +5175,7 @@ bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *fun
                                   protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
             if (!writable || (mbi.Protect & PAGE_GUARD) != 0)
             {
-                VirtualProtect(&iat[thunk_index].u1.Function, sizeof(std::uintptr_t), old_protect, &old_protect);
+                perf_probe::virtual_protect_counted(&iat[thunk_index].u1.Function, sizeof(std::uintptr_t), old_protect, &old_protect);
                 g_iat_skip_not_writable.fetch_add(1, std::memory_order_relaxed);
                 // 2026-09-23：这条路径同样要记模块名 —— 只计数的话，
                 // 看到 not_writable=N 时无法判断跳过了哪些模块、是否丢了关键钩子。
@@ -5169,7 +5187,7 @@ bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *fun
             void *current = reinterpret_cast<void *>(iat[thunk_index].u1.Function);
             if (current == replacement)
             {
-                VirtualProtect(&iat[thunk_index].u1.Function, sizeof(std::uintptr_t), old_protect, &old_protect);
+                perf_probe::virtual_protect_counted(&iat[thunk_index].u1.Function, sizeof(std::uintptr_t), old_protect, &old_protect);
                 return true;
             }
 
@@ -5218,7 +5236,7 @@ bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *fun
                 write_ok = false;
                 write_error = GetExceptionCode();
             }
-            VirtualProtect(&iat[thunk_index].u1.Function, sizeof(std::uintptr_t), old_protect, &old_protect);
+            perf_probe::virtual_protect_counted(&iat[thunk_index].u1.Function, sizeof(std::uintptr_t), old_protect, &old_protect);
 
             if (!write_ok)
             {
@@ -7068,6 +7086,14 @@ void tone_map_hdr_backbuffer_to_sdr(IDXGISwapChain *swapchain, std::uint64_t fra
 
 HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags)
 {
+    // 【诊断】PerfProbe：Present 钩子整体 + 帧边界。
+    // ⚠️ 本机 ffx12 直连模式下 `swapchain_present_hook_needed()` 默认**为假**
+    // （见该函数：只有 hook_present / final_scene_* / hdr_composite_probe /
+    // ffx12_present_probe 才需要 Present 钩子）⇒ 这一段在日志里会是 `present=0`，
+    // 那本身就是一条结论："Present 路径上的每帧工作不可能是元凶"。
+    perf_probe::Scope perf_scope(perf_probe::Segment::present);
+    perf_probe::note_frame(perf_probe::FrameSource::present);
+    perf_probe::maybe_flush();
 #if defined(DX11FSRBRIDGE_SERVER_DEBUG_RUNTIME) && defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     static std::uint32_t last_fsr2_query_mask = UINT32_MAX;
     const std::uint32_t fsr2_query_mask = fsr2_get_proc_address_shim_query_mask();
@@ -7737,9 +7763,17 @@ void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_
 {
     if (g_internal_bridge_dispatch)
     {
+        // 桥自己发起的 dispatch 不算游戏侧开销（且它已在 upscale 段内被计入）。
         g_original_dispatch(context, group_x, group_y, group_z);
         return;
     }
+
+    // 【诊断】PerfProbe：compute dispatch 钩子整体（**抽样**计时）。
+    perf_probe::SampledScope perf_scope(perf_probe::Segment::dispatch_hook,
+                                        perf_probe::dispatch_call_counter(),
+                                        perf_probe::dispatch_sample_counter(),
+                                        perf_probe::draw_sample_stride());
+    perf_probe::maybe_flush();
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     record_color_source_call("dispatch", group_x, group_y, group_z);
@@ -8554,6 +8588,10 @@ bool optiscaler_framegen_value_is_dlssg(const std::wstring &value)
 
 bool dlssg_framegen_selected()
 {
+    // 【诊断】PerfProbe：本函数是**带文件 IO 的 250 ms 限流轮询**
+    // （`std::filesystem::exists` + `GetPrivateProfileStringW`，且持锁）。
+    // 它只可能在交换链控制钩子里被调到 —— 这一段用来**证明**它不在帧路径上。
+    perf_probe::Scope perf_scope(perf_probe::Segment::config_io);
     static std::mutex mutex;
     static ULONGLONG last_check_tick = 0;
     static bool cached_result = false;
@@ -8569,10 +8607,12 @@ bool dlssg_framegen_selected()
     for (const std::filesystem::path &ini_path : optiscaler_ini_candidates())
     {
         std::error_code error;
+        perf_probe::count(perf_probe::Counter::file_probe);
         if (!std::filesystem::exists(ini_path, error))
             continue;
 
         wchar_t output_buffer[64] {};
+        perf_probe::count(perf_probe::Counter::config_read);
         GetPrivateProfileStringW(
             L"FrameGen",
             L"FGOutput",
@@ -9854,6 +9894,12 @@ bool collect_fsr2_gpu_timing_slot(ID3D11DeviceContext *context, Fsr2GpuTimingSlo
 
 Fsr2GpuTimingSlot *begin_fsr2_gpu_timing(ID3D11DeviceContext *context)
 {
+    // 【诊断】PerfProbe：GPU timestamp query 段。
+    // ⚠️ 本项目**没有**任何同步读回：`collect_fsr2_gpu_timing_slot` 的 `GetData`
+    // 全部带 `D3D11_ASYNC_GETDATA_DONOTFLUSH`（不阻塞、不 flush）⇒ 结构上不可能
+    // 制造"GPU 空转"。而 `Fsr2GpuTiming` 默认 **0 = 关** ⇒ 本段在默认配置下
+    // 只剩一次布尔判断（≈0 µs）。若日志里本段有可观耗时 ⇒ 才需要继续查它。
+    perf_probe::Scope perf_scope(perf_probe::Segment::gpu_query);
     if (!g_config.fsr2_gpu_timing || context == nullptr)
         return nullptr;
     ID3D11Device *device = nullptr;
@@ -9919,6 +9965,7 @@ void end_fsr2_gpu_timing(ID3D11DeviceContext *context, Fsr2GpuTimingSlot *slot)
 {
     if (context == nullptr || slot == nullptr)
         return;
+    perf_probe::Scope perf_scope(perf_probe::Segment::gpu_query);
     context->End(slot->timestamps[4]);
     context->End(slot->disjoint);
     slot->pending = true;
@@ -12004,6 +12051,13 @@ void note_family_notify(bool handled, const TargetUpscalerDrawInfo *target_draw_
 
 void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT index_count, UINT start_index_location, INT base_vertex_location)
 {
+    // 【诊断】PerfProbe：draw 钩子整体（**抽样**计时，绝不逐 draw 取时间）。
+    // 放在函数最前面 ⇒ 所有 return 路径都被计入（这正是要测的"钩子总开销"）。
+    perf_probe::SampledScope perf_scope(perf_probe::Segment::draw_hook,
+                                        perf_probe::draw_call_counter(),
+                                        perf_probe::draw_sample_counter(),
+                                        perf_probe::draw_sample_stride());
+    perf_probe::maybe_flush();
     // passthrough 机制已整体移除（实测让 OptiScaler 丢失 FFX 输入识别）。
     // 所有显卡统一桥直连；OptiScaler 共存时并行（各自独立链路，实测无冲突；
     // N/Intel 上 OptiScaler 用于提供 DLSS/XeSS，不依赖桥让路）。
@@ -12095,6 +12149,12 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
 // ---------------------------------------------------------------------------
 void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_count, UINT start_vertex_location)
 {
+    // 【诊断】PerfProbe：与 hooked_draw_indexed 同一处置（抽样计时，含所有 return 路径）。
+    perf_probe::SampledScope perf_scope(perf_probe::Segment::draw_hook,
+                                        perf_probe::draw_call_counter(),
+                                        perf_probe::draw_sample_counter(),
+                                        perf_probe::draw_sample_stride());
+    perf_probe::maybe_flush();
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     capture_runtime_snapshot_if_requested();
 #endif
@@ -13503,6 +13563,15 @@ std::uint64_t transparent_jitter_frame()
     return g_state.frame_index;
 }
 
+// 【诊断】PerfProbe 的日志出口。与 TransparentJitter 同一纪律：探针模块不依赖
+// BridgeLogger，出口由这里注入；**关闭时不注册**（零开销）。
+void perf_probe_log(const char *line)
+{
+    if (line == nullptr)
+        return;
+    LOG_INFO(blog::cat::probe, std::string(line));
+}
+
 void initialize()
 {
     wchar_t module_path[MAX_PATH] {};
@@ -13723,6 +13792,20 @@ void initialize()
     {
         // 用户**明确**关掉了修复：说清楚回退到了游戏原行为，不留静默。
         LOG_INFO(blog::cat::hook, "transparent_jitter_disabled key=TransparentJitter=0 fallback=game_default");
+    }
+
+    // ---- 【诊断】分段性能探针（PerfProbe，默认 0 = 关）----
+    // 关时 `enabled()` 为 false ⇒ 所有埋点只剩一次 relaxed 原子读（纳秒级、可忽略）。
+    // 开时：每 `PerfProbeIntervalMs` 输出**一行**分段汇总（见 PerfProbe.h 的分段说明）。
+    perf_probe::set_log_sink(&perf_probe_log);
+    perf_probe::configure(g_config.perf_probe, g_config.perf_probe_interval_ms,
+                          g_config.perf_probe_draw_sample);
+    if (g_config.perf_probe)
+    {
+        LOG_INFO(blog::cat::probe, "perf_probe_enabled interval_ms=" +
+            std::to_string(g_config.perf_probe_interval_ms) +
+            " draw_sample=" + std::to_string(g_config.perf_probe_draw_sample) +
+            " note=one_line_per_interval_only");
     }
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     // Release 构建同样需要 OSD（show_osd 配置控制）：此前被 Release 条件编译切掉，
