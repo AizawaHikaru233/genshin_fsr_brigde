@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 # 版本号**单一事实源**（2026-09-19 审核报告）。
 # 改版本只改这里；`.rc` 通过下面生成的头读取，不再手写。
-project(FufuGraphicsPlugin VERSION 2.2.0.0 LANGUAGES CXX RC)
+project(FufuGraphicsPlugin VERSION 2.3.0.0 LANGUAGES CXX RC)
 
 # 生成版本头供 .rc 使用（生成到构建目录，避免污染源码树）。
 configure_file(
