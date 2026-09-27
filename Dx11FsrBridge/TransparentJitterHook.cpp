@@ -1,4 +1,4 @@
-#include "JitterFlagProbe.h"
+#include "TransparentJitterHook.h"
 
 #include <Windows.h>
 
@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <cstring>
 
-namespace jitter_flag_probe
+namespace transparent_jitter
 {
 namespace
 {
@@ -58,10 +58,9 @@ std::uint8_t *g_target = nullptr;
 std::uint8_t g_saved[k_patch_len] {};
 std::uint8_t *g_stub = nullptr;
 std::atomic_bool g_active { false };
-std::uint32_t g_frames_limit = 0; // JitterFlagProbeFrames（0 = 不限制）
 
-// 观测计数（与日志限流无关，始终统计 —— 这样即使日志被限流，
-// 也能用"是否见过 false"回答机制问题）
+// 观测计数（与日志无关，始终统计 —— 这样即使一行日志都不打，
+// 也能用"是否见过 false"回答机制问题，并在 shutdown 时给出一行汇总）
 std::atomic_uint64_t g_calls { 0 };
 std::atomic_bool g_saw_false { false };
 std::atomic_bool g_saw_true { false };
@@ -69,23 +68,15 @@ std::atomic<std::uint8_t> g_last_value { 0 };
 std::atomic_uint64_t g_last_camera { 0 };
 std::atomic_uint64_t g_last_frame { 0 };
 
-// ---- 【强制 true】状态（JitterFlagForce / 热键）----
-// stub 不内联读它，而是读 observer 的返回值 ⇒ 这里每次调用都重新 load，
-// 因此热键翻转**下一次 setter 调用就生效**（不需要重装钩子）。
+// ---- 修复本体状态（Config.force）----
+// stub 不内联读它，而是读 observer 的返回值 ⇒ 这里每次调用都重新 load。
+// 正式版里它只在 install 时设定、shutdown 时复位（热键已移除，见头文件）。
 std::atomic<std::uint8_t> g_force { 0 };
 std::atomic_uint64_t g_overridden { 0 };      // 实际改写了实参的调用次数
 std::atomic<std::uint8_t> g_last_forwarded { 0 };
-// 调用点静态常量实参（安装时由签名发现给出）。放进观测行里，
-// 好让 A/B 时**一行**就能同时看到：静态原值 / 运行时原值 / 我们传出的值。
+// 调用点静态常量实参（安装时由签名发现给出）。放进安装行里，
+// 好让"静态原值"与"我们传出的值"能对照（二者一致 ⇒ 钩子挂在正确的地方）。
 std::atomic<int> g_callsite_imm { -1 };
-
-// 日志限流状态。
-// ⚠️ 刻意**不加锁**：写方只有游戏渲染线程（OnPreCull → 每帧一次），
-// shutdown() 不碰这些字段。多相机并发时最坏结果是多一行/少一行心跳，对诊断无影响；
-// 而加锁会让本模块在 DLL_PROCESS_DETACH 里变得不 loader-lock 安全。
-// ⚠️ set_force()（热键线程）也**不**碰它 —— 翻转后"下一行日志"由 decide_emit 的
-// `forwarded != last_forwarded` 判据自然带出（见头文件说明）。
-EmitState g_emit_state;
 
 void write_u64(std::uint8_t *dst, std::uint64_t value)
 {
@@ -143,19 +134,26 @@ int parse_callsite_imm(const std::uint8_t *code, std::size_t call_offset)
 //
 // ⚠️ 返回值 = **stub 要转发给原 setter 的 rdx**：
 //   force=0 → 原始 rdx（逐位相同 ⇒ 行为零改动）；
-//   force=1 → 1（这就是"强制 true"的**全部**改动）。
-// 这样"日志里的 forced=" 与"实际传出去的值"必然一致 —— 同一个表达式算出来的。
+//   force=1 → 1（这就是修复的**全部**改动）。
+// 这样"计数里的 overridden"与"实际传出去的值"必然一致 —— 同一个表达式算出来的。
+//
+// ⚠️ 本函数**刻意不打任何日志**（正式版日志纪律，见头文件）：它每帧至少被调一次，
+// 任何逐次输出都会把日志淹掉。这里只更新计数/最近值；一行汇总由 shutdown() 给出。
 __declspec(noinline) std::uint64_t on_flag_setter_enter(void *camera_ptr, std::uint64_t value_raw)
 {
     // ABI：bool 走 dl；rdx 高位未定义 ⇒ 只取低 8 位（与原函数的 `movzx edi,dl` 一致）。
     const std::uint8_t value = static_cast<std::uint8_t>(value_raw & 0xFFu);
     const bool force = g_force.load(std::memory_order_relaxed) != 0;
     const std::uint64_t forwarded = decide_forwarded_value(force, value_raw);
-    if (forwarded != value_raw)
+    // "改写了一次"按**语义**记：只有原值确实是 false 才需要改（false → true）。
+    // ⚠️ 刻意**不**写成 `forwarded != value_raw`：bool 参数在 Win64 下只有 dl 有意义，
+    // rdx 高位是未定义垃圾 —— 游戏传 true 时高位常常非 0，逐位比较会把"原值本来就是
+    // true、我们语义上什么都没改"也算成一次改写，让 `overridden=` 这个数字说谎。
+    // 该 setter 的 `movzx edi,dl` 只读 dl ⇒ "高位被规整"不是语义改动。
+    if (force && value == 0)
         g_overridden.fetch_add(1, std::memory_order_relaxed);
 
-    const std::uint64_t call_index = g_calls.fetch_add(1, std::memory_order_relaxed) + 1;
-
+    g_calls.fetch_add(1, std::memory_order_relaxed);
     if (value != 0)
         g_saw_true.store(true, std::memory_order_relaxed);
     else
@@ -166,31 +164,10 @@ __declspec(noinline) std::uint64_t on_flag_setter_enter(void *camera_ptr, std::u
 
     const FrameProvider provider = g_frame_provider.load(std::memory_order_relaxed);
     // 没有帧号来源时退回调用计数（setter 每帧一次 ⇒ 二者等价），
-    // 这样 frame= 字段不会永远是假的 0，帧数上限也仍然可用。
-    const std::uint64_t frame = provider != nullptr ? provider() : call_index;
+    // 这样 frame 字段不会永远是假的 0。
+    const std::uint64_t frame = provider != nullptr ? provider() : g_calls.load(std::memory_order_relaxed);
     g_last_frame.store(frame, std::memory_order_relaxed);
 
-    // ⚠️ 限流只影响**日志**，绝不影响转发：下面所有提前返回都必须返回 forwarded。
-    const EmitDecision decision = decide_emit(g_emit_state, value, static_cast<std::uint8_t>(forwarded & 0xFFu),
-                                              frame, call_index, g_frames_limit);
-    if (!decision.emit)
-        return forwarded;
-
-    const LogSink sink = g_log_sink.load(std::memory_order_relaxed);
-    if (sink == nullptr)
-        return forwarded;
-
-    // 栈上格式化：钩子内不做分配、不取锁、不碰日志器内部状态。
-    char line[224] {};
-    std::snprintf(line, sizeof(line),
-                  "jitter_flag value=%s forced=%s callsite_imm=%d camera=0x%llx frame=%llu calls=%llu reason=%s",
-                  value != 0 ? "true" : "false",
-                  (forwarded & 0xFFu) != 0 ? "true" : "false",
-                  g_callsite_imm.load(std::memory_order_relaxed),
-                  static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(camera_ptr)),
-                  static_cast<unsigned long long>(frame),
-                  static_cast<unsigned long long>(call_index), decision.reason);
-    sink(line);
     return forwarded;
 }
 
@@ -202,46 +179,6 @@ std::uint64_t decide_forwarded_value(bool force, std::uint64_t original_value_ra
     // 那会改掉 rdx 高位（原始实参里那几位是未定义垃圾），
     // 虽然原函数的 `movzx edi,dl` 不读它们，但"只读观测"模式必须做到字面意义的零改动。
     return force ? 1ull : original_value_raw;
-}
-
-EmitDecision decide_emit(EmitState &state, std::uint8_t value, std::uint8_t forwarded, std::uint64_t frame,
-                         std::uint64_t call_index, std::uint32_t frames_limit,
-                         std::uint32_t heartbeat_interval)
-{
-    EmitDecision out;
-    if (heartbeat_interval == 0)
-        heartbeat_interval = k_heartbeat_calls;
-    // 帧数上限：超过后**不再记录**，但钩子仍在（透传，行为零改动）。
-    if (frames_limit != 0 && frame > frames_limit)
-        return out;
-
-    if (!state.seen_any)
-    {
-        out.emit = true;
-        out.reason = "first";
-    }
-    else if (value != state.last_value || forwarded != state.last_forwarded)
-    {
-        // 原值变了（游戏自己改的）或转发值变了（我们按热键翻的）都要立刻可见。
-        out.emit = true;
-        out.reason = "change";
-    }
-    else if (call_index >= state.next_heartbeat_call)
-    {
-        out.emit = true;
-        out.reason = "heartbeat";
-    }
-
-    if (out.emit)
-    {
-        // 心跳用**调用计数**而不是帧号：帧号来源缺失/冻结时心跳会永远不打，
-        // 而"钩子还活着"恰恰只能靠心跳证明。
-        state.next_heartbeat_call = call_index + heartbeat_interval;
-    }
-    state.seen_any = true;
-    state.last_value = value;
-    state.last_forwarded = forwarded;
-    return out;
 }
 
 bool locate_flag_setter(const std::uint8_t *image, std::uint64_t image_size, std::uint32_t camera_rva,
@@ -434,7 +371,7 @@ bool install(std::uint64_t exe_base, const Config &cfg, const char **out_reason)
     };
 
     // 关闭时**零开销、零字节改动**：连序言都不读。
-    if (!cfg.enabled)
+    if (!cfg.hook)
         return fail("disabled");
     if (g_active.load(std::memory_order_relaxed))
         return true;
@@ -484,10 +421,8 @@ bool install(std::uint64_t exe_base, const Config &cfg, const char **out_reason)
     VirtualProtect(target, k_patch_len, old_protect, &old_protect);
     FlushInstructionCache(GetCurrentProcess(), target, k_patch_len);
 
-    g_frames_limit = cfg.frames_limit;
     g_target = target;
-    // 初值来自 ini（JitterFlagForce）。热键之后可以随时翻转它 —— stub 每次调用都重读，
-    // 因此**不需要重装钩子**就能在同一次会话内 A/B。
+    // 修复本体：初值来自 ini（TransparentJitter）。stub 每次调用都重读这个原子量。
     g_force.store(cfg.force ? 1 : 0, std::memory_order_relaxed);
     g_callsite_imm.store(callsite_imm, std::memory_order_relaxed);
     g_active.store(true, std::memory_order_release);
@@ -495,13 +430,15 @@ bool install(std::uint64_t exe_base, const Config &cfg, const char **out_reason)
     // 安装成功后立刻打一行"证据行"：把**签名发现的结果**、**调用点的静态常量实参**
     // 与 **force 初值**写进日志。静态常量就是那条 `= false` 的机器码（`xor edx,edx`）；
     // 它与运行时钩子互相独立 —— 两者一致才说明钩子挂在了正确的地方。
+    // 这是本模块在正式版里的**唯一**常驻日志（另一行在 shutdown）。
     if (const LogSink sink = g_log_sink.load(std::memory_order_relaxed))
     {
-        char line[224] {};
+        char line[256] {};
         std::snprintf(line, sizeof(line),
-                      "jitter_flag_probe_installed setter_rva=0x%x callsite_imm=%d camera_rva=0x%x force=%d",
+                      "transparent_jitter_installed setter_rva=0x%x callsite_imm=%d camera_rva=0x%x force=%d anchor=%s",
                       static_cast<unsigned>(setter_rva), callsite_imm,
-                      static_cast<unsigned>(cfg.camera_rva), cfg.force ? 1 : 0);
+                      static_cast<unsigned>(cfg.camera_rva), cfg.force ? 1 : 0,
+                      cfg.anchor_source != nullptr ? cfg.anchor_source : "unknown");
         sink(line);
     }
     return true;
@@ -535,8 +472,27 @@ void shutdown()
     // 内存而崩溃。stub 仅 96 字节，泄漏远优于崩溃。（与 Il2CppCallSiteHook 同一处置。）
     g_target = nullptr;
     g_stub = nullptr;
+
+    // 一行汇总（本会话统计）：直接回答"这次修复到底有没有落地"——
+    // `overridden == calls` 且 `saw_false=1` ⇒ 每一次调用都把 false 改成了 true。
+    // 放在 force 复位**之前**读，语义与运行期一致。
+    const std::uint64_t calls = g_calls.load(std::memory_order_relaxed);
+    const std::uint64_t overridden = g_overridden.load(std::memory_order_relaxed);
+    if (const LogSink sink = g_log_sink.load(std::memory_order_relaxed))
+    {
+        char line[224] {};
+        std::snprintf(line, sizeof(line),
+                      "transparent_jitter_stats calls=%llu overridden=%llu saw_false=%d saw_true=%d last_frame=%llu",
+                      static_cast<unsigned long long>(calls),
+                      static_cast<unsigned long long>(overridden),
+                      g_saw_false.load(std::memory_order_relaxed) ? 1 : 0,
+                      g_saw_true.load(std::memory_order_relaxed) ? 1 : 0,
+                      static_cast<unsigned long long>(g_last_frame.load(std::memory_order_relaxed)));
+        sink(line);
+    }
+
     // force 状态复位：还原后 stub 已不可达，"强制开着"这个残留状态会误导下一个读者
-    // （以及误报给 A/B 结论）。init 侧会按 ini 重新安装。
+    //（以及误报给结论）。init 侧会按 ini 重新安装。
     g_force.store(0, std::memory_order_relaxed);
 }
 
@@ -548,26 +504,6 @@ bool active()
 std::uint64_t observed_count()
 {
     return g_calls.load(std::memory_order_relaxed);
-}
-
-bool set_force(bool on, const char *source, std::uint64_t frame)
-{
-    const std::uint8_t next = on ? 1 : 0;
-    const std::uint8_t previous = g_force.exchange(next, std::memory_order_acq_rel);
-    if (previous == next)
-        return false;
-
-    // 每次**真的**切换都必打一行（这正是 A/B 的时间锚点：日志里能定位到哪一帧翻的面）。
-    // 状态未变时不打 —— 热键是边沿检测，但万一被重复调用也不该刷屏。
-    if (const LogSink sink = g_log_sink.load(std::memory_order_relaxed))
-    {
-        char line[192] {};
-        std::snprintf(line, sizeof(line), "jitter_flag_force toggled on=%s source=%s frame=%llu",
-                      on ? "true" : "false", source != nullptr ? source : "unknown",
-                      static_cast<unsigned long long>(frame));
-        sink(line);
-    }
-    return true;
 }
 
 bool force_enabled()
@@ -614,4 +550,4 @@ bool saw_true()
     return g_saw_true.load(std::memory_order_relaxed);
 }
 
-} // namespace jitter_flag_probe
+} // namespace transparent_jitter

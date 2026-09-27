@@ -13,7 +13,7 @@
 #include "RenderScaleMenu.h"
 #include "Fsr2FamilyTakeover.h"
 #include "Il2CppCallSiteHook.h"
-#include "JitterFlagProbe.h"
+#include "TransparentJitterHook.h"
 #include "Ffx12Backend.h"
 #include "Fsr2InputDump.h"
 #include "BridgeLogger.h"
@@ -245,15 +245,12 @@ struct Config
     std::uint32_t ffx12_camera_rva = 0x06B558D0;
     bool ffx12_projection_hook = false; // 观察已构造的 Camera projection matrix
     std::uint32_t ffx12_projection_setter_rva = 0x013DC510;
-    // 【只读观测 + 可选强制】jitter 标志 setter 探针（默认关闭）。钩住
-    // Camera.set_useJitteredProjectionMatrixForTransparentRendering，
-    // **只记录实参**（force=0），或把实参强制成 true（force=1，受控 A/B 修复尝试）。
-    // 定位走签名发现（锚点 = 特征识别出的 ConfigureJitteredProjectionMatrix），
-    // 不写死 RVA。详见 JitterFlagProbe.h。
-    bool jitter_flag_probe = false;
-    std::uint32_t jitter_flag_probe_frames = 0; // 0 = 一直记录；N = 只记录前 N 帧
-    bool jitter_flag_force = false;             // JitterFlagForce（默认 0）：1 = 强制 true
-    std::uint32_t jitter_flag_hotkey = 0;       // JitterFlagHotkey（默认 0 = 无热键）：VK 码
+    // 【正式功能】透明队列抖动修复（TransparentJitter，默认**开**）。
+    // 强制 Camera.set_useJitteredProjectionMatrixForTransparentRendering 的实参为 true，
+    // 让透明队列物件参与超分的时间重建（修复翅膀水晶羽片 / 月环边缘硬阶梯）。
+    // 定位走签名发现（锚点 = 特征识别出的 ConfigureJitteredProjectionMatrix），不写死 RVA。
+    // 详见 TransparentJitterHook.h。
+    bool transparent_jitter = true;
     // Phase 1：进程内 FSR2 2.3.4 后端（ffxApi → amd_fidelityfx_upscaler_dx12.dll）。
     // 桥直接驱动 AMD SDK（不经 OptiScaler）；Phase 2 的调用点接管会调用它的 dispatch。
     bool ffx12 = false;
@@ -1556,32 +1553,6 @@ void poll_mode_hotkeys()
         toggle_recording_mode(2);
     if (GetAsyncKeyState(VK_F9) & 1)
         toggle_recording_mode(3);
-}
-
-// ---- JitterFlagForce 热键（JitterFlagHotkey，默认 0 = 无热键）----
-//
-// 用途：让用户能在**同一次游戏会话内**对"强制 useJitteredProjectionMatrixForTransparentRendering
-// = true"做 A/B，而不是每翻一次面就重启游戏。
-//
-// ⚠️ 三个"别放"的坑（都踩过或已查实）：
-//   ① 别放进 poll_mode_hotkeys() 的 `#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)` 块 ——
-//      该宏对**非 Debug** 构建被强制打开（CMakeLists: $<NOT:$<CONFIG:Debug>>），
-//      那段在发布版**根本不编译**，热键会静默失效（B95 已查实）。
-//   ② 别只挂在 update_osd_from_dispatch() 上 —— 它首行就是 `if (!g_config.show_osd) return;`，
-//      关掉 OSD 的用户永远按不到热键（错误清单第 7 条：ini 里设了没用）。
-//   ③ 别放进任何 FSR2 翻译层宏里 —— 探针刻意不依赖翻译层。
-// 因此：本函数定义在**无宏区**，并由 hooked_present() **无条件每帧**调用一次。
-void poll_jitter_flag_hotkey(std::uint64_t frame_index)
-{
-    const std::uint32_t hotkey = g_config.jitter_flag_hotkey;
-    // 未配置热键、或探针没装上（没有可翻转的目标）⇒ 一次比较就返回，零开销。
-    if (hotkey == 0 || !jitter_flag_probe::active())
-        return;
-    // GetAsyncKeyState 的 bit0 = "自上次调用以来按下过"（边沿），与既有热键同一做法。
-    if ((GetAsyncKeyState(static_cast<int>(hotkey)) & 1) == 0)
-        return;
-    const bool next = !jitter_flag_probe::force_enabled();
-    jitter_flag_probe::set_force(next, "hotkey", frame_index);
 }
 
 ModeMatch classify_current_mode()
@@ -3919,22 +3890,80 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12CameraHook", 0, config_path.c_str()) != 0;
     g_config.ffx12_projection_hook =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ProjectionHook", 0, config_path.c_str()) != 0;
-    // 【只读观测】jitter 标志探针。⚠️ 键名/段位必须与发布 ini 一致：
-    // 段必须是 `[Dx11FsrBridge]`（放错段读不到，本项目踩过），且必须在**生产分支**读取
-    // （load_config 无条件执行，不受 DX11FSRBRIDGE_RELEASE_RUNTIME 影响）。
-    g_config.jitter_flag_probe =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"JitterFlagProbe", 0, config_path.c_str()) != 0;
-    g_config.jitter_flag_probe_frames = static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"JitterFlagProbeFrames", 0, config_path.c_str()));
-    // 【强制 true】开关与热键。同样必须在**生产分支**读取（load_config 无条件执行）。
-    // 热键 VK 码十进制/十六进制都认（**实测**：GetPrivateProfileIntW 对 `0x72` 返回 114 ✓，
-    // 与 TextureTraceHotkey / Fsr2InputDumpHotkey 的十进制写法也兼容）。
-    // ⚠️ 但**写错格式不会退回默认值**：实测 `Garbage=zzz` 返回 **0**（不是 default 参数）⇒
-    // 打错字就是"静默无热键/静默关闭"，这正是默认值 0 的安全方向 ✓。
-    g_config.jitter_flag_force =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"JitterFlagForce", 0, config_path.c_str()) != 0;
-    g_config.jitter_flag_hotkey = static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"JitterFlagHotkey", 0, config_path.c_str()));
+    // 【正式功能】透明队列抖动修复（TransparentJitter，默认 **1 = 修复生效**）。
+    // ⚠️ 键名/段位必须与发布 ini 一致：段必须是 `[Dx11FsrBridge]`（放错段读不到，
+    // 本项目踩过），且必须在**生产分支**读取（load_config 无条件执行，不受
+    // DX11FSRBRIDGE_RELEASE_RUNTIME 影响）。
+    //
+    // 旧键（JitterFlagProbe / JitterFlagForce / JitterFlagProbeFrames / JitterFlagHotkey）
+    // 是调查期的诊断开关，已废弃。⚠️ 不允许"两个键都生效、谁也说不清谁管用"：
+    //   ① 新键**存在** ⇒ 新键是唯一权威，旧键一律忽略（并打一行废弃告警）；
+    //   ② 新键**不存在**、旧键存在 ⇒ 按**旧语义**折算：旧版 force 需要 probe=1 才生效
+    //      ⇒ 等价于 (JitterFlagProbe && JitterFlagForce)；同时打告警呼吁迁移；
+    //   ③ 两者都不存在 ⇒ 默认 1（修复生效）。
+    // "键是否存在"必须用 GetPrivateProfileStringW 判断：GetPrivateProfileIntW
+    // 分不清"键不存在"与"键=0"，而后者是用户**明确要关掉修复**。
+    {
+        const auto ini_key_present = [&config_path](const wchar_t *key)
+        {
+            wchar_t buf[8] {};
+            GetPrivateProfileStringW(L"Dx11FsrBridge", key, L"", buf,
+                                     static_cast<DWORD>(std::size(buf)), config_path.c_str());
+            return buf[0] != L'\0';
+        };
+        const bool new_key_present = ini_key_present(L"TransparentJitter");
+        g_config.transparent_jitter =
+            GetPrivateProfileIntW(L"Dx11FsrBridge", L"TransparentJitter", 1, config_path.c_str()) != 0;
+
+        std::string legacy_keys;
+        for (const wchar_t *key : {L"JitterFlagProbe", L"JitterFlagForce"})
+        {
+            if (!ini_key_present(key))
+                continue;
+            if (!legacy_keys.empty())
+                legacy_keys += ",";
+            legacy_keys += narrow(key);
+        }
+        if (!legacy_keys.empty())
+        {
+            if (new_key_present)
+            {
+                g_config.logging.pending_warnings.push_back(
+                    "legacy_transparent_jitter_keys_ignored keys=" + legacy_keys +
+                    " effective=TransparentJitter=" +
+                    std::to_string(g_config.transparent_jitter ? 1 : 0));
+            }
+            else
+            {
+                // 旧语义：probe=1 才装钩，force=1 才改行为 ⇒ 两者都为 1 才等于"修复生效"。
+                const bool legacy_probe =
+                    GetPrivateProfileIntW(L"Dx11FsrBridge", L"JitterFlagProbe", 0, config_path.c_str()) != 0;
+                const bool legacy_force =
+                    GetPrivateProfileIntW(L"Dx11FsrBridge", L"JitterFlagForce", 0, config_path.c_str()) != 0;
+                g_config.transparent_jitter = legacy_probe && legacy_force;
+                g_config.logging.pending_warnings.push_back(
+                    "legacy_transparent_jitter_keys_deprecated keys=" + legacy_keys +
+                    " resolved=TransparentJitter=" +
+                    std::to_string(g_config.transparent_jitter ? 1 : 0) +
+                    " old_semantics=JitterFlagProbe_AND_JitterFlagForce migrate_to=TransparentJitter=1");
+            }
+        }
+        // 已**移除**的键：存在就如实说"本键无效"，不留"ini 里设了没用"的静默失效。
+        std::string removed_keys;
+        for (const wchar_t *key : {L"JitterFlagHotkey", L"JitterFlagProbeFrames"})
+        {
+            if (!ini_key_present(key))
+                continue;
+            if (!removed_keys.empty())
+                removed_keys += ",";
+            removed_keys += narrow(key);
+        }
+        if (!removed_keys.empty())
+            g_config.logging.pending_warnings.push_back(
+                "removed_transparent_jitter_keys_present keys=" + removed_keys +
+                " effect=none (hotkey removed: swallowed by the game;"
+                " per-frame observation log removed) migrate_to=TransparentJitter=1");
+    }
     const auto read_hex_rva = [&](const wchar_t *key, std::uint32_t fallback) {
         wchar_t buf[32] {};
         GetPrivateProfileStringW(L"Dx11FsrBridge", key, L"", buf, static_cast<DWORD>(std::size(buf)),
@@ -7076,11 +7105,10 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
         backbuffer_height = g_state.backbuffer_height;
     }
 
-    // ---- JitterFlagForce 热键（JitterFlagHotkey）----
-    // ⚠️ 放在 Present 路径**无条件**执行的位置：不受 show_osd 影响，也不在任何
-    // `#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)` 内 ⇒ 发布构建同样按得到。
-    // 未配置热键时它只是两次比较（hotkey==0 短路）。
-    poll_jitter_flag_hotkey(frame_index);
+    // ---- 透明队列抖动修复（TransparentJitter）在安装期一次性生效 ----
+    // 刻意**没有**热键轮询：`JitterFlagHotkey` 在游戏里被游戏吃掉（用户实测按 F3 无反应），
+    // 而 A/B 已在调查期完成 ⇒ 正式版不再留一个"看起来能用、实际按不动"的热键
+    // （见 TransparentJitterHook.h 的说明）。要关掉修复就在 ini 里写 TransparentJitter=0。
 
 #if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
     flush_final_scene_probe(frame_index);
@@ -13414,10 +13442,10 @@ static void route_from_d3d11_device(ID3D11Device *d3d11_device)
 //
 // 为什么需要缓存：`detect_ffx12_method_rvas()` 要遍历 .rdata/.data（本机实测约 62 MB
 // → 约 780 万个 u64）后再排序去重，一次性开销不可忽略；而现在有**两个**功能需要
-// 同一个相机锚点（il2cpp 调用点钩子、JitterFlagProbe 探针），各算一次等于把启动
+// 同一个相机锚点（il2cpp 调用点钩子、TransparentJitter 修复），各算一次等于把启动
 // 开销翻倍。
 //
-// 为什么两个功能**互不依赖**：探针只开 `JitterFlagProbe` 时也必须能工作 ——
+// 为什么两个功能**互不依赖**：只开 `TransparentJitter` 时也必须能工作 ——
 // 若把它塞进 `if (g_config.fsr2_il2cpp_hook)` 里，就会出现"ini 里设了没用"的
 // 静默失效（错误清单第 7/11 条那一族）。
 // ---------------------------------------------------------------------------
@@ -13459,18 +13487,19 @@ std::uint64_t main_module_image_size()
     return nt->OptionalHeader.SizeOfImage;
 }
 
-// 【只读观测】JitterFlagProbe 的日志出口与帧号来源。
-// 探针模块刻意不依赖 BridgeLogger ⇒ 这里注入；关闭时**不注册**（零开销）。
-void jitter_flag_probe_log(const char *line)
+// 【正式功能】TransparentJitter 修复的日志出口与帧号来源。
+// 该模块刻意不依赖 BridgeLogger ⇒ 这里注入；关闭修复时**不注册**（零开销）。
+void transparent_jitter_log(const char *line)
 {
     if (line == nullptr)
         return;
     LOG_INFO(blog::cat::probe, std::string(line));
 }
 
-std::uint64_t jitter_flag_probe_frame()
+std::uint64_t transparent_jitter_frame()
 {
-    // 全局 Present 帧计数（Present 钩子里自增）。探针只把它当诊断数字用。
+    // 全局 Present 帧计数（Present 钩子里自增）。修复模块只在 shutdown 的汇总行里
+    // 把它当诊断数字用，逐帧不输出。
     return g_state.frame_index;
 }
 
@@ -13583,7 +13612,7 @@ void initialize()
         const std::uint64_t exe_base = reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
         // 特征识别优先（不依赖硬编码 RVA——国服/国际服/版本更新通用）：
         // g_MethodPointers + FFX_FSR2 30 方法尺寸序列 gap 匹配；失败用配置（硬编码兜底）。
-        // 结果走缓存：JitterFlagProbe 用同一个锚点（见 il2cpp_rva_cache 的注释）。
+        // 结果走缓存：TransparentJitter 修复用同一个锚点（见 il2cpp_rva_cache 的注释）。
         const Il2CppRvaCache &detected = il2cpp_rva_cache();
         if (detected.detected)
         {
@@ -13653,40 +13682,47 @@ void initialize()
         }
     }
 #endif
-    // ---- jitter 标志 setter 探针（JitterFlagProbe=1，默认关；JitterFlagForce=1 才改行为）----
+    // ---- 透明队列抖动修复（TransparentJitter，默认 1 = 修复生效）----
     //
     // ⚠️ 刻意放在 `DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL` **之外**：
-    // 探针是纯诊断，不该依赖翻译层宏（否则某些构建里"ini 里设了没用"，错误清单第 7 条）。
-    // 关闭时（默认）**连 sink 都不注册**、不碰任何游戏内存 ⇒ 零开销。
-    if (g_config.jitter_flag_probe)
+    // 这是**正式功能**（修透明队列物件边缘硬阶梯），不该依赖实验性翻译层宏
+    //（否则某些构建里"ini 里设了没用"，错误清单第 7 条）。
+    // `TransparentJitter=0` 时**连 sink 都不注册**、不碰任何游戏内存 ⇒ 零开销。
+    if (g_config.transparent_jitter)
     {
-        const std::uint64_t probe_base = reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
-        const Il2CppRvaCache &probe_detected = il2cpp_rva_cache();
-        jitter_flag_probe::Config probe_cfg;
-        probe_cfg.enabled = true;
-        probe_cfg.force = g_config.jitter_flag_force;
-        probe_cfg.frames_limit = g_config.jitter_flag_probe_frames;
+        const std::uint64_t jitter_base = reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
+        const Il2CppRvaCache &jitter_detected = il2cpp_rva_cache();
+        transparent_jitter::Config jitter_cfg;
+        // 生产路径恒为 (hook=1, force=1)：装上钩子 + 改写那一个 bool 实参。
+        // `TransparentJitter=0` 已经在上面短路，所以这里没有"装钩但不改"的第三种状态。
+        jitter_cfg.hook = true;
+        jitter_cfg.force = true;
         // 锚点：特征识别优先，配置 RVA 兜底（load_config 已按 exe 名套用国际服的默认值）。
         // 无论走哪条，install 都会先用 14 字节序言校验 —— 地址错只会"拒绝安装"，不会误 patch。
-        probe_cfg.camera_rva = probe_detected.detected ? probe_detected.camera : g_config.ffx12_camera_rva;
-        probe_cfg.image_size = main_module_image_size();
-        jitter_flag_probe::set_log_sink(&jitter_flag_probe_log);
-        jitter_flag_probe::set_frame_provider(&jitter_flag_probe_frame);
-        const char *probe_reason = nullptr;
-        if (jitter_flag_probe::install(probe_base, probe_cfg, &probe_reason))
-            LOG_INFO(blog::cat::hook, "jitter_flag_probe_active camera_rva=" + hex64(probe_cfg.camera_rva) +
-                " frames_limit=" + std::to_string(probe_cfg.frames_limit) +
-                " force=" + std::to_string(g_config.jitter_flag_force ? 1 : 0) +
-                " hotkey=" + std::to_string(g_config.jitter_flag_hotkey) +
-                " feature_detected=" + std::to_string(probe_detected.detected ? 1 : 0));
-        else
+        jitter_cfg.camera_rva = jitter_detected.detected ? jitter_detected.camera : g_config.ffx12_camera_rva;
+        jitter_cfg.image_size = main_module_image_size();
+        jitter_cfg.anchor_source = jitter_detected.detected ? "feature" : "config";
+        transparent_jitter::set_log_sink(&transparent_jitter_log);
+        transparent_jitter::set_frame_provider(&transparent_jitter_frame);
+        const char *jitter_reason = nullptr;
+        if (!transparent_jitter::install(jitter_base, jitter_cfg, &jitter_reason))
+        {
             // ⚠️ 如实报出失败原因：分不清"锚点没找到 / 序言不匹配（游戏更新）/
             // 分配失败"就只能靠猜，而三者处置完全不同（同 Il2CppCallSiteHook 的纪律）。
-            LOG_WARN(blog::cat::hook, "jitter_flag_probe_failed reason=" +
-                (probe_reason != nullptr ? std::string(probe_reason) : std::string("unknown")) +
-                " camera_rva=" + hex64(probe_cfg.camera_rva) +
-                " image_size=" + std::to_string(probe_cfg.image_size) +
-                " feature_detected=" + std::to_string(probe_detected.detected ? 1 : 0));
+            LOG_WARN(blog::cat::hook, "transparent_jitter_failed reason=" +
+                (jitter_reason != nullptr ? std::string(jitter_reason) : std::string("unknown")) +
+                " camera_rva=" + hex64(jitter_cfg.camera_rva) +
+                " image_size=" + std::to_string(jitter_cfg.image_size) +
+                " feature_detected=" + std::to_string(jitter_detected.detected ? 1 : 0));
+        }
+        // 成功时**不在这里再打一行**：模块自己打的 `transparent_jitter_installed ...`
+        // 已经含定位来源 / setter RVA / 调用点静态常量 / 是否强制 —— 那是本功能在正式版里
+        // 唯一的常驻安装日志（逐帧观测行与心跳行已移除，见 TransparentJitterHook.h）。
+    }
+    else
+    {
+        // 用户**明确**关掉了修复：说清楚回退到了游戏原行为，不留静默。
+        LOG_INFO(blog::cat::hook, "transparent_jitter_disabled key=TransparentJitter=0 fallback=game_default");
     }
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     // Release 构建同样需要 OSD（show_osd 配置控制）：此前被 Release 条件编译切掉，
@@ -13777,9 +13813,10 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         if (reserved != nullptr)
             ffx12::set_process_exiting();
         il2cpp_callsite::shutdown();
-        // 【只读观测】jitter 标志探针的还原。不取任何锁（只做原子交换 +
+        // 【正式功能】透明队列抖动修复的还原。不取任何锁（只做原子交换 +
         // VirtualProtect + 校验后 memcpy），故同样满足本分支的 loader-lock 纪律。
-        jitter_flag_probe::shutdown();
+        // 它会输出一行 `transparent_jitter_stats ...`（本会话调用/改写次数）。
+        transparent_jitter::shutdown();
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         {
             std::lock_guard lock(g_ps_trace_mutex);

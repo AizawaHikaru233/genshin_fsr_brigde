@@ -51,13 +51,15 @@ $configValues = [ordered]@{
     # 异步写队列深度。必须在这里写：Add-LogSection 只在**没有** [Log] 段时才补整段，
     # 而已部署的 ini 都已有 [Log] 段 → 段内的新键永远不会被补上（实测 queue_capacity 缺失）。
     'queue_capacity'       = '8192'
-    # 诊断探针（默认关）。JitterFlagProbe=1 只读观测
-    # useJitteredProjectionMatrixForTransparentRendering 的实参，**不修改任何行为**。
+    # 透明队列抖动修复（**正式功能，默认开**）：强制 il2cpp setter
+    # Camera.set_useJitteredProjectionMatrixForTransparentRendering 的实参为 true，
+    # 让透明队列物件参与超分的时间重建（修翅膀水晶羽片 / 月环边缘硬阶梯）。
     # 放在这里是为了避免"键不存在 ⇒ 依赖代码默认值 ⇒ 默认值一变无人察觉"（同 RenderScaleMenu 的教训）。
-    'JitterFlagProbe'      = '1'
-    'JitterFlagProbeFrames'= '0'      # 0 = 一直记录；N = 只记录前 N 帧
-    'JitterFlagForce'      = '1'      # 1 = 强制 useJitteredProjectionMatrixForTransparentRendering=true（A/B 实验）
-    'JitterFlagHotkey'     = '0'      # VK 码；114=F3（0=无热键）
+    # ⚠️ 旧键 JitterFlagProbe / JitterFlagProbeFrames / JitterFlagForce / JitterFlagHotkey
+    # 已废弃：命名像"只读诊断探针"，实际承担修复（用户为了关诊断写 Probe=0 会让修复**静默失效**），
+    # 且其热键在游戏里被吃掉。本脚本不再写这 4 个键；DLL 仍兼容读取，但会写一行
+    # legacy/removed_transparent_jitter_keys_* 告警提示迁移。见 TransparentJitterHook.h。
+    'TransparentJitter'    = '1'      # 1 = 修复生效（默认，实机已验证）；0 = 回退游戏原行为
     # FSR2 输入纹理转储（默认关）。抓帧用热键，**跑完务必改回 0**（每组 3 帧约 130 MB）。
     'Fsr2InputDump'          = '0'
     'Fsr2InputDumpFrames'    = '3'
@@ -230,5 +232,6 @@ if (-not $Rollback) {
     Write-Host "  1. logger effective level=... categories=... file=... queue_capacity=...  ← 日志器生效确认"
     Write-Host "  2. swapchain_hook_decision install=1 present=.. controls=.. color=..      ← 交换链钩子决策（本轮修复）"
     Write-Host "  3. hooked D3D11CreateDevice / rtv_bind_target                            ← D3D11 钩子是否装上"
+    Write-Host "  4. transparent_jitter_installed ... force=1                              ← 透明队列抖动修复是否生效（正式功能）"
 }
 

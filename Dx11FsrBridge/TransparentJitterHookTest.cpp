@@ -1,16 +1,19 @@
-// JitterFlagProbeTest.cpp — JitterFlagProbe 的独立自测（不需要游戏、不需要 GPU）。
+// TransparentJitterHookTest.cpp — TransparentJitterHook 的独立自测
+// （不需要游戏、不需要 GPU）。
 //
 // 覆盖五件事（对应交付里"怎么证明"的每一条）：
 //   ① 定位：在**真实机器码形状**（取自两份实机构建的反汇编）上验证签名发现；
 //      含负例（找不到 / 并列候选）与 Tier-2 裁决。
 //   ② 只读（force=0）：装钩后调用假 setter，验证 observer 记录的实参正确、
 //      **函数仍然正常执行且返回值/副作用不变**（= 行为零改动）。
-//   ③ 【强制 true】（force=1）：**假 setter 体内真的收到 true**，
-//      而 observer 记录的仍是**原始 false**（日志能同时给出"原值"与"传出的值"）。
-//   ④ 限流：decide_emit 状态机（首次/变化/心跳/不刷屏/帧数上限）。
-//   ⑤ 关闭与还原：enabled=false 时零字节改动；shutdown() 还原原始序言。
+//   ③ 修复本体（force=1）：**假 setter 体内真的收到 true**，
+//      而 observer 记录的仍是**原始 false**（API 能同时给出"原值"与"传出的值"）。
+//   ④ 日志纪律（正式版）：装钩期间**一行都不打**（1000 次调用日志行数不增长）；
+//      只有 install 一行证据行 + shutdown 一行汇总行。
+//   ⑤ 关闭与还原：hook=false 时零字节改动；shutdown() 还原原始序言、复位 force、
+//      且还原后不再改写真参。
 // ASCII-only（与仓库既有测试一致）。
-#include "JitterFlagProbe.h"
+#include "TransparentJitterHook.h"
 
 #include <Windows.h>
 
@@ -62,9 +65,11 @@ constexpr std::size_t k_anchor_call1_off = 0x108; // call matrix setter
 constexpr std::size_t k_anchor_call2_off = 0x112; // call bool setter（与实机同为 +10 字节）
 
 int failures = 0;
+int checks = 0;
 #define CHECK(cond, msg)                                    \
     do                                                      \
     {                                                       \
+        ++checks;                                           \
         if (!(cond))                                        \
         {                                                   \
             std::printf("FAIL: %s\n", msg);                 \
@@ -144,12 +149,13 @@ void build_image()
 using flag_fn = bool (*)(void *camera, bool value);
 
 const char *g_last_line = nullptr;
-char g_lines[16][256] {};
+constexpr std::size_t k_max_lines = 16;
+char g_lines[k_max_lines][256] {};
 std::size_t g_line_count = 0;
 
 void test_sink(const char *line)
 {
-    if (g_line_count < 16)
+    if (g_line_count < k_max_lines)
     {
         std::snprintf(g_lines[g_line_count], sizeof(g_lines[0]), "%s", line);
         g_last_line = g_lines[g_line_count];
@@ -157,10 +163,19 @@ void test_sink(const char *line)
     ++g_line_count;
 }
 
+// 清空已记录行（只清"看得到的前 k_max_lines 行"的断言面；计数一并归零，
+// 便于用"行数没变"证明钩子逐次调用**不产生日志**）。
+void reset_lines()
+{
+    g_line_count = 0;
+    g_last_line = nullptr;
+    std::memset(g_lines, 0, sizeof(g_lines));
+}
+
 // 在所有已记录行里找子串
 bool any_line_has(const char *needle)
 {
-    for (std::size_t i = 0; i < g_line_count && i < 16; ++i)
+    for (std::size_t i = 0; i < g_line_count && i < k_max_lines; ++i)
     {
         if (std::strstr(g_lines[i], needle) != nullptr)
             return true;
@@ -180,26 +195,26 @@ void run_locate_tests()
     std::uint32_t setter = 0;
     int imm = -2;
     const char *reason = nullptr;
-    const bool ok = jitter_flag_probe::locate_flag_setter(g_image, k_image_size, k_anchor_rva,
-                                                          jitter_flag_probe::k_scan_window, &setter,
-                                                          &imm, &reason);
+    const bool ok = transparent_jitter::locate_flag_setter(g_image, k_image_size, k_anchor_rva,
+                                                           transparent_jitter::k_scan_window, &setter,
+                                                           &imm, &reason);
     CHECK(ok, "locate: 找到 bool setter");
     CHECK(setter == k_flag_rva, "locate: 目标 RVA 正确 (0x3080)");
     CHECK(imm == 0, "locate: 调用点实参识别为常量 0（= 源码里的 false）");
 
     // 负例：锚点序言/窗口非法
-    CHECK(!jitter_flag_probe::locate_flag_setter(g_image, k_image_size, 0, 0x1000, &setter, &imm, &reason),
+    CHECK(!transparent_jitter::locate_flag_setter(g_image, k_image_size, 0, 0x1000, &setter, &imm, &reason),
           "locate: camera_rva=0 被拒");
     CHECK(reason != nullptr && std::strcmp(reason, "bad_rva") == 0, "locate: 原因是 bad_rva");
-    CHECK(!jitter_flag_probe::locate_flag_setter(g_image, k_image_size, k_anchor_rva, 0, &setter, &imm, &reason),
+    CHECK(!transparent_jitter::locate_flag_setter(g_image, k_image_size, k_anchor_rva, 0, &setter, &imm, &reason),
           "locate: scan_window=0 被拒");
 
     // 负例：把 bool setter 的序言改掉 → 找不到
     std::uint8_t saved[19] {};
     std::memcpy(saved, g_image + k_flag_rva, sizeof(saved));
     g_image[k_flag_rva + 10] = 0x48; // movzx edi,dl -> mov rdi,rdx（不再是 bool setter）
-    CHECK(!jitter_flag_probe::locate_flag_setter(g_image, k_image_size, k_anchor_rva, 0x1000, &setter,
-                                                 &imm, &reason),
+    CHECK(!transparent_jitter::locate_flag_setter(g_image, k_image_size, k_anchor_rva, 0x1000, &setter,
+                                                  &imm, &reason),
           "locate: 序言被改后找不到（拒绝误判）");
     CHECK(reason != nullptr && std::strcmp(reason, "flag_setter_not_found") == 0,
           "locate: 原因是 flag_setter_not_found");
@@ -209,8 +224,8 @@ void run_locate_tests()
     std::uint8_t *anchor = g_image + k_anchor_rva;
     std::memcpy(anchor + 0x200, k_mov_rcx_r14, sizeof(k_mov_rcx_r14));
     write_call(anchor, 0x203, k_flag_rva);
-    CHECK(jitter_flag_probe::locate_flag_setter(g_image, k_image_size, k_anchor_rva, 0x1000, &setter,
-                                                &imm, &reason) &&
+    CHECK(transparent_jitter::locate_flag_setter(g_image, k_image_size, k_anchor_rva, 0x1000, &setter,
+                                                 &imm, &reason) &&
               setter == k_flag_rva,
           "locate: Tier-2 在并列候选中选中「紧跟矩阵 setter 且实参为常量」的那个");
 
@@ -221,8 +236,8 @@ void run_locate_tests()
     std::memcpy(anchor + 0x30D, k_mov_rcx_r14, sizeof(k_mov_rcx_r14));
     std::memcpy(anchor + 0x310, k_xor_edx_edx, sizeof(k_xor_edx_edx));
     write_call(anchor, 0x312, k_flag_rva);
-    CHECK(!jitter_flag_probe::locate_flag_setter(g_image, k_image_size, k_anchor_rva, 0x1000, &setter,
-                                                 &imm, &reason),
+    CHECK(!transparent_jitter::locate_flag_setter(g_image, k_image_size, k_anchor_rva, 0x1000, &setter,
+                                                  &imm, &reason),
           "locate: 两处等价候选 → 如实失败（不猜）");
     CHECK(reason != nullptr && std::strcmp(reason, "flag_setter_ambiguous") == 0,
           "locate: 原因是 flag_setter_ambiguous");
@@ -231,36 +246,46 @@ void run_locate_tests()
     std::memset(anchor + 0x200, 0xCC, 0x200);
 }
 
-// ---- ② 只读 + ④ 关闭/还原 ----
+// ---- ② 只读观测 + ④ 日志纪律 + ⑤ 关闭/还原 ----
 void run_install_tests()
 {
     auto *flag = reinterpret_cast<flag_fn>(g_image + k_flag_rva);
 
     // 关闭时：零字节改动
-    jitter_flag_probe::Config off_cfg;
-    off_cfg.enabled = false;
+    transparent_jitter::Config off_cfg;
+    off_cfg.hook = false;
     off_cfg.camera_rva = k_anchor_rva;
     off_cfg.image_size = k_image_size;
     const char *reason = nullptr;
-    CHECK(!jitter_flag_probe::install(reinterpret_cast<std::uint64_t>(g_image), off_cfg, &reason),
-          "install: enabled=false 返回 false");
+    CHECK(!transparent_jitter::install(reinterpret_cast<std::uint64_t>(g_image), off_cfg, &reason),
+          "install: hook=false 返回 false");
     CHECK(reason != nullptr && std::strcmp(reason, "disabled") == 0, "install: 原因是 disabled");
-    CHECK(!jitter_flag_probe::active(), "install: enabled=false 时 active() 为 false");
+    CHECK(!transparent_jitter::active(), "install: hook=false 时 active() 为 false");
     CHECK(std::memcmp(g_image + k_flag_rva, k_flag_head, sizeof(k_flag_head)) == 0,
-          "install: enabled=false 时目标字节**一个都没改**");
+          "install: hook=false 时目标字节**一个都没改**");
 
-    // 打开
-    jitter_flag_probe::set_log_sink(&test_sink);
-    jitter_flag_probe::set_frame_provider(&frame_provider);
-    jitter_flag_probe::Config cfg;
-    cfg.enabled = true;
+    // 打开（只读观测：hook=1, force=0）
+    transparent_jitter::set_log_sink(&test_sink);
+    transparent_jitter::set_frame_provider(&frame_provider);
+    reset_lines();
+    transparent_jitter::Config cfg;
+    cfg.hook = true;
+    cfg.force = false;
     cfg.camera_rva = k_anchor_rva;
     cfg.image_size = k_image_size;
-    CHECK(jitter_flag_probe::install(reinterpret_cast<std::uint64_t>(g_image), cfg, &reason),
+    cfg.anchor_source = "feature";
+    CHECK(transparent_jitter::install(reinterpret_cast<std::uint64_t>(g_image), cfg, &reason),
           "install: 打开后安装成功");
-    CHECK(jitter_flag_probe::active(), "install: active() 为 true");
+    CHECK(transparent_jitter::active(), "install: active() 为 true");
     CHECK(g_image[k_flag_rva] == 0x48 && g_image[k_flag_rva + 1] == 0xB8,
           "install: 目标序言已被绝对跳转替换");
+    // 安装行：恰好一行，且同时给出定位来源 / setter RVA / 静态常量 / 是否强制
+    CHECK(g_line_count == 1, "log: 安装**恰好一行**（不再有第二条 probe_active 重复行）");
+    CHECK(any_line_has("transparent_jitter_installed"), "log: 安装证据行前缀");
+    CHECK(any_line_has("setter_rva=0x3080"), "log: 安装行给出 setter RVA");
+    CHECK(any_line_has("callsite_imm=0"), "log: 安装行给出调用点静态常量（= 源码里的 false）");
+    CHECK(any_line_has("anchor=feature"), "log: 安装行给定位来源（feature=特征识别命中）");
+    CHECK(any_line_has("force=0"), "log: 安装行给出是否强制（force=0 = 纯观测）");
 
     // 只读观测：false。camera 字节既证明函数体执行了，也记录函数体**实际收到**的实参。
     std::uint8_t camera_byte = 0xAA;
@@ -271,129 +296,62 @@ void run_install_tests()
     CHECK(camera_byte == 0x00, "pass-through: 原函数体**确实执行了**，且收到的实参是 false");
     std::uint8_t value = 0xFF;
     std::uint64_t cam = 0, frame = 0;
-    CHECK(jitter_flag_probe::last_observation(&value, &cam, &frame), "observe: 有观测记录");
+    CHECK(transparent_jitter::last_observation(&value, &cam, &frame), "observe: 有观测记录");
     CHECK(value == 0, "observe: 记录到 value=false（这就是要证的实参）");
     CHECK(cam == reinterpret_cast<std::uint64_t>(camera), "observe: 记录到 camera 指针");
     CHECK(frame == 7, "observe: frame 来自注入的帧号来源");
-    CHECK(jitter_flag_probe::saw_false(), "observe: saw_false() 为 true");
-    CHECK(!jitter_flag_probe::saw_true(), "observe: 此时尚未见过 true");
+    CHECK(transparent_jitter::saw_false(), "observe: saw_false() 为 true");
+    CHECK(!transparent_jitter::saw_true(), "observe: 此时尚未见过 true");
 
     // 只读观测：true（证伪分支）
     g_fake_frame = 8;
     const bool r2 = flag(camera, true);
     CHECK(r2 == true, "pass-through: 传 true 时函数仍返回 true（实参未被改写）");
     CHECK(camera_byte == 0x01, "pass-through: 函数体收到的实参是 true（未被 stub 改成 false）");
-    CHECK(jitter_flag_probe::last_observation(&value, &cam, &frame) && value == 1,
+    CHECK(transparent_jitter::last_observation(&value, &cam, &frame) && value == 1,
           "observe: 记录到 value=true");
-    CHECK(jitter_flag_probe::saw_true(), "observe: saw_true() 为 true");
+    CHECK(transparent_jitter::saw_true(), "observe: saw_true() 为 true");
+    CHECK(transparent_jitter::overridden_count() == 0,
+          "observe: force=0 时一次改写都没有（overridden_count=0）");
 
-    // 日志：至少出现首次行与变化行，且形如 jitter_flag value=...
-    bool saw_first = false, saw_change = false, saw_installed = false;
-    for (std::size_t i = 0; i < g_line_count && i < 16; ++i)
-    {
-        if (std::strncmp(g_lines[i], "jitter_flag value=", 18) == 0)
-        {
-            if (std::strstr(g_lines[i], "reason=first") != nullptr)
-                saw_first = true;
-            if (std::strstr(g_lines[i], "reason=change") != nullptr)
-                saw_change = true;
-        }
-        if (std::strstr(g_lines[i], "jitter_flag_probe_installed") != nullptr)
-            saw_installed = true;
-    }
-    CHECK(saw_installed, "log: 安装证据行（含 setter_rva / callsite_imm）");
-    CHECK(saw_first, "log: 首次观测行（证明钩子确实装上了）");
-    CHECK(saw_change, "log: 值变化行（false -> true）");
-    CHECK(any_line_has("value=false forced=false"),
-          "log: force=0 时观测行的 forced 与 value 一致（= 没改任何东西）");
+    // ★ 日志降噪（正式版要求）：钩子每次调用**一行都不打**。
+    // 1000 次等值调用后日志行数必须与调用前完全一致。
+    const std::size_t lines_before_noise = g_line_count;
+    std::uint8_t noisy_camera = 0x00;
+    for (int i = 0; i < 1000; ++i)
+        flag(&noisy_camera, false);
+    CHECK(g_line_count == lines_before_noise,
+          "log: 1000 次调用**不产生任何新日志行**（心跳行与每帧观测行已移除）");
+    CHECK(!any_line_has("jitter_flag value="),
+          "log: 旧格式逐次观测行 (jitter_flag value=...) 已彻底消失");
 
     // 还原
-    jitter_flag_probe::shutdown();
-    CHECK(!jitter_flag_probe::active(), "shutdown: active() 变回 false");
+    const std::uint64_t calls_before_shutdown = transparent_jitter::observed_count();
+    transparent_jitter::shutdown();
+    CHECK(!transparent_jitter::active(), "shutdown: active() 变回 false");
     CHECK(std::memcmp(g_image + k_flag_rva, k_flag_head, sizeof(k_flag_head)) == 0,
           "shutdown: 原始序言已还原（16 字节）");
+    // 一行汇总行：本会话调用次数 / 改写次数 / 是否见过 false,true
+    CHECK(any_line_has("transparent_jitter_stats calls="), "log: shutdown 打一行汇总");
+    CHECK(any_line_has("overridden=0"), "log: 汇总行给出改写次数（纯观测 = 0）");
+    CHECK(any_line_has("saw_false=1"), "log: 汇总行给出 saw_false=1（本次会话确实观测到 false）");
+    CHECK(calls_before_shutdown >= 1002, "stats: 调用计数覆盖全部观测（含 1000 次降噪测试）");
+
     // 刻意**不**在这里"顺手修好"目标字节：下面的调用必须验证 `shutdown()` 真的还原了，
     // 而不是被测试自己补回来的。
-    const std::uint64_t before = jitter_flag_probe::observed_count();
+    const std::uint64_t before = transparent_jitter::observed_count();
     std::uint8_t camera_after = 0xAA;
     CHECK(flag(&camera_after, true) == true, "shutdown: 还原后函数仍可正常调用");
     CHECK(camera_after == 0x01, "shutdown: 还原后函数体仍执行并收到正确实参");
-    CHECK(jitter_flag_probe::observed_count() == before, "shutdown: 还原后不再产生观测");
+    CHECK(transparent_jitter::observed_count() == before, "shutdown: 还原后不再产生观测");
 }
 
-// ---- ③ 限流状态机 ----
-// ⚠️ decide_emit 现在同时看 value（原值）与 forwarded（转发值），因此下面每次调用都
-// 显式给出两者；"只读观测"场景里二者相等。
-void run_emit_tests()
-{
-    using namespace jitter_flag_probe;
-    EmitState st;
-    EmitDecision d = decide_emit(st, 0, 0, 0, 1, 0, 300);
-    CHECK(d.emit && std::strcmp(d.reason, "first") == 0, "emit: 首次必打");
-
-    bool spam = false;
-    for (std::uint64_t call = 2; call <= 300; ++call)
-    {
-        d = decide_emit(st, 0, 0, call - 1, call, 0, 300);
-        if (d.emit)
-            spam = true;
-    }
-    CHECK(!spam, "emit: 值不变时 300 次调用内**一行都不多打**（不刷屏）");
-
-    d = decide_emit(st, 0, 0, 300, 301, 0, 300);
-    CHECK(d.emit && std::strcmp(d.reason, "heartbeat") == 0, "emit: 第 301 次调用打心跳");
-
-    d = decide_emit(st, 1, 1, 301, 302, 0, 300);
-    CHECK(d.emit && std::strcmp(d.reason, "change") == 0, "emit: 原值变化立刻打（不等心跳）");
-
-    // ★ force 翻转：原值**没变**（游戏仍传 false），只有转发值变了 0->1 ⇒ 也必须立刻打。
-    // 否则按了热键之后要等最多 300 次调用才能在日志里看到 forced=true，
-    // 而"force 到底生效了没"正是 A/B 最需要立刻确认的一项。
-    EmitState st_force;
-    decide_emit(st_force, 0, 0, 0, 1, 0, 300);
-    d = decide_emit(st_force, 0, 1, 1, 2, 0, 300);
-    CHECK(d.emit && std::strcmp(d.reason, "change") == 0,
-          "emit: force 翻转（原值不变、转发值 0->1）立刻打一行");
-    d = decide_emit(st_force, 0, 0, 2, 3, 0, 300);
-    CHECK(d.emit && std::strcmp(d.reason, "change") == 0,
-          "emit: force 翻回（转发值 1->0）同样立刻打一行");
-
-    // 值不变时的不刷屏性：600 次调用里只应有 1 行心跳（第 301 次）
-    EmitState st2;
-    decide_emit(st2, 0, 0, 0, 1, 0, 300);
-    int heartbeats = 0;
-    for (std::uint64_t call = 2; call <= 600; ++call)
-    {
-        if (decide_emit(st2, 0, 0, call - 1, call, 0, 300).emit)
-            ++heartbeats;
-    }
-    CHECK(heartbeats == 1, "emit: 600 次等值调用里只有 1 行心跳（绝不刷屏）");
-
-    // 帧数上限
-    EmitState st3;
-    d = decide_emit(st3, 0, 0, 10, 1, 10, 300);
-    CHECK(d.emit, "emit: frame <= frames_limit 时正常记录");
-    d = decide_emit(st3, 1, 1, 11, 2, 10, 300);
-    CHECK(!d.emit, "emit: frame > frames_limit 后一律不打（即使值变化）");
-
-    // 帧号冻结时心跳仍应发生（心跳用调用计数，不用帧号）
-    EmitState st4;
-    decide_emit(st4, 0, 0, 0, 1, 0, 5);
-    bool heartbeat = false;
-    for (std::uint64_t call = 2; call <= 6; ++call)
-    {
-        if (decide_emit(st4, 0, 0, 0, call, 0, 5).emit)
-            heartbeat = true;
-    }
-    CHECK(heartbeat, "emit: 帧号冻结（恒为 0）时心跳仍会发生");
-}
-
-// ---- ④ 【强制 true】端到端 ----
+// ---- ③ 修复本体（force=1）端到端 ----
 // 关键断言不是"我们自己说改了"，而是**假 setter 体内真的收到 true**
 // （假 setter 体会把收到的 dil 写回 camera 字节，并把它当返回值返回）。
 void run_force_tests()
 {
-    using namespace jitter_flag_probe;
+    using namespace transparent_jitter;
     auto *flag = reinterpret_cast<flag_fn>(g_image + k_flag_rva);
 
     // 纯函数：force 的**全部语义**
@@ -404,71 +362,50 @@ void run_force_tests()
     CHECK(decide_forwarded_value(true, 0xDEADBEEFCAFEF00Dull) == 1,
           "forward: force=1 时**无论**原值是什么都变成 1");
 
-    // 重装（前面的 shutdown 已还原）—— 初值 force=false
+    // 安装：这就是 `TransparentJitter=1` 走的生产路径（hook=1, force=1）
+    reset_lines();
     Config cfg;
-    cfg.enabled = true;
-    cfg.force = false;
+    cfg.hook = true;
+    cfg.force = true;
     cfg.camera_rva = k_anchor_rva;
     cfg.image_size = k_image_size;
+    cfg.anchor_source = "feature";
     const char *reason = nullptr;
-    CHECK(install(reinterpret_cast<std::uint64_t>(g_image), cfg, &reason), "force: 重新安装成功");
-    CHECK(!force_enabled(), "force: 初值来自 cfg.force=false");
-    CHECK(any_line_has("jitter_flag_probe_installed") && any_line_has("force=0"),
-          "log: 安装行带 force 初值（force=0）");
+    CHECK(install(reinterpret_cast<std::uint64_t>(g_image), cfg, &reason), "force: 安装成功");
+    CHECK(force_enabled(), "force: 初值来自 cfg.force=true");
+    CHECK(any_line_has("transparent_jitter_installed") && any_line_has("force=1"),
+          "log: 安装行带 force 初值（force=1 = 修复生效）");
 
-    // force=0：行为与只读时完全一致
-    std::uint8_t camera = 0xAA;
-    g_fake_frame = 100;
     const std::uint64_t over_before = overridden_count();
-    CHECK(flag(&camera, false) == false, "force=0: 返回值不变（false）");
-    CHECK(camera == 0x00, "force=0: setter 体内收到的仍是 false");
-    CHECK(overridden_count() == over_before, "force=0: 没有任何一次改写被记入 overridden_count");
-    std::uint8_t orig = 0xFF, fwd = 0xFF;
-    CHECK(last_forwarding(&orig, &fwd) && orig == 0 && fwd == 0, "force=0: 原值=转发值=0");
-
-    // 切到 force=1（模拟热键）
-    const std::size_t lines_before_toggle = g_line_count;
-    CHECK(set_force(true, "hotkey", 1234), "force: set_force(true) 返回 true（状态确实变了）");
-    CHECK(force_enabled(), "force: force_enabled() 为 true");
-    CHECK(g_line_count > lines_before_toggle, "log: 切换必打一行");
-    CHECK(any_line_has("jitter_flag_force toggled on=true source=hotkey frame=1234"),
-          "log: 切换行格式为 jitter_flag_force toggled on=... source=... frame=...");
 
     // ★ 核心断言：游戏传 false，但 setter 体内**真的收到 true**
-    camera = 0xAA;
+    std::uint8_t camera = 0xAA;
     g_fake_frame = 101;
     CHECK(flag(&camera, false) == true, "force=1: 返回值变成 true（实参确实被改成 true）");
     CHECK(camera == 0x01, "force=1: **setter 体内收到的实参是 true**");
+    std::uint8_t orig = 0xFF, fwd = 0xFF;
     CHECK(last_observation(&orig, nullptr, nullptr) && orig == 0,
-          "force=1: observer 记录的**仍是原始值 false**（日志能给出原值）");
+          "force=1: observer 记录的**仍是原始值 false**");
     CHECK(last_forwarding(&orig, &fwd) && orig == 0 && fwd == 1,
-          "force=1: 原值=0 而转发值=1（原值与传出的值可同时观察）");
+          "force=1: 原值=0 而转发值=1（原值与传出的值可同时读到）");
     CHECK(overridden_count() == over_before + 1, "force=1: overridden_count 记到 1 次真实改写");
-    CHECK(any_line_has("value=false forced=true"),
-          "log: 观测行同时给出 value=false（原值）与 forced=true（实际传出的值）");
-    CHECK(any_line_has("callsite_imm=0"), "log: 观测行给出 callsite_imm=0（静态原值）");
+    CHECK(saw_false(), "force=1: saw_false() 为 true（原值仍是 false）");
 
-    // 幂等切换：状态没变就不打行（防止被重复调用时刷屏）
-    const std::size_t lines_before_idempotent = g_line_count;
-    CHECK(!set_force(true, "hotkey", 1235), "force: 重复置 true 返回 false（状态未变）");
-    CHECK(g_line_count == lines_before_idempotent, "log: 状态未变时不打行");
-
-    // 翻回 force=0
-    CHECK(set_force(false, "hotkey", 1300), "force: 翻回 false");
-    CHECK(!force_enabled(), "force: force_enabled() 变回 false");
+    // 原值本来就是 true 时**不需要**改写 ⇒ 改写计数不应增长（只改该改的那一次）
     camera = 0xAA;
-    g_fake_frame = 102;
-    CHECK(flag(&camera, false) == false, "force: 翻回后返回值恢复 false");
-    CHECK(camera == 0x00, "force: 翻回后 setter 体内收到的又是 false（热键可随时撤销）");
-    CHECK(overridden_count() == over_before + 1, "force: 翻回后不再改写（改写次数停在 1）");
+    CHECK(flag(&camera, true) == true, "force=1: 原值 true 时行为不变");
+    CHECK(camera == 0x01, "force=1: 原值 true 时 setter 体内收到 true");
+    CHECK(overridden_count() == over_before + 1, "force=1: 原值已是 true ⇒ 不计入改写次数");
 
     // 还原：仍然只在字节是我们的 jmp 时还原；且 force 状态复位
-    CHECK(set_force(true, "hotkey", 1400), "force: 还原前先重新打开");
+    reset_lines();
     shutdown();
     CHECK(!active(), "force: shutdown 后 active() 为 false");
     CHECK(!force_enabled(), "force: shutdown 把 force 状态复位为 false");
     CHECK(std::memcmp(g_image + k_flag_rva, k_flag_head, sizeof(k_flag_head)) == 0,
           "force: shutdown 后原始序言逐字节还原");
+    CHECK(any_line_has("transparent_jitter_stats calls=") && any_line_has("overridden=1"),
+          "log: 汇总行给出真实改写次数（=1，正是那一次 false->true）");
     camera = 0xAA;
     CHECK(flag(&camera, false) == false && camera == 0x00,
           "force: 还原后即使 force 曾开着也不再改写真参");
@@ -478,15 +415,14 @@ void run_force_tests()
 
 int main()
 {
-    std::printf("JitterFlagProbeTest\n");
+    std::printf("TransparentJitterHookTest\n");
     build_image();
     run_locate_tests();
     run_install_tests();
     run_force_tests();
-    run_emit_tests();
     if (failures == 0)
-        std::printf("ALL PASS\n");
+        std::printf("ALL PASS (%d checks)\n", checks);
     else
-        std::printf("%d FAILURE(S)\n", failures);
+        std::printf("%d FAILURE(S) out of %d checks\n", failures, checks);
     return failures == 0 ? 0 : 1;
 }
