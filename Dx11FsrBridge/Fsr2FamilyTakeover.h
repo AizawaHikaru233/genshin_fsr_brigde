@@ -37,6 +37,47 @@ bool should_skip_pre(std::uint64_t hash, std::uint64_t now_ms, std::uint64_t exp
 // 累积 pass 处理结果回填（try_fsr2_translation_draw 的返回值语义 + 当前时刻）
 void notify_accumulate_result(bool replaced_ok, std::uint64_t now_ms);
 
+// 接管权**交棒**（老接管者"离开接管"）时调用：立刻解除"跳过预处理 pass"的许可。
+//
+// 为什么必须有这一步（实机定案，2026-09-28）：
+//   本状态机是**全局单份**——它只记住"上次累积 pass 被桥替换过"，不看实例。
+//   P1 单实例接管下，接管权换给另一个实例后：
+//     · 老实例的累积 pass 改由**游戏原生**执行（passthrough）；
+//     · 可它的 4 个预处理 pass 仍被本状态机的全局许可跳过 ✗
+//   ⇒ 原生 FSR2 输入缺失 ⇒ 该路视图冻在最后一帧（与"另一个机位实时"叠成残影）。
+//   交棒瞬间显式解除许可，保证"放行"真的把原生路径还回去（下一次累积 pass 若是
+//   接管者自己的，会由 notify_accumulate_result(true) 重新武装——语义不变）。
+void notify_takeover_leave();
+
+// 交棒释放次数（诊断/验收：应随交棒事件增长，而不是恒 0）
+std::uint64_t takeover_leave_count();
+
+// ---------------------------------------------------------------------------
+// P1 单实例接管：修复②的**唯一判定点**（纯函数 ⇒ 可离线单测）。
+//
+// 背景（实机回归，本轮）：修复②的第一版直接"多义 ⇒ 拒绝"，但接管者的 out_a/out_b 是
+// **第一次成功 dispatch 时**才建立的 ⇒ 第一次 bootstrap 被拒 ⇒ 归属永远建立不起来 ⇒
+// 双实例场景下超分**完全停止**（实机：ffx12_ambiguous_bootstrap=3072、out_a=out_b=0、
+// ffx12_result 停在 14 条）。所以判据抽成纯函数，并把两条"不可饿死"不变式写死在里面：
+//   · claimer_has_ownership == false       ⇒ 永不拒绝（放行它是建立归属的唯一途径）
+//   · claimer_recently_dispatched == false ⇒ 永不拒绝（拒绝不刷新派发时间戳 ⇒ 自愈）
+// 单测（Fsr2FamilyTakeoverTest）逐条钉住这两条 ⇒ 回归不可能再次悄悄发生。
+struct TokenOnlyClaimFacts
+{
+    bool single_instance_takeover = false;  // Ffx12SingleInstance=1（P1 生效）
+    bool second_instance_present = false;   // 本进程出现过第二个实例（粘性互锁）
+    bool claimer_is_current_taker = false;  // 认领者就是当前接管者
+    bool claimed_by_token_only = false;     // match_path == 2（无输出归属校验）
+    bool output_belongs_to_claimer = false; // 输出命中认领者的 out_a/out_b（path 1/3）
+    bool claim_has_generation = false;      // call_gen != 0（确有新 Render 代次）
+    std::uint64_t same_size_token_candidates = 0; // 同尺寸未消费 token 的实例数
+    bool claimer_has_ownership = false;     // out_a/out_b 非 0（已有归属记忆）
+    bool claimer_recently_dispatched = false; // 最近 500ms 内尝试过派发（健康）
+};
+
+// true = 拒绝这次认领（调用方：消费 token 后放行游戏原生）
+bool p1_refuse_token_only_claim(const TokenOnlyClaimFacts &facts);
+
 // 统计（限频日志用）
 std::uint64_t skipped_count();
 std::uint64_t accumulate_replaced_count();
