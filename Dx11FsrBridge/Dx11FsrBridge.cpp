@@ -186,8 +186,6 @@ struct Config
     // swapchain target. It is used to select a future tone-map insertion point.
     bool hdr_composite_probe = false;
     std::uint32_t hdr_composite_probe_limit = 32;
-    bool capture_metadata_only = true;
-    bool dump_compute_shaders = false;
     bool dump_pixel_shaders = false;
     bool trace_pixel_shader_draws = false;
     bool trace_texture_creates = false;
@@ -199,7 +197,6 @@ struct Config
     std::uint64_t target_pixel_shader_hash = 0x78057A29AF6C2D99ull;
     std::uint32_t pixel_shader_replacement_mode = 0;
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
-    bool enable_fsr2_get_proc_address_shim = false;
     std::uint32_t fsr2_translation_mode = 0;
     bool fsr2_fast_state_tracking = false;
     bool fsr2_mode2_on_demand_state = true;
@@ -210,20 +207,16 @@ struct Config
     bool fsr2_use_transparency_mask = false;
     std::uint32_t fsr2_jitter_mode = 0;
     std::uint32_t fsr2_dump_input_textures = 0;
-    bool fsr2_compare_output_capture = false;
+    // ⚠️ 2026-09-27：`fsr2_compare_output_capture` 已按死代码删除（零读取点、零消费者）。
     std::uint32_t fsr2_sharpness_percent = 0;
-    bool fsr2_hdr10_pq_color = false;
     bool fsr2_use_native_exposure = true;
-    bool fsr2_fast_metadata_copy = false;
     bool fsr2_compact_linear_output = false;
     bool fsr2_lock_color_producer_shader = true;
-    bool fsr2_gpu_timing = false;
     bool fsr2_reset_on_color_path_change = false;
     bool fsr2_reset_on_optiscaler_config_change = false;
     std::uint32_t fsr2_optiscaler_config_reset_frames = 4;
     bool fsr2_reset_on_optiscaler_log_change = false;
     std::uint32_t fsr2_optiscaler_log_reset_duration_ms = 4000;
-    std::uint32_t fsr2_auto_recover_upscaler_ms = 0;
     bool fsr2_trace_color_producers = false;
     bool fsr2_early_output_probe = false;
     std::uint32_t fsr2_early_output_probe_frames = 60;
@@ -324,7 +317,6 @@ struct Config
     bool ffx12_gpu_interop = true;
 #endif
     bool show_osd = false;
-    bool assume_phase_order = false;
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     bool enable_similarity_probe = false;
     bool reset_similarity_on_recording = true;
@@ -656,13 +648,6 @@ struct HdrSdrToneMapResources
 
 std::mutex g_hdr_sdr_tone_map_mutex;
 HdrSdrToneMapResources g_hdr_sdr_tone_map_resources;
-struct HdrSdrToneMapDrawResources
-{
-    ID3D11Device *device = nullptr;
-    ID3D11PixelShader *pixel_shader = nullptr;
-    ID3D11Buffer *constants = nullptr;
-};
-HdrSdrToneMapDrawResources g_hdr_sdr_tone_map_draw_resources;
 std::vector<std::uint8_t> g_hdr_sdr_tone_map_vs_bytecode;
 std::vector<std::uint8_t> g_hdr_sdr_tone_map_ps_bytecode;
 bool g_hdr_sdr_tone_map_shader_compile_attempted = false;
@@ -745,21 +730,9 @@ std::uint32_t g_fsr2_color_replay_output_width = 0;
 std::uint32_t g_fsr2_color_replay_output_height = 0;
 DXGI_FORMAT g_fsr2_color_replay_output_format = DXGI_FORMAT_UNKNOWN;
 std::atomic_uint64_t g_fsr2_color_replay_count = 0;
-struct Fsr2GpuTimingSlot
-{
-    ID3D11Query *disjoint = nullptr;
-    std::array<ID3D11Query *, 5> timestamps {};
-    bool pending = false;
-};
-std::mutex g_fsr2_gpu_timing_mutex;
-ID3D11Device *g_fsr2_gpu_timing_device = nullptr;
-std::array<Fsr2GpuTimingSlot, 8> g_fsr2_gpu_timing_slots {};
-std::uint32_t g_fsr2_gpu_timing_cursor = 0;
-std::array<double, 4> g_fsr2_gpu_timing_accumulated_ms {};
-std::uint32_t g_fsr2_gpu_timing_sample_count = 0;
-std::uint32_t g_fsr2_gpu_timing_unavailable_streak = 0;
-ULONGLONG g_fsr2_gpu_timing_last_recovery_tick = 0;
-std::atomic_bool g_fsr2_translation_recovery_requested = false;
+// ⚠️ 2026-09-27：`Fsr2GpuTimingSlot` 与 `g_fsr2_gpu_timing_*` 全局已随死代码删除
+//   （详见 `consume_fsr2_optiscaler_config_reset()` 上方的说明）。
+// ⚠️ 2026-09-27：`g_fsr2_translation_recovery_requested` 已按死代码删除（只写不读、无任何引用）。
 // 上次成功接管（skip_original_draw）的 tick；用于检测"翻译空窗"（切原生档、
 // 加载、过场、dispatch 失败回退）后恢复时强制重置 FSR2 历史，避免旧场景鬼影。
 std::atomic<ULONGLONG> g_fsr2_last_translation_tick { 0 };
@@ -831,11 +804,13 @@ struct MappedBufferInfo
 };
 std::unordered_map<std::uint64_t, MappedBufferInfo> g_mapped_buffers;
 std::unordered_map<std::uint64_t, std::vector<std::uint8_t>> g_buffer_snapshots;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
 std::mutex g_osd_mutex;
 std::wstring g_osd_text = L"Dx11FsrBridge\n正在初始化";
 std::atomic_bool g_osd_running { false };
 HWND g_osd_window = nullptr;
 HANDLE g_osd_thread = nullptr;
+#endif
 std::mutex g_mode_mutex;
 std::vector<std::string> g_recent_mode_features;
 std::unordered_map<int, std::vector<std::string>> g_mode_samples;
@@ -1023,9 +998,11 @@ HRESULT STDMETHODCALLTYPE hooked_create_pixel_shader(ID3D11Device *device, const
 HRESULT STDMETHODCALLTYPE hooked_create_compute_shader(ID3D11Device *device, const void *shader_bytecode, SIZE_T bytecode_length, ID3D11ClassLinkage *class_linkage, ID3D11ComputeShader **compute_shader);
 void install_device_hooks(ID3D11Device *device);
 void log_line(const std::string &line);
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
 void set_osd_text(const std::wstring &text);
 void start_osd();
 void update_osd_from_dispatch(std::uint32_t phase, UINT group_x, UINT group_y, UINT group_z);
+#endif
 bool dlssg_framegen_selected();
 bool dlssg_dxgi_workaround_active();
 // 交换链钩子决策的唯一来源：外层调用点与 install_swapchain_hooks 内部必须共用这些谓词，
@@ -1305,24 +1282,6 @@ std::wstring widen_ascii(std::string_view value)
     return std::wstring(value.begin(), value.end());
 }
 
-std::wstring mode_name_for_phase(std::uint32_t phase)
-{
-    if (!g_config.assume_phase_order)
-        return L"未校准";
-
-    switch (phase)
-    {
-    case 1:
-        return L"FSR2 开启";
-    case 2:
-        return L"FSR2 关闭";
-    case 3:
-        return L"SMAA 开启";
-    default:
-        return L"加载/未知";
-    }
-}
-
 std::wstring calibrated_mode_name(int mode)
 {
     switch (mode)
@@ -1508,7 +1467,9 @@ void toggle_recording_mode(int mode)
 
     LOG_INFO(blog::cat::core, std::string(started ? "mode_recording_started " : "mode_recording_stopped ") +
         "mode=" + narrow(calibrated_mode_name(mode)) + " features=" + std::to_string(sample_size));
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     set_osd_text(L"Dx11FsrBridge OSD\n" + status);
+#endif
 }
 
 void clear_mode_samples()
@@ -1551,7 +1512,9 @@ void clear_mode_samples()
 #endif
 
     LOG_INFO(blog::cat::core, "mode_calibration_and_similarity_cleared");
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     set_osd_text(L"Dx11FsrBridge OSD\n已清空全部记录");
+#endif
 }
 
 void poll_mode_hotkeys()
@@ -1566,6 +1529,7 @@ void poll_mode_hotkeys()
             " main_base=" + hex64(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))));
     }
 #endif
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     if (GetAsyncKeyState(VK_F10) & 1)
     {
         clear_mode_samples();
@@ -1577,6 +1541,7 @@ void poll_mode_hotkeys()
         toggle_recording_mode(2);
     if (GetAsyncKeyState(VK_F9) & 1)
         toggle_recording_mode(3);
+#endif
 }
 
 ModeMatch classify_current_mode()
@@ -1884,27 +1849,10 @@ void append_constant_buffer_list(std::ostringstream &out, const char *label, con
 
 // ---- shader 转储诊断（正式版不编译）----
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-void dump_compute_shader_bytecode(std::uint64_t hash, const void *shader_bytecode, std::size_t bytecode_length)
-{
-    if (!g_config.dump_compute_shaders || hash == 0 || shader_bytecode == nullptr || bytecode_length == 0)
-        return;
-
-    try
-    {
-        const std::filesystem::path dump_dir = g_module_dir / L"Dx11FsrBridge.shaders";
-        std::filesystem::create_directories(dump_dir);
-        const std::filesystem::path dump_path = dump_dir / (hex64(hash) + ".cso");
-        if (std::filesystem::exists(dump_path))
-            return;
-
-        std::ofstream out(dump_path, std::ios::binary);
-        out.write(static_cast<const char *>(shader_bytecode), static_cast<std::streamsize>(bytecode_length));
-    }
-    catch (...)
-    {
-    }
-}
-
+// ⚠️ 2026-09-27：`dump_compute_shader_bytecode()` 与 `Config::dump_compute_shaders`
+//   **已按死代码删除** —— 该开关**没有任何 ini 读取点**（没有对应的键），
+//   所以它恒为 false、函数永不可达；同时删掉它唯一的调用点。
+//   像素/顶点着色器 dump 仍保留（它们有 `DumpPixelShaders` 键，属诊断构建）。
 void dump_pixel_shader_bytecode(std::uint64_t hash, const void *shader_bytecode, std::size_t bytecode_length)
 {
     if (!g_config.dump_pixel_shaders || hash == 0 || shader_bytecode == nullptr || bytecode_length == 0)
@@ -3562,6 +3510,7 @@ DXGI_FORMAT shader_resource_view_format(ID3D11ShaderResourceView *view)
     return desc.Format;
 }
 
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
 void set_osd_text(const std::wstring &text)
 {
     if (!g_config.show_osd)
@@ -3808,6 +3757,7 @@ void update_osd_from_dispatch(std::uint32_t phase, UINT group_x, UINT group_y, U
 
     set_osd_text(out.str());
 }
+#endif
 
 void load_config()
 {
@@ -3820,6 +3770,18 @@ void load_config()
     g_logging_enabled.store(true, std::memory_order_relaxed);
     g_config.dlssg_dxgi_workaround =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"DlssgDxgiWorkaround", -1, config_path.c_str());
+    // ---- 【诊断】HDR / 输出路径（native-LDR）/ D3D11On12 / 元数据抓取 整块 ----
+    // 归属判定（按"读取点 + 消费者"实证，不按名字猜）：
+    //   - `HdrEnvironmentProbe` / `HdrOutputDescProbe` / `HdrCompositeProbe*` 是**只读观测**，
+    //     源码注释本身就写着 "never changes the returned display state" ⇒ 纯诊断；
+    //   - `HdrSwapchainSpoof` / `HdrSwapchainForce` / `HdrOutputDescSpoof` / `HdrSdrToneMap*` /
+    //     `NativeLdr*` / `Dx11On12Swapchain` 是 "HDR / 输出路径" **实验装置**
+    //     （伪装 HDR 能力再压回 SDR、改写交换链格式），发布 ini 模板里**一个键都没有**；
+    //     发布的 HDR 通路是 `Ffx12Hdr` / `Ffx12PqChain` / `Ffx12NonLinear`，**不在本块内**；
+    //     ini 模板头部已把"HDR 与输出路径探针"划归**开发构建专属**；
+    //   - `CaptureMetadataOnly` 在读取点之外**没有任何消费者** ⇒ 幻影键 ⇒ 一并排除。
+    // ⇒ 整块只在诊断构建里读取；发布构建连键名字符串都不进产物。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     g_config.hdr_swapchain_spoof =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSwapchainSpoof", 0, config_path.c_str()) != 0;
     g_config.hdr_swapchain_force =
@@ -3857,13 +3819,16 @@ void load_config()
             L"Dx11FsrBridge", L"HdrCompositeProbeLimit", 32, config_path.c_str())),
         1u,
         512u);
-    g_config.capture_metadata_only =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"CaptureMetadataOnly", 0, config_path.c_str()) != 0;
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（HDR / native-LDR / D3D11On12）
     // FSR2 输入纹理转储（诊断，默认关）。放在无条件区，避免被下面的 #if 吞掉。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     fsr2dump::configure(config_path.c_str());
+#endif
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
-    g_config.enable_fsr2_get_proc_address_shim =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableFsr2GetProcAddressShim", 1, config_path.c_str()) != 0;
+    // ⚠️ 2026-09-27：ini 键 `EnableFsr2GetProcAddressShim` 的读取点与
+    //   `Config::enable_fsr2_get_proc_address_shim` 字段**已删除** —— 它是**幻影键**：
+    //   读取点之外没有任何消费者（`fsr2_get_proc_address_shim_query_mask()` 走的是
+    //   `DX11FSRBRIDGE_SERVER_DEBUG_RUNTIME` 构建宏，与本 ini 键无关）⇒ 用户设了等于没设。
     g_config.fsr2_translation_mode = static_cast<std::uint32_t>(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2TranslationMode", 2, config_path.c_str()));
     g_config.fsr2_mode2_on_demand_state =
@@ -3883,12 +3848,11 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2UseTransparencyMask", 0, config_path.c_str()) != 0;
     g_config.fsr2_jitter_mode = static_cast<std::uint32_t>(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2JitterMode", 3, config_path.c_str()));
-    g_config.fsr2_hdr10_pq_color =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2Hdr10PqColor", 0, config_path.c_str()) != 0;
+    // ⚠️ 2026-09-27：ini 键 `Fsr2Hdr10PqColor` 的读取点与字段**已删除**（幻影键：
+    //   声明 + 读取点之外无任何消费者）。
     g_config.fsr2_use_native_exposure =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2UseNativeExposure", 1, config_path.c_str()) != 0;
-    g_config.fsr2_fast_metadata_copy =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2FastMetadataCopy", 1, config_path.c_str()) != 0;
+    // ⚠️ 2026-09-27：ini 键 `Fsr2FastMetadataCopy` 的读取点与字段**已删除**（幻影键同上）。
     g_config.fsr2_compact_linear_output =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2CompactLinearOutput", 1, config_path.c_str()) != 0;
     g_config.fsr2_lock_color_producer_shader =
@@ -3908,86 +3872,31 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2Il2CppHook", 0, config_path.c_str()) != 0;
     g_config.fsr2_il2cpp_skip_render =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2Il2CppSkipRender", 0, config_path.c_str()) != 0;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    // 【诊断】相机/投影观测钩子（只读抓取游戏侧矩阵用于对照）——
+    // 发布的相机参数走**静态 ini 值**（Ffx12CameraNear / Ffx12CameraFar / Ffx12FovScale），
+    // 不依赖这三个钩子 ⇒ 归 B 组，只在诊断构建里读取。
     g_config.ffx12_probe_camera =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ProbeCamera", 0, config_path.c_str()) != 0;
     g_config.ffx12_camera_hook =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12CameraHook", 0, config_path.c_str()) != 0;
     g_config.ffx12_projection_hook =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ProjectionHook", 0, config_path.c_str()) != 0;
+#endif
     // 【正式功能】透明队列抖动修复（TransparentJitter，默认 **1 = 修复生效**）。
     // ⚠️ 键名/段位必须与发布 ini 一致：段必须是 `[Dx11FsrBridge]`（放错段读不到，
     // 本项目踩过），且必须在**生产分支**读取（load_config 无条件执行，不受
     // DX11FSRBRIDGE_RELEASE_RUNTIME 影响）。
     //
-    // 旧键（JitterFlagProbe / JitterFlagForce / JitterFlagProbeFrames / JitterFlagHotkey）
-    // 是调查期的诊断开关，已废弃。⚠️ 不允许"两个键都生效、谁也说不清谁管用"：
-    //   ① 新键**存在** ⇒ 新键是唯一权威，旧键一律忽略（并打一行废弃告警）；
-    //   ② 新键**不存在**、旧键存在 ⇒ 按**旧语义**折算：旧版 force 需要 probe=1 才生效
-    //      ⇒ 等价于 (JitterFlagProbe && JitterFlagForce)；同时打告警呼吁迁移；
-    //   ③ 两者都不存在 ⇒ 默认 1（修复生效）。
-    // "键是否存在"必须用 GetPrivateProfileStringW 判断：GetPrivateProfileIntW
-    // 分不清"键不存在"与"键=0"，而后者是用户**明确要关掉修复**。
-    {
-        const auto ini_key_present = [&config_path](const wchar_t *key)
-        {
-            wchar_t buf[8] {};
-            GetPrivateProfileStringW(L"Dx11FsrBridge", key, L"", buf,
-                                     static_cast<DWORD>(std::size(buf)), config_path.c_str());
-            return buf[0] != L'\0';
-        };
-        const bool new_key_present = ini_key_present(L"TransparentJitter");
-        g_config.transparent_jitter =
-            GetPrivateProfileIntW(L"Dx11FsrBridge", L"TransparentJitter", 1, config_path.c_str()) != 0;
-
-        std::string legacy_keys;
-        for (const wchar_t *key : {L"JitterFlagProbe", L"JitterFlagForce"})
-        {
-            if (!ini_key_present(key))
-                continue;
-            if (!legacy_keys.empty())
-                legacy_keys += ",";
-            legacy_keys += narrow(key);
-        }
-        if (!legacy_keys.empty())
-        {
-            if (new_key_present)
-            {
-                g_config.logging.pending_warnings.push_back(
-                    "legacy_transparent_jitter_keys_ignored keys=" + legacy_keys +
-                    " effective=TransparentJitter=" +
-                    std::to_string(g_config.transparent_jitter ? 1 : 0));
-            }
-            else
-            {
-                // 旧语义：probe=1 才装钩，force=1 才改行为 ⇒ 两者都为 1 才等于"修复生效"。
-                const bool legacy_probe =
-                    GetPrivateProfileIntW(L"Dx11FsrBridge", L"JitterFlagProbe", 0, config_path.c_str()) != 0;
-                const bool legacy_force =
-                    GetPrivateProfileIntW(L"Dx11FsrBridge", L"JitterFlagForce", 0, config_path.c_str()) != 0;
-                g_config.transparent_jitter = legacy_probe && legacy_force;
-                g_config.logging.pending_warnings.push_back(
-                    "legacy_transparent_jitter_keys_deprecated keys=" + legacy_keys +
-                    " resolved=TransparentJitter=" +
-                    std::to_string(g_config.transparent_jitter ? 1 : 0) +
-                    " old_semantics=JitterFlagProbe_AND_JitterFlagForce migrate_to=TransparentJitter=1");
-            }
-        }
-        // 已**移除**的键：存在就如实说"本键无效"，不留"ini 里设了没用"的静默失效。
-        std::string removed_keys;
-        for (const wchar_t *key : {L"JitterFlagHotkey", L"JitterFlagProbeFrames"})
-        {
-            if (!ini_key_present(key))
-                continue;
-            if (!removed_keys.empty())
-                removed_keys += ",";
-            removed_keys += narrow(key);
-        }
-        if (!removed_keys.empty())
-            g_config.logging.pending_warnings.push_back(
-                "removed_transparent_jitter_keys_present keys=" + removed_keys +
-                " effect=none (hotkey removed: swallowed by the game;"
-                " per-frame observation log removed) migrate_to=TransparentJitter=1");
-    }
+    // ⚠️ 2026-09-27：**旧键兼容层已整体删除** —— `JitterFlagProbe` / `JitterFlagForce` /
+    // `JitterFlagProbeFrames` / `JitterFlagHotkey` 的读取、旧语义折算（probe && force）、
+    // 以及三条迁移告警串（`legacy_transparent_jitter_keys_ignored` /
+    // `legacy_transparent_jitter_keys_deprecated` / `removed_transparent_jitter_keys_present`）
+    // 全部移除。依据：发布更新方式是**覆盖安装**，不需要为旧版 ini 保留兼容；
+    // 留兼容层只会造成"两个键都生效、谁也说不清谁管用"。
+    // ⇒ 现在 `TransparentJitter` 是**唯一权威**，四个旧键**彻底不存在**（写了也无任何反应）。
+    g_config.transparent_jitter =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"TransparentJitter", 1, config_path.c_str()) != 0;
     const auto read_hex_rva = [&](const wchar_t *key, std::uint32_t fallback) {
         wchar_t buf[32] {};
         GetPrivateProfileStringW(L"Dx11FsrBridge", key, L"", buf, static_cast<DWORD>(std::size(buf)),
@@ -4069,8 +3978,13 @@ void load_config()
     g_config.ffx12_reuse_same_generation =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ReuseSameGeneration", 0,
                               config_path.c_str()) != 0;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    // 【诊断】`Ffx12OutputMark`：源码注释即"输出标记（诊断：验证画面来源是否 ffx12）"，
+    // 且消费点 `ffx12::set_output_mark()` 本身就在 `!RELEASE_RUNTIME` 内
+    // ⇒ 发布构建里它连消费者都没有（幻影）⇒ 归 B 组。
     g_config.ffx12_output_mark =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12OutputMark", 0, config_path.c_str()) != 0;
+#endif
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     ffx12::set_output_mark(g_config.ffx12_output_mark);
 #endif
@@ -4101,8 +4015,12 @@ void load_config()
     ffx12::set_debug_layer(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DebugLayer", 0, config_path.c_str()) != 0);
 #endif
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    // 【诊断】`Ffx12MotionDeadzone`：已实测**无效**的 motion 死区实验键
+    // （审查矩阵：102 轮实测 motion<0.0005UV 归零无效果）⇒ 归 B 组，不再进发布构建。
     ffx12::set_motion_deadzone(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12MotionDeadzone", 0, config_path.c_str()) != 0);
+#endif
     ffx12::set_depth_inverted(g_config.ffx12_depth_inverted);
     ffx12::set_decode_motion(g_config.ffx12_decode_motion);
     ffx12::set_motion_vectors_jittered(g_config.fsr2_motion_vectors_jittered);
@@ -4130,11 +4048,20 @@ void load_config()
                                  static_cast<DWORD>(std::size(ver_buf)), config_path.c_str());
         ffx12::set_sdk_version(narrow(ver_buf).c_str());
     }
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    // 【诊断】像素着色器 dump（把 .cso 落盘）。消费者 `dump_pixel_shader_bytecode` /
+    // `dump_vertex_shader_bytecode` 本身都在 `!RELEASE_RUNTIME` 内 ⇒ 归 B 组。
     // 诊断 shader dump 也必须在 RELEASE 分支读取（非 RELEASE 分支的读取不生效）
     g_config.dump_pixel_shaders = GetPrivateProfileIntW(L"Dx11FsrBridge", L"DumpPixelShaders", 0, config_path.c_str()) != 0;
+#endif
     // 后端输出读回采样（诊断，默认关）。开启会引入同步 GPU 等待 → 掉帧，仅排查用。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    // 【诊断】`Ffx12ReadbackProbes`：**本项目唯一持续 GPU 同步读回点**
+    // （Begin/End + GetData；源码注释即"开启会引入同步 GPU 等待 → 掉帧，仅排查用"）
+    // ⇒ 归 B 组，发布构建整块不参与编译。
     g_config.ffx12_readback_probes =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ReadbackProbes", 0, config_path.c_str()) != 0;
+#endif
     // ⚠️ Fsr2FastStateTracking —— 生产构建下**必须读**，且默认开启（=1）。
     //
     // 该键门控的是**状态镜像钩子的整体旁路**，共 11 处：
@@ -4152,15 +4079,21 @@ void load_config()
     // 默认值取 1：这是该开关的设计意图（学到目标后旁路），也是发布配置期望的行为。
     g_config.fsr2_fast_state_tracking =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2FastStateTracking", 1, config_path.c_str()) != 0;
+    // ---- 【诊断束】呈现探针 / 着色器与纹理追踪 / 像素着色器替换 ----
+    // 归属判定（读取点 + 消费者）：
+    //   - `Ffx12PresentProbe` 只 LOG present 参数与帧间隔（源码注释：仅记录）；
+    //   - `TracePixelShaderDraws` + `PixelShaderTraceLimit` + `TargetPixelShaderHash` +
+    //     `PixelShaderReplacementMode` + `DumpPixelShaders` 是同一支"目标 PS 追踪/替换"实验
+    //     （消费者只写 JSON 追踪流与替换 shader，不参与发布通路）；
+    //   - `TraceTextureCreates` + `TextureTrace*`（热键触发的限时纹理创建追踪）同理。
+    // ⇒ 整束归 B 组，只在诊断构建里读取。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     // Present 参数/帧间隔诊断（默认关）。仅记录 sync_interval/flags/帧间隔/前台状态。
     g_config.ffx12_present_probe =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12PresentProbe", 0, config_path.c_str()) != 0;
     g_config.trace_pixel_shader_draws =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"TracePixelShaderDraws", 0, config_path.c_str()) != 0;
-    // ---- 以下键此前**只在非 RELEASE 分支读取**，而生产构建定义
-    // DX11FSRBRIDGE_RELEASE_RUNTIME=1 → 这些开关在生产里从未生效（ini 里设了也没用，
-    // 与配置文档/部署脚本的说法不符）。合并双分支时一并补进唯一实现。----
-    // 纹理创建追踪（热键触发的限时追踪；TraceTextureCreates 由部署脚本写入）
+    // 纹理创建追踪（热键触发的限时追踪）
     g_config.trace_texture_creates =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"TraceTextureCreates", 0, config_path.c_str()) != 0;
     g_config.texture_trace_hotkey = static_cast<std::uint32_t>(
@@ -4183,18 +4116,22 @@ void load_config()
     }
     g_config.pixel_shader_trace_limit = static_cast<std::uint32_t>(std::max<INT>(
         1, GetPrivateProfileIntW(L"Dx11FsrBridge", L"PixelShaderTraceLimit", 512, config_path.c_str())));
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（呈现探针 / PS+纹理追踪 / PS 替换）
     // FSR2 锐化：**此前只在非 RELEASE 分支读取**，导致 sdk_in.enable_sharpening 那处
     // "日志撒谎修复"在生产里拿到的永远是默认 0 —— 等于该功能从未生效。
     g_config.fsr2_sharpness_percent = static_cast<std::uint32_t>(std::clamp<INT>(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2SharpnessPercent", 0, config_path.c_str()), 0, 100));
-    g_config.fsr2_gpu_timing =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2GpuTiming", 0, config_path.c_str()) != 0;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    // ---- 【诊断束】色彩产出者追踪 / 早输出探针（`Fsr2GpuTiming` 整支已按死代码删除）----
+    //   - `Fsr2TraceColorProducers`：色彩产出者写历史追踪（F6 手动落盘）；
+    //   - `Fsr2EarlyOutputProbe(+Frames)`：早输出探针。
     g_config.fsr2_trace_color_producers =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2TraceColorProducers", 0, config_path.c_str()) != 0;
     g_config.fsr2_early_output_probe =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2EarlyOutputProbe", 0, config_path.c_str()) != 0;
     g_config.fsr2_early_output_probe_frames = static_cast<std::uint32_t>(std::max<INT>(
         1, GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2EarlyOutputProbeFrames", 60, config_path.c_str())));
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（色彩产出者追踪 / 早输出探针）
     {
         wchar_t buf[520] {};
         GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12DllPath", L"", buf,
@@ -4207,24 +4144,23 @@ void load_config()
             g_config.ffx12_dll_path = g_module_dir.parent_path() / L"AMD" / L"amd_fidelityfx_upscaler_dx12.dll";
         ffx12::set_sdk_dll_path(g_config.ffx12_dll_path.c_str());
     }
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    // 【诊断】`Ffx12FailClosed`：源码注释即"禁止回退原生（测试/故障显式暴露）"——
+    // 它把 dispatch 失败从"回退原生"改成"直接失败"（=黑屏式故障注入）。
+    // 审查文档也把它记为 fail-closed 诊断 ⇒ 归 B 组，发布构建不再读取。
     g_config.ffx12_fail_closed =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FailClosed", 0, config_path.c_str()) != 0;
+#endif
     // -----------------------------------------------------------------------
     // 日志配置。新方案：显式等级 + 分类过滤（[Log] 段），不做内容推断。
-    // `[Log] level` 是**唯一权威**（缺省 info）；旧键 LogLevel / Ffx12FullLogging /
-    // EnableLogging **已被停用**（只检测存在性并提示迁移），理由见下方块内注释。
+    // `[Log] level` 是**唯一权威**（缺省 info）。
+    //
+    // ⚠️ 2026-09-27：旧键存在性探测（`LogLevel` / `Ffx12FullLogging` / `EnableLogging`）
+    // 与 `legacy_log_keys_ignored` 迁移告警**已删除** —— 发布更新方式是**覆盖安装**，
+    // 不为旧版 ini 保留兼容。旧键现在**彻底不存在**（写了也不会有任何反应，
+    // 也不会再污染"已废弃键"的告警噪声）。
     // -----------------------------------------------------------------------
     {
-        // ⚠️ 2026-09-23（用户要求）：**默认等级固定为 info**，且旧键不再改变等级。
-        //
-        // 背景：旧版发布包 ini 里带 `Ffx12FullLogging`（直到 `0322fa4` 才移除），
-        // 它原来会**无条件**把等级抬到 TRACE，且执行顺序在 `LogLevel` 之后 ——
-        // 于是"旧 ini + 没有 [Log] 段"的部署（如用户的 Linux 环境）会**静默变成 TRACE**，
-        // 用户既不知道原因、也没有显式设过 trace。
-        //
-        // 现在：`[Log] level` 是**唯一权威**，缺省 `info`。
-        // 三个旧键（LogLevel / Ffx12FullLogging / EnableLogging）只**检测存在性**，
-        // 不再影响任何行为；存在时记一条 WARN 提示迁移 —— 避免"设置了却无效"的困惑。
         wchar_t level_text[32] {};
         GetPrivateProfileStringW(L"Log", L"level", L"info", level_text,
                                  static_cast<DWORD>(std::size(level_text)), config_path.c_str());
@@ -4238,30 +4174,9 @@ void load_config()
         }
         g_config.logging.level = parsed;
 
-        // 日志开关由等级派生：`level=off` 即关闭（替代旧键 `EnableLogging`）
+        // 日志开关由等级派生：`level=off` 即关闭
         g_config.enable_logging = (parsed != blog::Level::Off);
         g_logging_enabled.store(g_config.enable_logging, std::memory_order_relaxed);
-
-        // 旧键：只检测存在性，用于提示迁移
-        {
-            std::string legacy_keys;
-            for (const wchar_t *key : {L"LogLevel", L"Ffx12FullLogging", L"EnableLogging"})
-            {
-                wchar_t legacy_buf[32] {};
-                GetPrivateProfileStringW(L"Dx11FsrBridge", key, L"", legacy_buf,
-                                         static_cast<DWORD>(std::size(legacy_buf)), config_path.c_str());
-                if (legacy_buf[0] != L'\0')
-                {
-                    if (!legacy_keys.empty())
-                        legacy_keys += ",";
-                    legacy_keys += narrow(key);
-                }
-            }
-            if (!legacy_keys.empty())
-                g_config.logging.pending_warnings.push_back(
-                    "legacy_log_keys_ignored keys=" + legacy_keys +
-                    " migrate_to=[Log] level (default info) / to_file");
-        }
 
         g_config.logging.to_debugger =
             GetPrivateProfileIntW(L"Log", L"to_debugger", 0, config_path.c_str()) != 0;
@@ -4325,33 +4240,47 @@ void load_config()
     g_config.render_scale_menu =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"RenderScaleMenu", 1, config_path.c_str()) != 0;
 #endif
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     g_config.show_osd = GetPrivateProfileIntW(L"Dx11FsrBridge", L"ShowOSD", 0, config_path.c_str()) != 0;
+#endif
     g_config.ffx12_feature_fallback =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FeatureFallback", 1, config_path.c_str()) != 0;
-    g_config.assume_phase_order = GetPrivateProfileIntW(L"Dx11FsrBridge", L"AssumePhaseOrder", 0, config_path.c_str()) != 0;
+    // ⚠️ 2026-09-27：ini 键 `AssumePhaseOrder` 的读取点与字段**已删除**，同时删除其
+    //   唯一（死）消费者 `mode_name_for_phase()` —— 该函数全仓没有任何调用点，
+    //   读到的值不改变任何行为（幻影键）。
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_config.enable_similarity_probe = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableSimilarityProbe", 0, config_path.c_str()) != 0;
     g_config.reset_similarity_on_recording = GetPrivateProfileIntW(L"Dx11FsrBridge", L"ResetSimilarityOnRecording", 1, config_path.c_str()) != 0;
 #endif
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    // 【诊断束】候选上限 + 有趣 dispatch 的日志节流参数。
+    //   - `CandidateLimitPerFrame`：唯一消费者是 `maybe_track_fsr2_color_candidate`
+    //     （每帧候选记录上限），消费者本身与色彩产出者追踪同属诊断观测；
+    //   - `InterestingDispatch*`：只控制"有趣 dispatch"日志的条数与相位间隔 ⇒ 日志节流参数。
     g_config.candidate_limit_per_frame = static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"CandidateLimitPerFrame", 64, config_path.c_str()));
     g_config.interesting_dispatch_log_limit = static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"InterestingDispatchLogLimit", 256, config_path.c_str()));
     g_config.interesting_dispatch_phase_gap_ms = static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"InterestingDispatchPhaseGapMs", 1500, config_path.c_str()));
+#endif
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_config.similarity_report_interval_ms = static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"SimilarityReportIntervalMs", 2000, config_path.c_str()));
 #endif
     wchar_t label_buffer[128] {};
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     GetPrivateProfileStringW(L"Dx11FsrBridge", L"RunLabel", L"", label_buffer, static_cast<DWORD>(std::size(label_buffer)), config_path.c_str());
     g_config.run_label = label_buffer;
+#endif
 
     // 【诊断】分段性能探针（默认关）。⚠️ 三个键只在这里读一次（配置读取本身
     // 就是被怀疑的对象之一：`GetPrivateProfile*` 是文件/注册表 IO，
     // **绝不允许出现在每帧路径上** —— 本探针会把它计数并证明它不在热路径）。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     g_config.perf_probe =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"PerfProbe", 0, config_path.c_str()) != 0;
     g_config.perf_probe_interval_ms = static_cast<std::uint32_t>(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"PerfProbeIntervalMs", 1000, config_path.c_str()));
     g_config.perf_probe_draw_sample = static_cast<std::uint32_t>(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"PerfProbeDrawSample", 32, config_path.c_str()));
+#endif
 
     // 【正式功能】入口级过滤（B109）——**段必须是 `[Dx11FsrBridge]`**（放错段读不到，
     // 本项目踩过这个坑）。⚠️ 它与 `PerfProbe` 总开关**无关**：探针关着它照样生效
@@ -4489,8 +4418,10 @@ bool safe_read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo
 // （`safe_read_resource_info` 对空指针直接返回 false，不做任何 COM 调用）。
 bool safe_read_resource_info_counted(ID3D11View *view, const wchar_t *kind, ResourceInfo &out_info)
 {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     if (view != nullptr)
         perf_probe::note_view_read();
+#endif
     return safe_read_resource_info(view, kind, out_info);
 }
 
@@ -5473,6 +5404,11 @@ bool is_user32_module(HMODULE module)
 
 void install_hdr_environment_probe_for_loaded_modules()
 {
+#if !defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    // 发布构建：HDR 环境探针整块不参与编译 ⇒ 本安装点保留为**空实现**
+    //（调用点 `on_module_activity` / `initialize` 无需改动）。
+    return;
+#else
     if (!g_config.hdr_environment_probe && !g_config.hdr_output_desc_spoof)
         return;
 
@@ -5507,8 +5443,10 @@ void install_hdr_environment_probe_for_loaded_modules()
     }
     if (summary_changed)
         LOG_INFO(blog::cat::hdr, summary);
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（HDR 环境探针）
 }
 
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
 HRESULT STDMETHODCALLTYPE hooked_output_get_desc1(IDXGIOutput6 *output, DXGI_OUTPUT_DESC1 *desc)
 {
     const HRESULT result = g_original_output_get_desc1 != nullptr
@@ -5612,6 +5550,14 @@ void install_hdr_output_desc_probe_from_adapter(IDXGIAdapter *adapter)
         g_original_output_get_desc1 = nullptr;
     }
 }
+#else
+// 发布构建：HDR 输出描述探针 / 伪装整块不参与编译 ⇒
+// 安装点保留为空实现（`hooked_output_get_desc1` 只在本安装点里被挂钩）。
+void install_hdr_output_desc_probe_from_adapter(IDXGIAdapter *adapter)
+{
+    static_cast<void>(adapter);
+}
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（HDR 输出描述探针 / 伪装）
 
 void install_create_hooks_for_loaded_modules()
 {
@@ -6792,98 +6738,10 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target0
         compile(pixel_source, "Dx11FsrBridgeHdrSdrToneMapPS", "main", "ps_5_0", g_hdr_sdr_tone_map_ps_bytecode);
 }
 
-void release_hdr_sdr_tone_map_draw_resources_locked()
-{
-    if (g_hdr_sdr_tone_map_draw_resources.pixel_shader != nullptr)
-    {
-        g_hdr_sdr_tone_map_draw_resources.pixel_shader->Release();
-        g_hdr_sdr_tone_map_draw_resources.pixel_shader = nullptr;
-    }
-    if (g_hdr_sdr_tone_map_draw_resources.constants != nullptr)
-    {
-        g_hdr_sdr_tone_map_draw_resources.constants->Release();
-        g_hdr_sdr_tone_map_draw_resources.constants = nullptr;
-    }
-    if (g_hdr_sdr_tone_map_draw_resources.device != nullptr)
-    {
-        g_hdr_sdr_tone_map_draw_resources.device->Release();
-        g_hdr_sdr_tone_map_draw_resources.device = nullptr;
-    }
-}
-
-bool acquire_hdr_sdr_tone_map_draw_resources(
-    ID3D11DeviceContext *context,
-    ID3D11PixelShader **pixel_shader,
-    ID3D11Buffer **constants)
-{
-    if (pixel_shader == nullptr || constants == nullptr || context == nullptr)
-        return false;
-    *pixel_shader = nullptr;
-    *constants = nullptr;
-
-    ID3D11Device *device = nullptr;
-    context->GetDevice(&device);
-    if (device == nullptr)
-        return false;
-
-    std::lock_guard lock(g_hdr_sdr_tone_map_mutex);
-    auto &resources = g_hdr_sdr_tone_map_draw_resources;
-    if (resources.device != device)
-    {
-        release_hdr_sdr_tone_map_draw_resources_locked();
-        resources.device = device;
-        device = nullptr;
-    }
-    if (device != nullptr)
-        device->Release();
-
-    if (resources.pixel_shader == nullptr || resources.constants == nullptr)
-    {
-        if (!compile_hdr_sdr_tone_map_shaders_locked())
-            return false;
-        const HRESULT shader_result = g_original_create_pixel_shader != nullptr
-            ? g_original_create_pixel_shader(
-                resources.device,
-                g_hdr_sdr_tone_map_ps_bytecode.data(),
-                g_hdr_sdr_tone_map_ps_bytecode.size(),
-                nullptr,
-                &resources.pixel_shader)
-            : resources.device->CreatePixelShader(
-                g_hdr_sdr_tone_map_ps_bytecode.data(),
-                g_hdr_sdr_tone_map_ps_bytecode.size(),
-                nullptr,
-                &resources.pixel_shader);
-        if (FAILED(shader_result) || resources.pixel_shader == nullptr)
-        {
-            LOG_DEBUG(blog::cat::hdr, "hdr_sdr_tone_map_draw_shader_create_failed hr=" +
-                std::to_string(static_cast<long>(shader_result)));
-            release_hdr_sdr_tone_map_draw_resources_locked();
-            return false;
-        }
-
-        D3D11_BUFFER_DESC buffer_desc {};
-        buffer_desc.ByteWidth = 16;
-        buffer_desc.Usage = D3D11_USAGE_DEFAULT;
-        buffer_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        const HRESULT buffer_result = g_original_create_buffer != nullptr
-            ? g_original_create_buffer(resources.device, &buffer_desc, nullptr, &resources.constants)
-            : resources.device->CreateBuffer(&buffer_desc, nullptr, &resources.constants);
-        if (FAILED(buffer_result) || resources.constants == nullptr)
-        {
-            LOG_DEBUG(blog::cat::hdr, "hdr_sdr_tone_map_draw_constants_create_failed hr=" +
-                std::to_string(static_cast<long>(buffer_result)));
-            release_hdr_sdr_tone_map_draw_resources_locked();
-            return false;
-        }
-        LOG_DEBUG(blog::cat::hdr, "hdr_sdr_tone_map_draw_resources_ready");
-    }
-
-    resources.pixel_shader->AddRef();
-    resources.constants->AddRef();
-    *pixel_shader = resources.pixel_shader;
-    *constants = resources.constants;
-    return true;
-}
+// ⚠️ 2026-09-27：`HdrSdrToneMapDrawResources` / `g_hdr_sdr_tone_map_draw_resources` /
+//   `release_hdr_sdr_tone_map_draw_resources_locked()` /
+//   `acquire_hdr_sdr_tone_map_draw_resources()` **已按死代码删除** ——
+//   这一组"draw 入口色调映射"资源从未被接线：`acquire_...` 全仓只有定义、没有调用点。
 
 bool ensure_hdr_sdr_tone_map_resources_locked(
     ID3D11Device *device,
@@ -7132,9 +6990,11 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
     // （见该函数：只有 hook_present / final_scene_* / hdr_composite_probe /
     // ffx12_present_probe 才需要 Present 钩子）⇒ 这一段在日志里会是 `present=0`，
     // 那本身就是一条结论："Present 路径上的每帧工作不可能是元凶"。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::Scope perf_scope(perf_probe::Segment::present);
     perf_probe::note_frame(perf_probe::FrameSource::present);
     perf_probe::maybe_flush();
+#endif
 #if defined(DX11FSRBRIDGE_SERVER_DEBUG_RUNTIME) && defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     static std::uint32_t last_fsr2_query_mask = UINT32_MAX;
     const std::uint32_t fsr2_query_mask = fsr2_get_proc_address_shim_query_mask();
@@ -7194,6 +7054,7 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
     //   dt_ms                —— 与上一次 Present 的间隔（直接反映限速）
     //   focused              —— 本进程窗口是否为前台窗口（对照用）
     // 全部按 500ms 限流，避免自身成为日志负担。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     if (g_config.ffx12_present_probe)
     {
         static std::atomic_uint64_t last_probe_tick { 0 };
@@ -7221,6 +7082,7 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
         }
         last_present_tick = probe_now;
     }
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（Ffx12PresentProbe）
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME) && defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     static std::atomic_uint64_t last_runtime_status_tick { 0 };
     const ULONGLONG now = GetTickCount64();
@@ -7367,12 +7229,22 @@ HRESULT STDMETHODCALLTYPE hooked_resize_target(IDXGISwapChain *swapchain, const 
 
 bool hdr_swapchain_spoof_active()
 {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     return g_config.hdr_swapchain_spoof;
+#else
+    // 发布构建：HDR 交换链伪装整块不参与编译 ⇒ 判据恒为假（键也不再读取）
+    return false;
+#endif
 }
 
 bool hdr_swapchain_force_active()
 {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     return g_config.hdr_swapchain_force;
+#else
+    // 发布构建：HDR 线性色彩空间强制整块不参与编译 ⇒ 判据恒为假（键也不再读取）
+    return false;
+#endif
 }
 
 bool is_hdr10_color_space(DXGI_COLOR_SPACE_TYPE color_space)
@@ -7810,11 +7682,13 @@ void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_
     }
 
     // 【诊断】PerfProbe：compute dispatch 钩子整体（**抽样**计时）。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::SampledScope perf_scope(perf_probe::Segment::dispatch_hook,
                                         perf_probe::dispatch_call_counter(),
                                         perf_probe::dispatch_sample_counter(),
                                         perf_probe::draw_sample_stride());
     perf_probe::maybe_flush();
+#endif
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     record_color_source_call("dispatch", group_x, group_y, group_z);
@@ -8260,8 +8134,10 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     //     ⇒ 本轮的漏斗读数和旧顺序下的漏斗读数**是同一批集合**；
     //   - 探针关时：构造里只有一次 relaxed 读，`mark()` 是可预测的空分支（不加原子操作）。
     // 见 `PerfProbe.h` 的 `FunnelStage` / `FunnelScope`。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::FunnelScope perf_funnel;
     perf_funnel.mark(perf_probe::FunnelStage::entry);
+#endif
 
     // =======================================================================
     // 【正式功能】B109 入口级过滤：**在进内省之前**用调用实参淘汰。
@@ -8344,7 +8220,9 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
 
     std::array<ID3D11RenderTargetView *, 2> render_targets {};
     context->OMGetRenderTargets(static_cast<UINT>(render_targets.size()), render_targets.data(), nullptr);
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_funnel.mark(perf_probe::FunnelStage::after_om);
+#endif
 
     // ⚠️ 双 RTV 预筛必须放在**最前面**——它只是两个指针判空，是整个函数最便宜的检查。
     //
@@ -8382,7 +8260,9 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         }
         return std::nullopt;
     }
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_funnel.mark(perf_probe::FunnelStage::after_prescreen);
+#endif
 
     // 低分辨率候选 draw 诊断（TAAU 渲染精度 <1 时应出现低分辨率 rtv0）——
     // 记录其 RTV/SRV 特征判断国际服 TAAU 布局（前 12 次）。
@@ -8444,7 +8324,9 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     ID3D11Buffer *constant_buffer = nullptr;
     context->PSGetShaderResources(0, static_cast<UINT>(shader_resources.size()), shader_resources.data());
     context->PSGetConstantBuffers(0, 1, &constant_buffer);
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_funnel.mark(perf_probe::FunnelStage::after_ps_query);
+#endif
 
     // 统一的释放（B106：下面新增了两条早退路径 ⇒ 用一处 lambda 消灭"失败返回漏 Release"
     // 这一类错，错误清单第 12 条）。释放对象与顺序与旧实现**逐条一致**（SRV → RTV → cb）。
@@ -8475,8 +8357,12 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     if (const auto fast_info = try_upscaler_path_cache_fast(
             render_targets.data(), shader_resources.data(), output_metadata_info))
     {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         perf_funnel.mark(perf_probe::FunnelStage::fast_hit);
+#endif
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         perf_probe::mark_draw_shape_identified(draw_shape_mark);
+#endif
         // 【B109 保险】识别成功点 ①（正缓存快路径命中）：检查本次绘制的 `element_count`。
         // 正常情形（`== 3`）立即返回、零原子操作；一旦出现非 3 ⇒ 一次性停用入口过滤器
         // 并打 `draw_entry_filter_disabled …` 告警（fail-open 回原路径）。
@@ -8484,12 +8370,16 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         perf_probe::note_draw_identified_element_count(element_count, draw_shape_mark,
                                                        entry_admit.canary);
         // B108：漏斗层的**非抽样**识别计数（与形状层那只手交叉核对，见 flush 的自洽断言）
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         perf_probe::note_identified_total();
+#endif
         register_cb0_for_jitter(constant_buffer);
         release_bound_views();
         return fast_info;
     }
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_funnel.mark(perf_probe::FunnelStage::after_fast_path);
+#endif
 
     // ---- 便宜判据①（B106 前移）：cb0 为空或 ByteWidth < 464 ⇒ 两套签名都不可能识别 ----
     //
@@ -8509,7 +8399,9 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         release_bound_views();
         return std::nullopt;
     }
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_funnel.mark(perf_probe::FunnelStage::after_cb);
+#endif
 
     // ---- 便宜判据②（B106 前移）：视口可用 + 存在 RTV 输出候选 ----
     //
@@ -8538,7 +8430,9 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         release_bound_views();
         return std::nullopt;
     }
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_funnel.mark(perf_probe::FunnelStage::after_viewport);
+#endif
 
     const auto rtv_matches_viewport = [&](const ResourceInfo &info)
     {
@@ -8552,7 +8446,9 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         release_bound_views();
         return std::nullopt;
     }
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_funnel.mark(perf_probe::FunnelStage::after_output);
+#endif
 
     std::array<ResourceInfo, 7> inputs {};
     for (std::size_t index = 0; index < shader_resources.size(); ++index)
@@ -8635,8 +8531,10 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     };
 
     std::optional<TargetUpscalerDrawInfo> identified = fixed_slot_identify();
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     if (identified)
         perf_funnel.mark(perf_probe::FunnelStage::fixed_ok);
+#endif
     if (!identified)
     {
         // 第二签名：动态槽位评分（国服技能等不同 shader 的 TAAU 路径）
@@ -8645,8 +8543,10 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
             viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Width) : 0,
             viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Height) : 0,
             constant_buffer_description.ByteWidth, constant_buffer_key);
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         if (identified)
             perf_funnel.mark(perf_probe::FunnelStage::dynamic_ok);
+#endif
     }
     if (!identified)
     {
@@ -8669,15 +8569,21 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         return std::nullopt;
     }
     stage_log("identify_end ok");
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_funnel.mark(perf_probe::FunnelStage::identified);
+#endif
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::mark_draw_shape_identified(draw_shape_mark);
+#endif
     // 【B109 保险】识别成功点 ②（两套签名之一成功）：同 ①，检查 `element_count`。
     // `entry_admit.canary == true` 说明这次是"非 3 的 canary 抽样放行" ——
     // 它一旦被识别，就证明 `count == 3` **不是**目标绘制的必要条件 ⇒ 立刻停用过滤器。
     perf_probe::note_draw_identified_element_count(element_count, draw_shape_mark,
                                                    entry_admit.canary);
     // B108：漏斗层的**非抽样**识别计数（与上面那只手成对；缺一个就等不到自洽）
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::note_identified_total();
+#endif
 
     g_trace_ps_cb0_key.store(constant_buffer_key, std::memory_order_relaxed);
     register_cb0_for_jitter(constant_buffer);
@@ -8789,12 +8695,16 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(
         // 【诊断】B108：这条"快速状态跟踪"路径**也是一次识别成功**，此前漏记 ⇒
         // 形状行与漏斗行的 `identified` 会与真实识别次数不符（自洽断言会直接报出来）。
         // 这里只补两笔纯计数（形状层 + 漏斗层），**判定逻辑一行未动**。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         perf_probe::mark_draw_shape_identified(draw_shape_mark);
+#endif
         // 【B109 保险】识别成功点 ③（"快速状态跟踪"路径，B108 补记过的那一条）：
         // 这条路径**代码上**要求 `element_count == 3`（本分支开头就拒绝非 3）
         // ⇒ 检查在此**必然成立**，它是"防止将来有人放宽上面那个判据"的护栏。
         perf_probe::note_draw_identified_element_count(element_count, draw_shape_mark, false);
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         perf_probe::note_identified_total();
+#endif
         return identified;
     }
 #endif
@@ -8861,7 +8771,9 @@ bool dlssg_framegen_selected()
     // 【诊断】PerfProbe：本函数是**带文件 IO 的 250 ms 限流轮询**
     // （`std::filesystem::exists` + `GetPrivateProfileStringW`，且持锁）。
     // 它只可能在交换链控制钩子里被调到 —— 这一段用来**证明**它不在帧路径上。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::Scope perf_scope(perf_probe::Segment::config_io);
+#endif
     static std::mutex mutex;
     static ULONGLONG last_check_tick = 0;
     static bool cached_result = false;
@@ -8877,12 +8789,16 @@ bool dlssg_framegen_selected()
     for (const std::filesystem::path &ini_path : optiscaler_ini_candidates())
     {
         std::error_code error;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         perf_probe::count(perf_probe::Counter::file_probe);
+#endif
         if (!std::filesystem::exists(ini_path, error))
             continue;
 
         wchar_t output_buffer[64] {};
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         perf_probe::count(perf_probe::Counter::config_read);
+#endif
         GetPrivateProfileStringW(
             L"FrameGen",
             L"FGOutput",
@@ -10080,167 +9996,12 @@ bool copy_fsr2_history_metadata(
     return true;
 }
 
-void release_fsr2_gpu_timing_queries()
-{
-    for (Fsr2GpuTimingSlot &slot : g_fsr2_gpu_timing_slots)
-    {
-        if (slot.disjoint != nullptr)
-            slot.disjoint->Release();
-        for (ID3D11Query *query : slot.timestamps)
-        {
-            if (query != nullptr)
-                query->Release();
-        }
-        slot = {};
-    }
-    if (g_fsr2_gpu_timing_device != nullptr)
-        g_fsr2_gpu_timing_device->Release();
-    g_fsr2_gpu_timing_device = nullptr;
-    g_fsr2_gpu_timing_cursor = 0;
-    g_fsr2_gpu_timing_accumulated_ms = {};
-    g_fsr2_gpu_timing_sample_count = 0;
-    g_fsr2_gpu_timing_unavailable_streak = 0;
-}
-
-bool collect_fsr2_gpu_timing_slot(ID3D11DeviceContext *context, Fsr2GpuTimingSlot &slot)
-{
-    if (!slot.pending)
-        return true;
-    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint {};
-    if (context->GetData(slot.disjoint, &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
-        return false;
-    std::array<UINT64, 5> timestamps {};
-    for (std::size_t index = 0; index < timestamps.size(); ++index)
-    {
-        if (context->GetData(
-                slot.timestamps[index],
-                &timestamps[index],
-                sizeof(timestamps[index]),
-                D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
-        {
-            return false;
-        }
-    }
-    slot.pending = false;
-    if (disjoint.Disjoint || disjoint.Frequency == 0)
-        return true;
-
-    for (std::size_t stage = 0; stage < g_fsr2_gpu_timing_accumulated_ms.size(); ++stage)
-    {
-        g_fsr2_gpu_timing_accumulated_ms[stage] +=
-            static_cast<double>(timestamps[stage + 1] - timestamps[stage]) * 1000.0 /
-            static_cast<double>(disjoint.Frequency);
-    }
-    ++g_fsr2_gpu_timing_sample_count;
-    if (g_fsr2_gpu_timing_sample_count >= 120)
-    {
-        const double divisor = static_cast<double>(g_fsr2_gpu_timing_sample_count);
-        const double upscaler_average_ms = g_fsr2_gpu_timing_accumulated_ms[1] / divisor;
-        LOG_DEBUG(blog::cat::upscale, "fsr2_gpu_timing samples=" + std::to_string(g_fsr2_gpu_timing_sample_count) +
-            " prepare_ms=" + std::to_string(g_fsr2_gpu_timing_accumulated_ms[0] / divisor) +
-            " upscaler_ms=" + std::to_string(upscaler_average_ms) +
-            " metadata_ms=" + std::to_string(g_fsr2_gpu_timing_accumulated_ms[2] / divisor) +
-            " color_replay_ms=" + std::to_string(g_fsr2_gpu_timing_accumulated_ms[3] / divisor) +
-            " total_ms=" + std::to_string(
-                (g_fsr2_gpu_timing_accumulated_ms[0] + g_fsr2_gpu_timing_accumulated_ms[1] +
-                    g_fsr2_gpu_timing_accumulated_ms[2] + g_fsr2_gpu_timing_accumulated_ms[3]) /
-                divisor));
-        const ULONGLONG now = GetTickCount64();
-        if (g_config.fsr2_auto_recover_upscaler_ms > 0 &&
-            upscaler_average_ms >= static_cast<double>(g_config.fsr2_auto_recover_upscaler_ms) &&
-            (g_fsr2_gpu_timing_last_recovery_tick == 0 ||
-                now - g_fsr2_gpu_timing_last_recovery_tick >= 10000))
-        {
-            g_fsr2_gpu_timing_last_recovery_tick = now;
-            g_fsr2_translation_recovery_requested.store(true, std::memory_order_release);
-            LOG_WARN(blog::cat::upscale, "fsr2_upscaler_stall_detected upscaler_ms=" +
-                std::to_string(upscaler_average_ms) + " recovery=requested");
-        }
-        g_fsr2_gpu_timing_accumulated_ms = {};
-        g_fsr2_gpu_timing_sample_count = 0;
-    }
-    return true;
-}
-
-Fsr2GpuTimingSlot *begin_fsr2_gpu_timing(ID3D11DeviceContext *context)
-{
-    // 【诊断】PerfProbe：GPU timestamp query 段。
-    // ⚠️ 本项目**没有**任何同步读回：`collect_fsr2_gpu_timing_slot` 的 `GetData`
-    // 全部带 `D3D11_ASYNC_GETDATA_DONOTFLUSH`（不阻塞、不 flush）⇒ 结构上不可能
-    // 制造"GPU 空转"。而 `Fsr2GpuTiming` 默认 **0 = 关** ⇒ 本段在默认配置下
-    // 只剩一次布尔判断（≈0 µs）。若日志里本段有可观耗时 ⇒ 才需要继续查它。
-    perf_probe::Scope perf_scope(perf_probe::Segment::gpu_query);
-    if (!g_config.fsr2_gpu_timing || context == nullptr)
-        return nullptr;
-    ID3D11Device *device = nullptr;
-    context->GetDevice(&device);
-    if (device == nullptr)
-        return nullptr;
-
-    std::lock_guard lock(g_fsr2_gpu_timing_mutex);
-    if (g_fsr2_gpu_timing_device != device)
-    {
-        release_fsr2_gpu_timing_queries();
-        g_fsr2_gpu_timing_device = device;
-        D3D11_QUERY_DESC disjoint_description { D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
-        D3D11_QUERY_DESC timestamp_description { D3D11_QUERY_TIMESTAMP, 0 };
-        for (Fsr2GpuTimingSlot &slot : g_fsr2_gpu_timing_slots)
-        {
-            if (FAILED(device->CreateQuery(&disjoint_description, &slot.disjoint)))
-            {
-                release_fsr2_gpu_timing_queries();
-                return nullptr;
-            }
-            for (ID3D11Query *&query : slot.timestamps)
-            {
-                if (FAILED(device->CreateQuery(&timestamp_description, &query)))
-                {
-                    release_fsr2_gpu_timing_queries();
-                    return nullptr;
-                }
-            }
-        }
-    }
-    else
-    {
-        device->Release();
-    }
-
-    Fsr2GpuTimingSlot &slot =
-        g_fsr2_gpu_timing_slots[g_fsr2_gpu_timing_cursor++ % g_fsr2_gpu_timing_slots.size()];
-    if (!collect_fsr2_gpu_timing_slot(context, slot))
-    {
-        ++g_fsr2_gpu_timing_unavailable_streak;
-        if (g_fsr2_gpu_timing_unavailable_streak == 120 ||
-            g_fsr2_gpu_timing_unavailable_streak % 600 == 0)
-        {
-            LOG_DEBUG(blog::cat::upscale, "fsr2_gpu_queue_backlog unavailable_queries=" +
-                std::to_string(g_fsr2_gpu_timing_unavailable_streak) +
-                " ring_size=" + std::to_string(g_fsr2_gpu_timing_slots.size()));
-        }
-        return nullptr;
-    }
-    if (g_fsr2_gpu_timing_unavailable_streak >= 120)
-    {
-        LOG_DEBUG(blog::cat::upscale, "fsr2_gpu_queue_recovered unavailable_queries=" +
-            std::to_string(g_fsr2_gpu_timing_unavailable_streak));
-    }
-    g_fsr2_gpu_timing_unavailable_streak = 0;
-    context->Begin(slot.disjoint);
-    context->End(slot.timestamps[0]);
-    return &slot;
-}
-
-void end_fsr2_gpu_timing(ID3D11DeviceContext *context, Fsr2GpuTimingSlot *slot)
-{
-    if (context == nullptr || slot == nullptr)
-        return;
-    perf_probe::Scope perf_scope(perf_probe::Segment::gpu_query);
-    context->End(slot->timestamps[4]);
-    context->End(slot->disjoint);
-    slot->pending = true;
-}
-
+// ⚠️ 2026-09-27：`Fsr2GpuTiming`（GPU timestamp 分段计时）整支**已删除** ——
+//   实测全仓**无任何调用点**：`begin_fsr2_gpu_timing()` / `end_fsr2_gpu_timing()`
+//   只被彼此引用，没有任何外部调用者，也不出现在函数指针表 / 宏展开 / 条件编译分支里
+//   ⇒ 纯死代码。随之一并删除：`Fsr2GpuTimingSlot`、`g_fsr2_gpu_timing_*` 全局、
+//   `release_fsr2_gpu_timing_queries()`、`collect_fsr2_gpu_timing_slot()`，
+//   以及 ini 键 `Fsr2GpuTiming` 的读取点与 `Config::fsr2_gpu_timing` 字段。
 bool consume_fsr2_optiscaler_config_reset()
 {
     if (!g_config.fsr2_reset_on_optiscaler_config_change)
@@ -11520,6 +11281,7 @@ bool try_fsr2_translation_draw(
                 // **必须无条件调用**：热键/延时触发要在里面轮询，若先判"已启用"再调用，
                 // 开关关闭时永远不会进入 ⇒ 热键永远武装不上。关闭时内部走一次原子读即返回。
                 // 只在这里喂参数与纹理，读回由模块跨帧延迟完成——不在本 draw 内做 CPU 同步。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
                 {
                     bool dump_dx11on12 = false, dump_gpu_only = false;
                     ffx12::interop_capabilities(dump_dx11on12, dump_gpu_only);
@@ -11555,6 +11317,7 @@ bool try_fsr2_translation_draw(
                     }
                     fsr2dump::on_dispatch(context, dump_desc, !dump_dx11on12);
                 }
+#endif
 
                 if (ffx12::dispatch(sdk_in, context, call_params.instance))
                 {
@@ -11601,8 +11364,10 @@ bool try_fsr2_translation_draw(
                     }
                     if (dcount == 1 || dcount % 15 == 0)
                     {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
                         update_osd_sdk234(dcount, sdk_in.render_w, sdk_in.render_h,
                                           sdk_in.display_w, sdk_in.display_h);
+#endif
                     }
                     if (dcount == 1 || dcount % 1024 == 0)
                     {
@@ -12327,16 +12092,20 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
     // （见 PerfProbe.h）——旧写法在这里的每条 return 上手写
     // `draw_cost_histogram(0).record(perf_scope.elapsed_ns())`，而 `elapsed_ns()`
     // 要到析构才被填 ⇒ 恒记 0（真机 `draw_all mean_us=0.000000`）。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::SampledScope perf_scope(perf_probe::Segment::draw_hook,
                                         perf_probe::draw_call_counter(),
                                         perf_probe::draw_sample_counter(),
                                         perf_probe::draw_sample_stride(),
                                         perf_probe::k_draw_all_slot);
     perf_probe::maybe_flush();
+#endif
     // 【诊断】draw 直方图槽 1 = **内省窗口**（只包住 inspect_target_upscaler_draw；
     // 未进入内省的 draw 记 0）⇒ 两槽样本集合一致，"draw_all − draw_inspect" 才有意义。
     // 见 PerfProbe.h 里 DrawInspectScope 的口径说明与 B105。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::DrawInspectScope perf_inspect_scope(perf_scope.sampled());
+#endif
     // 【诊断】B107 形状分桶：**调用入口**的实参就是最强的判别式候选
     // （`IndexCount` / `StartIndexLocation` / `BaseVertexLocation`）。
     // 这里只做"打包 + 计数"（探针关时只读一次开关，零原子操作）；
@@ -12345,7 +12114,9 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
     // 本身就要花钱 ⇒ 先用"已经拿在手里的实参"分桶（见 PerfProbe.h 的说明）。
     const perf_probe::DrawShapeMarkArmed perf_draw_shape = perf_probe::make_draw_shape_mark(
         perf_probe::DrawShapeSlot::indexed(index_count, start_index_location, base_vertex_location));
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::mark_draw_shape_call(perf_draw_shape);
+#endif
     // passthrough 机制已整体移除（实测让 OptiScaler 丢失 FFX 输入识别）。
     // 所有显卡统一桥直连；OptiScaler 共存时并行（各自独立链路，实测无冲突；
     // N/Intel 上 OptiScaler 用于提供 DLSS/XeSS，不依赖桥让路）。
@@ -12373,9 +12144,13 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
         return;
     // ⚠️ 内省窗口只包住这一次调用（B105）：`perf_inspect_scope` 在出口按情况记
     // "本次耗时"或"未内省 = 0"，两槽样本集合因此恒等。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_inspect_scope.start();
+#endif
     const auto target_draw_info = inspect_target_upscaler_draw(context, index_count, perf_draw_shape);
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_inspect_scope.stop();
+#endif
     if (target_draw_info && g_config.fsr2_translation_mode >= 3)
         observe_fsr2_dynamic_color_target(*target_draw_info);
     maybe_track_fsr2_color_candidate(context, index_count);
@@ -12441,20 +12216,26 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
 {
     // 【诊断】PerfProbe：与 hooked_draw_indexed 同一处置（抽样计时，含所有 return 路径；
     // 直方图槽 0 的落桶在 SampledScope 析构里，见 B105）。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::SampledScope perf_scope(perf_probe::Segment::draw_hook,
                                         perf_probe::draw_call_counter(),
                                         perf_probe::draw_sample_counter(),
                                         perf_probe::draw_sample_stride(),
                                         perf_probe::k_draw_all_slot);
     perf_probe::maybe_flush();
+#endif
     // 【诊断】与 hooked_draw_indexed 同一处置（内省窗口；未内省记 0）。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::DrawInspectScope perf_inspect_scope(perf_scope.sampled());
+#endif
     // 【诊断】B107 形状分桶（与 hooked_draw_indexed 同一处置，形状种类 = `dr`）。
     // 两个入口共用一张形状表 ⇒ 日志里能直接看出"这 490 次调用里有多少走的是
     // 非索引路径"（`dr` 行）—— 这也是"索引数/顶点数"判别式的一部分。
     const perf_probe::DrawShapeMarkArmed perf_draw_shape = perf_probe::make_draw_shape_mark(
         perf_probe::DrawShapeSlot::non_indexed(vertex_count, start_vertex_location));
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::mark_draw_shape_call(perf_draw_shape);
+#endif
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     capture_runtime_snapshot_if_requested();
 #endif
@@ -12477,9 +12258,13 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
     // Phase 1：FSR2 合成族预处理 pass 跳过（仅当上一帧累积 pass 被桥成功替换且未超时）
     if (fsr2_family_skip_gate(context, vertex_count, false))
         return;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_inspect_scope.start();
+#endif
     const auto target_draw_info = inspect_target_upscaler_draw(context, vertex_count, perf_draw_shape);
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_inspect_scope.stop();
+#endif
     if (target_draw_info && g_config.fsr2_translation_mode >= 3)
         observe_fsr2_dynamic_color_target(*target_draw_info);
     maybe_track_fsr2_color_candidate(context, vertex_count);
@@ -13026,9 +12811,6 @@ HRESULT STDMETHODCALLTYPE hooked_create_compute_shader(ID3D11Device *device, con
             if (bytecode_hash != 0)
                 g_compute_shader_info_by_hash[bytecode_hash] = info;
         }
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-        dump_compute_shader_bytecode(bytecode_hash, shader_bytecode, static_cast<std::size_t>(bytecode_length));
-#endif
     }
     return hr;
 }
@@ -13588,6 +13370,7 @@ HMODULE WINAPI hooked_load_library_ex_w(LPCWSTR file_name, HANDLE file, DWORD fl
     return module;
 }
 
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
 LONG WINAPI hooked_display_config_get_device_info(DISPLAYCONFIG_DEVICE_INFO_HEADER *request)
 {
     const LONG result = g_original_display_config_get_device_info != nullptr
@@ -13672,6 +13455,23 @@ LONG WINAPI hooked_display_config_set_device_info(DISPLAYCONFIG_DEVICE_INFO_HEAD
         ? g_original_display_config_set_device_info(request)
         : ERROR_PROC_NOT_FOUND;
 }
+#else
+// 发布构建：HDR 环境探针 + HDR 输出描述伪装整块不参与编译 ⇒ 两个 user32 钩子纯透传
+// （`GetProcAddress` 拦截点仍在，但两个配置开关恒为假 ⇒ 永远不会返回这两个钩子）。
+LONG WINAPI hooked_display_config_get_device_info(DISPLAYCONFIG_DEVICE_INFO_HEADER *request)
+{
+    return g_original_display_config_get_device_info != nullptr
+        ? g_original_display_config_get_device_info(request)
+        : ERROR_PROC_NOT_FOUND;
+}
+
+LONG WINAPI hooked_display_config_set_device_info(DISPLAYCONFIG_DEVICE_INFO_HEADER *request)
+{
+    return g_original_display_config_set_device_info != nullptr
+        ? g_original_display_config_set_device_info(request)
+        : ERROR_PROC_NOT_FOUND;
+}
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（HDR 环境探针 / 输出描述伪装）
 
 FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR proc_name)
 {
@@ -14098,8 +13898,10 @@ void initialize()
     // 关时 `enabled()` 为 false ⇒ 所有埋点只剩一次 relaxed 原子读（纳秒级、可忽略）。
     // 开时：每 `PerfProbeIntervalMs` 输出**一行**分段汇总（见 PerfProbe.h 的分段说明）。
     perf_probe::set_log_sink(&perf_probe_log);
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::configure(g_config.perf_probe, g_config.perf_probe_interval_ms,
                           g_config.perf_probe_draw_sample);
+#endif
     // 【正式功能】入口级过滤（B109）：**不跟 `PerfProbe` 开关**（见 PerfProbe.h 的说明）。
     // 常驻一行说明它是开是关、canary 步长是多少 ⇒ 用户看日志就知道过滤器在不在生效，
     // 以及保险有没有把它自我证伪（后者另有一行 `draw_entry_filter_disabled …`）。
@@ -14109,6 +13911,7 @@ void initialize()
         std::string(perf_probe::draw_entry_filter_state_name()) +
         " canary_stride=" + std::to_string(perf_probe::draw_entry_filter_canary_stride()) +
         " predicate=element_count==3 entry=ix|dr key=DrawEntryFilter");
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     if (g_config.perf_probe)
     {
         LOG_INFO(blog::cat::probe, "perf_probe_enabled interval_ms=" +
@@ -14116,12 +13919,16 @@ void initialize()
             " draw_sample=" + std::to_string(g_config.perf_probe_draw_sample) +
             " note=one_line_per_interval_only");
     }
+#endif
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     // Release 构建同样需要 OSD（show_osd 配置控制）：此前被 Release 条件编译切掉，
     // 导致 OSD 悬浮窗从未启动（"无可见 OSD"根因）。以下两行移到 #endif 之后。
 #endif
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    // OSD 属诊断整块（键 `ShowOSD`）⇒ 只在诊断构建里启动并喂首帧文本。
     start_osd();
     set_osd_text(L"Dx11FsrBridge OSD\n等待 DX11 dispatch 数据");
+#endif
 
     LOG_DEBUG(blog::cat::hook, std::string("d3d11_loaded=") + (GetModuleHandleW(L"d3d11.dll") != nullptr ? "1" : "0"));
     install_create_hooks_for_loaded_modules();
@@ -14219,9 +14026,11 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID reserved)
             }
         }
 #endif
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         g_osd_running = false;
         if (g_osd_window != nullptr)
             PostMessageW(g_osd_window, WM_CLOSE, 0, 0);
+#endif
         // 排空并关闭日志文件。即使 atexit 因宿主直接 TerminateProcess 而没跑到，
         // 尾部日志也已经落盘。
         blog::shutdown();

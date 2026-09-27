@@ -144,8 +144,10 @@ __declspec(noinline) std::uint64_t on_flag_setter_enter(void *camera_ptr, std::u
 {
     // 【诊断】PerfProbe：本 observer 的单次成本 × 调用频率 = 钩子机制的总开销。
     // 这一段就是"用数据回答'钩子每调用开销是否可忽略'"，不再靠推算。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::Scope perf_scope(perf_probe::Segment::jitter_observer);
     perf_probe::note_jitter_call();
+#endif
     // ABI：bool 走 dl；rdx 高位未定义 ⇒ 只取低 8 位（与原函数的 `movzx edi,dl` 一致）。
     const std::uint8_t value = static_cast<std::uint8_t>(value_raw & 0xFFu);
     const bool force = g_force.load(std::memory_order_relaxed) != 0;

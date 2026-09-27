@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 # 版本号**单一事实源**（2026-09-19 审核报告）。
 # 改版本只改这里；`.rc` 通过下面生成的头读取，不再手写。
-project(Dx11FsrBridge VERSION 2.2.0.0 LANGUAGES C CXX RC)
+project(Dx11FsrBridge VERSION 2.3.0.0 LANGUAGES C CXX RC)
 
 # 生成版本头供 .rc 使用（生成到构建目录，避免污染源码树）。
 configure_file(
@@ -11,6 +11,16 @@ configure_file(
     @ONLY)
 
 option(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL "Build the standard FSR2 translation exports" ON)
+# ⚠️⚠️ 宏名**严重误导**（2026-09-27 复核确认）：`EXPERIMENTAL` 听起来像"实验开关、
+#      可以关掉"，但它包的**全是生产主干**：
+#        - `try_fsr2_translation_draw`（draw 翻译派发主链）
+#        - `fsr2_family_skip`（合成族预处理跳过，ini 里 Fsr2FamilySkip 默认 =1）
+#        - `Fsr2TranslationMode` 的 mode-2 按需识别路径
+#        - **`TransparentJitter` 的 ini 读取点物理上位于该宏块内（3864…4327 行）**
+#        - 以及整个 FSR2 键组（Ffx12*/Fsr2*/TransparentJitter/DrawEntryFilter/Il2Cpp 钩子…）
+#      ⇒ **在 Release 里把它置 OFF 会让上面整片静默失效、且没有任何报错** ✗
+#      ⇒ **本开关不是诊断开关**：不要与 `DX11FSRBRIDGE_DIAGNOSTICS` 混淆，
+#        更不要在发布构建里关掉它。如需改名请当作"改构建接口"单独评审（本轮刻意不改名）。
 option(DX11FSRBRIDGE_RELEASE_RUNTIME "Build the release runtime" ON)
 option(DX11FSRBRIDGE_BUILD_FAMILY_TEST "Build the Fsr2FamilyTakeover state-machine test" OFF)
 # 统一测试开关（2026-09-19 审核报告）。
@@ -31,6 +41,41 @@ option(DX11FSRBRIDGE_BUILD_FAMILY_TEST "Build the Fsr2FamilyTakeover state-machi
 #   - `GpuRouteTest`                —— 已在文件内标注 OBSOLETE
 # 这些留待需要时按 FFX SDK staging 接入；先保证"能无外部依赖编译"的两个进 CI。
 option(DX11FSRBRIDGE_BUILD_TESTS "Build the SDK-free unit tests (il2cpp callsite, ffx12 backend)" OFF)
+
+# ---- 诊断/探针代码开关（2026-09-27）----
+#
+# 目的：把**所有诊断/探针代码**挡在**发布构建之外**：
+#   - `PerfProbe`（分段性能探针，`PerfProbe.h` 约 2000 行 + 散在 5 个文件里的埋点）
+#   - `Fsr2InputDump`（FSR2 输入纹理抓帧）
+#   - 各类 `*Probe*` / `Trace*` / `Dump*`（HDR 探针、像素着色器追踪、纹理创建追踪、
+#     相似度探针、GPU timing、early-output 探针……）
+#
+# 语义：
+#   OFF（默认 = 发布构建）⇒ 诊断代码**完全不参与编译** ⇒ 产物里连诊断字符串都没有；
+#   ON （开发/排查构建）  ⇒ 诊断代码照旧编译，`PerfProbeTest` / `Fsr2InputDumpTest`
+#                            这两个诊断专用 test target 也一起建出来。
+#
+# ⚠️ 源码树**一个文件都不删**：排除全靠本开关 +
+#    `#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)`，所以将来排查问题
+#    打开开关就拿到全部工具（与"删掉"在发布产物上等价，但保留了工具）。
+#
+# ⚠️ Debug 配置**自动**视为开发构建：单配置生成器（Ninja / Makefile）下
+#    `CMAKE_BUILD_TYPE=Debug` ⇒ 自动打开本开关，不需要额外传参。
+#    多配置生成器（VS / Xcode）下 `CMAKE_BUILD_TYPE` 为空 ⇒ 请显式传
+#    `-DDX11FSRBRIDGE_DIAGNOSTICS=ON`。
+option(DX11FSRBRIDGE_DIAGNOSTICS
+    "Compile diagnostics/probes (PerfProbe, Fsr2InputDump, *Probe*, Trace*, Dump*) - keep OFF for release" OFF)
+
+set(DX11FSRBRIDGE_DIAGNOSTICS_ON ${DX11FSRBRIDGE_DIAGNOSTICS})
+if(NOT DX11FSRBRIDGE_DIAGNOSTICS_ON AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(DX11FSRBRIDGE_DIAGNOSTICS_ON ON)
+    message(STATUS "Dx11FsrBridge: CMAKE_BUILD_TYPE=Debug ⇒ 自动启用诊断开关（开发构建）")
+endif()
+if(DX11FSRBRIDGE_DIAGNOSTICS_ON)
+    message(STATUS "Dx11FsrBridge: 诊断/探针代码 **参与编译**（DX11FSRBRIDGE_ENABLE_DIAGNOSTICS=1）")
+else()
+    message(STATUS "Dx11FsrBridge: 诊断/探针代码 **排除出编译**（发布构建）")
+endif()
 
 # The bridge deliberately uses the deployed ffx-api runtime provider.  The
 # static open-SDK host was tested in-game and produced a black output, while
@@ -72,8 +117,21 @@ add_library(Dx11FsrBridge SHARED
     Il2CppCallSiteHook.cpp
     TransparentJitterHook.cpp
     Ffx12Backend.cpp
-    Fsr2InputDump.cpp
 )
+
+# ⚠️ `Fsr2InputDump.cpp`（抓帧诊断）**只在诊断构建里**进源列表：
+# 发布构建 ⇒ 这个 .cpp 一行都不编译 ⇒ `Fsr2InputDump*` 9 个 ini 键名、
+# `fsr2_input_dump*` / `fsr2dump` 等字符串全部不会进产物。
+# 源码文件本身**保留在仓库里**（不删），靠本开关切换。
+if(DX11FSRBRIDGE_DIAGNOSTICS_ON)
+    target_sources(Dx11FsrBridge PRIVATE Fsr2InputDump.cpp)
+endif()
+
+# 诊断开关宏：只有打开时才定义（发布构建**不定义** ⇒ 所有
+# `#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)` 块整体不参与编译）。
+if(DX11FSRBRIDGE_DIAGNOSTICS_ON)
+    target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_ENABLE_DIAGNOSTICS=1)
+endif()
 
 # 旧方案已彻底移除：Fsr2TranslationLayer（旧翻译层）与 Dx11On12Swapchain（On12 引导）
 # 不再编译进 DLL；OptiScaler 以新 ffx12 链路为基底接入。
@@ -197,6 +255,13 @@ if(DX11FSRBRIDGE_BUILD_TESTS OR DX11FSRBRIDGE_BUILD_BACKEND_TEST)
             UNICODE
             _UNICODE
         )
+        # ⚠️ 测试 target 必须与主 target **用同一个诊断开关**：
+        # 否则要么诊断 test 在没有诊断实现的构建里编译失败（PerfProbeTest /
+        # Fsr2InputDumpTest），要么 `Il2CppCallSiteHookTest` /
+        # `TransparentJitterHookTest` 与 DLL 走不同的 `PerfProbe.h` 分支。
+        if(DX11FSRBRIDGE_DIAGNOSTICS_ON)
+            target_compile_definitions(${target} PRIVATE DX11FSRBRIDGE_ENABLE_DIAGNOSTICS=1)
+        endif()
     endfunction()
 endif()
 
@@ -212,19 +277,6 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     enable_testing()
     add_test(NAME Il2CppCallSiteHookTest COMMAND Il2CppCallSiteHookTest)
 
-    # FSR2 输入纹理转储的纯函数单测：PNG 结构/CRC/zlib 回读、motion 平方解码、
-    # 半精度转换、raw 头。**不需要 GPU、不需要游戏、不链接 BridgeLogger**
-    # （用 FSR2DUMP_NO_LOGGER 把日志裁剪为空操作）。
-    # 这些公式必须与 Ffx12Backend.cpp 的 CS 一致——不一致会让诊断图本身说谎。
-    add_executable(Fsr2InputDumpTest
-        Fsr2InputDumpTest.cpp
-        Fsr2InputDump.cpp
-    )
-    fsrbridge_configure_test(Fsr2InputDumpTest)
-    target_compile_definitions(Fsr2InputDumpTest PRIVATE FSR2DUMP_NO_LOGGER)
-    target_include_directories(Fsr2InputDumpTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(NAME Fsr2InputDumpTest COMMAND Fsr2InputDumpTest)
-
     # 透明队列抖动修复（TransparentJitter）：签名定位 + 只读/强制的透传 + 还原纪律
     # + 日志纪律（钩子逐次调用不打日志）。不需要游戏、不需要 GPU、不链接
     # BridgeLogger（日志走注入的 sink）。
@@ -236,15 +288,38 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     target_include_directories(TransparentJitterHookTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME TransparentJitterHookTest COMMAND TransparentJitterHookTest)
 
-    # 分段性能探针（PerfProbe）：**header-only** ⇒ 本 target 只需这一个 .cpp。
-    # 覆盖：关时零开销 / 段累计与 max / 抽样步长 / 计数器 / 帧计数 /
-    # 汇总行只打一行且复位 / 汇总不可重入 / 间隔语义。
-    add_executable(PerfProbeTest
-        PerfProbeTest.cpp
-    )
-    fsrbridge_configure_test(PerfProbeTest)
-    target_include_directories(PerfProbeTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(NAME PerfProbeTest COMMAND PerfProbeTest)
+    # ---- 以下两个 test target 是**诊断专用**，随诊断开关一起排除 ----
+    #
+    # ⚠️ 必须一起排除，否则发布构建会挂：`PerfProbeTest` 要测 `perf_probe::read_*` /
+    # `reset_for_test` / 直方图；`Fsr2InputDumpTest` 要链 `Fsr2InputDump.cpp`——
+    # 两者在发布构建里**根本不存在**（诊断核心被 `#if` 排除、诊断 .cpp 不在源列表里）。
+    if(DX11FSRBRIDGE_DIAGNOSTICS_ON)
+        # FSR2 输入纹理转储的纯函数单测：PNG 结构/CRC/zlib 回读、motion 平方解码、
+        # 半精度转换、raw 头。**不需要 GPU、不需要游戏、不链接 BridgeLogger**
+        # （用 FSR2DUMP_NO_LOGGER 把日志裁剪为空操作）。
+        # 这些公式必须与 Ffx12Backend.cpp 的 CS 一致——不一致会让诊断图本身说谎。
+        add_executable(Fsr2InputDumpTest
+            Fsr2InputDumpTest.cpp
+            Fsr2InputDump.cpp
+        )
+        fsrbridge_configure_test(Fsr2InputDumpTest)
+        target_compile_definitions(Fsr2InputDumpTest PRIVATE FSR2DUMP_NO_LOGGER)
+        target_include_directories(Fsr2InputDumpTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        add_test(NAME Fsr2InputDumpTest COMMAND Fsr2InputDumpTest)
+
+        # 分段性能探针（PerfProbe）：**header-only** ⇒ 本 target 只需这一个 .cpp。
+        # 覆盖：关时零开销 / 段累计与 max / 抽样步长 / 计数器 / 帧计数 /
+        # 汇总行只打一行且复位 / 汇总不可重入 / 间隔语义。
+        add_executable(PerfProbeTest
+            PerfProbeTest.cpp
+        )
+        fsrbridge_configure_test(PerfProbeTest)
+        target_include_directories(PerfProbeTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        add_test(NAME PerfProbeTest COMMAND PerfProbeTest)
+    else()
+        message(STATUS "Dx11FsrBridge: 跳过诊断专用 test target "
+            "(PerfProbeTest / Fsr2InputDumpTest) —— 发布构建不编译诊断代码")
+    endif()
 endif()
 
 if(DX11FSRBRIDGE_BUILD_BACKEND_TEST)

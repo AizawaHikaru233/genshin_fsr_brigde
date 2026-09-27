@@ -117,6 +117,27 @@ namespace perf_probe
 // 日志出口（由调用方注入；为空则只统计不输出）。line 以 '\0' 结尾。
 using LogSink = void (*)(const char *line);
 
+// ===========================================================================
+// 【发布构建开关（2026-09-27）】
+//
+//   `DX11FSRBRIDGE_ENABLE_DIAGNOSTICS` 已定义 ⇒ 诊断核心参与编译（开发/排查构建）；
+//   未定义（发布构建的默认）            ⇒ 诊断核心**一行都不参与编译**。
+//
+// 范围（发布构建里被排除的）：
+//   分段计时（Segment / Scope / SampledScope）、抽样与直方图（DrawCostHistogram /
+//   DrawElementHistogram）、形状分桶表（DrawShapeTable，B107/B108）、内省漏斗
+//   （FunnelStage / FunnelScope）、计数器（Counter）、汇总与格式化
+//   （flush_now / format_*_report / *_name 表）——**全部汇总/格式化字符串都在这一侧**。
+//
+// 范围（**两个分支都编译**，因为它们是**正式功能**）：
+//   - B109 入口级过滤器（`draw_entry_filter_admit` 等，见下面 B109 小节）；
+//   - B109 的**自我证伪告警**（`note_draw_identified_element_count` + 经 `set_log_sink`
+//     注入的出口）——它要写清是哪个钩子入口（`ix` / `dr`）⇒ 依赖形状槽打包。
+//
+// ⚠️ 本文件**不删任何代码**：排除靠这一个开关。将来排查问题打开开关即可恢复全部工具。
+// ===========================================================================
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+
 // ---- 段定义（顺序即输出顺序；新增段必须同步 k_segment_names 与单测）----
 enum class Segment : std::uint32_t
 {
@@ -1521,6 +1542,223 @@ inline void note_identified_total()
     detail::g_funnel_identified_total.fetch_add(1, std::memory_order_relaxed);
 }
 
+#else // !defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS) —— 发布构建：诊断核心整体排除
+// ===========================================================================
+// 【发布构建的空实现面】
+//
+// 目标：埋点语句**一行都不删**（源码保持完整），但在发布构建里
+//   ① 不产生任何**诊断字符串** —— 全部汇总/格式化/名称表都在上面的 `#if` 里；
+//   ② 不产生任何**实际代码** —— 下面全是 `inline` 空体，优化器直接消掉。
+//
+// 保留的**唯一真实逻辑**是正式功能（B109）要用的两小块：
+//   - 注入式日志出口 `set_log_sink`：B109 的自我证伪告警必须能输出
+//     （那行 `draw_entry_filter_disabled …` 是**功能**，不是诊断）；
+//   - 形状槽打包/解包（`DrawShapeSlot` / `DrawShapeMarkArmed` / `pack_draw_shape` /
+//     `unpack_draw_shape_kind`）：告警行要写清是哪个钩子入口（`ix` / `dr`）。
+//     ⇒ 它们只是"把已经拿在手里的实参打包"，**不建表、不计数、不取时间、无字符串**。
+//
+// 其余符号都是**签名兜底的空实现**：只为让任何一处没被 `#if` 排除干净的埋点语句
+// 照样能编译通过（防御性 —— 不改变行为，也不引入字符串）。
+// ===========================================================================
+
+namespace detail
+{
+// B109 告警行的输出口（配置见 `set_log_sink`）。
+inline std::atomic<LogSink> g_sink { nullptr };
+} // namespace detail
+
+inline void set_log_sink(LogSink sink)
+{
+    detail::g_sink.store(sink, std::memory_order_relaxed);
+}
+
+// ---- 形状槽打包/解包（位域与诊断分支**完全一致**：版本内稳定）----
+inline std::uint64_t pack_draw_shape(int kind_index, std::uint32_t element_count,
+                                     std::uint32_t start, std::int32_t base)
+{
+    const std::uint64_t kind_bits = static_cast<std::uint64_t>(static_cast<std::uint32_t>(kind_index) & 0x3u);
+    const std::uint64_t count_bits = static_cast<std::uint64_t>(element_count > 0xFFFFu ? 0xFFFFu : element_count);
+    const std::uint64_t start_bits = static_cast<std::uint64_t>(start & 0xFFFFFFu);
+    const std::uint64_t base_bits = static_cast<std::uint64_t>(static_cast<std::uint32_t>(base) & 0xFFFFu);
+    return kind_bits | (count_bits << 2) | (start_bits << 18) | (base_bits << 42);
+}
+
+inline int unpack_draw_shape_kind(std::uint64_t packed)
+{
+    return static_cast<int>(packed & 0x3ull);
+}
+
+// 打包后的形状槽（发布构建不建表、不计数；只为把入口种类带给 B109 的告警行）。
+struct DrawShapeSlot
+{
+    std::uint64_t value = 0;
+    bool valid = false;
+    std::uint32_t instance_count = 0;
+
+    DrawShapeSlot() = default;
+
+    static DrawShapeSlot indexed(std::uint32_t index_count, std::uint32_t start_index, std::int32_t base_vertex)
+    {
+        DrawShapeSlot slot;
+        slot.value = pack_draw_shape(0, index_count, start_index, base_vertex);
+        slot.valid = true;
+        return slot;
+    }
+
+    static DrawShapeSlot non_indexed(std::uint32_t vertex_count, std::uint32_t start_vertex)
+    {
+        DrawShapeSlot slot;
+        slot.value = pack_draw_shape(2, vertex_count, start_vertex, 0);
+        slot.valid = true;
+        return slot;
+    }
+
+    static DrawShapeSlot indexed_instanced(std::uint32_t index_count, std::uint32_t instance_count,
+                                           std::uint32_t start_index, std::int32_t base_vertex)
+    {
+        DrawShapeSlot slot;
+        slot.value = pack_draw_shape(1, index_count, start_index, base_vertex);
+        slot.instance_count = instance_count;
+        slot.valid = true;
+        return slot;
+    }
+
+    static DrawShapeSlot non_indexed_instanced(std::uint32_t vertex_count, std::uint32_t instance_count,
+                                               std::uint32_t start_vertex)
+    {
+        DrawShapeSlot slot;
+        slot.value = pack_draw_shape(3, vertex_count, start_vertex, 0);
+        slot.instance_count = instance_count;
+        slot.valid = true;
+        return slot;
+    }
+};
+
+struct DrawShapeMarkArmed
+{
+    bool armed = false;
+    DrawShapeSlot slot {};
+};
+
+inline DrawShapeMarkArmed make_draw_shape_mark(const DrawShapeSlot &slot)
+{
+    DrawShapeMarkArmed mark;
+    mark.armed = false; // 发布构建没有形状表 ⇒ 永远不"上膛"
+    mark.slot = slot;
+    return mark;
+}
+
+// 诊断建表/计数：发布构建为空操作（入口种类仍由 `mark.slot` 携带）。
+inline void mark_draw_shape_call(const DrawShapeMarkArmed &) {}
+inline void mark_draw_shape_identified(const DrawShapeMarkArmed &) {}
+inline void note_identified_total() {}
+inline void note_view_read() {}
+
+// ---- 下面全是签名兜底的空实现（发布构建里没有任何调用点会走到真实逻辑）----
+enum class Segment : std::uint32_t { present = 0, il2cpp_observer, draw_hook, dispatch_hook, jitter_observer,
+    gpu_query, config_io, render_scale, upscale_dispatch, interop_prep, interop_signal, interop_queue_wait,
+    interop_submit, finish_wait, finish_copy, count };
+enum class Counter : std::uint32_t { virtual_protect = 0, flush_instruction_cache, sleep, wait_single_object,
+    config_read, file_probe, count };
+enum class FunnelStage : std::uint32_t { entry = 0, after_om, after_prescreen, after_ps_query, after_fast_path,
+    fast_hit, after_cb, after_viewport, after_output, fixed_ok, dynamic_ok, identified, count };
+enum class FrameSource : std::uint32_t { upscale = 0, present };
+
+inline void configure(bool, std::uint32_t, std::uint32_t) {}
+inline bool enabled() { return false; }
+inline std::uint32_t draw_sample_stride() { return 32; }
+inline const char *segment_name(Segment) { return ""; }
+
+// 计时作用域（空体：不取时间、不计数）。
+class Scope
+{
+public:
+    explicit Scope(Segment) {}
+};
+
+class SampledScope
+{
+public:
+    SampledScope(Segment, std::atomic_uint64_t &, std::atomic_uint64_t &, std::uint32_t, std::size_t = 0) {}
+    bool sampled() const { return false; }
+};
+
+// 内省漏斗作用域（空体）。
+class FunnelScope
+{
+public:
+    FunnelScope() = default;
+    bool sampled() const { return false; }
+    void mark(FunnelStage) const {}
+};
+
+// 复用已有分段测量：发布构建直接丢弃。
+inline void add_span_us(Segment, std::uint64_t) {}
+
+// 重量级系统调用计数：发布构建直接丢弃（热路径上不能有任何计数原子操作）。
+inline void count(Counter) {}
+inline void count_with_us(Counter, std::uint64_t) {}
+inline void sleep_counted(DWORD milliseconds) { Sleep(milliseconds); }
+
+// ⚠️ 下面两个是**功能路径**的包装（Il2CppCallSiteHook / TransparentJitterHook 在装钩子与
+// 还原时调用）⇒ 发布构建里必须**原样转发**到 Win32 API，行为与诊断分支完全一致。
+inline BOOL virtual_protect_counted(LPVOID address, SIZE_T size, DWORD new_protect, PDWORD old_protect)
+{
+    return VirtualProtect(address, size, new_protect, old_protect);
+}
+
+inline BOOL flush_instruction_cache_counted(HANDLE process, LPCVOID base, SIZE_T size)
+{
+    return FlushInstructionCache(process, base, size);
+}
+
+// 显式阻塞等待：同上，必须原样转发（Ffx12Backend 的 fence 等待语义不能变）。
+inline DWORD wait_single_object_counted(HANDLE handle, DWORD milliseconds)
+{
+    return WaitForSingleObject(handle, milliseconds);
+}
+
+inline void note_frame(FrameSource) {}
+inline void note_jitter_call() {}
+inline void flush_now() {}
+inline void maybe_flush() {}
+
+inline std::atomic_uint64_t &draw_call_counter()
+{
+    static std::atomic_uint64_t counter { 0 };
+    return counter;
+}
+
+inline std::atomic_uint64_t &draw_sample_counter()
+{
+    static std::atomic_uint64_t counter { 0 };
+    return counter;
+}
+
+inline std::atomic_uint64_t &dispatch_call_counter()
+{
+    static std::atomic_uint64_t counter { 0 };
+    return counter;
+}
+
+inline std::atomic_uint64_t &dispatch_sample_counter()
+{
+    static std::atomic_uint64_t counter { 0 };
+    return counter;
+}
+
+inline constexpr std::size_t k_draw_all_slot = 0;
+inline constexpr std::size_t k_draw_inspect_slot = 1;
+
+// draw 钩子内省段的计时作用域（空体）。
+class DrawInspectScope
+{
+public:
+    explicit DrawInspectScope(bool) {}
+};
+
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS
+
 // ===========================================================================
 // ---- 入口级过滤器（B109：在**进内省之前**用调用实参 `element_count == 3` 淘汰）----
 //
@@ -1819,6 +2057,7 @@ inline DrawEntryFilterSnapshot read_draw_entry_filter()
     return snapshot;
 }
 
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
 // 单测/诊断读取（不影响计数）。
 inline std::uint64_t read_shape_calls(std::uint64_t packed)
 {
@@ -1879,6 +2118,7 @@ inline bool shape_slot_claimed(std::uint64_t packed)
         return false;
     return detail::g_draw_shape_table.find_slot(packed) < detail::DrawShapeTable::k_bucket_count;
 }
+
 
 // ---- 内省漏斗作用域（B106：每道判定"还剩多少"）----
 //
@@ -2543,5 +2783,7 @@ private:
     bool m_ended = false;
     std::int64_t m_start = 0;
 };
+
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS —— 尾部诊断 API（漏斗 / 计数包装 / 汇总 / 直方图）
 
 } // namespace perf_probe

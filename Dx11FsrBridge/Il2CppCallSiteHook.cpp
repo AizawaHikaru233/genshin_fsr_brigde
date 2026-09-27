@@ -87,7 +87,9 @@ std::atomic_uint64_t g_pending_overflow { 0 };
 __declspec(noinline) void on_render_enter(void *this_ptr, void *context_ptr)
 {
     // 【诊断】PerfProbe：il2cpp render 入口观察者整体（每帧级，2×QPC 可忽略）。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::Scope perf_scope(perf_probe::Segment::il2cpp_observer);
+#endif
     g_render_calls.fetch_add(1, std::memory_order_relaxed);
     if (this_ptr != nullptr)
     {
