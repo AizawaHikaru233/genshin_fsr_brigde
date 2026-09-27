@@ -174,6 +174,15 @@ bool async_upscale_enabled();
 // 由桥在 Present 前调用；dispatch 入口也会先 finish 上一帧（防异常路径堆积）。
 bool finish_pending();
 
+// P2 诊断（**默认关**）：打开后把两类低频事件写进 SDK 消息（note 数量有上限，
+// 避免把消息缓冲刷满）：
+//   ① 每实例尺寸池重建（ensure_pool 走了重建路径）
+//   ② FSR context 因 render/display 尺寸变化被销毁重建
+// 意义：尺寸抖动（动态分辨率、UI 全屏切换等）会销毁 FFX context ⇒ 历史清零 +
+// 下一帧 reset，表现为隔几秒一次的短暂画面变化。这条日志能直接证实/否定
+// "闪烁来自尺寸抖动"这一机制，并给出准确频率。
+void set_instance_diag(bool enable);
+
 // 查询当前选择的后端版本名（"2.3.4"/"4.1.1"/...）——诊断用。
 const char *selected_version_name();
 // 实际匹配到的 provider 版本名（"4.1.1"/"4.0.2c"/"3.1.5" 等，含降级结果）。
