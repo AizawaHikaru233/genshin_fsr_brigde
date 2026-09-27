@@ -257,7 +257,7 @@ function Expand-ReShadeSetupModule {
 
 function Update-ReShade {
     # reshade.me 官方最新正式版（含 add-on 支持版）。官方指引"Do NOT share the binaries"，
-    # 故只更新本地/国内完整包内置文件与版本基线；GitHub 合规包由安装器在用户机器上从官网下载。
+    # 故只更新本地发布包内置文件与版本基线；GitHub 发布包由安装器在用户机器上从官网下载。
     Write-Host '--- ReShade (reshade.me 最新正式版) ---' -ForegroundColor Cyan
     $version = Get-LatestReShadeVersion
     $setupUrl = "https://reshade.me/downloads/ReShade_Setup_${version}_Addon.exe"

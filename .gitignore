@@ -28,7 +28,7 @@ build-package-antiplayermosaic/
 publish-staging/
 local-only/
 
-# Runtime state and third-party release files kept only for local Full builds
+# Runtime state and third-party release files kept only for local package builds
 SharedResources/FpsUnlocker/runtime/
 SharedResources/NVIDIA/
 SharedResources/ReShade/runtime/ReShade.ini
@@ -40,9 +40,9 @@ SharedResources/OptiScaler/runtime/
 
 # ReShade 二进制**不入库**（2026-09-19）：
 #   官方指引 "Do NOT share the binaries"，且该文件 5.6 MB。
-#   本地/国内完整包在打包时由 tools\Update-UpstreamComponents.ps1 的 Update-ReShade
+#   本地发布包在打包时由 tools\Update-UpstreamComponents.ps1 的 Update-ReShade
 #   从 reshade.me 官方渠道下载并解出（Build-OnlineInstaller.ps1 的 -FetchUpstream）；
-#   GitHub 合规包**不内置**，由安装器在用户机器上从官方下载
+#   GitHub 发布包**不内置**，由安装器在用户机器上从官方下载
 #   （Configure.ps1 第 1367 行按 payload 内是否存在自动选择 Existing / Auto）。
 #   与 SharedResources/OptiScaler/runtime/OptiScaler.dll 同一处理方式。
 SharedResources/ReShade/runtime/ReShade64.dll
@@ -127,7 +127,7 @@ AI智能体任务计划*.md
 # 注：archify/ 只在这里出现（上面的"研究树"块没有它），删除本行会失去忽略效果。
 archify/
 
-# Full 包第三方依赖（本地保留——打包需要，不提交）
+# 本地包第三方依赖（本地保留——打包需要，不提交）
 # 注：SharedResources/NVIDIA/ 已在文件上方"Runtime state"块中列出，此处不再重复。
 SharedResources/FpsUnlocker/
 SharedResources/OptiScaler/runtime/OptiScaler.dll

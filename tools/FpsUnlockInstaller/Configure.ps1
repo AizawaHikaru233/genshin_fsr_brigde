@@ -970,7 +970,8 @@ function Install-OptiScaler {
         # 旧实现是 `Remove-Item $optiRootDir -Recurse -Force`：它会连带删掉用户放进
         # `payload\OptiScaler` 的一切（自定义 OptiScaler 版本、额外后端 DLL、自建配置、
         # 日志、旧布局残留目录里的其它文件）。按清单删之后，非托管文件一律保留。
-        # 与打包侧规则②一致：已部署目录不清空、升级走手动增量替换。
+        # 设计前提：已解压、已部署出去的安装目录**永不清空**，升级一律走"手动增量
+        # 替换"（只覆盖同名文件，保留用户配置与用户新增文件）——清空会毁掉一个正在用的安装。
         # 清单不可用时本函数只打警告、一个文件都不删（见其 fail-safe 说明）。
         $removedManagedFiles = @(Remove-ManagedOptiScalerFiles -RootDirectory $optiRootDir)
         if ($removedManagedFiles.Count -gt 0) {

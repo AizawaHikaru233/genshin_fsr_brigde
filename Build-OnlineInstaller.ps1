@@ -1,4 +1,4 @@
-﻿# Build-OnlineInstaller.ps1 — 发布包构建入口（本地完整包 / GitHub 合规包 / 芙芙商城包）。
+﻿# Build-OnlineInstaller.ps1 — 发布包构建入口（本地 7z 包 / GitHub 发布包 / 芙芙商城包）。
 #
 # ── 打包产物清理规则（每次运行都执行；实现见 Remove-DistArtifacts）────────────
 # ① 打包产物**每次编译都先清理再重建**：本脚本在编译**之前**按**模式**删除 dist 下
@@ -61,11 +61,11 @@ $script:tloaderDll = $null
 # ── 规则①：本流程在 dist 下产生的产物 / 中间目录的清理模式 ──────────────────────
 # 全部按**模式**匹配（而非列死版本号文件名），新增版本号无需改这里。
 # 已知产物清单（脚本内 Join-Path $dist 的全部落点）：
-#   dist\原神解帧FSR插件包_v<ver>.7z                 本地/国内完整包（7z；历史版本曾用 .zip）
+#   dist\原神解帧FSR插件包_v<ver>.7z                 本地发布包（7z；历史版本曾用 .zip）
 #   dist\原神解帧FSR插件包Lite_* / Full_*.7z|.zip     历史命名（保留兼容）
 #   dist\芙芙启动器插件包Lite_* / Full_*.zip          历史命名（保留兼容）
 #   dist\FSR-Bridge-Plugin.v<ver>.zip                芙芙启动器商城包
-#   dist\GenshinFSRBridge_v<ver>.zip                 GitHub 合规包在 dist 的中间产物
+#   dist\GenshinFSRBridge_v<ver>.zip                 GitHub 发布包在 dist 的中间产物
 #                                                    （-GithubOnly 时会留在 dist）
 #   dist\GenshinFSRBridge_v<ver>\                    同名目录：手工解压该包做验证时的遗留
 #   dist\github-release\GenshinFSRBridge_v<ver>.zip  GitHub 发布目录（整目录由本脚本重建）
@@ -312,7 +312,7 @@ function New-SevenZipArchive {
 
     Push-Location -LiteralPath $SourceDirectory
     try {
-        # 固实压缩配合 LZMA2 优先减小完整本地包的体积，便于提交蓝奏云 100 MB 限制。
+        # 固实压缩配合 LZMA2 优先减小本地包体积，便于满足发布渠道的体积限制。
         & $sevenZip a -t7z -mx=9 -m0=lzma2 -ms=on -mmt=on $ArchivePath '.\*' | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "7-Zip 打包失败: $ArchivePath" }
     }
@@ -321,12 +321,12 @@ function New-SevenZipArchive {
     }
 }
 
-function Assert-LanzouUploadSize {
+function Assert-PackageSizeLimit {
     param([Parameter(Mandatory)][string]$ArchivePath)
     $limit = [long]100000000
     $size = (Get-Item -LiteralPath $ArchivePath).Length
     if ($size -gt $limit) {
-        throw "本地 7z 包仍为 $size bytes，超过蓝奏云 100 MB 限制。请进一步精简组件后再发布。"
+        throw "本地 7z 包仍为 $size bytes，超过 100 MB 体积限制。请进一步精简组件后再发布。"
     }
 }
 
@@ -394,7 +394,7 @@ function Prepare-FpsStage {
         }
     }
     New-Item -ItemType Directory -Path (Join-Path $stagePayloadTextureLoader 'Mods') -Force | Out-Null
-    # ReShade：本地/国内完整包内置 ReShade64.dll；GitHub 合规包不内置（ReShade 官方指引
+    # ReShade：本地发布包内置 ReShade64.dll；GitHub 发布包不内置（ReShade 官方指引
     # "Do NOT share the binaries"，由 Configure.ps1 在用户机器上从 reshade.me 官方下载）。
     # 两种包都携带 renodx Add-on（作者书面授权）与 ReShade BSD-3 许可文本。
     if ($LocalFull) {
@@ -454,7 +454,7 @@ function Prepare-FpsStage {
         }
     }
 
-    # NVIDIA DLSS Runtime：仅本地/国内完整包内置；GitHub 合规包不内置（Configure.ps1 首次配置时从
+    # NVIDIA DLSS Runtime：仅本地发布包内置；GitHub 发布包不内置（Configure.ps1 首次配置时从
     # NVIDIA 官方 Streamline 发行版下载，分发主体为 NVIDIA 自身，避免第三方分发灰色）。
     if ($LocalFull) {
         $stageNvidia = Join-Path $payload 'NVIDIA\DLSS'
@@ -513,7 +513,7 @@ function Build-FpsPackage {
         $archive = Join-Path $dist $name
         if ($ArchiveFormat -eq 'SevenZip') {
             New-SevenZipArchive -SourceDirectory $stage -ArchivePath $archive
-            Assert-LanzouUploadSize -ArchivePath $archive
+            Assert-PackageSizeLimit -ArchivePath $archive
         }
         else {
             New-ZipArchive -SourceDirectory $stage -ArchivePath $archive
@@ -649,7 +649,7 @@ try {
     New-ZipArchive -SourceDirectory $stage -ArchivePath $archive
     $item = Get-Item -LiteralPath $archive
     Write-Host ''
-    Write-Host 'FufuLauncher 官方商城完整包构建完成。' -ForegroundColor Green
+    Write-Host 'FufuLauncher 官方商城包构建完成。' -ForegroundColor Green
     Write-Host "$($item.Name)  $($item.Length) bytes  SHA256=$((Get-FileHash $archive -Algorithm SHA256).Hash)"
 }
 finally {
@@ -696,12 +696,12 @@ $version = Get-BridgeVersion
 $localArchive = $null
 $fufuArchive = $null
 if (-not $GithubOnly) {
-    # 本地/国内完整包：内置全部组件（含 NVIDIA DLSS Runtime 与 ReShade64.dll）。
+    # 本地发布包：内置全部组件（含 NVIDIA DLSS Runtime 与 ReShade64.dll）。
     $localArchive = Build-FpsPackage -Version $version -LocalFull -ArchiveFormat SevenZip
     $fufuArchive = Build-FufuMarketplacePackage -Version $version
 }
 
-# GitHub 合规包：完整组件但内置不包含 NVIDIA DLSS 与 ReShade64.dll（两者分发均为灰色地带：
+# GitHub 发布包：组件齐全但不内置 NVIDIA DLSS 与 ReShade64.dll（两者分发均为灰色地带：
 # DLSS 由 Configure.ps1 从 NVIDIA 官方 Streamline 下载；ReShade 官方指引 "Do NOT share the
 # binaries"，由 Configure.ps1 从 reshade.me 官方下载）。
 $githubReleaseDist = Join-Path $dist 'github-release'
@@ -715,10 +715,10 @@ if (-not $GithubOnly) { Remove-Item -LiteralPath $githubSourceArchive -Force }
 
 Write-Host ''
 if ($GithubOnly) {
-    Write-Host 'GitHub 合规包构建完成。' -ForegroundColor Green
+    Write-Host 'GitHub 发布包构建完成。' -ForegroundColor Green
 }
 else {
-    Write-Host '本地完整包、GitHub 合规包与 FufuLauncher 完整包构建完成。' -ForegroundColor Green
+    Write-Host '本地发布包、GitHub 发布包与 FufuLauncher 商城包构建完成。' -ForegroundColor Green
 }
 foreach ($archive in @($localArchive, $fufuArchive, $githubArchive) | Where-Object { $null -ne $_ }) {
     $item = Get-Item -LiteralPath $archive

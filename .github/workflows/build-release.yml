@@ -1,12 +1,16 @@
 name: Build GitHub Release Package
 
-# 说明（2026-09-19 重写）：
-#   旧版围绕**已删除的 Lite 包概念**，且参数名与产物名全错，触发即失败：
-#     - 调用 -GithubLiteOnly，而 Build-OnlineInstaller.ps1 的参数只有 $GithubOnly
-#     - 上传 dist/原神解帧FSR插件包Lite_*.zip（脚本从不产出该名）
-#     - 发布 dist/github-release/GenshinFSRBridge.Lite_v*.zip（实际无 .Lite）
-#   现在对齐脚本实际行为：-GithubOnly 产出
-#     dist/github-release/GenshinFSRBridge_v<version>.zip
+# 说明：
+#   本 workflow 手动构建**面向 GitHub 的发布包**：
+#     - 触发方式：仅 workflow_dispatch（手动 Run workflow），不随 push / PR 自动运行
+#     - 构建命令：./Build-OnlineInstaller.ps1 -Configuration Release -GithubOnly
+#     - 构建产物：dist/github-release/GenshinFSRBridge_v<version>.zip
+#     - 上传 artifact 名：GenshinFSRBridge-Package
+#     - 可选发布：publish_release=true 且填 release_tag 时，用 softprops/action-gh-release
+#       把该 zip 发到对应 tag 的 GitHub Release
+#
+#   文件名说明：本文件名沿用自一个**已移除的旧包概念**（历史上的 "Lite 包"），
+#   本 workflow 与该旧概念无关 —— 它只产出上面那一个 zip。
 #
 #   ⚠️ 关键前置：Dx11FsrBridge 的 CMake 配置需要 AMD FidelityFX SDK 头文件
 #   （Dx11FsrBridge/CMakeLists.txt 第 13-37 行，默认取
@@ -15,6 +19,7 @@ name: Build GitHub Release Package
 #   且 OptiScaler-src/ 被 .gitignore → 全新检出没有它。
 #   故必须先克隆 OptiScaler 源码树并初始化 FidelityFX-SDK-v2 子模块，
 #   否则 CMake 会以 "FidelityFX ffx-api headers were not found" 直接失败。
+#   该克隆与子模块初始化由下方 "Fetch OptiScaler source tree" step 完成。
 
 on:
   workflow_dispatch:
