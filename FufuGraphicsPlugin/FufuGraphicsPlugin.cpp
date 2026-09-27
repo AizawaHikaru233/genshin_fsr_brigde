@@ -28,8 +28,9 @@ struct BootstrapConfig
     // ReShade 缺键时的默认值必须与**安装器的 GPU 策略**一致（2026-09-19）。
     //
     // 三方原本不一致：
-    //   - Lua 安装器：**N 卡不写 config**（Install-FufuPlugin.lua 第 58-59 行），
-    //     非 N 卡写 `EnableReShade = is_nvidia and "0" or "1"`
+    //   - Lua 安装器：当时**N 卡整体跳过写 config**；2026-09-27 起改为**恒写**
+    //     （N 卡只多打一行日志，见该脚本的 `install.write_config` 调用），
+    //     写 `EnableReShade = is_nvidia and "0" or "1"`
     //   - 包内 `config.ini` 模板：`EnableReShade = 0`（N 卡走这条）
     //   - 本处缺键默认：**恒 `true`**
     // 后果：N 卡用户若 config.ini 缺失/损坏，会落到"恒 true" → **开启本应关闭的

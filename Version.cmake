@@ -22,13 +22,15 @@
 #  ⇒ 升版只改**下面这一行**：各组件 `.rc` 经 `configure_file` 生成的头读取，
 #    不手写版本号。
 #
-#  ⇒ 发版时**只需改下面一行**；另有 3 处必须手工跟着走（不适合自动化，
-#    因为它们是启动器清单格式，只能写 3 段式 `x.y.z`）：
+#  ⇒ 发版时**只需改下面一行**；另有 1 处必须手工跟着走（不适合自动化，
+#    因为它是启动器清单格式，只能写 3 段式 `x.y.z`）：
 #      `FufuGraphicsPlugin/config.ini`
-#      `FufuGraphicsPlugin/Install-FufuPlugin.lua`
-#      `FufuGraphicsPlugin/Install-FufuPlugin-Marketplace.lua`
-#    → 三个文件里的 `x.y.z` 都应等于本文件的 `x.y.z`（第 4 段固定 0）。
-#    `Build-OnlineInstaller.ps1` 打包时会按本文件改写 `config.ini` 的那一行，
-#    两个 `.lua` 不自动改写。改完用 `git grep -n FSR_SUITE_VERSION` 复核。
+#    → 该文件里的 `x.y.z` 应等于本文件的 `x.y.z`（第 4 段固定 0）。
+#    `Build-OnlineInstaller.ps1` 打包时会按本文件改写 `config.ini` 的那一行。
+#    改完用 `git grep -n FSR_SUITE_VERSION` 复核。
+#
+#  ⇒ `FufuGraphicsPlugin/*.lua` 是安装脚本，**不参与打包** ⇒ **不跟版本号**：
+#    其内的 `Version` 只是安装时由 `install.write_config` 写进 `config.ini` 的
+#    清单副本，不列入上面这份手工跟号清单。
 # ============================================================================
 set(FSR_SUITE_VERSION 2.3.0.0)
