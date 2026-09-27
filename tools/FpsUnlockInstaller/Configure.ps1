@@ -20,6 +20,10 @@
     [switch]$NoShortcut,
     [switch]$ResetPluginConfigsOnly,
     [switch]$PreserveExistingConfigs,
+    # 【重新安装】：把 fps_config.json **全部覆写**为默认值（含 AutoStart / AutoClose /
+    # PopupWindow / StartMinimized ...）。只有 Installer.ps1 里"真的要装/重装"的入口
+    # 才传它；不传 ⇒ 保持用户现有设置（见 New-DefaultFpsConfig 上方的三条写入语义）。 - 2026-09-28
+    [switch]$Reinstall,
     [ValidateSet('Auto', 'zh-CN', 'en-US')]
     [string]$Language = 'Auto'
 )
@@ -1273,6 +1277,87 @@ function Initialize-ReShadeConfiguration {
     }
 }
 
+# ---------------------------------------------------------------------------
+# fps_config.json 的**三条写入语义**（2026-09-28 —— 新增写入点前必读）
+#
+# 用户要求（原文）："fpsunlock 在重新安装和恢复设置时全部覆写，只运行安装脚本不覆写。"
+# 逐条落到代码里。**任何写 fps_config.json 的地方都必须归入下面三条之一**：
+#
+#   ① 【重新安装】⇒ **全部覆写**
+#        Installer.ps1 里"真的要装 / 重装"的入口传 `-Reinstall`，本模块据此用
+#        `New-DefaultFpsConfig` 写出**全套**键（AutoStart / AutoClose / PopupWindow /
+#        StartMinimized / ... 一律回到默认值）。
+#        当前调用点：Installer.ps1 的 `Invoke-FoundationSetup`（FPS Unlocker 缺失
+#        ⇒ 正在重新安装）与 `Invoke-InstallWizard`（菜单 1「安装模块」= 用户显式安装）。
+#
+#   ② 【恢复设置】⇒ **全部覆写**
+#        `-ResetPluginConfigsOnly`（Installer.ps1 菜单 7）→ `Reset-PluginConfigurations`。
+#        它同样用 `New-DefaultFpsConfig` 写 fps_config.json（DllList 保留既有选择、
+#        FPSTarget 回到 60），但**额外**重置 OptiScaler / ReShade 等其它插件配置 ——
+#        这是它与 ① 的唯一区别。
+#
+#   ③ 【只运行安装脚本 / 升级 / 每次启动 / 只换游戏目录】⇒ **不覆写**
+#        没有 ① ② 开关时，本文件末尾的主流程**只强制 4 个键**
+#        （GamePath / FPSTarget / DllList / UseHDR）；Installer.ps1 的
+#        `Repair-RuntimePaths` 也**只**修这 4 个键。AutoStart / AutoClose /
+#        PopupWindow / StartMinimized / Fullscreen / 分辨率 / 优先级 /
+#        自定义命令行等**原样保留**。
+#
+#   ⇒ **不要在 ③ 的路径上新增任何键的写入** —— 那会抹掉用户在 FPS Unlocker
+#     界面里的设置。"想多写几个键"的改动一律属于 ① 或 ②：
+#     要么在 `New-DefaultFpsConfig` 里加，要么让调用方传 `-Reinstall`。
+#
+# UseHDR 的判据三条语义一致：**ReShade64.dll 是否在本次写出的 DllList 里**
+# （与 Installer.ps1 的 `Test-ConfiguredDll` 同源），**不是无脑 $true**。
+# ---------------------------------------------------------------------------
+
+# 内部：判断某个 DLL 是否在给定 DllList 里 —— 即 UseHDR 的判据（全路径、忽略大小写）。
+function Test-DllListContains {
+    param([string[]]$DllList, [string]$Path)
+    $target = [IO.Path]::GetFullPath($Path)
+    foreach ($entry in @($DllList)) {
+        try {
+            if ([string]::Equals([IO.Path]::GetFullPath([string]$entry), $target, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+        catch { }
+    }
+    return $false
+}
+
+# 【重新安装 / 恢复设置 / 首次安装】专用的**全套默认值**写入器（见上方三条语义）。
+# ⚠️ 只在 ① ② 与"没有配置文件可保留"时调用；③ 的路径**不要**调用它。
+function New-DefaultFpsConfig {
+    param(
+        [string]$GamePath,
+        [bool]$UseHDR,
+        [int]$FpsTarget,
+        [string[]]$DllList
+    )
+    # 键的**顺序**与首次安装写出的文件一致（ConvertTo-Json 按插入顺序输出）。
+    return [pscustomobject][ordered]@{
+        GamePath = $GamePath
+        AutoStart = $true
+        AutoClose = $true
+        PopupWindow = $true
+        Fullscreen = $false
+        UseCustomRes = $false
+        IsExclusiveFullscreen = $false
+        StartMinimized = $true
+        UsePowerSave = $false
+        SuspendLoad = $false
+        UseMobileUI = $false
+        UseHDR = $UseHDR
+        FPSTarget = $FpsTarget
+        CustomResX = 1920
+        CustomResY = 1080
+        MonitorNum = 1
+        Priority = 3
+        AdditionalCommandLine = ''
+        LastVersionNotify = 0
+        DllList = @($DllList)
+    }
+}
+
 function Reset-PluginConfigurations {
     param([string]$RequestedGamePath)
     $resolvedGameExe = Get-GamePath -RequestedPath $RequestedGamePath -ConfigPath $fpsConfig
@@ -1296,16 +1381,8 @@ function Reset-PluginConfigurations {
             if (Test-Path -LiteralPath $candidate -PathType Leaf) { $loadedDlls.Add($candidate) }
         }
     }
-    $hdrEnabled = $false
-    foreach ($entry in $loadedDlls) {
-        try {
-            if ([string]::Equals([IO.Path]::GetFullPath($entry), [IO.Path]::GetFullPath($reshadeDll), [StringComparison]::OrdinalIgnoreCase)) {
-                $hdrEnabled = $true
-                break
-            }
-        }
-        catch {}
-    }
+    # ② 恢复设置：UseHDR 判据 = ReShade64.dll 是否在既有 DllList 里（**不是无脑 $true**）。
+    $hdrEnabled = Test-DllListContains -DllList $loadedDlls -Path $reshadeDll
     # ReShade must initialize its D3D hooks before Bridge and OptiScaler.
     # Preserve every existing non-ReShade entry, but move the managed ReShade
     # module to the front whenever configurations are reset.
@@ -1352,28 +1429,9 @@ function Reset-PluginConfigurations {
             (Join-Path $reshadeDir 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
     }
 
-    [ordered]@{
-        GamePath = $resolvedGameExe
-        AutoStart = $true
-        AutoClose = $true
-        PopupWindow = $true
-        Fullscreen = $false
-        UseCustomRes = $false
-        IsExclusiveFullscreen = $false
-        StartMinimized = $true
-        UsePowerSave = $false
-        SuspendLoad = $false
-        UseMobileUI = $false
-        UseHDR = $hdrEnabled
-        FPSTarget = 60
-        CustomResX = 1920
-        CustomResY = 1080
-        MonitorNum = 1
-        Priority = 3
-        AdditionalCommandLine = ''
-        LastVersionNotify = 0
-        DllList = @($loadedDlls)
-    } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $fpsConfig -Encoding UTF8
+    # ② 恢复设置 / 【全部覆写】—— 与 ① 用**同一个**写入器（见上方三条语义）。
+    New-DefaultFpsConfig -GamePath $resolvedGameExe -UseHDR $hdrEnabled -FpsTarget 60 -DllList @($loadedDlls) |
+        ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $fpsConfig -Encoding UTF8
 }
 
 if ($ResetPluginConfigsOnly) {
@@ -1541,33 +1599,29 @@ $config = $null
 if (Test-Path -LiteralPath $fpsConfig -PathType Leaf) {
     try { $config = Get-Content -LiteralPath $fpsConfig -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $config = $null }
 }
-if ($null -eq $config) {
-    $config = [pscustomobject][ordered]@{
-        GamePath = $gameExe
-        AutoStart = $true
-        AutoClose = $true
-        PopupWindow = $true
-        Fullscreen = $false
-        UseCustomRes = $false
-        IsExclusiveFullscreen = $false
-        StartMinimized = $true
-        UsePowerSave = $false
-        SuspendLoad = $false
-        UseMobileUI = $false
-        UseHDR = (-not [bool]$DisableHDR)
-        FPSTarget = $FpsTarget
-        CustomResX = 1920
-        CustomResY = 1080
-        MonitorNum = 1
-        Priority = 3
-        AdditionalCommandLine = ''
-        LastVersionNotify = 0
-        DllList = @($dllList)
-    }
+# ---------------------------------------------------------------------------
+# fps_config.json 主流程写入 —— 只走【① 重新安装】与【③ 只运行安装脚本】两条：
+#
+#   · ① `-Reinstall`（Installer.ps1 的安装/重装入口）⇒ **全部覆写**为默认值。
+#   ·   首次安装（文件不存在）⇒ 没有可保留的键，同样写全套默认值。
+#   · ③ 其余情况（升级 / 每次启动 / 只换游戏目录）⇒ **不覆写**：下面只强制
+#        GamePath / FPSTarget / DllList / UseHDR 四个键，其余键原样保留。
+#
+# ⚠️ 想在这里多写键 = 破坏 ③ 的承诺（会抹掉用户的 FPS Unlocker 设置）。
+#    要动"默认值"请改 `New-DefaultFpsConfig`；要动"什么时候覆写"请改 `-Reinstall`。
+# ---------------------------------------------------------------------------
+if ($null -eq $config -or $Reinstall) {
+    # UseHDR 判据（①②③ 一致）：ReShade64.dll 是否在本次写出的 DllList 里
+    # ⇒ 未安装 ReShade 时必须是 $false（绝不无脑写 $true）。
+    $useHdrConfigured = Test-DllListContains -DllList @($dllList) -Path $reshadeDll
+    $config = New-DefaultFpsConfig -GamePath $gameExe -UseHDR $useHdrConfigured -FpsTarget $FpsTarget -DllList @($dllList)
 }
+# ③ 只运行安装脚本 / 升级 / 每次启动 / 只换游戏目录：**只强制这 4 个键**，
+# 其余键（AutoStart / AutoClose / PopupWindow / StartMinimized / ...）保持用户现状。
 Set-JsonPropertyValue -Object $config -Name 'GamePath' -Value $gameExe
 Set-JsonPropertyValue -Object $config -Name 'FPSTarget' -Value $FpsTarget
 Set-JsonPropertyValue -Object $config -Name 'DllList' -Value @($dllList)
+# UseHDR 与上面 ①② 同一判据：ReShade 在 DllList 里 ⇔ 本次启用 HDR（等价于 -not $DisableHDR）。
 Set-JsonPropertyValue -Object $config -Name 'UseHDR' -Value (-not [bool]$DisableHDR)
 $config | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $fpsConfig -Encoding UTF8
 

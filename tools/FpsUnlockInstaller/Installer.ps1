@@ -193,6 +193,11 @@ function Repair-RuntimePaths {
     param([string]$SelectedGamePath)
     $defaultConfigDirectory = Join-Path $payloadDirectory 'default_config'
     $config = Get-FpsConfig
+    # 本函数每次安装器启动都跑，属于 ③"只运行安装脚本"：**只修路径**。
+    # 它只动 GamePath / DllList / UseHDR（+ OptiScaler.ini / ReShade.ini 的路径键），
+    # ⚠️ **绝不要在这里新增键**（AutoStart / AutoClose / ...）—— 那会每次启动都抹掉
+    # 用户在 FPS Unlocker 界面里的设置。全套默认值只在 ①② 写：
+    # 见 Configure.ps1「fps_config.json 的三条写入语义」。
     if ($null -ne $config) {
         $changed = -not [string]::Equals([string]$config.GamePath, $SelectedGamePath, [StringComparison]::OrdinalIgnoreCase)
         if (Set-JsonPropertyValue -Object $config -Name 'GamePath' -Value $SelectedGamePath) { $changed = $true }
@@ -842,6 +847,10 @@ function Invoke-FoundationSetup {
     $firstRun = $null -eq $config
     $unlockerWasMissing = -not (Test-Path -LiteralPath $unlockerPath -PathType Leaf)
     $ready = -not $unlockerWasMissing -and $null -ne $config -and [string]::Equals([string]$config.GamePath, $SelectedGamePath, [StringComparison]::OrdinalIgnoreCase)
+    # ③【只运行安装脚本】的短路点：FPS Unlocker 在 + 配置在 + GamePath 匹配 ⇒ 无需安装，
+    # 直接返回 —— **不调用 Configure.ps1**，因此 fps_config.json **一个键都不覆写**。
+    # 用户要求"只运行安装脚本不覆写"正是指这条：⚠️ **不要**为了给 ① 让路而删掉它；
+    # ①（重新安装 ⇒ 全部覆写）走的是下面的 `-Reinstall`（unlocker 缺失 = 真的在重装）。
     if ($ready) { return $true }
     Write-Header -Title '安装必需组件'
     if ($unlockerWasMissing) {
@@ -870,6 +879,14 @@ function Invoke-FoundationSetup {
     if (-not $plugins.AntiBlur) { $arguments += '-DisableAntiBlur' }
     if (-not $plugins.HDR) { $arguments += '-DisableHDR' }
     if ($source.Mode -eq 'Manual') { $arguments += @('-UnlockerPackagePath', $source.Path) }
+    # 【重新安装】语义（①，见 Configure.ps1「fps_config.json 的三条写入语义」）：
+    # 本次**真的在装 / 重装 FPS Unlocker**（unlocker 缺失 ⇒ $unlockerWasMissing）⇒ 传
+    # `-Reinstall`，让 Configure.ps1 把 fps_config.json **全部覆写**为默认值
+    # （AutoStart / AutoClose / PopupWindow / StartMinimized ... 回到默认）。
+    #
+    # 反之（unlocker 已在 ⇒ 本次只是"运行安装脚本"：升级补丁 / 每次启动 / 只换游戏目录）
+    # **不传** ⇒ 只修路径，用户设置原样保留（③）。⚠️ 不要为了"顺手统一"删掉这个条件。
+    if ($unlockerWasMissing) { $arguments += '-Reinstall' }
     if ($NoShortcut) { $arguments += '-NoShortcut' }
     Write-Host ''
     Write-Host '正在安装，请稍候...' -ForegroundColor Cyan
@@ -967,6 +984,16 @@ function Invoke-InstallWizard {
     if ($desired.TextureLoader) { $arguments += '-EnableTextureLoader' } else { $arguments += '-DisableTextureLoader' }
     if ($desired.OptiScaler -and $optiSource -eq 'Manual') { $arguments += @('-OptiScalerPackagePath', $optiPackagePath) }
     $arguments += '-PreserveExistingConfigs'
+    # 【重新安装】语义（①，见 Configure.ps1「fps_config.json 的三条写入语义」）：
+    # 菜单 1「安装模块」= 用户**显式安装 / 重新安装**所选模块 ⇒ 让 Configure.ps1 把
+    # fps_config.json **全部覆写**为默认值（AutoStart=true / AutoClose=true /
+    # PopupWindow=true / StartMinimized=true ...）。
+    #
+    # ⚠️ 上面那个 `-PreserveExistingConfigs` 只管 OptiScaler / ReShade 的 ini，
+    # **不**管 fps unlock 配置 —— 两者语义不冲突：① 只重置 fps unlock 配置，
+    # 不碰其它插件配置（"连其它插件一起重置"是 ② 菜单 7 的事）。
+    # ⚠️ Invoke-UpdateWizard（菜单 2「更新模块」= 升级 / 修补）**绝不加**这个开关（③）。
+    $arguments += '-Reinstall'
     if ($NoShortcut) { $arguments += '-NoShortcut' }
     Write-Host ''
     Write-Host '正在安装，请稍候...' -ForegroundColor Cyan
@@ -993,12 +1020,27 @@ function Invoke-UpdateWizard {
     )
     Write-Header -Title '更新模块'
     Write-InstallCatalog -SelectedGamePath $SelectedGamePath
-    $selection = if ($null -ne $PreselectedModules -and $PreselectedModules.Count -gt 0) {
-        @($PreselectedModules)
-    }
-    else {
-        @(Select-ModuleSet -ActionName '更新')
-    }
+    # ⚠️ 必须写成 `@(if (...) { ... })`，**不能**写成 `$selection = if (...) { @(...) }`。
+    #
+    # 后者在 PowerShell 里的解释是"把 if 语句的**输出**赋给变量"：输出只有一个对象时
+    # 会退化成**标量**（`@(1)` → `1`），于是下一行的 `$selection.Count` 在
+    # `Set-StrictMode -Version Latest` 下直接抛
+    # "The property 'Count' cannot be found on this object"。
+    # `Select-ModuleSet` 正是【单值返回】的（单个模块号 → `@($selectedId)`；
+    # 返回上一层 → `@()`）⇒ 菜单 2 以前**只要输入单个模块号或 0 就崩**，只有输入 "A" 能走通。
+    # 外面套一层 `@(...)` 后 `$selection` 恒为数组（0/1/n 个元素都安全）。
+    #
+    # ⇒ 同一类写法（`$x = if (...) { @(...) }` 之后再用 `.Count`/索引/`-contains`）
+    #   已在本目录全量扫描，**仅此一处**；回归测试见
+    #   `tests\Test-InstallerWiring.ps1` 的「if 赋值退化」用例。
+    $selection = @(
+        if ($null -ne $PreselectedModules -and $PreselectedModules.Count -gt 0) {
+            @($PreselectedModules)
+        }
+        else {
+            @(Select-ModuleSet -ActionName '更新')
+        }
+    )
     if ($selection.Count -eq 0) { return }
     # 只更新用户选中的模块；不再按显卡剔除 TextureLoader（模块 5）
     $selectableIds = @(1, 2, 3, 4, 5)
@@ -1074,6 +1116,8 @@ function Invoke-UpdateWizard {
         if ($desired.HDR) { $arguments += @('-ReShadeSource', $reShadeSource) } else { $arguments += '-DisableHDR' }
         if ($desired.TextureLoader) { $arguments += '-EnableTextureLoader' } else { $arguments += '-DisableTextureLoader' }
         if ($shouldPreserveExistingConfigs) { $arguments += '-PreserveExistingConfigs' }
+        # ⚠️ 这里**故意不传** `-Reinstall`：菜单 2「更新模块」是**升级 / 修补**，
+        # 属于 ③"只运行安装脚本"⇒ fps_config.json 只修 4 个键，不覆写用户设置。
         if ($NoShortcut) { $arguments += '-NoShortcut' }
         Write-Host ''
         Write-Host '正在更新所选模块，请稍候...' -ForegroundColor Cyan
@@ -1270,6 +1314,11 @@ while ($true) {
     Write-Host '  0. 退出'
     $choice = (Read-Host '请输入选项').Trim()
     switch ($choice) {
+        # fps_config.json（fps unlock 配置）的三条写入语义 —— 详见 Configure.ps1
+        # 「fps_config.json 的三条写入语义」：
+        #   ① 重新安装（菜单 1 安装模块 / 基础组件缺失时自动装）⇒ 全部覆写默认值
+        #   ② 恢复设置（菜单 7）⇒ 全部覆写默认值（并重置其它插件配置）
+        #   ③ 只运行安装脚本 / 升级（菜单 2）/ 每次启动 / 只换游戏目录 ⇒ 只修 4 个键，不覆写
         '1' { Invoke-InstallWizard -SelectedGamePath $selectedGamePath -FpsTarget $fpsTarget }
         '2' {
             Invoke-UpdateWizard -SelectedGamePath $selectedGamePath -FpsTarget $fpsTarget
