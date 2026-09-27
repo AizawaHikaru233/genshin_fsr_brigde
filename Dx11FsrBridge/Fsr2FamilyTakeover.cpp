@@ -91,8 +91,11 @@ std::uint64_t takeover_leave_count()
 
 bool p1_refuse_token_only_claim(const TokenOnlyClaimFacts &facts)
 {
-    // 只有在 P1 单实例接管 + 本进程确实并存多个实例时，才存在"这条路可能属于别人"的风险。
-    if (!facts.single_instance_takeover || !facts.second_instance_present)
+    // 只有在 P1 单实例接管 + **当前确实**还存在另一个活跃实例时，才存在"这条路可能属于别人"的风险。
+    // ⚠️ 两个条件都必须是"当前"语义（实机回归 2026-09-28）：粘性条件 + 幽灵实例会让接管者
+    // 每个累积 draw 都被拒 ⇒ 普通单视图场景超分大幅降低、静止抖动/锯齿。
+    if (!facts.single_instance_takeover || !facts.second_instance_present ||
+        !facts.other_instance_currently_live)
         return false;
     if (!facts.claimer_is_current_taker || !facts.claim_has_generation)
         return false;
@@ -110,5 +113,30 @@ bool p1_refuse_token_only_claim(const TokenOnlyClaimFacts &facts)
     if (!facts.claimer_has_ownership || !facts.claimer_recently_dispatched)
         return false;
     return true;
+}
+
+bool p1_other_instance_currently_live(const std::uint64_t *instances,
+                                      const std::uint64_t *last_seen_ms,
+                                      std::size_t count,
+                                      std::uint64_t exclude_instance,
+                                      std::uint64_t now_ms,
+                                      std::uint64_t live_ms)
+{
+    if (instances == nullptr || last_seen_ms == nullptr)
+        return false;
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        const std::uint64_t inst = instances[i];
+        if (inst == 0 || inst == exclude_instance)
+            continue;
+        const std::uint64_t seen = last_seen_ms[i];
+        if (seen == 0)
+            continue; // 从未被匹配到 ⇒ 不活跃（幽灵实例或全新实例）
+        if (now_ms < seen)
+            continue; // 时钟回拨防御：当作"未见"
+        if (now_ms - seen <= live_ms)
+            return true; // 确实还有另一个实例在画 ⇒ 当前真有多个活跃实例
+    }
+    return false;
 }
 } // namespace fsr2_family_takeover

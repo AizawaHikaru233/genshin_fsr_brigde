@@ -59,7 +59,7 @@ int main()
     notify_accumulate_result(true, T0 + 900);
     expect(!should_skip_pre(k_pre_hash_1, T0 + 800, 500), "clock rollback: not skipped");
 
-    // ---- 6b. 交棒释放（）：老接管者离开时必须**立刻**停止跳过预处理 pass ----
+    // ---- 6b. 交棒释放（notify_takeover_leave）：老接管者离开时必须**立刻**停止跳过预处理 pass ----
     // 这是缺陷①的直接修复点：只解除许可、不重置计数；随后接管者自己的累积 pass
     // 会让许可重新武装（下面第 5 步已证明该路径）。
     notify_accumulate_result(true, T0 + 950);
@@ -82,6 +82,7 @@ int main()
             TokenOnlyClaimFacts f {};
             f.single_instance_takeover = true;
             f.second_instance_present = true;
+            f.other_instance_currently_live = true;
             f.claimer_is_current_taker = true;
             f.claimed_by_token_only = true;
             f.output_belongs_to_claimer = false;
@@ -92,6 +93,33 @@ int main()
             return f;
         };
         expect(p1_refuse_token_only_claim(baseline()), "ambiguous: baseline refuses");
+        // ★★ 第 1 号硬指标（2026-09-28 实机回归的回归防线）：
+        //    **单实例场景下不得放行/拒绝任何依赖"多实例"前提的判据**。
+        //    实机签名：`ffx12_ambiguous_bootstrap` 每帧命中一次、涨到 5376 ⇒ 接管者每个累积
+        //    draw 都被放行给游戏原生 ⇒ 超分大幅降低、静止边缘抖动/锯齿。
+        //    下面三条分别代表"只有一个活跃实例"的三种形态 ⇒ 都必须**不拒绝** ✓
+        {
+            // (1) 从未出现过第二个实例（真正干净的单实例会话）
+            TokenOnlyClaimFacts f = baseline();
+            f.second_instance_present = false;
+            f.other_instance_currently_live = false;
+            f.same_size_token_candidates = 1;
+            expect(!p1_refuse_token_only_claim(f),
+                   "single instance (only ever one) NEVER refuses any accumulate claim");
+            // (2) 曾经有第二个实例、但它**当前不再活跃**（幽灵实例：只调 Render 不产画面）
+            //     —— 这正是实机回归的形态。
+            f = baseline();
+            f.second_instance_present = false;
+            f.other_instance_currently_live = false;
+            f.same_size_token_candidates = 2; // 幽灵的同尺寸新鲜 token 仍被计入候选
+            expect(!p1_refuse_token_only_claim(f),
+                   "single LIVE instance (stale/ghost second instance) NEVER refuses");
+            // (3) 裁决说"当前只有一个活跃实例"，但候选计数仍为 2（口径不一致的历史形态）
+            f = baseline();
+            f.other_instance_currently_live = false;
+            expect(!p1_refuse_token_only_claim(f),
+                   "no other instance currently drawing NEVER refuses");
+        }
         // ★ 不变式 1：尚无归属记忆 ⇒ **绝不**拒绝（否则归属永远建立不起来 = 死锁）
         {
             TokenOnlyClaimFacts f = baseline();
@@ -146,6 +174,63 @@ int main()
             f = baseline();
             f.claim_has_generation = false;
             expect(!p1_refuse_token_only_claim(f), "claim without generation never refuses");
+        }
+    }
+
+    // ---- 8b. 活性判据纯函数（**非粘性**）：`p1_other_instance_currently_live` ----
+    // 这是本轮修复的核心判据：把"多实例"从"历史上出现过"改成"**当前**是否真有另一个
+    // 实例在画目标累积 draw"。幽灵实例（只调 Render、不再产画面）必须**不**算活跃。
+    {
+        constexpr std::uint64_t kLiveMs = 3000;
+        const std::uint64_t inst_a = 0xA0A0ull;
+        const std::uint64_t inst_b = 0xB0B0ull;
+        const std::uint64_t t = T0;
+        // (1) 只有一个实例 ⇒ 排除它自己之后恒 false（单实例等价性的**判据本体**）
+        {
+            const std::uint64_t insts[1] = { inst_a };
+            const std::uint64_t seen[1] = { t };
+            expect(!p1_other_instance_currently_live(insts, seen, 1, inst_a, t, kLiveMs),
+                   "live: single instance -> false (exclude self)");
+            // exclude_instance=0 的语义是"不排除任何实例"（调用方传真实实例指针时用不到）
+            expect(p1_other_instance_currently_live(insts, seen, 1, 0, t, kLiveMs),
+                   "live: exclude none keeps the only fresh instance");
+        }
+        // (2) 两个实例都新鲜 ⇒ true（真·多实例，此时拒绝才是正当的）
+        {
+            const std::uint64_t insts[2] = { inst_a, inst_b };
+            const std::uint64_t seen[2] = { t, t };
+            expect(p1_other_instance_currently_live(insts, seen, 2, inst_a, t, kLiveMs),
+                   "live: two fresh instances -> true");
+        }
+        // (3) ★ 幽灵实例：第二路"画过"但早已沉默（超出活性窗）⇒ false
+        //     —— 实机回归形态：它的 token 仍然新鲜，但它**不再产画面**。
+        {
+            const std::uint64_t insts[2] = { inst_a, inst_b };
+            const std::uint64_t seen[2] = { t, t - kLiveMs - 1 };
+            expect(!p1_other_instance_currently_live(insts, seen, 2, inst_a, t, kLiveMs),
+                   "live: ghost (stale second instance) -> false");
+            // 恰好在窗口边界上仍算活跃
+            const std::uint64_t edge[2] = { t, t - kLiveMs };
+            expect(p1_other_instance_currently_live(insts, edge, 2, inst_a, t, kLiveMs),
+                   "live: exactly at window edge -> true");
+        }
+        // (4) 从未被匹配到（last_seen == 0）⇒ 不活跃
+        {
+            const std::uint64_t insts[2] = { inst_a, inst_b };
+            const std::uint64_t seen[2] = { t, 0 };
+            expect(!p1_other_instance_currently_live(insts, seen, 2, inst_a, t, kLiveMs),
+                   "live: never-matched second instance -> false");
+        }
+        // (5) 时钟回拨防御 + 空指针
+        {
+            const std::uint64_t insts[2] = { inst_a, inst_b };
+            const std::uint64_t seen[2] = { t, t + 100 };
+            expect(!p1_other_instance_currently_live(insts, seen, 2, inst_a, t, kLiveMs),
+                   "live: clock rollback -> false");
+            expect(!p1_other_instance_currently_live(nullptr, seen, 2, inst_a, t, kLiveMs),
+                   "live: null instances -> false");
+            expect(!p1_other_instance_currently_live(insts, nullptr, 2, inst_a, t, kLiveMs),
+                   "live: null ticks -> false");
         }
     }
 

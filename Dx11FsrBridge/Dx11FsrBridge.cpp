@@ -272,14 +272,14 @@ struct Config
     // 桥直接驱动 AMD SDK（不经 OptiScaler）；Phase 2 的调用点接管会调用它的 dispatch。
     bool ffx12 = false;
     std::wstring ffx12_dll_path;
-    bool ffx12_fail_closed = false; // ：禁止回退原生（测试/故障显式暴露）
+    bool ffx12_fail_closed = false; // 禁止回退原生（测试/故障显式暴露）
     // 【正式功能】P1 单实例接管（默认**开**）：多个 FSR2 上下文并存时只接管**一个**实例，
     // 其余实例**放行游戏原生上采样**（返回 false，让游戏的累积 draw 照常执行；返回 true
     // 会吞掉那一路的累积 pass ⇒ 画面冻住）。
     // 为什么需要：FFX12 的 GPU 互操作共享层是**全局单份**（共享纹理/fence/单槽 pending/
     // 尺寸池），只支持一条流水线；而现场实测有两个长期并存的 FSR2 上下文（各有一份
     // ffxContext、历史各归各的）⇒ 两路交替复用同一份共享资源，交付帧混进另一视角的角色。
-    // P1 不隔离共享层（那是 P2），只消除"并存"。证据见 local-only/twocam2/REPORT_twocam2.md。
+    // P1 不隔离共享层（那是 P2），只消除"并存"：只要任一时刻只有一路走桥，就不会混帧。
     bool ffx12_single_instance = true;
     // 接管哪一个（默认 0 = 自动）：0 = render 面积大者优先、面积相同取**最早出现**；
     // 1 = 强制最早出现；2 = 强制最新出现（与 1 互补：改一行 ini 即可换成"另一路"验证）。
@@ -1295,10 +1295,16 @@ static std::atomic_uint64_t g_sdk234_output_tick { 0 };
 // ① "跳过预处理 pass"的**互锁**：置 1 ⇒ `fsr2_family_skip` 必须关闭。该跳过的前提是
 //    "每次累积 pass 都被桥成功替换"；P1 只替换**一个**实例的累积 pass，放行给原生的
 //    那一路仍需要自己的预处理 pass（其输出被族内的原生累积 pass 消费）。
-//    ⚠️ 判据必须包含 `sdk234_inst_count > 1`（本进程出现过第二个实例），它是**粘性**的
-//    （槽只增不减）。只用"最近 3000ms 内被匹配到 ≥2 个实例"会**自锁**：老实例一旦因
-//    原生路径被破坏而不再被匹配（实机 age 涨到 176 秒），它就掉出窗口 ⇒ 互锁释放 ⇒
-//    它的预处理 pass 继续被全局许可跳过 ⇒ 它永远回不来（缺陷①的实机机制）。
+//    ⚠️ 判据 = "**当前**确有多个活跃实例"（活性窗口 k_p1_live_ms 内被匹配到 ≥2 个实例）。
+//    这里**刻意不用**粘性条件 `sdk234_inst_count > 1`（"本进程出现过第二个实例"）：
+//    状态槽只增不减、场景/视图切换也不回收 ⇒ 一次为真、终生为真 ⇒ 单视图场景下这条互锁
+//    永久关闭、且 `release_untagged_accumulate` 永久放行累积 draw ⇒ 本桥超分被大面积让给
+//    游戏原生（实机回归 2026-09-28：普通场景超分大幅降低 + 静止抖动/锯齿 ✓ 已定案）。
+//    为什么"当前活跃"不会让缺陷①复发（老实例掉出 3 秒窗 ⇒ 互锁松开 ⇒ 它永远回不来）：
+//    交棒时对老实例做了**逐实例**处置（清残留 + notify_takeover_leave 解除跳过许可 +
+//    native_until_tick 纯原生窗口）⇒ 它的原生路径是**被显式交还**的，不再依赖这个全局标记
+//    兜底；标记回落不会夺走它已经拿回的原生路径。单实例场景（从未出现第二个实例）恒为 0
+//    ⇒ 行为与引入 P1 之前**逐字相同** ✓
 // ② 被放行给游戏原生上采样的累积 draw 次数（可观测性：证明 P1 真的在生效）。
 static std::atomic_uint32_t g_sdk234_multi_instance { 0 };
 static std::atomic_uint64_t g_sdk234_passthrough_count { 0 };
@@ -4380,7 +4386,7 @@ bool process_matches()
 
 bool read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo &out_info); // 定义见下（cached 版本在其后调用）
 
-// 从 ID3D11Resource 填充"资源级"字段（2026-09-19 审核报告：消除两套实现的重复）。
+// 从 ID3D11Resource 填充"资源级"字段（2026-09-19：消除两套实现的重复）。
 //
 // `read_resource_info`（视图入口）与 `read_resource_info_from_resource`（资源入口）
 // 此前各写了一份 Texture2D 的 GetDesc + 字段填充，后者是前者的**真子集**：
@@ -7161,7 +7167,7 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
         LOG_DEBUG(blog::cat::upscale, "fsr2_runtime_status frame=" + std::to_string(frame_index) +
             " candidates=" + std::to_string(g_fsr2_translation_candidate_count.load(std::memory_order_relaxed)) +
             " dispatches=" + std::to_string(g_fsr2_translation_dispatch_count.load(std::memory_order_relaxed)) +
-            " failures=" + std::to_string(g_fsr2_translation_failure_count.load(std::memory_order_relaxed))); // ：旧 shim 已移除
+            " failures=" + std::to_string(g_fsr2_translation_failure_count.load(std::memory_order_relaxed))); // 旧 shim 已移除
     }
 #endif
     tone_map_hdr_backbuffer_to_sdr(swapchain, frame_index);
@@ -10176,7 +10182,7 @@ static std::size_t read_game_floats_seh(std::uint64_t ptr, float *out, std::size
     }
 }
 
-// sdk234 未接管原因的低频诊断（2026-09-19 审核报告：从 try_fsr2_translation_draw
+// sdk234 未接管原因的低频诊断（2026-09-19：从 try_fsr2_translation_draw
 // 内抽出，该函数原约 1800 行）。
 //
 // **只读**：不修改任何状态机状态，只写自己的静态节流计数器 —— 因此可安全抽出，
@@ -10240,7 +10246,7 @@ void log_sdk234_skip_reason(
 
 // 一次性原生参数探测（诊断用，Ffx12Probe=1 时启用；正式版不编译）。
 //
-// 2026-09-19（审核报告）：从 try_fsr2_translation_draw 内抽出（该函数原约 1800 行）。
+// 2026-09-19：从 try_fsr2_translation_draw 内抽出（该函数原约 1800 行）。
 // **纯诊断**：已逐项核实对 g_sdk234_output_ptr / g_sdk234_output_tick / st-> / g_config.
 // 的写入均为 **0 处** —— 只写自己的静态节流计数器与 dump 文件，不影响 dispatch 语义。
 // 整个函数体在 !RELEASE_RUNTIME 下才编译，故对发布版是**编译期无操作**。
@@ -10550,7 +10556,7 @@ bool try_fsr2_translation_draw(
             std::uint64_t duplicate_frame_count = 0;
             std::uint64_t last_dispatch_tick = 0; // 接管空窗检测
             std::uint64_t last_frame_tick = 0;    // 帧间隔测量
-            // 帧时间步（）：高精度 + 游戏帧号门控——
+            // 帧时间步：高精度 + 游戏帧号门控——
             // 同帧多次 dispatch（alternate 双缓冲/多视图）共享同一时间步；
             // 不同帧间 dt = QPC 实测真实帧间隔。
             std::uint64_t last_frame_index = 0;
@@ -10671,7 +10677,102 @@ bool try_fsr2_translation_draw(
         // 视图归属 —— 若接管者的 draw 实际只靠 token bootstrap 认领（2），那一帧就可能
         // 把"另一路视图"的帧喂进接管者的 FSR 历史（跟随剪影的短暂覆盖层）。日志可定案。
         std::uint32_t match_path = 0;
-        std::uint32_t match_token_candidates = 0; // bootstrap 时有未消费 token 的实例数
+        std::uint32_t match_token_candidates = 0; // bootstrap 时"仍有未消费 token 且**当前活跃**"的实例数
+        std::uint32_t match_token_ghosts = 0;     // 诊断：有未消费 token 但**已经不再画**的实例数
+        // ---- P1 活性判据（**非粘性**）：某个实例**当前**是否真在画目标累积 draw ----
+        // 纯函数 `fsr2_family_takeover::p1_other_instance_currently_live`（可离线单测）定义口径；
+        // 下面建一张查询表，供本次匹配（token 候选计数）与后续所有"多实例/多义"判据（拒绝认领、
+        // 放行无归属 draw）**共用同一个**活性语义 —— 避免出现"裁决说只有一个活跃实例、认领判据
+        // 却认为有两个"的自相矛盾。
+        //
+        // 活性 = 该实例在最近 k_p1_live_ms 内被本函数匹配到过（确实还在画）。
+        // 反例（幽灵实例）：曾经画过、但早已沉默，却仍被游戏调用 Render（FSR2 上下文尚未销毁）
+        // ⇒ 每帧都有一枚新鲜的 250ms token、却**不再产画面**。它**不得**参与任何"多义/多实例"
+        // 裁决，否则单视图场景里接管者会被永久拒绝（实机回归 2026-09-28：
+        // `ffx12_ambiguous_bootstrap` 每帧命中一次、涨到 5376，而另一路的 :g 代次已冻住 54 秒
+        // ⇒ 桥超分隔帧推进 ⇒ 静止边缘抖动/锯齿）。
+        constexpr std::uint64_t k_p1_live_ms = 3000;
+        std::uint64_t p1_liveness_inst[8] {};
+        std::uint64_t p1_liveness_seen[8] {};
+        std::uint32_t p1_liveness_n = 0;
+        {
+            std::uint64_t all_insts[8] {};
+            std::size_t all_n = 0;
+            il2cpp_callsite::known_instances(all_insts, 8, all_n);
+            const std::uint64_t live_now = GetTickCount64();
+            for (std::size_t k = 0; k < all_n && p1_liveness_n < 8; ++k)
+            {
+                if (all_insts[k] == 0)
+                    continue;
+                std::uint64_t seen = 0;
+                for (std::size_t j = 0; j < sdk234_inst_count; ++j)
+                {
+                    if (sdk234_insts[j].instance == all_insts[k])
+                    {
+                        seen = sdk234_insts[j].p1_last_seen_tick;
+                        break;
+                    }
+                }
+                if (seen != 0 && live_now >= seen && live_now - seen <= k_p1_live_ms)
+                {
+                    p1_liveness_inst[p1_liveness_n] = all_insts[k];
+                    p1_liveness_seen[p1_liveness_n] = seen;
+                    ++p1_liveness_n;
+                }
+            }
+        }
+        // 查询：inst 是否**当前活跃**（= 它确实还在画这一路的累积 draw）。
+        const auto p1_instance_is_live = [&](std::uint64_t inst) -> bool
+        {
+            for (std::uint32_t k = 0; k < p1_liveness_n; ++k)
+            {
+                if (p1_liveness_inst[k] == inst)
+                    return true;
+            }
+            return false;
+        };
+        // "除 inst 之外，**当前**是否还有另一个活跃实例" —— P1 多实例/多义判据的唯一入口。
+        const auto p1_other_instance_live = [&](std::uint64_t inst) -> bool
+        {
+            for (std::uint32_t k = 0; k < p1_liveness_n; ++k)
+            {
+                if (p1_liveness_inst[k] != inst)
+                    return true;
+            }
+            return false;
+        };
+        // 诊断：是否存在"画过但早已沉默"的幽灵实例（不参与任何裁决，只用于验收探针）。
+        // 这里顺手把纯函数跑一遍（生产路径也覆盖它，避免实现漂移只在单测里被发现）。
+        bool p1_ghost_instance_present = false;
+        {
+            std::uint64_t all_insts[8] {};
+            std::size_t all_n = 0;
+            il2cpp_callsite::known_instances(all_insts, 8, all_n);
+            for (std::size_t k = 0; k < all_n; ++k)
+            {
+                if (all_insts[k] == 0 || p1_instance_is_live(all_insts[k]))
+                    continue;
+                // 它自己不在活性表里 ⇒ 用纯函数确认"确实没有别的活跃实例"（口径一致性）
+                const bool others_live =
+                    fsr2_family_takeover::p1_other_instance_currently_live(
+                        p1_liveness_inst, p1_liveness_seen, p1_liveness_n, all_insts[k],
+                        GetTickCount64(), k_p1_live_ms);
+                if (others_live)
+                    continue;
+                bool ever_matched = false;
+                for (std::size_t j = 0; j < sdk234_inst_count; ++j)
+                {
+                    if (sdk234_insts[j].instance == all_insts[k] &&
+                        sdk234_insts[j].p1_last_seen_tick != 0)
+                    {
+                        ever_matched = true;
+                        break;
+                    }
+                }
+                if (ever_matched)
+                    p1_ghost_instance_present = true;
+            }
+        }
         {
             std::uint64_t insts[8] {};
             std::size_t inst_n = 0;
@@ -10732,7 +10833,24 @@ bool try_fsr2_translation_draw(
                     if (!il2cpp_callsite::latest_pending_render_token_for(
                             insts[i], draw_info->render_width, draw_info->render_height, token))
                         continue;
-                    ++match_token_candidates; // 诊断：同尺寸下有几个实例"看起来都可能是本 draw"
+                    // 诊断/拒绝判据共用的"竞争性候选"计数：**必须**排除"有未消费 token、但早已
+                    // 不再画这个累积 draw"的实例（下称幽灵实例）。
+                    // ⚠️ 实机回归（2026-09-28，用户报告"普通场景超分大幅降低 + 静止抖动/锯齿"）：
+                    //   旧实现在这里只按"token 是否存在且未过期"计数 ⇒ 幽灵实例只要还在被游戏
+                    //   调用 Render（它的 FSR2 上下文仍未销毁，即使这一路早已不产画面），就会有
+                    //   一枚 250ms 内的新 token ⇒ 计数**长期恒为 2** ⇒ 下游"多义认领拒绝"永久
+                    //   命中 ⇒ 接管者**每一个**累积 draw 都被放行给游戏原生（实测每帧命中一次：
+                    //   `ffx12_ambiguous_bootstrap count` 从 1 涨到 5376，而
+                    //   `ffx12_election cand=[...(pass,g=3610...)]` 里那个"pass"实例的 :g 已冻住
+                    //   54 秒）⇒ 桥的超分时域累积变成隔帧推进 ⇒ 静止画面边缘也抖动/锯齿。
+                    //   判据与 `g_sdk234_multi_instance` 的活性判据保持**同一个**语义：实例必须
+                    //   最近 k_p1_live_ms 内真的被本函数匹配到（= 它确实还在画）。幽灵实例永远
+                    //   不再"活跃"，因此永远不会再有能力否掉接管者的认领 ✓
+                    //   ⇒ 单实例场景（本进程从未出现过第二个实例）行为与修复②之前**逐字相同** ✓
+                    if (p1_instance_is_live(insts[i]))
+                        ++match_token_candidates;
+                    else
+                        ++match_token_ghosts;  // 诊断：只计数，不参与裁决
                     if (token.generation > best_gen)
                     {
                         best_gen = token.generation;
@@ -10866,10 +10984,17 @@ bool try_fsr2_translation_draw(
                     break;
                 }
             }
-            // 注：`sdk234_inst_count > 1` 是**粘性**判据（槽只增不减，见上方的全局注释）
-            // ⇒ 一旦本进程出现过第二个 FSR2 实例，P1 模式下"跳过预处理 pass"就永久关闭。
-            g_sdk234_multi_instance.store(
-                (p1_live > 1 || sdk234_inst_count > 1) ? 1u : 0u, std::memory_order_relaxed);
+            // ⚠️ 判据 = "**当前**确有多个活跃实例"（p1_live > 1，活性窗口与上方裁决同一个），
+            // **不是**"历史上出现过第二个实例"（`sdk234_inst_count > 1`）。后者是**粘性**的
+            // （状态槽只增不减、场景/视图切换也不回收）⇒ 一次为真、终生为真。
+            // 实机回归（2026-09-28，用户报告"普通场景超分大幅降低 + 静止抖动/锯齿"）：粘性判据
+            // 让下面这个标记永久为 1，于是本进程**只剩一路活跃视图**时，那条 "认不出归属的累积
+            // draw 一律放行" 的分支仍永久生效 ⇒ 桥超分被大面积让给游戏原生。
+            // 为什么"当前活跃"不会让缺陷①复发（老实例掉出 3 秒窗 ⇒ 互锁松开 ⇒ 它永远回不来）：
+            //   老实例"离开接管"时已被**逐实例**处置（p1_release_instance_state +
+            //   notify_takeover_leave + native_until_tick 纯原生窗口），它的原生路径是**被显式
+            //   交还**的，不再依赖这个全局标记来兜底 ⇒ 标记回落不会夺走它已经拿回的原生路径。
+            g_sdk234_multi_instance.store(p1_live > 1 ? 1u : 0u, std::memory_order_relaxed);
             // ---- 诊断 D2：交棒事件 + 原因（独立于下方"变更即打"的去重逻辑）----
             // prev_age_ms > k_p1_live_ms ⇒ 交棒是"上一任静默掉出候选窗"导致的（活跃度）；
             // prev_present=0 ⇒ 它连状态槽都没了（槽位被复用/实例重建 = 键变化）；
@@ -11147,8 +11272,12 @@ bool try_fsr2_translation_draw(
             // 纯诊断：这一 draw 是否写的就是接管者的双缓冲（用于判断"放行有没有误伤接管者"）
             const bool writes_taker_buffer = taker_state != nullptr &&
                 (taker_state->out_a == draw_out_ptr || taker_state->out_b == draw_out_ptr);
+            // ⚠️ 放行前提必须是"**当前**确有另一个活跃实例"（非粘性）。见 g_sdk234_multi_instance
+            // 的判据注释：用"历史上出现过第二个实例"会让这条放行在单视图场景长期生效 ⇒ 本桥的
+            // 超分被大面积让给游戏原生（实机回归的直接机制之一）。
             const bool release_now = g_config.ffx12_single_instance &&
-                g_sdk234_multi_instance.load(std::memory_order_relaxed) != 0;
+                g_sdk234_multi_instance.load(std::memory_order_relaxed) != 0 &&
+                p1_other_instance_live(match_inst);
             if (release_now)
                 release_untagged_accumulate = true;
             static std::atomic_uint64_t sdk234_untagged_draw_count { 0 };
@@ -11172,6 +11301,23 @@ bool try_fsr2_translation_draw(
                     " taker_out_b=" + hex64(taker_state != nullptr ? taker_state->out_b : 0) +
                     " writes_taker_buffer=" + std::to_string(writes_taker_buffer ? 1 : 0) +
                     " frame=" + std::to_string(call_params.frame_index) +
+                    " action=" + std::string(release_now ? "passthrough_native" : "fail_closed"));
+            }
+            // 诊断：这次"认不出归属"的累积 draw 是不是因为**幽灵实例**（只调 Render、早就不画）
+            // 才不再放行的。这是 2026-09-28 回归修复的**验收探针**：
+            //   修复前 ⇒ 幽灵存在时这里 `release=1`、`ghost=1`；
+            //   修复后 ⇒ `release=0`（幽灵不再算"当前活跃实例"），且 `ghost=1` 仍为 1
+            //   ⇒ 两行一起看即可确认"放行确实只由活跃实例触发" ✓
+            if (g_config.ffx12_single_instance_diag && p1_ghost_instance_present &&
+                (ur <= 8 || ur % 512 == 0))
+            {
+                LOG_INFO(blog::cat::upscale, "ffx12_untagged_ghost count=" +
+                    std::to_string(ur) +
+                    " release=" + std::to_string(release_now ? 1 : 0) +
+                    " token_ghosts=" + std::to_string(match_token_ghosts) +
+                    " multi=" + std::to_string(
+                        g_sdk234_multi_instance.load(std::memory_order_relaxed)) +
+                    " take=" + hex64(sdk234_take_cur & 0xFFFFFFFFull) +
                     " action=" + std::string(release_now ? "passthrough_native" : "fail_closed"));
             }
         }
@@ -11296,8 +11442,13 @@ bool try_fsr2_translation_draw(
         //   这里只负责把"事实"填进去。
         fsr2_family_takeover::TokenOnlyClaimFacts p2_facts {};
         p2_facts.single_instance_takeover = g_config.ffx12_single_instance;
+        // ⚠️ 必须用"**当前**确有另一个活跃实例"（非粘性），而不是"历史上出现过第二个实例"。
+        // 实机回归（2026-09-28）：粘性版本 + `token_cands` 把幽灵实例也计入 ⇒ 接管者**每一个**
+        // 累积 draw 都被拒（`ffx12_ambiguous_bootstrap` 涨到 5376，而另一路 :g 已冻住 54 秒）
+        // ⇒ 普通单视图场景超分大幅降低、静止边缘抖动/锯齿。
         p2_facts.second_instance_present =
             g_sdk234_multi_instance.load(std::memory_order_relaxed) != 0;
+        p2_facts.other_instance_currently_live = p1_other_instance_live(match_inst);
         p2_facts.claimer_is_current_taker = match_inst != 0 && match_inst == sdk234_take_cur;
         p2_facts.claimed_by_token_only = match_path == 2;
         p2_facts.output_belongs_to_claimer = output_belongs_to_instance;
@@ -11319,6 +11470,7 @@ bool try_fsr2_translation_draw(
                     " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
                     " take=" + hex64(sdk234_take_cur & 0xFFFFFFFFull) +
                     " token_cands=" + std::to_string(match_token_candidates) +
+                    " token_ghosts=" + std::to_string(match_token_ghosts) +
                     " out=" + hex64(draw_out_ptr) +
                     " out_a=" + hex64(st->out_a) + " out_b=" + hex64(st->out_b) +
                     " dispatch_age_ms=" + std::to_string(sdk234_now - st->last_dispatch_tick) +
@@ -11556,7 +11708,7 @@ bool try_fsr2_translation_draw(
                         return true;
                     }
                 }
-                // 2026-08-24（）：切断原生 FSR2，全部实例接管，只允许 FSR2.3.4 SDK。
+                // 2026-08-24：切断原生 FSR2，全部实例接管，只允许 FSR2.3.4 SDK。
                 // 每实例独立 FSR2 context（后端按 instance_key 隔离历史）；实例重建 = 新 key = 隐式 reset。
                 // 实例切换日志（低频）：记录实例集合变化供诊断。
                 {
@@ -12356,11 +12508,11 @@ bool try_fsr2_translation_draw(
         return true;
     }
 
-    // 旧翻译层执行段已删除（2026-09-19，审核报告）：
+    // 旧翻译层执行段已删除（2026-09-19）：
     // 它位于 11117 的 `return true` 之后，**不可达** —— 条件为真时已在此返回，
     // 为假则直接落到下方 return false。原注释称"文本保留供参考"，但该段自 74bed58
     // 起就在 git 历史中，保留在源文件里只会让这个 1793 行的函数更难读。
-    return false; // ：旧翻译层停用后直接放行（新架构仅 ffx12 链路）
+    return false; // 旧翻译层停用后直接放行（新架构仅 ffx12 链路）
 }
 #endif
 
@@ -12634,15 +12786,15 @@ bool fsr2_family_should_skip_draw(ID3D11DeviceContext *context)
 {
     if (!g_config.fsr2_family_skip)
         return false;
-    // P1 单实例接管：本进程出现过第二个 FSR2 实例时**禁止**跳过预处理 pass。
+    // P1 单实例接管：**当前**确有多个活跃实例时**禁止**跳过预处理 pass。
     // 该跳过的前提是"每次累积 pass 都被桥成功替换"，而 P1 只替换**一个**实例的累积
     // pass —— 放行给原生的那一路仍需要自己的预处理 pass（其输出被族内的原生累积 pass
     // 消费），否则该路原生 FSR2 输入缺失 ⇒ 画面冻在最后一帧（实机定案）。
-    // ⚠️ 这个标记是**粘性**的（见 g_sdk234_multi_instance 的全局注释）：判据里含
-    // "本进程出现过第二个实例"，一旦出现就不再放开。为什么不能用"最近 3 秒内并存的
-    // 实例数 > 1"：那样会在交棒后**自锁** —— 老实例因为原生路径被破坏而不再被本函数
-    // 匹配（实机 age 涨到 176 秒）⇒ 掉出 3 秒窗口 ⇒ 互锁松开 ⇒ 它的预处理 pass 继续
-    // 被跳过 ⇒ 它永远回不来。
+    // ⚠️ 判据是"当前活跃"而**不是**粘性的"本进程出现过第二个实例"：后者会让单视图场景
+    // 永久关闭本条优化（见 g_sdk234_multi_instance 的全局注释与 2026-09-28 实机回归）。
+    // 至于"老实例掉出活性窗后互锁松开、它的预处理 pass 又被跳过"这个自锁风险：交棒时已对
+    // 它做了逐实例处置（notify_takeover_leave + 纯原生窗口），原生路径是被显式交还的，
+    // 不依赖本标记兜底 ⇒ 不会复发。
     if (g_config.ffx12_single_instance &&
         g_sdk234_multi_instance.load(std::memory_order_relaxed) != 0)
         return false;
@@ -12680,7 +12832,7 @@ bool fsr2_family_should_skip_draw(ID3D11DeviceContext *context)
         fsr2_family_takeover::should_skip_pre(hash, GetTickCount64(), g_config.fsr2_family_expire_ms);
 }
 
-// FSR2 合成族：draw / draw_indexed 共用的两段逻辑（2026-09-19 审核报告）
+// FSR2 合成族：draw / draw_indexed 共用的两段逻辑（2026-09-19）
 //
 // **为什么抽出来**：这两段原本在 `hooked_draw_indexed` 与 `hooked_draw` 里
 // 各抄了一份，且**已经漂移**：
@@ -13915,7 +14067,7 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
         install_device_hooks(device != nullptr ? *device : nullptr);
         install_factory_hooks_from_device(device != nullptr ? *device : nullptr);
         install_context_hooks(context != nullptr ? *context : nullptr);
-        route_from_d3d11_device(device != nullptr ? *device : nullptr); // ：设备级路由补检
+        route_from_d3d11_device(device != nullptr ? *device : nullptr); // 设备级路由补检
         if (swapchain != nullptr && *swapchain != nullptr)
         {
             DXGI_SWAP_CHAIN_DESC created_desc {};
@@ -13959,7 +14111,7 @@ HRESULT WINAPI hooked_create_device(
         install_device_hooks(device != nullptr ? *device : nullptr);
         install_factory_hooks_from_device(device != nullptr ? *device : nullptr);
         install_context_hooks(context != nullptr ? *context : nullptr);
-        route_from_d3d11_device(device != nullptr ? *device : nullptr); // ：设备级路由补检
+        route_from_d3d11_device(device != nullptr ? *device : nullptr); // 设备级路由补检
         LOG_INFO(blog::cat::core, "hooked D3D11CreateDevice");
     }
     return hr;
@@ -14537,7 +14689,7 @@ void initialize()
                 " render_va=" + hex64(exe_base + hook_cfg.render_rva));
         else
         {
-            // ⚠️ 2026-09-23（审核项）：如实带上**失败原因**。此前只有"失败了"，
+            // ⚠️ 2026-09-23：如实带上**失败原因**。此前只有"失败了"，
             // 分不清 RVA 为 0（配置）/ 序言不匹配（游戏更新）/ 分配失败（资源）——
             // 三者处置完全不同，缺了这句就只能靠猜。
             LOG_ERROR(blog::cat::hook, "fsr2_il2cpp_hook_failed render_rva=" + hex64(hook_cfg.render_rva) +

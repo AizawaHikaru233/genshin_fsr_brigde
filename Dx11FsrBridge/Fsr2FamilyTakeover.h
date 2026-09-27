@@ -9,6 +9,7 @@
 // 本模块（默认关闭）在"上一次累积 pass 被桥成功替换"的前提下跳过 4 个预处理 pass，
 // 消除双跑残余。纯 C++ 状态机，不依赖 D3D11/Windows（时间由调用方注入，可单测）。
 
+#include <cstddef>
 #include <cstdint>
 
 namespace fsr2_family_takeover
@@ -65,18 +66,56 @@ std::uint64_t takeover_leave_count();
 struct TokenOnlyClaimFacts
 {
     bool single_instance_takeover = false;  // Ffx12SingleInstance=1（P1 生效）
-    bool second_instance_present = false;   // 本进程出现过第二个实例（粘性互锁）
+    bool second_instance_present = false;   // 当前确有多个**活跃**实例（非粘性，见下）
+    // ⚠️ 实机回归（2026-09-28）：`second_instance_present` 早先被实现为**粘性**（"本进程出现过
+    // 第二个实例"）。状态槽只增不减、场景/视图切换也不回收 ⇒ 一次为真终生为真 ⇒ 单视图场景下
+    // 这个拒绝判据永久命中，接管者每个累积 draw 都被放行给原生 ⇒ 超分大幅降低、静止抖动/锯齿。
+    // 现在拆成两个事实并**必须同时**为真才可能拒绝：
+    //   · second_instance_present        — 本进程当前确有多个活跃实例（裁决出来的活性计数）
+    //   · other_instance_currently_live   — 除认领者之外，确实还有实例在画目标累积 draw
+    //     （"只调 Render、早就不产画面"的幽灵实例不算 ⇒ 不能否掉认领）
+    bool other_instance_currently_live = false;
     bool claimer_is_current_taker = false;  // 认领者就是当前接管者
     bool claimed_by_token_only = false;     // match_path == 2（无输出归属校验）
     bool output_belongs_to_claimer = false; // 输出命中认领者的 out_a/out_b（path 1/3）
     bool claim_has_generation = false;      // call_gen != 0（确有新 Render 代次）
-    std::uint64_t same_size_token_candidates = 0; // 同尺寸未消费 token 的实例数
+    std::uint64_t same_size_token_candidates = 0; // 同尺寸未消费 token 的**活跃**实例数
     bool claimer_has_ownership = false;     // out_a/out_b 非 0（已有归属记忆）
     bool claimer_recently_dispatched = false; // 最近 500ms 内尝试过派发（健康）
 };
 
 // true = 拒绝这次认领（调用方：消费 token 后放行游戏原生）
 bool p1_refuse_token_only_claim(const TokenOnlyClaimFacts &facts);
+
+// ---------------------------------------------------------------------------
+// P1 活性判据（**不是**"历史上出现过"的粘性条件）。
+//
+// 语义：本进程**当前**是否真的还有第二个"仍在画目标累积 draw"的实例。
+// 为什么必须有它（实机回归，2026-09-28）：
+//   早先的判据是 `sdk234_inst_count > 1`（状态槽只增不减 ⇒ 一次为真，终生为真）。而状态槽
+//   在**场景/视图切换**时并不回收：老实例的槽会一直留着（它的 :g 代次冻住不再推进，却仍在
+//   被游戏调用 Render ⇒ 每帧都有一枚新鲜的 250ms token）。于是"多实例"永久为真：
+//     · `fsr2_family_should_skip_draw` 永久关闭跳过许可；
+//     · `release_untagged_accumulate` 永久放行认不出归属的累积 draw；
+//     · 同尺寸 token 候选数恒为 2 ⇒ `p1_refuse_token_only_claim` 永久拒绝接管者自己的认领。
+//   三者叠加 ⇒ 普通（单视图）场景下桥的超分被大面积放行给游戏原生 ⇒ 用户报告
+//   "超分效果大幅降低、静止状态边缘抖动/锯齿"（= 时域累积没生效的典型签名）。
+//
+// 判据定义：某个实例在窗口内被本函数**匹配到过**（= 它确实还在画这一路的累积 draw）。
+//   幽灵实例（只调 Render、不再画）永远不满足 ⇒ 不再能污染任何裁决 ✓
+//   从未出现过第二个实例的单实例场景 ⇒ 恒为 false ⇒ 行为与引入本判据之前**逐字相同** ✓
+//
+// 入参（两个数组**同序对齐**，由调用方保证；count 为有效项数）：
+//   instances[i]        — 第 i 个已知实例指针
+//   last_seen_ms[i]     — 该实例最近一次"被本函数匹配到"的时刻（0 = 从未匹配 ⇒ 视为不活跃）
+//   exclude_instance    — 当前正在认领的实例（它自己不算"另一个实例"）
+//   now_ms / live_ms    — 当前时刻与活性窗口（与 P1 裁决用的 k_p1_live_ms 同值）
+bool p1_other_instance_currently_live(const std::uint64_t *instances,
+                                      const std::uint64_t *last_seen_ms,
+                                      std::size_t count,
+                                      std::uint64_t exclude_instance,
+                                      std::uint64_t now_ms,
+                                      std::uint64_t live_ms);
 
 // 统计（限频日志用）
 std::uint64_t skipped_count();
