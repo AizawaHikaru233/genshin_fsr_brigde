@@ -1,6 +1,7 @@
 // 由 CMake 生成 —— **不要直接编辑**（改动会被下次 configure 覆盖）。
 //
-// 单一版本源在 CMakeLists.txt 的 `project(FufuGraphicsPlugin VERSION x.y.z)`。
+// 单一版本源在**仓库根** `Version.cmake` 的 `FSR_SUITE_VERSION`
+// （CMakeLists 顶部 `include(.../Version.cmake)` 后用于 `project(... VERSION ...)`）。
 //
 // 为什么需要（2026-09-19）：`.rc` 里的 FILEVERSION / FileVersion 等
 // 此前是**手写**的 `2,2,0,0` / `"2.2.0.0"`，与构建版本源无同步机制 ——

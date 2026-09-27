@@ -1,8 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 
-# 版本号**单一事实源**（2026-09-19）。
-# 改版本只改这里；`.rc` 通过下面生成的头读取，不再手写。
-project(Dx11FsrBridge VERSION 2.3.0.0 LANGUAGES C CXX RC)
+# 版本号**全仓库唯一事实源** = 仓库根 `../Version.cmake`（2026-09-28 用户要求：
+# **所有自有组件的版本号同步迭代**，本组件本次无内容改动也照样跟号）。
+# ⇒ 改版本只改 `Version.cmake` 一行；`.rc` 通过下面生成的头读取，不再手写。
+# 组件目录不能单独拷出构建：事实源缺失时**显式失败**，不静默退回本地硬编码。
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../Version.cmake")
+    message(FATAL_ERROR "缺少自有组件版本单一事实源：${CMAKE_CURRENT_SOURCE_DIR}/../Version.cmake（请使用完整仓库检出）")
+endif()
+include("${CMAKE_CURRENT_SOURCE_DIR}/../Version.cmake")
+project(Dx11FsrBridge VERSION ${FSR_SUITE_VERSION} LANGUAGES C CXX RC)
 
 # 生成版本头供 .rc 使用（生成到构建目录，避免污染源码树）。
 configure_file(
