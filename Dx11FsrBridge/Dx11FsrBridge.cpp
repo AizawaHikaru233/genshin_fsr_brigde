@@ -8192,13 +8192,34 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         return std::nullopt;
 
     // 诊断：候选 draw（3 顶点）识别失败限量记录（5s 一次），定位 UI 切换后桥接掉线环节
+    //
+    // ⚠️ 2026-09-27（B105 性能修复）：**先过闸门，再拼字符串**。
+    // 旧写法把这个 lambda 的实参直接写成
+    //   `std::string("stage=prescreen rtv0=") + ... + " rtv1=" + ...`
+    // 而实参在**调用前**就求值 —— 于是**每一次被预筛拒绝的 draw**（B104 自述"绝大多数
+    // draw 都是单 RTV"）都要付 4 次堆分配 + 4 次释放（MSVC 的 SSO 只有 15 字符，
+    // 这条消息 ≈29 字符），而字符串 99.9% 的时候被这里的 5s 限流直接丢掉。
+    // 这是一条**每-draw 的堆流量**，且它是 B104 那个离线微基准（170 ns，
+    // 只建模了 OMGetRenderTargets + Release）**没有复刻**的部分。
+    // 日志内容、触发时机、限流状态与旧写法**逐条等价**（闸门副作用完全一致）。
+    //
+    // ⚠️ 诚实标注（B105 离线微基准，本机 /O2、真机 D3D11 硬件设备，取 7 轮最小值）：
+    // 这条被丢掉的字符串实测只有 **36.2 ns（单线程）/ 46.2 ns（另开 3 线程压同一个
+    // CRT 堆）**，而同机 `OMGetRenderTargets(2)+Release` = **2.4 ns**。
+    // ⇒ 它是**真实存在的浪费**（且是预筛拒绝路径上唯一的堆流量），但**不足以**解释
+    //   B104 记录的"微基准 170 ns vs 真机 2.2 µs"那 13 倍差（46×13≈600 ns，仍差量级）✗。
+    // ⇒ 13 倍差的主因**仍未查明**；B105 之后最站得住的解释是"那 2.2 µs 根本不是内省的
+    //   耗时，而是**整个钩子体**（含游戏自己的 DrawIndexed 提交）" —— 这正是 B105
+    //   收窄 `draw_inspect` 口径要回答的问题（见 PerfProbe.h 的槽口径说明）。
     static std::atomic_uint64_t on_demand_fail_tick { 0 };
-    const auto log_fail = [](std::string &&detail) {
+    const auto fail_log_open = []() -> bool {
         const ULONGLONG now = GetTickCount64();
         ULONGLONG last = on_demand_fail_tick.load(std::memory_order_relaxed);
-        if (now - last < 5000 ||
-            !on_demand_fail_tick.compare_exchange_strong(last, now, std::memory_order_relaxed))
-            return;
+        if (now - last < 5000)
+            return false;
+        return on_demand_fail_tick.compare_exchange_strong(last, now, std::memory_order_relaxed);
+    };
+    const auto fail_log = [](std::string &&detail) {
         LOG_DEBUG(blog::cat::upscale, "fsr2_on_demand_identify_fail " + detail);
     };
 
@@ -8218,10 +8239,22 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     // 探针数字后来被证明**几乎全是探针自身开销**（分段计时显示钩子实际逻辑约 1ns）。
     // 也就是说：这条路径本来就很便宜，重排它是**正确但收益微小**的整理，不是性能修复。
     // 保留重排的理由：判空确实应该先于昂贵的资源内省，这是正确的顺序。
+    //
+    // ⚠️ 2026-09-27（B105 更正）✗：上面"这条路径本来就很便宜"这句**已被证伪**，
+    // 但**下面的 B105 修复也不是那 13 倍差的答案**：
+    //   - 证伪依据：那次 `avg_ns 2591→2600` 的探针本身不可信（错误清单第 10 条：
+    //     给纳秒级函数加微秒级探针），不能用来支持"便宜"；
+    //   - 而 B105 修掉的那条 `std::string` 实测只有 36~46 ns（见上），量级不够；
+    //   - ⇒ 剩下的候选是"2.2 µs 量的是**整个钩子体**（含游戏自己的 draw 提交）"，
+    //     B105 已把 `draw_inspect` 收窄到只包住内省调用，真机直方图即可判定。
     if (render_targets[0] == nullptr || render_targets[1] == nullptr)
     {
-        log_fail(std::string("stage=prescreen rtv0=") + (render_targets[0] != nullptr ? "1" : "0") +
-            " rtv1=" + (render_targets[1] != nullptr ? "1" : "0"));
+        // ⚠️ 字符串只在闸门通过后才拼（见 fail_log_open 的说明）。
+        if (fail_log_open())
+        {
+            fail_log(std::string("stage=prescreen rtv0=") + (render_targets[0] != nullptr ? "1" : "0") +
+                " rtv1=" + (render_targets[1] != nullptr ? "1" : "0"));
+        }
         for (ID3D11RenderTargetView *render_target : render_targets)
         {
             if (render_target != nullptr)
@@ -8233,41 +8266,56 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     // 低分辨率候选 draw 诊断（TAAU 渲染精度 <1 时应出现低分辨率 rtv0）——
     // 记录其 RTV/SRV 特征判断国际服 TAAU 布局（前 12 次）。
     // 放在预筛之后：只有真正双 RTV 的候选 draw（极少）才值得付这个代价。
+    //
+    // ⚠️ 2026-09-27（B105）：12 次预算检查**前置**到读取之前。
+    // `safe_read_resource_info` 要付 GetResource+GetType+QueryInterface+GetDesc
+    // （B104 微基准 ≈53 ns/次），而计数器**只在下面这个块里自增**
+    // ⇒ 预算用完后这条诊断**永远不会再输出**，旧写法却让此后每个双 RTV 候选 draw
+    // 白读一次 rtv0。判定条件、记录内容、计数器的语义完全不变。
     {
-        ResourceInfo rtv0_info {};
-        safe_read_resource_info(render_targets[0], L"fsr2_diag_rtv0", rtv0_info);
-        if (rtv0_info.resource_key != 0 && rtv0_info.width < 3840)
+        static std::atomic_uint32_t lowres_diag_count { 0 };
+        if (lowres_diag_count.load(std::memory_order_relaxed) < 12)
         {
-            static std::atomic_uint32_t lowres_diag_count { 0 };
-            if (lowres_diag_count.fetch_add(1, std::memory_order_relaxed) < 12)
+            ResourceInfo rtv0_info {};
+            safe_read_resource_info(render_targets[0], L"fsr2_diag_rtv0", rtv0_info);
+            if (rtv0_info.resource_key != 0 && rtv0_info.width < 3840)
             {
-                std::array<ID3D11ShaderResourceView *, 7> diag_srvs {};
-                context->PSGetShaderResources(0, static_cast<UINT>(diag_srvs.size()), diag_srvs.data());
-                std::ostringstream diag;
-                diag << "fsr2_on_demand_lowres rtv0=" << rtv0_info.width << "x" << rtv0_info.height
-                     << "f" << static_cast<std::uint32_t>(rtv0_info.format)
-                     << " rtv1=" << (render_targets[1] != nullptr ? "1" : "0")
-                     << " srvs=";
-                for (std::size_t i = 0; i < diag_srvs.size(); ++i)
+                if (lowres_diag_count.fetch_add(1, std::memory_order_relaxed) < 12)
                 {
-                    ResourceInfo info {};
-                    read_resource_info(diag_srvs[i], L"fsr2_diag_srv", info);
-                    diag << i << ":" << (info.resource_key
-                        ? (std::to_string(info.width) + "x" + std::to_string(info.height) + "f" + std::to_string(static_cast<std::uint32_t>(info.format)))
-                        : "0") << " ";
-                    if (diag_srvs[i] != nullptr)
-                        diag_srvs[i]->Release();
+                    std::array<ID3D11ShaderResourceView *, 7> diag_srvs {};
+                    context->PSGetShaderResources(0, static_cast<UINT>(diag_srvs.size()), diag_srvs.data());
+                    std::ostringstream diag;
+                    diag << "fsr2_on_demand_lowres rtv0=" << rtv0_info.width << "x" << rtv0_info.height
+                         << "f" << static_cast<std::uint32_t>(rtv0_info.format)
+                         << " rtv1=" << (render_targets[1] != nullptr ? "1" : "0")
+                         << " srvs=";
+                    for (std::size_t i = 0; i < diag_srvs.size(); ++i)
+                    {
+                        ResourceInfo info {};
+                        read_resource_info(diag_srvs[i], L"fsr2_diag_srv", info);
+                        diag << i << ":" << (info.resource_key
+                            ? (std::to_string(info.width) + "x" + std::to_string(info.height) + "f" + std::to_string(static_cast<std::uint32_t>(info.format)))
+                            : "0") << " ";
+                        if (diag_srvs[i] != nullptr)
+                            diag_srvs[i]->Release();
+                    }
+                    LOG_INFO(blog::cat::upscale, diag.str());
                 }
-                LOG_INFO(blog::cat::upscale, diag.str());
             }
         }
     }
     // 阶段日志（崩溃定位）：到达此处的 draw 已是双 RTV 候选（预筛已在上方完成）
+    //
+    // ⚠️ 2026-09-27（B105）：形参 `std::string &&` → `const char *`。
+    // 旧写法每次双 RTV 候选都要先把字面量拼成 `std::string`（这几条 17~25 字符，
+    // 超过 MSVC 的 15 字符 SSO ⇒ 一次堆分配），而这条日志**只在前 16 次**输出。
+    // `on_demand_stage_count.fetch_add` 仍照旧**每次都执行**（计数语义不变），
+    // 只是不再拼字符串。
     static std::atomic_uint32_t on_demand_stage_count { 0 };
-    const auto stage_log = [](std::string &&msg) {
+    const auto stage_log = [](const char *msg) {
         if (on_demand_stage_count.fetch_add(1, std::memory_order_relaxed) >= 16)
             return;
-        LOG_DEBUG(blog::cat::upscale, "fsr2_stage " + msg);
+        LOG_DEBUG(blog::cat::upscale, "fsr2_stage " + std::string(msg));
     };
     stage_log("identify_begin dual_rtv=1");
 
@@ -8404,16 +8452,21 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     }
     if (!identified)
     {
-        std::ostringstream detail;
-        detail << "stage=identify"
-               << " out0=" << outputs[0].width << "x" << outputs[0].height
-               << " fmt=" << static_cast<std::uint32_t>(outputs[0].format)
-               << " out1=" << outputs[1].width << "x" << outputs[1].height
-               << " srv0=" << inputs[0].width << "x" << inputs[0].height
-               << " srv1=" << inputs[1].width << "x" << inputs[1].height
-               << " vp=" << static_cast<std::uint32_t>(viewport.Width) << "x"
-               << static_cast<std::uint32_t>(viewport.Height);
-        log_fail(detail.str());
+        // ⚠️ 先过闸门再拼字符串（B105）：`std::ostringstream` 的构造成本远高于
+        // 一条 std::string，而这段只在 5s 限流窗口内才真的输出。
+        if (fail_log_open())
+        {
+            std::ostringstream detail;
+            detail << "stage=identify"
+                   << " out0=" << outputs[0].width << "x" << outputs[0].height
+                   << " fmt=" << static_cast<std::uint32_t>(outputs[0].format)
+                   << " out1=" << outputs[1].width << "x" << outputs[1].height
+                   << " srv0=" << inputs[0].width << "x" << inputs[0].height
+                   << " srv1=" << inputs[1].width << "x" << inputs[1].height
+                   << " vp=" << static_cast<std::uint32_t>(viewport.Width) << "x"
+                   << static_cast<std::uint32_t>(viewport.Height);
+            fail_log(detail.str());
+        }
         stage_log("identify_end fail");
         return std::nullopt;
     }
@@ -12053,14 +12106,19 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
 {
     // 【诊断】PerfProbe：draw 钩子整体（**抽样**计时，绝不逐 draw 取时间）。
     // 放在函数最前面 ⇒ 所有 return 路径都被计入（这正是要测的"钩子总开销"）。
+    // ⚠️ 2026-09-27（B105）：直方图槽 0 的落桶**搬进了 SampledScope 的析构**
+    // （见 PerfProbe.h）——旧写法在这里的每条 return 上手写
+    // `draw_cost_histogram(0).record(perf_scope.elapsed_ns())`，而 `elapsed_ns()`
+    // 要到析构才被填 ⇒ 恒记 0（真机 `draw_all mean_us=0.000000`）。
     perf_probe::SampledScope perf_scope(perf_probe::Segment::draw_hook,
                                         perf_probe::draw_call_counter(),
                                         perf_probe::draw_sample_counter(),
-                                        perf_probe::draw_sample_stride());
+                                        perf_probe::draw_sample_stride(),
+                                        perf_probe::k_draw_all_slot);
     perf_probe::maybe_flush();
-    // 【诊断】内省段的直方图计时（只对已抽样的那次调用计时；见 PerfProbe.h 段定义）。
-    // 目的：`drawhook` 的**均值**（"抽样均值 × 次数"外推）无法区分"每次调用都有固定成本"
-    // 与"少数巨贵调用把均值带偏"。直方图给出真实分布，两者对应的优化方向相反。
+    // 【诊断】draw 直方图槽 1 = **内省窗口**（只包住 inspect_target_upscaler_draw；
+    // 未进入内省的 draw 记 0）⇒ 两槽样本集合一致，"draw_all − draw_inspect" 才有意义。
+    // 见 PerfProbe.h 里 DrawInspectScope 的口径说明与 B105。
     perf_probe::DrawInspectScope perf_inspect_scope(perf_scope.sampled());
     // passthrough 机制已整体移除（实测让 OptiScaler 丢失 FFX 输入识别）。
     // 所有显卡统一桥直连；OptiScaler 共存时并行（各自独立链路，实测无冲突；
@@ -12086,12 +12144,12 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
 #endif
     // Phase 1：FSR2 合成族预处理 pass 跳过（仅当上一帧累积 pass 被桥成功替换且未超时）
     if (fsr2_family_skip_gate(context, index_count, true))
-    {
-        if (perf_scope.sampled())
-            perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
         return;
-    }
+    // ⚠️ 内省窗口只包住这一次调用（B105）：`perf_inspect_scope` 在出口按情况记
+    // "本次耗时"或"未内省 = 0"，两槽样本集合因此恒等。
+    perf_inspect_scope.start();
     const auto target_draw_info = inspect_target_upscaler_draw(context, index_count);
+    perf_inspect_scope.stop();
     if (target_draw_info && g_config.fsr2_translation_mode >= 3)
         observe_fsr2_dynamic_color_target(*target_draw_info);
     maybe_track_fsr2_color_candidate(context, index_count);
@@ -12113,33 +12171,21 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
     finish_fsr2_transient_capture_fallback();
 #endif
     if (fsr2_translation_handled)
-    {
-        if (perf_scope.sampled())
-            perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
         return;
-    }
 #endif
 
     if (try_hdr_sdr_tone_map_draw(context, index_count, [&]
         {
             g_original_draw_indexed(context, index_count, start_index_location, base_vertex_location);
         }))
-    {
-        if (perf_scope.sampled())
-            perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
         return;
-    }
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (try_spatial_copy_draw(context, index_count, [&]
         {
             g_original_draw_indexed(context, index_count, start_index_location, base_vertex_location);
         }))
-    {
-        if (perf_scope.sampled())
-            perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
         return;
-    }
 
     if (g_config.enable_similarity_probe ||
         (g_config.trace_pixel_shader_draws && g_current_ps_hash.load(std::memory_order_relaxed) == g_config.trace_pixel_shader_hash))
@@ -12162,20 +12208,20 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
     if (final_scene_snapshot_boundary)
         queue_final_scene_snapshot(context, final_scene_snapshot_frame);
 #endif
-    if (perf_scope.sampled())
-        perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
 }
 
 // ---------------------------------------------------------------------------
 void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_count, UINT start_vertex_location)
 {
-    // 【诊断】PerfProbe：与 hooked_draw_indexed 同一处置（抽样计时，含所有 return 路径）。
+    // 【诊断】PerfProbe：与 hooked_draw_indexed 同一处置（抽样计时，含所有 return 路径；
+    // 直方图槽 0 的落桶在 SampledScope 析构里，见 B105）。
     perf_probe::SampledScope perf_scope(perf_probe::Segment::draw_hook,
                                         perf_probe::draw_call_counter(),
                                         perf_probe::draw_sample_counter(),
-                                        perf_probe::draw_sample_stride());
+                                        perf_probe::draw_sample_stride(),
+                                        perf_probe::k_draw_all_slot);
     perf_probe::maybe_flush();
-    // 【诊断】与 hooked_draw_indexed 同一处置（只对已抽样的调用计时）。
+    // 【诊断】与 hooked_draw_indexed 同一处置（内省窗口；未内省记 0）。
     perf_probe::DrawInspectScope perf_inspect_scope(perf_scope.sampled());
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     capture_runtime_snapshot_if_requested();
@@ -12198,12 +12244,10 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
 #endif
     // Phase 1：FSR2 合成族预处理 pass 跳过（仅当上一帧累积 pass 被桥成功替换且未超时）
     if (fsr2_family_skip_gate(context, vertex_count, false))
-    {
-        if (perf_scope.sampled())
-            perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
         return;
-    }
+    perf_inspect_scope.start();
     const auto target_draw_info = inspect_target_upscaler_draw(context, vertex_count);
+    perf_inspect_scope.stop();
     if (target_draw_info && g_config.fsr2_translation_mode >= 3)
         observe_fsr2_dynamic_color_target(*target_draw_info);
     maybe_track_fsr2_color_candidate(context, vertex_count);
@@ -12225,22 +12269,14 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
     finish_fsr2_transient_capture_fallback();
 #endif
     if (fsr2_translation_handled)
-    {
-        if (perf_scope.sampled())
-            perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
         return;
-    }
 #endif
 
     if (try_hdr_sdr_tone_map_draw(context, vertex_count, [&]
         {
             g_original_draw(context, vertex_count, start_vertex_location);
         }))
-    {
-        if (perf_scope.sampled())
-            perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
         return;
-    }
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (try_spatial_copy_draw(context, vertex_count, [&]
@@ -12270,8 +12306,6 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
     if (final_scene_snapshot_boundary)
         queue_final_scene_snapshot(context, final_scene_snapshot_frame);
 #endif
-    if (perf_scope.sampled())
-        perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
 }
 
 HRESULT STDMETHODCALLTYPE hooked_map(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource, D3D11_MAP map_type, UINT map_flags, D3D11_MAPPED_SUBRESOURCE *mapped)

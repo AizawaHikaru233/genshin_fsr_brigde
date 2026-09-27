@@ -15,6 +15,12 @@
 //   9) maybe_flush respects the interval
 //  10) the emitted line carries the fields the A/B procedure reads
 //  11) segment name table covers every segment
+//  12) B105: SampledScope records draw_all into the histogram slot from its
+//      DESTRUCTOR and the value equals the segment accumulation (the old code
+//      read elapsed_ns() inside the scope, which is always 0)
+//  13) B105: DrawInspectScope is an explicit window; a draw that never enters
+//      introspection records 0, so both slots always share one sample set
+//  14) B105: the paired usage keeps draw_all and draw_inspect sample counts equal
 //
 // ASCII-only (consistent with the other tests in this directory).
 #include "PerfProbe.h"
@@ -246,6 +252,8 @@ void test_flush_line_and_reset()
     CHECK(g_histogram.find("2-4:1") != std::string::npos, "histogram line reports the 2-4us bucket");
     CHECK(g_histogram.find("64-128:1") != std::string::npos, "histogram line reports the 64-128us bucket");
     CHECK(g_histogram.find("mean_us=") != std::string::npos, "histogram line reports the mean");
+    CHECK(g_histogram.find("entered=") != std::string::npos,
+          "histogram line reports how many sampled draws really entered introspection (B105)");
     const char *needles[] = {
         "ms=", "fps=", "frames=", "ups=", "present=", "draws=",
         "budget_us=", "acct_us=", "unacc_us=", "self_est_us=",
@@ -384,6 +392,150 @@ void test_flush_not_reentrant()
     CHECK(g_sink_calls == 2, "flush is not re-entrant (sink calling flush_now does not recurse)");
 }
 
+// ⚠️ B105 回归：`draw_all` 直方图槽必须由 **SampledScope 自己在析构时**落桶，
+// 且与段累计拿到**同一份**耗时。
+//
+// 旧写法是调用方在函数体内写 `histogram.record(scope.elapsed_ns())`，而
+// `elapsed_ns()` 要到析构才被填 ⇒ 每次记的都是 0（真机：`draw_all n=685
+// mean_us=0.000000 <1us:685`，而同一秒的 `draw_inspect` 有数）。
+void test_sampled_scope_histogram_slot()
+{
+    perf_probe::reset_for_test();
+    perf_probe::configure(true, 60000, 4);
+    perf_probe::detail::DrawCostHistogram &histogram =
+        perf_probe::draw_cost_histogram(perf_probe::k_draw_all_slot);
+    CHECK(histogram.line() == "n=0", "draw_all slot starts empty");
+
+    // stride 4 ⇒ 12 次调用里只有下标 0/4/8 被计时。
+    // Sleep(5) 保证 QPC 真的跨过 tick（本机粒度 100 ns；错误清单第 10 条那一族坑）。
+    for (int i = 0; i < 12; ++i)
+    {
+        perf_probe::SampledScope scope(perf_probe::Segment::draw_hook,
+                                       perf_probe::draw_call_counter(),
+                                       perf_probe::draw_sample_counter(), 4,
+                                       perf_probe::k_draw_all_slot);
+        spin(20000);
+        Sleep(5);
+    }
+    std::uint64_t calls = 0;
+    std::uint64_t segment_total_ns = 0;
+    perf_probe::read_segment(perf_probe::Segment::draw_hook, &calls, &segment_total_ns, nullptr);
+    CHECK(calls == 3, "draw_all slot: 3 of 12 calls are timed at stride 4");
+    CHECK(histogram.count.load() == calls,
+          "draw_all slot: exactly one histogram sample per timed call (same sample set)");
+    CHECK(histogram.total_ns.load() == segment_total_ns,
+          "draw_all slot: the histogram and the segment accumulate the SAME elapsed");
+    CHECK(histogram.total_ns.load() > 0,
+          "draw_all slot is no longer all-zero (B105 regression)");
+
+    // 关掉探针：既不计时也不落桶（探针必须真的免费）
+    perf_probe::reset_for_test();
+    perf_probe::configure(false, 60000, 1);
+    {
+        perf_probe::SampledScope scope(perf_probe::Segment::draw_hook,
+                                       perf_probe::draw_call_counter(),
+                                       perf_probe::draw_sample_counter(), 1,
+                                       perf_probe::k_draw_all_slot);
+        spin(20000);
+    }
+    CHECK(histogram.line() == "n=0", "draw_all slot: disabled probe records nothing");
+}
+
+// ⚠️ B105 回归：内省窗口（槽 1）口径。
+//   进入内省 ⇒ 记实测耗时；没进入内省 ⇒ 记 0（这样两槽样本集合恒等，
+//   `mean(draw_all) − mean(draw_inspect)` 才是"非内省部分"）。
+void test_draw_inspect_window()
+{
+    perf_probe::reset_for_test();
+    perf_probe::configure(true, 60000, 1);
+    perf_probe::detail::DrawCostHistogram &histogram =
+        perf_probe::draw_cost_histogram(perf_probe::k_draw_inspect_slot);
+
+    // 本次调用没被抽样（active=false）⇒ 什么都不记
+    {
+        perf_probe::DrawInspectScope inactive(false);
+        inactive.start();
+        inactive.stop();
+    }
+    CHECK(histogram.line() == "n=0", "inspect window: unsampled calls record nothing");
+    CHECK(perf_probe::read_draw_inspect_entered() == 0,
+          "inspect window: unsampled calls are not counted as entered");
+
+    // 提前 return（family gate 命中 / 翻译接管）⇒ 记 0
+    {
+        perf_probe::DrawInspectScope skipped(true);
+    }
+    CHECK(histogram.count.load() == 1,
+          "inspect window: a draw that never entered still records one sample");
+    CHECK(histogram.total_ns.load() == 0, "inspect window: the skipped sample is exactly 0");
+    CHECK(histogram.buckets[0].load() == 1, "inspect window: the skipped sample lands in <1us");
+    CHECK(perf_probe::read_draw_inspect_entered() == 0,
+          "inspect window: skipped draws are not 'entered'");
+
+    // 真的进入内省 ⇒ 记实测耗时，entered +1
+    {
+        perf_probe::DrawInspectScope active(true);
+        active.start();
+        spin(20000);
+        Sleep(5);
+        active.stop();
+    }
+    CHECK(histogram.count.load() == 2, "inspect window: entered draws record one sample");
+    CHECK(histogram.total_ns.load() > 0, "inspect window: the entered sample carries real time");
+    CHECK(histogram.max_ns.load() == histogram.total_ns.load(),
+          "inspect window: only the entered sample contributed time");
+    CHECK(perf_probe::read_draw_inspect_entered() == 1,
+          "inspect window: entered draws are counted once");
+
+    // stop() 必须幂等，且析构兜底不能重复记
+    {
+        perf_probe::DrawInspectScope active(true);
+        active.start();
+        spin(20000);
+        active.stop();
+        active.stop();
+    }
+    CHECK(histogram.count.load() == 3, "inspect window: a second stop() does not record twice");
+    CHECK(perf_probe::read_draw_inspect_entered() == 2,
+          "inspect window: start() is idempotent for the entered counter");
+}
+
+// ⚠️ B105：`draw_all − draw_inspect` 成立的前提是**两槽样本集合恒等**。
+// 这里用真实的配对用法（同一个 `sampled()` 决定两个作用域）证明它：
+// 一半的 draw 提前 return（不进内省），样本数仍必须一模一样。
+void test_two_slots_share_sample_set()
+{
+    perf_probe::reset_for_test();
+    perf_probe::configure(true, 60000, 3);
+    int inspected = 0;
+    for (int i = 0; i < 9; ++i)
+    {
+        perf_probe::SampledScope scope(perf_probe::Segment::draw_hook,
+                                       perf_probe::draw_call_counter(),
+                                       perf_probe::draw_sample_counter(), 3,
+                                       perf_probe::k_draw_all_slot);
+        perf_probe::DrawInspectScope inspect(scope.sampled());
+        // i 为偶数 ⇒ 模拟 family gate 命中 / 翻译接管：**提前 return，没进内省**。
+        // 只有被抽样到的那些调用才可能真的进入内省（未抽样时 active=false）。
+        if ((i % 2) == 1)
+        {
+            inspect.start();
+            spin(20000);
+            inspect.stop();
+            if (scope.sampled())
+                ++inspected;
+        }
+    }
+    const std::uint64_t all = perf_probe::draw_cost_histogram(perf_probe::k_draw_all_slot).count.load();
+    const std::uint64_t only_inspect =
+        perf_probe::draw_cost_histogram(perf_probe::k_draw_inspect_slot).count.load();
+    CHECK(all == 3, "paired scopes: stride 3 over 9 calls => 3 samples in draw_all");
+    CHECK(only_inspect == all,
+          "paired scopes: draw_inspect has the SAME sample count as draw_all (so the difference is valid)");
+    CHECK(perf_probe::read_draw_inspect_entered() == static_cast<std::uint64_t>(inspected),
+          "paired scopes: entered counts only the draws that really ran introspection");
+}
+
 void test_maybe_flush_interval()
 {
     perf_probe::reset_for_test();
@@ -519,6 +671,9 @@ int main()
     test_flush_line_and_reset();
     test_draw_cost_histogram();
     test_sampled_scope_reports_sampling();
+    test_sampled_scope_histogram_slot();
+    test_draw_inspect_window();
+    test_two_slots_share_sample_set();
     test_flush_not_reentrant();
     test_maybe_flush_interval();
     test_interval_zero_falls_back();

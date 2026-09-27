@@ -43,6 +43,20 @@
 //     与"每 draw 2.26 µs"的均值矛盾 ⇒ 必须先看**分布**，再决定优化方向）。
 //   - 探针自身开销估算也打进那一行（`self_est_us/frame`），让读数可以自我核对。
 //
+// 【直方图两个槽的口径（B105 修正，读这两列前必看）】
+//   `draw_all`     = **整个 draw / draw_indexed 钩子体**（含 `g_original_draw_*`
+//                    —— **游戏自己的绘制提交**，桥不装也照样要花）。落桶在
+//                    `SampledScope` 的**析构**里 ⇒ 任何 return 路径都盖得到。
+//   `draw_inspect` = **只包住 `inspect_target_upscaler_draw*` 调用本身**；本次 draw
+//                    没进入内省（family gate 命中 / 翻译接管 / HDR 直通）时记 0。
+//   两槽样本集合都由 `perf_scope.sampled()` 决定 ⇒ **恒等**，因此
+//     `mean(draw_all) − mean(draw_inspect)` = 每次调用的**非内省部分**。
+//   ⚠️ `entered=` 是 slot 1 里"非 0 样本"的个数；它远小于 `draws_sampled` 时，
+//      slot 1 的均值被"未内省记 0"稀释过，别按"内省只要这么点时间"去读。
+//   ⚠️ `draw_all` **不等于"桥的开销"**：它把游戏自己的 `DrawIndexed` 提交也算进去了。
+//      判"桥净增多少"要看 `draw_inspect` 与"同一秒 `per_frame_us drawhook=` ÷
+//      `n draw_pf=`"的对比，不能直接拿 `drawhook` 当桥的成本。
+//
 // 【ini 键（段位 `[Dx11FsrBridge]`）】
 //   PerfProbe=0              总开关，**默认 0**（关）。非 0 = 开。
 //   PerfProbeIntervalMs=1000 汇总行间隔（毫秒）。0 视为默认。
@@ -299,8 +313,14 @@ struct DrawCostHistogram
     }
 };
 
-// 下标 0 = 钩子整体；下标 1 = 其中"内省"（inspect_target_upscaler_draw）那一段。
+// 下标 0 = 钩子整体（**由 SampledScope 在析构时落桶**）；下标 1 = 其中"内省"
+// （`inspect_target_upscaler_draw*`）那一段（由 DrawInspectScope 的窗口计时落桶）。
 inline DrawCostHistogram g_draw_cost[DrawCostHistogram::k_draw_cost_slots];
+
+// 本区间内**真正进入内省**的抽样次数（slot 1 里"非 0 样本"的个数）。
+// 用途：DrawInspectScope 会把"没进入内省"的 draw 记为 0 ⇒ 只看 slot 1 的
+// `<1us` 桶无法区分"内省很快"与"根本没内省"；这个数把两者分开。
+inline std::atomic_uint64_t g_draw_inspect_entered { 0 };
 
 } // namespace detail
 
@@ -367,9 +387,21 @@ private:
 class SampledScope
 {
 public:
+    // "不落直方图"的哨兵槽位。
+    static constexpr std::size_t k_no_histogram = static_cast<std::size_t>(-1);
+
+    // `histogram_slot` 非哨兵时，**析构**里把本次实测耗时记进该直方图槽。
+    //
+    // ⚠️ 2026-09-27（B105 修复 `draw_all` 恒 0）：落桶**必须发生在析构**。
+    // 旧写法由调用方在函数体内写 `histogram.record(scope.elapsed_ns())`，而
+    // `elapsed_ns()` 读的是 `m_elapsed_ns`，它**只在析构时**被填上 ⇒ 每次记的都是 0
+    // （真机 `draw_all n=685 mean_us=0.000000 <1us:685`）。
+    // 把落桶搬进来之后：**任何** return 路径、以及将来新增的 return 路径都不可能漏记。
     SampledScope(Segment segment, std::atomic_uint64_t &call_counter,
-                 std::atomic_uint64_t &sample_counter, std::uint32_t stride)
+                 std::atomic_uint64_t &sample_counter, std::uint32_t stride,
+                 std::size_t histogram_slot = k_no_histogram)
         : m_segment(segment)
+        , m_histogram_slot(histogram_slot)
     {
         if (!detail::g_enabled.load(std::memory_order_relaxed))
             return;
@@ -390,8 +422,13 @@ public:
         if (now > m_start)
         {
             m_elapsed_ns = detail::ticks_to_ns(now - m_start);
+            // 段累计口径与旧版**逐字不变**：只在真的跨过 tick 时才 add_ns。
             detail::add_ns(m_segment, m_elapsed_ns);
         }
+        // 直方图则**每个已抽样的调用都记一次**（含耗时取整为 0 的情况），
+        // 这样槽的样本数恒等于 `draw_sampled`，与 `per_frame_us drawhook=` 同源。
+        if (m_histogram_slot != k_no_histogram)
+            detail::g_draw_cost[m_histogram_slot].record(m_elapsed_ns);
     }
 
     SampledScope(const SampledScope &) = delete;
@@ -407,6 +444,10 @@ public:
     }
 
     // 已计时的耗时（纳秒）；未计时返回 0。
+    //
+    // ⚠️ **只在析构之后有效** —— 析构时才会填 `m_elapsed_ns`。在作用域内读它
+    // 恒得 0（B104 的 `draw_all` 恒 0 就是这个原因）。B105 起槽 0 的落桶已由
+    // 本类自己承担，新代码**不应**再需要这个接口；它留给单测与诊断读取。
     std::uint64_t elapsed_ns() const
     {
         return m_elapsed_ns;
@@ -416,6 +457,7 @@ private:
     Segment m_segment;
     std::int64_t m_start = 0;
     std::uint64_t m_elapsed_ns = 0;
+    std::size_t m_histogram_slot = k_no_histogram;
 };
 
 // ---- 复用已有的分段测量（不额外取时间）----
@@ -527,6 +569,8 @@ inline void flush_now()
     const std::uint64_t dispatch_sampled = detail::g_dispatch_sampled.exchange(0, std::memory_order_relaxed);
     const std::uint64_t jitter_calls = detail::g_jitter_calls.exchange(0, std::memory_order_relaxed);
     const std::uint64_t scope_calls = detail::g_scope_calls.exchange(0, std::memory_order_relaxed);
+    const std::uint64_t inspect_entered =
+        detail::g_draw_inspect_entered.exchange(0, std::memory_order_relaxed);
 
     // 每段：calls / 每帧 µs / max µs，并复位
     std::uint64_t calls[detail::k_segment_count] {};
@@ -641,10 +685,12 @@ inline void flush_now()
         // （每帧总量），本行是**分布** —— 用来判断"均值是不是被少数巨贵调用带偏的"。
         char histogram_line[768] {};
         std::snprintf(histogram_line, sizeof(histogram_line),
-            "perf_probe_hist_draw ms=%.0f draws_total=%llu draws_sampled=%llu | draw_all %s | draw_inspect %s",
+            "perf_probe_hist_draw ms=%.0f draws_total=%llu draws_sampled=%llu entered=%llu"
+            " | draw_all %s | draw_inspect %s",
             elapsed_ms,
             static_cast<unsigned long long>(draw_calls),
             static_cast<unsigned long long>(draw_sampled),
+            static_cast<unsigned long long>(inspect_entered),
             detail::g_draw_cost[0].line().c_str(),
             detail::g_draw_cost[1].line().c_str());
         sink(histogram_line);
@@ -707,6 +753,12 @@ inline std::uint64_t read_draw_calls()
     return detail::g_draw_calls.load(std::memory_order_relaxed);
 }
 
+// 本区间真正进入内省的抽样次数（slot 1 里非 0 样本的个数）。
+inline std::uint64_t read_draw_inspect_entered()
+{
+    return detail::g_draw_inspect_entered.load(std::memory_order_relaxed);
+}
+
 inline std::uint64_t read_frames(FrameSource source)
 {
     return source == FrameSource::upscale
@@ -724,6 +776,10 @@ inline detail::DrawCostHistogram &draw_cost_histogram(std::size_t slot)
 {
     return detail::g_draw_cost[slot < detail::DrawCostHistogram::k_draw_cost_slots ? slot : 0];
 }
+
+// 直方图槽位的具名下标（埋点处**不要**写裸 0/1）。
+inline constexpr std::size_t k_draw_all_slot = 0;      // 整个 draw / draw_indexed 钩子
+inline constexpr std::size_t k_draw_inspect_slot = 1;  // 其中"内省窗口"（未内省记 0）
 
 inline const char *segment_name(Segment segment)
 {
@@ -753,6 +809,7 @@ inline void reset_for_test()
     detail::g_dispatch_sampled.store(0, std::memory_order_relaxed);
     detail::g_jitter_calls.store(0, std::memory_order_relaxed);
     detail::g_scope_calls.store(0, std::memory_order_relaxed);
+    detail::g_draw_inspect_entered.store(0, std::memory_order_relaxed);
     detail::g_last_check_ms.store(0, std::memory_order_relaxed);
     detail::g_flushing.store(false, std::memory_order_relaxed);
     for (std::size_t i = 0; i < detail::DrawCostHistogram::k_draw_cost_slots; ++i)
@@ -782,27 +839,63 @@ inline std::atomic_uint64_t &dispatch_sample_counter()
 }
 
 // ---- draw 钩子内省段的计时作用域（直方图下标 1）----
-// 只对**已抽样**的那次调用计时（1/stride），且与 SampledScope 共用 "sampled()" 判定，
-// 保证两个直方图槽的样本集合完全一致 ⇒ "draw_all 减去 draw_inspect" 才有意义。
+//
+// 【口径（与读数一一对应，B105 起）】
+//   下标 0 `draw_all`     = **整个钩子体**（由 `SampledScope` 在析构时落桶）；
+//   下标 1 `draw_inspect` = **只包住 `inspect_target_upscaler_draw*` 调用本身**；
+//                           本次 draw 没进入内省时记 **0**。
+//   两槽的样本集合都由 `perf_scope.sampled()` 决定 ⇒ **恒等**
+//   ⇒ `mean(draw_all) − mean(draw_inspect)` = 每次调用的**非内省部分**
+//     （family gate / 探针闸门 / **原始 draw 调用**）。
+//
+// 【为什么不能像 B104 那样把作用域摆在函数开头】
+//   那样量到的是整个钩子体（含 `g_original_draw_indexed` —— 游戏自己的绘制提交），
+//   与 `draw_all` 同口径 ⇒ 两数相减恒 ≈0，"1.1 ms 里有多少是内省"**结构上无法回答**
+//   （真机上 `draw_inspect ≈ drawhook 均值` 正是这么来的）。
+//
+// 【为什么用 start()/stop() 而不是纯 RAII】
+//   "本次没有内省"本身也是要上报的读数（记 0），所以生命周期必须横跨整条函数；
+//   纯 RAII 只能覆盖"进过内省"的那部分，样本集合就会与 slot 0 不一致。
 class DrawInspectScope
 {
 public:
     explicit DrawInspectScope(bool active)
         : m_active(active)
     {
-        if (!m_active)
+    }
+
+    // 内省窗口开始 / 结束。**只在真的调用内省的那一行前后成对调用**；
+    // 提前 return 的路径（family gate / 翻译接管）不调用 ⇒ 析构时记 0。
+    void start()
+    {
+        if (!m_active || m_started)
             return;
+        m_started = true;
         m_start = detail::qpc_ticks();
         detail::g_scope_calls.fetch_add(1, std::memory_order_relaxed);
+        detail::g_draw_inspect_entered.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void stop()
+    {
+        if (!m_active || !m_started || m_ended)
+            return;
+        m_ended = true;
+        const std::int64_t now = detail::qpc_ticks();
+        detail::g_draw_cost[1].record(now > m_start ? detail::ticks_to_ns(now - m_start) : 0);
     }
 
     ~DrawInspectScope()
     {
-        if (!m_active || m_start == 0)
+        if (!m_active)
             return;
-        const std::int64_t now = detail::qpc_ticks();
-        if (now > m_start)
-            detail::g_draw_cost[1].record(detail::ticks_to_ns(now - m_start));
+        if (!m_started)
+        {
+            // 本次 draw 没有进入内省 ⇒ 如实记 0（保证与 slot 0 的样本集合一致）。
+            detail::g_draw_cost[1].record(0);
+            return;
+        }
+        stop();  // 兜底：万一调用方忘了 stop()，不要把这一份样本丢掉
     }
 
     DrawInspectScope(const DrawInspectScope &) = delete;
@@ -810,6 +903,8 @@ public:
 
 private:
     bool m_active = false;
+    bool m_started = false;
+    bool m_ended = false;
     std::int64_t m_start = 0;
 };
 
