@@ -19,6 +19,9 @@
 #include "BridgeLogger.h"
 #include "PerfProbe.h"
 // 旧方案（On12 引导 / FSR2 翻译层）已移除，不再编译。
+//
+// 【本文件中的 `B1xx` 编号】= 本项目历次变更批次的编号（`B103`…`B109`）；
+//   每个编号的实质内容即紧随其后的注释段落。
 
 #include <algorithm>
 #include <array>
@@ -8314,7 +8317,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     //
     // ⚠️ 2026-09-27（B105 更正）✗：上面"这条路径本来就很便宜"这句**已被证伪**，
     // 但**下面的 B105 修复也不是那 13 倍差的答案**：
-    //   - 证伪依据：那次 `avg_ns 2591→2600` 的探针本身不可信（错误清单第 10 条：
+    //   - 证伪依据：那次 `avg_ns 2591→2600` 的探针本身不可信（给纳秒级函数加微秒级探针），
     //     给纳秒级函数加微秒级探针），不能用来支持"便宜"；
     //   - 而 B105 修掉的那条 `std::string` 实测只有 36~46 ns（见上），量级不够；
     //   - ⇒ 剩下的候选是"2.2 µs 量的是**整个钩子体**（含游戏自己的 draw 提交）"，
@@ -8403,7 +8406,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
 #endif
 
     // 统一的释放（B106：下面新增了两条早退路径 ⇒ 用一处 lambda 消灭"失败返回漏 Release"
-    // 这一类错，错误清单第 12 条）。释放对象与顺序与旧实现**逐条一致**（SRV → RTV → cb）。
+    // 这一类错）。释放对象与顺序与旧实现**逐条一致**（SRV → RTV → cb）。
     const auto release_bound_views = [&]()
     {
         for (ID3D11ShaderResourceView *view : shader_resources)
@@ -14484,7 +14487,7 @@ static void route_from_d3d11_device(ID3D11Device *d3d11_device)
 //
 // 为什么两个功能**互不依赖**：只开 `TransparentJitter` 时也必须能工作 ——
 // 若把它塞进 `if (g_config.fsr2_il2cpp_hook)` 里，就会出现"ini 里设了没用"的
-// 静默失效（错误清单第 7/11 条那一族）。
+// 静默失效。
 // ---------------------------------------------------------------------------
 struct Il2CppRvaCache
 {
@@ -14732,7 +14735,7 @@ void initialize()
     //
     // ⚠️ 刻意放在 `DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL` **之外**：
     // 这是**正式功能**（修透明队列物件边缘硬阶梯），不该依赖实验性翻译层宏
-    //（否则某些构建里"ini 里设了没用"，错误清单第 7 条）。
+    //（否则某些构建里"ini 里设了没用"）。
     // `TransparentJitter=0` 时**连 sink 都不注册**、不碰任何游戏内存 ⇒ 零开销。
     if (g_config.transparent_jitter)
     {

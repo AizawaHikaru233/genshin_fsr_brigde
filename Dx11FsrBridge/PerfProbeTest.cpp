@@ -1,5 +1,8 @@
 // PerfProbeTest.cpp — PerfProbe (header-only segmented frame-time probe) unit test.
 //
+// `B1xx` below = the project's internal change-batch numbers (B103..B109); each
+// number's substance is the paragraph that immediately follows it in this file.
+//
 // No game, no GPU, no BridgeLogger: PerfProbe.h is header-only and the log line
 // goes through an injected sink, so this test only needs Windows API + the header.
 //
@@ -517,7 +520,7 @@ void test_sampled_scope_histogram_slot()
     CHECK(histogram.line() == "n=0", "draw_all slot starts empty");
 
     // stride 4 ⇒ 12 次调用里只有下标 0/4/8 被计时。
-    // Sleep(5) 保证 QPC 真的跨过 tick（本机粒度 100 ns；错误清单第 10 条那一族坑）。
+    // Sleep(5) 保证 QPC 真的跨过 tick（本机粒度 100 ns；同一族坑）。
     for (int i = 0; i < 12; ++i)
     {
         perf_probe::SampledScope scope(perf_probe::Segment::draw_hook,
