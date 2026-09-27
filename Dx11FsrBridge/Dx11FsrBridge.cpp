@@ -12058,6 +12058,10 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
                                         perf_probe::draw_sample_counter(),
                                         perf_probe::draw_sample_stride());
     perf_probe::maybe_flush();
+    // 【诊断】内省段的直方图计时（只对已抽样的那次调用计时；见 PerfProbe.h 段定义）。
+    // 目的：`drawhook` 的**均值**（"抽样均值 × 次数"外推）无法区分"每次调用都有固定成本"
+    // 与"少数巨贵调用把均值带偏"。直方图给出真实分布，两者对应的优化方向相反。
+    perf_probe::DrawInspectScope perf_inspect_scope(perf_scope.sampled());
     // passthrough 机制已整体移除（实测让 OptiScaler 丢失 FFX 输入识别）。
     // 所有显卡统一桥直连；OptiScaler 共存时并行（各自独立链路，实测无冲突；
     // N/Intel 上 OptiScaler 用于提供 DLSS/XeSS，不依赖桥让路）。
@@ -12082,7 +12086,11 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
 #endif
     // Phase 1：FSR2 合成族预处理 pass 跳过（仅当上一帧累积 pass 被桥成功替换且未超时）
     if (fsr2_family_skip_gate(context, index_count, true))
+    {
+        if (perf_scope.sampled())
+            perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
         return;
+    }
     const auto target_draw_info = inspect_target_upscaler_draw(context, index_count);
     if (target_draw_info && g_config.fsr2_translation_mode >= 3)
         observe_fsr2_dynamic_color_target(*target_draw_info);
@@ -12105,7 +12113,11 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
     finish_fsr2_transient_capture_fallback();
 #endif
     if (fsr2_translation_handled)
+    {
+        if (perf_scope.sampled())
+            perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
         return;
+    }
 #endif
 
     if (try_hdr_sdr_tone_map_draw(context, index_count, [&]
@@ -12113,6 +12125,8 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
             g_original_draw_indexed(context, index_count, start_index_location, base_vertex_location);
         }))
     {
+        if (perf_scope.sampled())
+            perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
         return;
     }
 
@@ -12121,7 +12135,11 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
         {
             g_original_draw_indexed(context, index_count, start_index_location, base_vertex_location);
         }))
+    {
+        if (perf_scope.sampled())
+            perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
         return;
+    }
 
     if (g_config.enable_similarity_probe ||
         (g_config.trace_pixel_shader_draws && g_current_ps_hash.load(std::memory_order_relaxed) == g_config.trace_pixel_shader_hash))
@@ -12144,6 +12162,8 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
     if (final_scene_snapshot_boundary)
         queue_final_scene_snapshot(context, final_scene_snapshot_frame);
 #endif
+    if (perf_scope.sampled())
+        perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
 }
 
 // ---------------------------------------------------------------------------
@@ -12155,6 +12175,8 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
                                         perf_probe::draw_sample_counter(),
                                         perf_probe::draw_sample_stride());
     perf_probe::maybe_flush();
+    // 【诊断】与 hooked_draw_indexed 同一处置（只对已抽样的调用计时）。
+    perf_probe::DrawInspectScope perf_inspect_scope(perf_scope.sampled());
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     capture_runtime_snapshot_if_requested();
 #endif
@@ -12176,7 +12198,11 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
 #endif
     // Phase 1：FSR2 合成族预处理 pass 跳过（仅当上一帧累积 pass 被桥成功替换且未超时）
     if (fsr2_family_skip_gate(context, vertex_count, false))
+    {
+        if (perf_scope.sampled())
+            perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
         return;
+    }
     const auto target_draw_info = inspect_target_upscaler_draw(context, vertex_count);
     if (target_draw_info && g_config.fsr2_translation_mode >= 3)
         observe_fsr2_dynamic_color_target(*target_draw_info);
@@ -12199,7 +12225,11 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
     finish_fsr2_transient_capture_fallback();
 #endif
     if (fsr2_translation_handled)
+    {
+        if (perf_scope.sampled())
+            perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
         return;
+    }
 #endif
 
     if (try_hdr_sdr_tone_map_draw(context, vertex_count, [&]
@@ -12207,6 +12237,8 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
             g_original_draw(context, vertex_count, start_vertex_location);
         }))
     {
+        if (perf_scope.sampled())
+            perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
         return;
     }
 
@@ -12238,6 +12270,8 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
     if (final_scene_snapshot_boundary)
         queue_final_scene_snapshot(context, final_scene_snapshot_frame);
 #endif
+    if (perf_scope.sampled())
+        perf_probe::draw_cost_histogram(0).record(perf_scope.elapsed_ns());
 }
 
 HRESULT STDMETHODCALLTYPE hooked_map(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource, D3D11_MAP map_type, UINT map_flags, D3D11_MAPPED_SUBRESOURCE *mapped)

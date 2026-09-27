@@ -47,6 +47,8 @@ int checks = 0;
     } while (0)
 
 std::string g_captured;
+std::string g_summary;
+std::string g_histogram;
 int g_sink_calls = 0;
 bool g_sink_reenters = false;
 
@@ -54,6 +56,10 @@ void capture_sink(const char *line)
 {
     ++g_sink_calls;
     g_captured = line != nullptr ? line : "";
+    if (g_captured.rfind("perf_probe_hist_draw ", 0) == 0)
+        g_histogram = g_captured;
+    else
+        g_summary = g_captured;
     if (g_sink_reenters)
     {
         // Re-entrancy guard check: this must return immediately (g_flushing is set).
@@ -210,6 +216,8 @@ void test_flush_line_and_reset()
     perf_probe::set_log_sink(&capture_sink);
     perf_probe::configure(true, 60000, 1);
     g_captured.clear();
+    g_summary.clear();
+    g_histogram.clear();
     g_sink_calls = 0;
 
     for (int i = 0; i < 4; ++i)
@@ -222,10 +230,22 @@ void test_flush_line_and_reset()
                                      perf_probe::draw_call_counter(),
                                      perf_probe::draw_sample_counter(), 1);
     perf_probe::add_span_us(perf_probe::Segment::interop_signal, 200);
+    // 直方图也必须有真实样本，示例输出才不是空的（字段形状来自实跑）。
+    perf_probe::draw_cost_histogram(0).record(420);
+    perf_probe::draw_cost_histogram(0).record(2260);
+    perf_probe::draw_cost_histogram(0).record(90000);
+    perf_probe::draw_cost_histogram(1).record(180);
     perf_probe::flush_now();
 
-    CHECK(g_sink_calls == 1, "flush_now: emits exactly one line");
-    CHECK(g_captured.rfind("perf_probe ", 0) == 0, "flush line starts with perf_probe");
+    CHECK(g_sink_calls == 2, "flush_now: emits the summary line plus the histogram line");
+    CHECK(g_summary.rfind("perf_probe ", 0) == 0, "flush line starts with perf_probe");
+    CHECK(g_histogram.rfind("perf_probe_hist_draw ", 0) == 0, "histogram line starts with perf_probe_hist");
+    CHECK(g_histogram.find("draw_all n=3") != std::string::npos, "histogram line carries the draw_all column");
+    CHECK(g_histogram.find("draw_inspect n=1") != std::string::npos, "histogram line carries the draw_inspect column");
+    CHECK(g_histogram.find("<1us:1") != std::string::npos, "histogram line reports the <1us bucket");
+    CHECK(g_histogram.find("2-4:1") != std::string::npos, "histogram line reports the 2-4us bucket");
+    CHECK(g_histogram.find("64-128:1") != std::string::npos, "histogram line reports the 64-128us bucket");
+    CHECK(g_histogram.find("mean_us=") != std::string::npos, "histogram line reports the mean");
     const char *needles[] = {
         "ms=", "fps=", "frames=", "ups=", "present=", "draws=",
         "budget_us=", "acct_us=", "unacc_us=", "self_est_us=",
@@ -233,7 +253,7 @@ void test_flush_line_and_reset()
         "jitter=", "cnt vprotect=", "flushic=", "sleep=", "waitobj=",
     };
     for (const char *needle : needles)
-        CHECK(g_captured.find(needle) != std::string::npos, needle);
+        CHECK(g_summary.find(needle) != std::string::npos, needle);
 
     // counters / frames must be reset by the flush
     CHECK(perf_probe::read_frames(perf_probe::FrameSource::upscale) == 0, "flush resets frames");
@@ -246,11 +266,109 @@ void test_flush_line_and_reset()
     CHECK(calls == 0 && total == 0, "flush resets segment accumulation");
 
     // frames counted => fps and budget_us must be finite/positive-ish tokens
-    CHECK(g_captured.find("frames=4") != std::string::npos, "flush reports the frame count");
+    CHECK(g_summary.find("frames=4") != std::string::npos, "flush reports the frame count");
 
-    // Print one real line so the shape of the output is documented (and so the
+    // Print the real lines so the shape of the output is documented (and so the
     // user's A/B instruction can quote an actual example instead of a mock-up).
-    std::printf("\nexample_flush_line:\n%s\n", g_captured.c_str());
+    std::printf("\nexample_flush_lines:\n%s\n%s\n", g_summary.c_str(), g_histogram.c_str());
+}
+
+// 单次调用成本直方图：桶边界必须是精确的（否则"中位数落在哪个桶"会被读错）。
+void test_draw_cost_histogram()
+{
+    perf_probe::reset_for_test();
+    perf_probe::configure(true, 60000, 1);
+
+    perf_probe::detail::DrawCostHistogram &histogram = perf_probe::draw_cost_histogram(0);
+    CHECK(histogram.line() == "n=0", "histogram: empty line is n=0");
+    CHECK(perf_probe::detail::DrawCostHistogram::bucket_for(0) == 0, "histogram: 0 ns -> <1us");
+    CHECK(perf_probe::detail::DrawCostHistogram::bucket_for(999) == 0, "histogram: 999 ns -> <1us");
+    CHECK(perf_probe::detail::DrawCostHistogram::bucket_for(1000) == 1, "histogram: 1000 ns -> 1-2us");
+    CHECK(perf_probe::detail::DrawCostHistogram::bucket_for(2047) == 1, "histogram: 2047 ns -> 1-2us");
+    CHECK(perf_probe::detail::DrawCostHistogram::bucket_for(2048) == 2, "histogram: 2048 ns -> 2-4us");
+    CHECK(perf_probe::detail::DrawCostHistogram::bucket_for(4096) == 3, "histogram: 4096 ns -> 4-8us");
+    CHECK(perf_probe::detail::DrawCostHistogram::bucket_for(2260) == 2, "histogram: the 2.26 us reading lands in 2-4us");
+    CHECK(perf_probe::detail::DrawCostHistogram::bucket_for(1000000) == perf_probe::detail::DrawCostHistogram::k_bucket_count - 1,
+          "histogram: 1 ms and above clamps to the last bucket");
+
+    histogram.record(300);
+    histogram.record(1200);
+    histogram.record(2260);
+    const std::string line = histogram.line();
+    CHECK(line.find("n=3") != std::string::npos, "histogram: counts every record");
+    CHECK(line.find("<1us:1") != std::string::npos, "histogram: 300 ns reported in <1us");
+    CHECK(line.find("1-2:1") != std::string::npos, "histogram: 1200 ns reported in 1-2us");
+    CHECK(line.find("2-4:1") != std::string::npos, "histogram: 2260 ns reported in 2-4us");
+    CHECK(histogram.max_ns.load() == 2260, "histogram: max is the largest recorded");
+
+    // idx 1 与 idx 0 必须彼此独立（整体钩子 vs 内省段）
+    CHECK(perf_probe::draw_cost_histogram(1).line() == "n=0", "histogram: slot 1 is independent");
+
+    // 越界下标必须被夹住，不能写到数组外
+    CHECK(&perf_probe::draw_cost_histogram(99) == &perf_probe::draw_cost_histogram(0),
+          "histogram: out-of-range slot clamps to slot 0");
+
+    perf_probe::flush_now();
+    CHECK(perf_probe::draw_cost_histogram(0).line() == "n=0", "histogram: flush resets the histogram");
+}
+
+// SampledScope 必须自报"本次是否计时"，直方图据此取样（不重新读计数器，避免偏移 1）。
+//
+// ⚠️ `elapsed_ns()` 只在**析构**时才被填上 ⇒ 若写成栈对象，作用域内读到的一定是 0
+// （本测试第一版就是这么错的：那是**测试**的错，不是探针的错）。
+// 这里 new 一个再 delete：delete **之前**复制出 `sampled()` 与 `elapsed_ns()`
+// （delete 之后再解引用就是 use-after-free），析构之后再读段累计来证明"确实记了时间"。
+void measure_one_sampled_scope(bool *out_sampled, std::uint64_t *out_elapsed_alive,
+                               std::uint64_t *out_segment_total_ns)
+{
+    auto *scope = new perf_probe::SampledScope(perf_probe::Segment::draw_hook,
+                                               perf_probe::draw_call_counter(),
+                                               perf_probe::draw_sample_counter(), 8);
+    // Sleep(5) 保证 QPC 真的跨过 tick：本机 QPC 粒度 100 ns，而纯 spin(200000) 在
+    // /O2 下仍可能整段落在同一个 tick 内（实测 delta=0）⇒ 那样测的是粒度不是逻辑。
+    spin(200000);
+    Sleep(5);
+    const bool sampled = scope->sampled();
+    const std::uint64_t alive = scope->elapsed_ns(); // 析构前：必然是 0
+    delete scope;
+    std::uint64_t calls = 0;
+    std::uint64_t total = 0;
+    perf_probe::read_segment(perf_probe::Segment::draw_hook, &calls, &total, nullptr);
+    if (out_sampled != nullptr)
+        *out_sampled = sampled;
+    if (out_elapsed_alive != nullptr)
+        *out_elapsed_alive = alive;
+    if (out_segment_total_ns != nullptr)
+        *out_segment_total_ns = total;
+}
+
+void test_sampled_scope_reports_sampling()
+{
+    perf_probe::reset_for_test();
+    perf_probe::configure(true, 60000, 8);
+    int sampled = 0;
+    int unsampled = 0;
+    std::uint64_t segment_total_ns = 0;
+    for (int i = 0; i < 16; ++i)
+    {
+        bool was_sampled = false;
+        std::uint64_t alive = 0xFFFFFFFFFFFFFFFFull;
+        const std::uint64_t before = segment_total_ns;
+        measure_one_sampled_scope(&was_sampled, &alive, &segment_total_ns);
+        CHECK(alive == 0, "SampledScope: elapsed_ns is 0 until the scope is destroyed");
+        if (was_sampled)
+        {
+            ++sampled;
+            CHECK(segment_total_ns > before, "SampledScope: a sampled call adds time to its segment");
+        }
+        else
+        {
+            ++unsampled;
+            CHECK(segment_total_ns == before, "SampledScope: an unsampled call adds no time");
+        }
+    }
+    CHECK(sampled == 2, "SampledScope: 2 of 16 calls are sampled at stride 8");
+    CHECK(unsampled == 14, "SampledScope: the rest are not sampled");
 }
 
 void test_flush_not_reentrant()
@@ -263,7 +381,7 @@ void test_flush_not_reentrant()
     perf_probe::note_frame(perf_probe::FrameSource::upscale);
     perf_probe::flush_now();
     g_sink_reenters = false;
-    CHECK(g_sink_calls == 1, "flush is not re-entrant (sink calling flush_now does not recurse)");
+    CHECK(g_sink_calls == 2, "flush is not re-entrant (sink calling flush_now does not recurse)");
 }
 
 void test_maybe_flush_interval()
@@ -284,10 +402,10 @@ void test_maybe_flush_interval()
     // well past one tick.
     Sleep(50);
     perf_probe::maybe_flush();
-    CHECK(g_sink_calls == 1, "maybe_flush: emits once the interval elapses");
+    CHECK(g_sink_calls == 2, "maybe_flush: emits the two lines once the interval elapses");
     perf_probe::maybe_flush();
     perf_probe::maybe_flush();
-    CHECK(g_sink_calls <= 2, "maybe_flush: does not emit again immediately");
+    CHECK(g_sink_calls <= 4, "maybe_flush: does not emit again immediately");
 }
 
 void test_interval_zero_falls_back()
@@ -399,6 +517,8 @@ int main()
     test_sampling();
     test_counters_and_frames();
     test_flush_line_and_reset();
+    test_draw_cost_histogram();
+    test_sampled_scope_reports_sampling();
     test_flush_not_reentrant();
     test_maybe_flush_interval();
     test_interval_zero_falls_back();

@@ -36,7 +36,11 @@
 //     `抽到的总时长 × (实际次数 / 抽样次数)` 外推 ⇒ 开销降到 1/32，且 max 仍保留。
 //   - `upscale_dispatch` 与 `interop_*` **不额外取时间**：直接复用 Ffx12Backend
 //     已有的 `qpc_us()` 分段测量（`add_span_us`）⇒ 这些段零附加开销。
-//   - 日志：**每 `PerfProbeIntervalMs`（默认 1000 ms）一行**，不刷屏。
+//   - 日志：**每 `PerfProbeIntervalMs`（默认 1000 ms）两行**，不刷屏：
+//     ① `perf_probe …` 汇总行；② `perf_probe_hist_draw …` **单次调用成本直方图**
+//     （见 `detail::DrawCostHistogram`）。②回答的是①**结构上**回答不了的问题：
+//     "均值是不是被少数巨贵调用带偏的"（B104 实测：逐 draw 的 COM 调用都是纳秒级，
+//     与"每 draw 2.26 µs"的均值矛盾 ⇒ 必须先看**分布**，再决定优化方向）。
 //   - 探针自身开销估算也打进那一行（`self_est_us/frame`），让读数可以自我核对。
 //
 // 【ini 键（段位 `[Dx11FsrBridge]`）】
@@ -52,6 +56,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <string>
 
 namespace perf_probe
 {
@@ -197,6 +202,106 @@ inline double per_frame_us(std::uint64_t total_ns, std::uint64_t frames)
     return static_cast<double>(total_ns) / 1000.0 / static_cast<double>(frames);
 }
 
+// ---- 单次调用成本直方图（回答"均值是不是被少数巨贵调用带偏的"）----
+//
+// 【它回答什么问题】
+//   `draw_hook` 段只给**均值**（抽样均值 × 实际次数）。均值有两个盲区：
+//     ① 若每帧只有几次调用是微秒级、其余是纳秒级，均值会把账记到"每次调用"头上；
+//     ② 若成本均匀分布在每一次调用上，均值才是"逐 draw 固定成本"。
+//   两者对应的优化方向**完全相反**（前者要找那几次调用，后者才该削固定成本），
+//   所以必须看**分布**，不能只看均值。
+//
+// 【为什么是指数桶】耗时天然跨数量级（50 ns ~ 500 µs）；线性桶要么分辨率不够、
+//   要么桶太细。指数桶（2 的幂）用一次位宽计算定位，且"中位数落在哪个桶"
+//   一眼可读 ⇒ 直接给出"绝大多数调用有多便宜"。
+//
+// 【开销】与 SampledScope 同源：只对**已抽样**的那一次调用记录，即 1/stride；
+//   记录本身 = 1 次位宽计算 + 3 次 relaxed 原子加。
+struct DrawCostHistogram
+{
+    // 调用方在**同一个**局部作用域里 record 两次（整体钩子 / 只含内省），
+    // 两个下标即可拆出"非内省部分"。
+    static constexpr std::size_t k_draw_cost_slots = 2;
+    static constexpr std::size_t k_bucket_count = 11; // <1us,1-2,...,256-512,>=512 (us)
+
+    std::atomic_uint64_t count { 0 };
+    std::atomic_uint64_t total_ns { 0 };
+    std::atomic_uint64_t max_ns { 0 };
+    std::atomic_uint64_t buckets[k_bucket_count] {};
+
+    // ns 的最高有效位（0..64）。不用 `__builtin_clzll`：那是 GCC/Clang 内建，
+    // MSVC 不认（本仓库用 MSVC 构建）。
+    static std::size_t bit_width(std::uint64_t value)
+    {
+        std::size_t width = 0;
+        while (value != 0)
+        {
+            ++width;
+            value >>= 1;
+        }
+        return width;
+    }
+
+    static std::size_t bucket_for(std::uint64_t ns)
+    {
+        if (ns < 1000)
+            return 0;
+        // 1000..2047 -> 1, 2048..4095 -> 2, ...
+        // bit_width(1000)=10、bit_width(1024)=11 ⇒ 偏移 10 会让 1000..1023 落到 0，
+        // 也就是与"<1us"合并 —— 这不是错，但会让 1-2us 的边界变成 1024 而不是 1000，
+        // 读数时容易误判，所以显式把 1000..2047 全部归入 1。
+        const std::size_t width = bit_width(ns);
+        const std::size_t index = width <= 11 ? 1 : width - 10;
+        return index < k_bucket_count ? index : k_bucket_count - 1;
+    }
+
+    void record(std::uint64_t ns)
+    {
+        count.fetch_add(1, std::memory_order_relaxed);
+        total_ns.fetch_add(ns, std::memory_order_relaxed);
+        std::uint64_t current = max_ns.load(std::memory_order_relaxed);
+        if (ns > current)
+            max_ns.store(ns, std::memory_order_relaxed);
+        buckets[bucket_for(ns)].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void reset()
+    {
+        count.store(0, std::memory_order_relaxed);
+        total_ns.store(0, std::memory_order_relaxed);
+        max_ns.store(0, std::memory_order_relaxed);
+        for (std::size_t i = 0; i < k_bucket_count; ++i)
+            buckets[i].store(0, std::memory_order_relaxed);
+    }
+
+    // 形如 "n=120 mean_us=0.4 max_us=12.1 <1us:110 1-2:8 8-16:2"（只报非零桶）
+    std::string line() const
+    {
+        static const char *const labels[k_bucket_count] = {
+            "<1us", "1-2", "2-4", "4-8", "8-16", "16-32", "32-64", "64-128", "128-256", "256-512", ">=512"
+        };
+        const std::uint64_t total = count.load(std::memory_order_relaxed);
+        std::string text = "n=" + std::to_string(total);
+        if (total == 0)
+            return text;
+        const double mean_us = static_cast<double>(total_ns.load(std::memory_order_relaxed)) / 1000.0 /
+            static_cast<double>(total);
+        text += " mean_us=" + std::to_string(mean_us);
+        text += " max_us=" + std::to_string(
+            static_cast<double>(max_ns.load(std::memory_order_relaxed)) / 1000.0);
+        for (std::size_t i = 0; i < k_bucket_count; ++i)
+        {
+            const std::uint64_t value = buckets[i].load(std::memory_order_relaxed);
+            if (value != 0)
+                text += " " + std::string(labels[i]) + ":" + std::to_string(value);
+        }
+        return text;
+    }
+};
+
+// 下标 0 = 钩子整体；下标 1 = 其中"内省"（inspect_target_upscaler_draw）那一段。
+inline DrawCostHistogram g_draw_cost[DrawCostHistogram::k_draw_cost_slots];
+
 } // namespace detail
 
 // ---- 配置 ----
@@ -283,15 +388,34 @@ public:
             return;
         const std::int64_t now = detail::qpc_ticks();
         if (now > m_start)
-            detail::add_ns(m_segment, detail::ticks_to_ns(now - m_start));
+        {
+            m_elapsed_ns = detail::ticks_to_ns(now - m_start);
+            detail::add_ns(m_segment, m_elapsed_ns);
+        }
     }
 
     SampledScope(const SampledScope &) = delete;
     SampledScope &operator=(const SampledScope &) = delete;
 
+    // 本次调用是否真的在计时；调用方据此决定是否把同一份耗时投进直方图。
+    // ⚠️ **不要**在 SampledScope 之后再读 draw_call_counter 自己重算：
+    // 构造时已经 fetch_add 过同一个计数器，重算会偏移 1 ⇒ 直方图样本集合
+    // 与这里的计时样本集合不一致，"均值"就对不上 `per_frame_us drawhook=`。
+    bool sampled() const
+    {
+        return m_start != 0;
+    }
+
+    // 已计时的耗时（纳秒）；未计时返回 0。
+    std::uint64_t elapsed_ns() const
+    {
+        return m_elapsed_ns;
+    }
+
 private:
     Segment m_segment;
     std::int64_t m_start = 0;
+    std::uint64_t m_elapsed_ns = 0;
 };
 
 // ---- 复用已有的分段测量（不额外取时间）----
@@ -511,6 +635,21 @@ inline void flush_now()
             static_cast<unsigned long long>(counter_values[5]),
             static_cast<unsigned long long>(counter_max_us[static_cast<std::size_t>(Counter::wait_single_object)]));
         sink(line);
+
+        // 第二行：**单次调用成本直方图**（只含已抽样的那次调用）。
+        // 与上一行 `per_frame_us drawhook=` 的区别：上一行是"抽样均值 × 次数"的外推
+        // （每帧总量），本行是**分布** —— 用来判断"均值是不是被少数巨贵调用带偏的"。
+        char histogram_line[768] {};
+        std::snprintf(histogram_line, sizeof(histogram_line),
+            "perf_probe_hist_draw ms=%.0f draws_total=%llu draws_sampled=%llu | draw_all %s | draw_inspect %s",
+            elapsed_ms,
+            static_cast<unsigned long long>(draw_calls),
+            static_cast<unsigned long long>(draw_sampled),
+            detail::g_draw_cost[0].line().c_str(),
+            detail::g_draw_cost[1].line().c_str());
+        sink(histogram_line);
+        for (std::size_t i = 0; i < detail::DrawCostHistogram::k_draw_cost_slots; ++i)
+            detail::g_draw_cost[i].reset();
     }
 
     detail::g_flushing.store(false, std::memory_order_release);
@@ -580,6 +719,12 @@ inline std::uint64_t read_jitter_calls()
     return detail::g_jitter_calls.load(std::memory_order_relaxed);
 }
 
+// 直方图访问（draw 钩子埋点用；下标含义见 detail::DrawCostHistogram 注释）。
+inline detail::DrawCostHistogram &draw_cost_histogram(std::size_t slot)
+{
+    return detail::g_draw_cost[slot < detail::DrawCostHistogram::k_draw_cost_slots ? slot : 0];
+}
+
 inline const char *segment_name(Segment segment)
 {
     const auto index = static_cast<std::size_t>(segment);
@@ -610,6 +755,8 @@ inline void reset_for_test()
     detail::g_scope_calls.store(0, std::memory_order_relaxed);
     detail::g_last_check_ms.store(0, std::memory_order_relaxed);
     detail::g_flushing.store(false, std::memory_order_relaxed);
+    for (std::size_t i = 0; i < detail::DrawCostHistogram::k_draw_cost_slots; ++i)
+        detail::g_draw_cost[i].reset();
     detail::g_enabled.store(false, std::memory_order_relaxed);
 }
 
@@ -633,5 +780,37 @@ inline std::atomic_uint64_t &dispatch_sample_counter()
 {
     return detail::g_dispatch_sampled;
 }
+
+// ---- draw 钩子内省段的计时作用域（直方图下标 1）----
+// 只对**已抽样**的那次调用计时（1/stride），且与 SampledScope 共用 "sampled()" 判定，
+// 保证两个直方图槽的样本集合完全一致 ⇒ "draw_all 减去 draw_inspect" 才有意义。
+class DrawInspectScope
+{
+public:
+    explicit DrawInspectScope(bool active)
+        : m_active(active)
+    {
+        if (!m_active)
+            return;
+        m_start = detail::qpc_ticks();
+        detail::g_scope_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    ~DrawInspectScope()
+    {
+        if (!m_active || m_start == 0)
+            return;
+        const std::int64_t now = detail::qpc_ticks();
+        if (now > m_start)
+            detail::g_draw_cost[1].record(detail::ticks_to_ns(now - m_start));
+    }
+
+    DrawInspectScope(const DrawInspectScope &) = delete;
+    DrawInspectScope &operator=(const DrawInspectScope &) = delete;
+
+private:
+    bool m_active = false;
+    std::int64_t m_start = 0;
+};
 
 } // namespace perf_probe
