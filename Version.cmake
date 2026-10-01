@@ -33,4 +33,4 @@
 #    其内的 `Version` 只是安装时由 `install.write_config` 写进 `config.ini` 的
 #    清单副本，不列入上面这份手工跟号清单。
 # ============================================================================
-set(FSR_SUITE_VERSION 2.3.0.0)
+set(FSR_SUITE_VERSION 2.3.1.0)
