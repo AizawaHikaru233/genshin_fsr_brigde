@@ -1321,6 +1321,14 @@ constexpr std::uint64_t k_p1_native_release_ms = 500;
 // 连续拒绝最多持续这么久就会自动放行一次 ⇒ 拒绝**不可能**饿死接管者（实机教训：不加
 // 这个上界会造成"超分完全停止"的死锁）。
 constexpr std::uint64_t k_p1_bootstrap_health_ms = 500;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+// 【本批新增 · 问题 B】"另一个实例**仍在派发**"的时间窗（毫秒）：`ffx12_input_alias` 的
+// 命中若落在这个窗内（或另一实例仍在活性表里）⇒ 算"真·两路并发共用同一组输入"；
+// 否则只是**陈旧记录 / 指针复用**（时间序交替的两代实例、切场景重建后的老槽）。
+// 取 100ms：一帧以上（远大于两路交替派发的间隔），又远小于账户切换/重建的秒级间隙。
+// ⚠️ 它只服务 `ffx12_input_alias` 的"并发/陈旧"分类（**只喂日志**）⇒ 发布构建排除。
+constexpr std::uint64_t k_input_alias_recent_ms = 100;
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（ffx12_input_alias 的分类窗口 —— 只喂日志）
 
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
 std::string hex32(std::uint32_t value)
@@ -4093,7 +4101,7 @@ void load_config()
     // 【正式功能】P1 单实例接管（默认开）——段必须是 `[Dx11FsrBridge]`。
     // 它读在诊断守卫之外：这是**功能键**（消费者改变行为），发布构建必须保留。
     g_config.ffx12_single_instance =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12SingleInstance", 1, config_path.c_str()) != 0;
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12SingleInstance", 0, config_path.c_str()) != 0;
     g_config.ffx12_single_instance_pick = std::clamp<std::uint32_t>(
         static_cast<std::uint32_t>(GetPrivateProfileIntW(
             L"Dx11FsrBridge", L"Ffx12SingleInstancePick", 0, config_path.c_str())),
@@ -10598,6 +10606,56 @@ bool try_fsr2_translation_draw(
             // 视图↔实例 归属错配（两路 render 尺寸相同 ⇒ (instance,w,h) 过滤器区分不了）。
             std::uint64_t dbg_color = 0;
             std::uint64_t dbg_depth = 0;
+            // ---- 【功能 · B124】本实例**上一次真正派发**用的 color 采样来源（输入归属证据）----
+            // 消费者是**决策**、不是日志：路径 2 的候选选择（"来源命中 ⇒ 首选" /
+            // "来源不同且记忆新鲜 ⇒ 排除"）与多义拒绝的豁免判据 `claim_input_owned` 都读它
+            // ⇒ 属于 B124 的归属修法（修左右 1:1 分屏的可见抖动）⇒ 发布构建**必须保留**。
+            // ⚠️ 口径：只在**派发成功**时更新（"上次派发用的那张"才有归属含义）。
+            std::uint64_t acc_in_color = 0;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+            // ---- 【仅诊断 · B123】本实例的累积 draw"去向"分布（纯计数，不做任何决策）----
+            // 为什么必须有：单实例接管下**被选中**那一路"没进 dispatch"的 draw 此前没有计数器
+            //   （`ffx12_single_instance_passthrough` 只统计**未选中**那一路；fail-closed 那一类
+            //   完全不可见）⇒ 实机出现"被选中实例只派发 2 次 / 另一路 passthrough 6656 次"却
+            //   答不出"那 6654 个 draw 去哪了"。
+            // 口径（与 `fsr2_family_takeover::classify_accumulate_destination` 逐条一致）：
+            //   acc_seen = 本实例被认领的累积 draw 总数；下面各桶之和应等于它（可对账）。
+            std::uint64_t acc_seen = 0;
+            std::uint64_t acc_dispatch = 0;            // ① 进了 dispatch
+            std::uint64_t acc_dispatch_repair = 0;      // ①' 输出修复拷贝
+            std::uint64_t acc_dispatch_reuse = 0;       // ①'' 同代次复用拷贝
+            std::uint64_t acc_pass_not_taker = 0;       // ② 未被选中 ⇒ 放行原生
+            std::uint64_t acc_pass_refuse = 0;          // ② 多义拒绝 ⇒ 放行原生
+            std::uint64_t acc_pass_native_window = 0;   // ② 交棒后的纯原生窗口
+            std::uint64_t acc_pass_strict = 0;          // ② E2 严格匹配
+            std::uint64_t acc_fail_closed = 0;          // ③ 被 fail-closed 吞掉（既不派发也不放行）
+            std::uint64_t acc_dispatch_failed = 0;      // ⑤ 其它：派发失败（fail-open）
+            std::uint64_t acc_texture_missing = 0;      // ⑤ 其它：纹理取不到
+            // ---- 【仅诊断 · B123/B125】本实例**上一次真正派发**时的输入/输出资源键 ----
+            // 用途：让"每一路各自的输入资源键"成为可读事实（两路同键时直接看得见），
+            //   并给 `ffx12_input_alias` 的"并发 / 陈旧记录"分类提供那条记录的时刻。
+            // ⚠️ `acc_in_color` **不在本门控内**（它是 B124 的功能证据，见上）。
+            std::uint64_t acc_in_depth = 0;
+            std::uint64_t acc_in_motion = 0;
+            std::uint64_t acc_in_out = 0;
+            std::uint64_t acc_in_tick = 0;   // 上面这组指针的记录时刻（GetTickCount64）
+            std::uint32_t acc_in_frame = 0;  // 最近一次派发的游戏帧号
+            std::uint32_t acc_in_match_path = 0; // 该 draw 是怎么被认领的（1/2/3）
+            std::uint32_t acc_in_slots = 0;      // 打包的槽位（color|depth<<8|motion<<16|out<<24）
+            std::uint64_t acc_log_tick = 0;      // 本实例上一行对账日志的时刻（限频用）
+            // ---- 【仅诊断 · B125】**喂进去**的抖动 + 它的新鲜度（纯诊断）----
+            // 为什么需要：本场实机（`ffx12_dispatch` 的 `jitter_px=`）显示，进程最初几帧之后
+            //   每个实例的抖动**恒定不变**（分屏那一路 13/13、另一路 108/108 次采样同值）
+            //   ⇒ FSR 时域累积失去亚像素采样多样性（本仓记录："抖动冻结 → 无 AA"），
+            //   与"画面偏软 + 边缘闪"同形。这里只记录**实际喂进去**的那一对值，
+            //   以及"与上一帧逐位相同"的连续帧数（判据本体在纯函数里，可离线单测）。
+            float acc_in_jit_x = 0.0f;
+            float acc_in_jit_y = 0.0f;
+            std::uint32_t acc_in_jit_frozen = 0; // 连续"与上一帧相同"的帧数（0 = 本帧有变化）
+            float jit_last_x = 0.0f;             // 上一帧喂进去的抖动（本实例独立）
+            float jit_last_y = 0.0f;
+            bool jit_last_valid = false;
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（去向计数 + 输入/输出键 + 抖动新鲜度 —— 只喂日志）
         };
         static Sdk234InstState sdk234_insts[8] {};
         static std::size_t sdk234_inst_count = 0;
@@ -10608,6 +10666,14 @@ bool try_fsr2_translation_draw(
         // 诊断：交棒总次数（**单调计数**，与日志行是否被丢弃无关）。
         static std::atomic_uint64_t sdk234_flip_total { 0 };
         static std::atomic_uint64_t sdk234_dispatch_count { 0 };
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+        // 【仅诊断 · B123】"没被匹配到任何实例"（untagged）的累积 draw 总数。
+        // 为什么放在函数层：对账行（`ffx12_accum_dest`）要在**认领完成处**就报出第 ④ 类，
+        // 而原来的计数点在其后（`match_inst == 0` 分支内的局部 static）⇒ 这里提升为作用域内
+        // 单一定义，两个位置共用同一个来源（避免两套口径）。
+        // ⚠️ 它只服务那一行日志（`untagged_total=`）⇒ 发布构建排除。
+        static std::atomic_uint64_t sdk234_untagged_total { 0 };
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（ffx12_accum_dest 的 untagged_total= —— 只喂日志）
         static std::atomic_uint64_t sdk234_inst_log_tick { 0 };
 
         // ---- 修复①(c)：释放一个实例的"接管残留状态"（交棒时对老接管者调用）----
@@ -10665,6 +10731,34 @@ bool try_fsr2_translation_draw(
         if (draw_out_res != nullptr)
             draw_out_res->Release();
 
+        // 1b) 当前 draw 的**采样来源**（color SRV 上的资源指针）—— 【本批 2026-09-29 新增】
+        // 为什么必须有它（**左右 1:1 分屏实机定案**，B123 的 `ffx12_accum_dest` 直接给出）：
+        //   两路 render 尺寸相同时，(instance,render_w,render_h) 与"token 代次最新"都分不出
+        //   这个 draw 属于哪一路 ⇒ 实测接管者 seen=17561 / disp=2393（13.6%）/ pass_refuse=15119
+        //   （86%）⇒ 那半屏在 FSR4 与游戏原生之间来回切 = 用户看到的**可见抖动**。
+        //   而"采样来源"是每一路视图自己的 G-buffer（实机 56 秒内同一路 111 行读数完全一致）
+        //   ⇒ 它是**与输出归属并列**的一等归属证据，同时用于两处：
+        //     ① draw→实例 归属（下面第 2 步：优先认给"来源命中"的实例）；
+        //     ② "多义拒绝"的豁免（本 draw 采的就是我们自己的 ⇒ 不是猜测，是真帧）。
+        // 成本：每个**被识别出的**累积 draw 一次 `PSGetShaderResources(1)` + 1 次 GetResource
+        //   （实机量级 ~620 次/秒；同一路径里的 OMGetRenderTargets(4) + 识别本身都比它重）。
+        //   ⚠️ 与派发时记录 `acc_in_color` 的口径**同一来源**（都用 color_srv_slot）⇒ 可比。
+        std::uint64_t claim_color_ptr = 0;
+        {
+            ID3D11ShaderResourceView *claim_srv = nullptr;
+            context->PSGetShaderResources(draw_info->color_srv_slot, 1, &claim_srv);
+            if (claim_srv != nullptr)
+            {
+                ID3D11Resource *claim_res = nullptr;
+                if ((claim_srv->GetResource(&claim_res), claim_res != nullptr))
+                {
+                    claim_color_ptr = reinterpret_cast<std::uint64_t>(claim_res);
+                    claim_res->Release();
+                }
+                claim_srv->Release();
+            }
+        }
+
         // 2) draw→实例 匹配
         il2cpp_callsite::CapturedParams call_params {};
         std::uint64_t call_gen = 0;
@@ -10694,7 +10788,7 @@ bool try_fsr2_translation_draw(
         // 裁决，否则单视图场景里接管者会被永久拒绝（实机回归 2026-09-28：
         // `ffx12_ambiguous_bootstrap` 每帧命中一次、涨到 5376，而另一路的 :g 代次已冻住 54 秒
         // ⇒ 桥超分隔帧推进 ⇒ 静止边缘抖动/锯齿）。
-        constexpr std::uint64_t k_p1_live_ms = 3000;
+        constexpr std::uint64_t k_p1_live_ms = 200;
         std::uint64_t p1_liveness_inst[8] {};
         std::uint64_t p1_liveness_seen[8] {};
         std::uint32_t p1_liveness_n = 0;
@@ -10743,6 +10837,19 @@ bool try_fsr2_translation_draw(
                     return true;
             }
             return false;
+        };
+        // 【本批 2026-09-29】按实例取状态槽（只读）：draw→实例 归属要看"它记过的采样来源/
+        // 输出"，而这一步发生在 `st`（本次认领的槽）解析之前 ⇒ 需要一个只读查表入口。
+        const auto p1_state_for = [&](std::uint64_t inst) -> const Sdk234InstState *
+        {
+            if (inst == 0)
+                return nullptr;
+            for (std::size_t j = 0; j < sdk234_inst_count; ++j)
+            {
+                if (sdk234_insts[j].instance == inst)
+                    return &sdk234_insts[j];
+            }
+            return nullptr;
         };
         // 诊断：是否存在"画过但早已沉默"的幽灵实例（不参与任何裁决，只用于验收探针）。
         // 这里顺手把纯函数跑一遍（生产路径也覆盖它，避免实现漂移只在单测里被发现）。
@@ -10830,6 +10937,20 @@ bool try_fsr2_translation_draw(
             if (match_inst == 0)
             {
                 std::uint64_t best_gen = 0;
+                // 【本批 2026-09-29 · 分屏】两条**不依赖 token 代次**的备选（都只在读到
+                // 采样来源 `claim_color_ptr` 时才可能成立）：
+                //   `best_gen_src`  —— 本 draw 采样的 color **就是**该实例上次派发用的那张
+                //                     ⇒ 正面证据："这个 draw 是它的"（首选，与代次顺序无关）；
+                //   `best_gen_keep` —— 该实例**没有**采样来源记忆（例如从未派发过的另一路），
+                //                     或它的记忆可能已过期 ⇒ 不排除（次选，按代次最新）。
+                //   被**排除**的形态 = "记忆是新的、且确与本 draw 的来源不同" ⇒ 这个 draw
+                //   不是它的（实机：另一路的累积 draw 因"token 代次最新"被误认给接管者，
+                //   既让接管者的 `seen` 混进别人的 draw，也白占一次拒绝计数）。
+                std::uint64_t best_gen_src = 0, best_gen_keep = 0;
+                std::uint64_t pick_src_inst = 0, pick_keep_inst = 0;
+                il2cpp_callsite::RenderToken pick_src_token {}, pick_keep_token {};
+                std::uint64_t cand_now = 0;
+                bool cand_now_valid = false;
                 for (std::size_t i = 0; i < inst_n; ++i)
                 {
                     il2cpp_callsite::RenderToken token {};
@@ -10862,6 +10983,65 @@ bool try_fsr2_translation_draw(
                         call_params = token.params;
                         match_path = 2; // 仅靠 token bootstrap：**没有输出归属校验**
                     }
+                    if (claim_color_ptr != 0)
+                    {
+                        const Sdk234InstState *cand = p1_state_for(insts[i]);
+                        const std::uint64_t cand_color = cand != nullptr ? cand->acc_in_color : 0;
+                        const bool cand_color_known = cand_color != 0;
+                        const bool cand_color_matches = cand_color_known && cand_color == claim_color_ptr;
+                        bool cand_memory_fresh = false;
+                        if (cand_color_known && cand != nullptr)
+                        {
+                            if (!cand_now_valid)
+                            {
+                                cand_now = GetTickCount64();
+                                cand_now_valid = true;
+                            }
+                            cand_memory_fresh = cand->last_dispatch_tick != 0 &&
+                                cand_now >= cand->last_dispatch_tick &&
+                                cand_now - cand->last_dispatch_tick <= k_p1_bootstrap_health_ms;
+                        }
+                        if (cand_color_matches)
+                        {
+                            // 正面：来源命中（首选）
+                            if (token.generation > best_gen_src)
+                            {
+                                best_gen_src = token.generation;
+                                pick_src_inst = insts[i];
+                                pick_src_token = token;
+                            }
+                        }
+                        else if (!fsr2_family_takeover::p1_exclude_candidate_by_source(
+                                     cand_color_known, cand_color_matches, cand_memory_fresh))
+                        {
+                            // 没有来源记忆 / 记忆可能过期 ⇒ 不排除（次选）
+                            if (token.generation > best_gen_keep)
+                            {
+                                best_gen_keep = token.generation;
+                                pick_keep_inst = insts[i];
+                                pick_keep_token = token;
+                            }
+                        }
+                        // else：记忆是新的、且确实不是本 draw 的来源 ⇒ **排除**这个候选
+                    }
+                }
+                // 覆盖旧规则的**唯一**条件（旧规则仍保留为兜底：既有单测/既有场景不变）：
+                //   · 有来源命中 ⇒ 认给命中者（与代次顺序无关 ⇒ 两路交错渲染下也稳定）；
+                //   · 否则若有"未被排除"的候选 ⇒ 认给其中代次最新者；
+                //   · 一个都没有 ⇒ 退回旧规则（**绝不出现"无人认领"** ⇒ 不可能因此饿死接管者）。
+                if (best_gen_src != 0)
+                {
+                    match_inst = pick_src_inst;
+                    call_gen = pick_src_token.generation;
+                    call_params = pick_src_token.params;
+                    match_path = 2;
+                }
+                else if (best_gen_keep != 0)
+                {
+                    match_inst = pick_keep_inst;
+                    call_gen = pick_keep_token.generation;
+                    call_params = pick_keep_token.params;
+                    match_path = 2;
                 }
             }
             // No pending token means this is not a new temporal input.  It
@@ -10925,13 +11105,149 @@ bool try_fsr2_translation_draw(
                 st->render_area = p1_area;
         }
 
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+        // ---- 【仅诊断 · B123/B125】逐实例"累积 draw 去向"对账 + 各路输入资源键（限频、只读）----
+        // 位置：认领完成之后、本函数**任何** return 之前 ⇒ 本实例的每一个被认领的累积 draw 都
+        //   计入 `acc_seen`，无论它最终①进 dispatch、②放行原生、③被 fail-closed 吞掉。
+        //   这修掉的正是"被选中实例只派发 2 次、其余 draw 去向无处可查"的那个盲区
+        //   （`ffx12_single_instance_passthrough` 只统计**未选中**那一路）。
+        // 只写日志、不改任何决策；`Ffx12SingleInstanceDiag=1` 才写（默认关，≤1 行/实例/2 秒）。
+        if (st != nullptr)
+        {
+            ++st->acc_seen;
+            if (g_config.ffx12_single_instance_diag)
+            {
+                constexpr std::uint64_t k_acc_log_interval_ms = 2000;
+                const std::uint64_t dest_now = GetTickCount64();
+                if (st->acc_log_tick == 0 || dest_now - st->acc_log_tick >= k_acc_log_interval_ms)
+                {
+                    st->acc_log_tick = dest_now;
+                    const std::uint64_t acc_sum = st->acc_dispatch + st->acc_dispatch_repair +
+                        st->acc_dispatch_reuse + st->acc_pass_not_taker + st->acc_pass_refuse +
+                        st->acc_pass_native_window + st->acc_pass_strict + st->acc_fail_closed +
+                        st->acc_dispatch_failed;
+                    // ⚠️ `acc_texture_missing` **刻意不进这个和**：它是 fail_closed 的**子原因标签**
+                    // （同一个 draw 既算 fail_closed 又打标签）⇒ 计入会让 `dest_gap` 恒无意义。
+                    // "两路同键"直接指认：找出另一个实例，它的**上次派发**用的是同一组
+                    // (color,depth)（或同一个输出）⇒ 连同它自己的归属路径/槽位一起打出，
+                    // 这样"同键是哪个决策点造成的"不必再从别处推。
+                    std::uint64_t same_in_other = 0, same_out_other = 0;
+                    std::uint32_t same_in_other_mp = 0, same_in_other_slots = 0;
+                    // 【本批 2026-09-29 · B125】"两路共用几何输入"的**指认**（只读、只进日志）：
+                    //   `sh_other` = 那个**在线**的另一路实例；`sh_geom` = 共用了什么。
+                    // 判据本体在纯函数 `classify_shared_geometry` 里（含两条排除：陈旧记录不算、
+                    // color 相同的"同一路"不算）⇒ 该字段可以直接当"游戏是否把 depth/motion
+                    // 绑给了两路"的机器可读证据，不必再从 `in=` 手工比对推断。
+                    std::uint64_t sh_other = 0;
+                    fsr2_family_takeover::SharedGeometryKind sh_kind =
+                        fsr2_family_takeover::SharedGeometryKind::None;
+                    std::uint32_t same_out_other_live = 0;
+                    for (std::size_t j = 0; j < sdk234_inst_count; ++j)
+                    {
+                        const Sdk234InstState &o = sdk234_insts[j];
+                        if (o.instance == 0 || o.instance == match_inst || o.acc_in_tick == 0)
+                            continue;
+                        if (same_in_other == 0 && st->acc_in_color != 0 &&
+                            o.acc_in_color == st->acc_in_color && o.acc_in_depth == st->acc_in_depth)
+                        {
+                            same_in_other = o.instance;
+                            same_in_other_mp = o.acc_in_match_path;
+                            same_in_other_slots = o.acc_in_slots;
+                        }
+                        if (same_out_other == 0 && st->acc_in_out != 0 &&
+                            o.acc_in_out == st->acc_in_out)
+                        {
+                            same_out_other = o.instance;
+                            // 那条记录是不是来自**仍在画**的实例（0 = 陈旧记录/已销毁）
+                            same_out_other_live = p1_instance_is_live(o.instance) ? 1u : 0u;
+                        }
+                        if (sh_other == 0)
+                        {
+                            fsr2_family_takeover::SharedGeometryFacts sh_facts {};
+                            sh_facts.self_color = st->acc_in_color;
+                            sh_facts.self_depth = st->acc_in_depth;
+                            sh_facts.self_motion = st->acc_in_motion;
+                            sh_facts.other_color = o.acc_in_color;
+                            sh_facts.other_depth = o.acc_in_depth;
+                            sh_facts.other_motion = o.acc_in_motion;
+                            sh_facts.other_currently_live = p1_instance_is_live(o.instance);
+                            const fsr2_family_takeover::SharedGeometryKind k =
+                                fsr2_family_takeover::classify_shared_geometry(sh_facts);
+                            if (k != fsr2_family_takeover::SharedGeometryKind::None)
+                            {
+                                sh_other = o.instance;
+                                sh_kind = k;
+                            }
+                        }
+                    }
+                    LOG_INFO(blog::cat::upscale, "ffx12_accum_dest inst=" +
+                        hex64(match_inst & 0xFFFFFFFFull) +
+                        " role=" + std::string(match_inst == sdk234_take_cur ? "take" : "pass") +
+                        " seen=" + std::to_string(st->acc_seen) +
+                        // ① 进 dispatch（含不推进历史的两种拷贝）
+                        " disp=" + std::to_string(st->acc_dispatch) +
+                        " repair=" + std::to_string(st->acc_dispatch_repair) +
+                        " reuse=" + std::to_string(st->acc_dispatch_reuse) +
+                        // ② 走了 passthrough（按放行原因分桶）
+                        " pass_not_taker=" + std::to_string(st->acc_pass_not_taker) +
+                        " pass_refuse=" + std::to_string(st->acc_pass_refuse) +
+                        " pass_native=" + std::to_string(st->acc_pass_native_window) +
+                        " pass_strict=" + std::to_string(st->acc_pass_strict) +
+                        // ③ fail-closed 吞掉（**此前完全不可见**的那一类）
+                        " fail_closed=" + std::to_string(st->acc_fail_closed) +
+                        // ⑤ 其它
+                        " disp_failed=" + std::to_string(st->acc_dispatch_failed) +
+                        " tex_missing=" + std::to_string(st->acc_texture_missing) +
+                        // 对账：各桶之和 == seen ⇒ 没有"去向不明"的 draw（缺口即桶不全）
+                        " dest_gap=" + std::to_string(
+                            st->acc_seen >= acc_sum ? st->acc_seen - acc_sum : 0) +
+                        " untagged_total=" + std::to_string(
+                            sdk234_untagged_total.load(std::memory_order_relaxed)) +
+                        // 本路**自己的**输入/输出资源键（是否真的与另一路不同，一眼可判）
+                        " in=" + hex64(st->acc_in_color) + "/" + hex64(st->acc_in_depth) + "/" +
+                        hex64(st->acc_in_motion) + "/" + hex64(st->acc_in_out) +
+                        " in_age_ms=" + std::to_string(
+                            st->acc_in_tick != 0 && dest_now >= st->acc_in_tick
+                                ? dest_now - st->acc_in_tick : 0) +
+                        " in_frame=" + std::to_string(st->acc_in_frame) +
+                        " in_path=" + std::to_string(st->acc_in_match_path) +
+                        " in_slots=" + std::to_string((st->acc_in_slots >> 24) & 0xFFu) + "/" +
+                        std::to_string((st->acc_in_slots >> 16) & 0xFFu) + "/" +
+                        std::to_string((st->acc_in_slots >> 8) & 0xFFu) + "/" +
+                        std::to_string(st->acc_in_slots & 0xFFu) +
+                        // 两路同键/同输出的**指认**（0 = 没有）
+                        " same_in_other=" + hex64(same_in_other & 0xFFFFFFFFull) +
+                        " same_in_other_path=" + std::to_string(same_in_other_mp) +
+                        " same_in_other_slots=" + std::to_string((same_in_other_slots >> 24) & 0xFFu) + "/" +
+                        std::to_string((same_in_other_slots >> 16) & 0xFFu) + "/" +
+                        std::to_string((same_in_other_slots >> 8) & 0xFFu) + "/" +
+                        std::to_string(same_in_other_slots & 0xFFu) +
+                        " same_out_other=" + hex64(same_out_other & 0xFFFFFFFFull) +
+                        // 【本批 2026-09-29 · B125】那条"同输出"记录是不是来自**仍在画**的实例
+                        //   （0 = 陈旧记录 ⇒ 不是"两路写同一输出"）
+                        " same_out_other_live=" + std::to_string(same_out_other_live) +
+                        // 【本批 2026-09-29 · B125】"两路共用几何输入"的指认 + 分类
+                        //   （none / depth_only / motion_only / depth_and_motion；见纯函数说明）
+                        " sh_geom=" + std::string(
+                            fsr2_family_takeover::shared_geometry_kind_name(sh_kind)) +
+                        " sh_other=" + hex64(sh_other & 0xFFFFFFFFull) +
+                        // 【本批 2026-09-29 · B125】本帧**实际喂进去**的抖动 + 连续冻结帧数
+                        //   （判据：与上一帧逐位相同 ⇒ 冻结；抖动恒定 = 没有亚像素采样多样性）
+                        " in_jit=" + std::to_string(st->acc_in_jit_x) + "," +
+                        std::to_string(st->acc_in_jit_y) +
+                        " jit_frozen=" + std::to_string(st->acc_in_jit_frozen));
+                }
+            }
+        }
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（ffx12_accum_dest 对账行 + 去向计数 + 共享几何/抖动字段）
+
         // ---- P1：多实例裁决（只接管一个实例，其余放行游戏原生上采样） ----
         // 判据（全序 ⇒ 天然粘滞，不逐帧漂移）：① render 面积大者优先；② 面积相同取
         // **最早出现**的实例。候选只在"最近 k_p1_live_ms 内仍被匹配到"的实例间产生，
         // 已退场的实例不会长期占着接管权。理由见交付说明，Ffx12SingleInstancePick 可覆盖。
         if (g_config.ffx12_single_instance && st != nullptr)
         {
-            constexpr std::uint64_t k_p1_live_ms = 3000;
+            constexpr std::uint64_t k_p1_live_ms = 200;
             const std::uint64_t p1_now = GetTickCount64();
             st->p1_last_seen_tick = p1_now;
             std::uint64_t take_inst = 0;
@@ -11192,6 +11508,9 @@ bool try_fsr2_translation_draw(
             // 未消费 token 在 250ms 内一直有效，留着会污染后续的 draw→实例匹配。
             if (take_inst != 0 && take_inst != match_inst)
             {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                ++st->acc_pass_not_taker; // 【仅诊断】② 未被选中 ⇒ 放行原生（按实例记账）
+#endif
                 const bool p1_consumed =
                     call_gen != 0 && il2cpp_callsite::consume_render_token_for(match_inst, call_gen);
                 const std::uint64_t pc =
@@ -11231,6 +11550,9 @@ bool try_fsr2_translation_draw(
             // 窗口内**所有**该实例的累积 draw 都放行（不逐个判代次）：整段窗口内这一路
             // 完全由游戏原生 FSR2 产出，避免"一帧原生 + 一帧我们"在同一双缓冲里交替。
             const std::uint64_t nw_count = ++st->native_window_count;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+            ++st->acc_pass_native_window; // 【仅诊断】② 交棒后的纯原生窗口 ⇒ 放行原生
+#endif
             if (g_config.ffx12_single_instance_diag && (nw_count <= 8 || nw_count % 256 == 0))
             {
                 LOG_INFO(blog::cat::upscale, "ffx12_native_window count=" +
@@ -11285,6 +11607,11 @@ bool try_fsr2_translation_draw(
                 release_untagged_accumulate = true;
             static std::atomic_uint64_t sdk234_untagged_draw_count { 0 };
             static std::atomic_uint64_t sdk234_untagged_release_count { 0 };
+            // 【本批新增 · 问题 A】同一个事实的第二处记账：函数层总数（供对账行输出）。
+            // 增量点与下面 `ur` 完全同步 ⇒ 两个读数口径一致。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+            sdk234_untagged_total.fetch_add(1, std::memory_order_relaxed);
+#endif
             const std::uint64_t ur =
                 sdk234_untagged_draw_count.fetch_add(1, std::memory_order_relaxed) + 1;
             const std::uint64_t released_total = release_now
@@ -11443,6 +11770,16 @@ bool try_fsr2_translation_draw(
         //   判据本体已抽成纯函数 `fsr2_family_takeover::p1_refuse_token_only_claim`
         //   （见 Fsr2FamilyTakeover.h/.cpp）：两条"不可饿死"不变式由离线单测钉住，
         //   这里只负责把"事实"填进去。
+        // ---- P1（本批 2026-09-29）：输入归属 —— "本 draw 采样的 color 就是我们自己的" ----
+        // （采样来源 `claim_color_ptr` 已在第 1b 步读到，这里只做判定，不再重复读 SRV。）
+        // 判据口径：认领者上一次**成功派发**时用的 color（`acc_in_color`）== 本 draw 现场
+        //   在 color_srv_slot 上取到的 color 指针 ⇒ 这是同一路视图的帧。
+        //   ⚠️ 只比 color、**刻意不比 depth**：派发时记录的 depth 是"DSV 覆盖后"的那张
+        //   （见上方 ffx12_depth_dsv 分支），而这里现场只能拿到 SRV 槽位上的那张 ——
+        //   两者在实机上并不总是同一张 ⇒ 比 depth 会假阴性。color 没有这个覆盖问题。
+        const bool claim_input_owned = st != nullptr && match_path == 2 &&
+            !output_belongs_to_instance && st->acc_in_color != 0 &&
+            st->acc_in_color == claim_color_ptr;
         fsr2_family_takeover::TokenOnlyClaimFacts p2_facts {};
         p2_facts.single_instance_takeover = g_config.ffx12_single_instance;
         // ⚠️ 必须用"**当前**确有另一个活跃实例"（非粘性），而不是"历史上出现过第二个实例"。
@@ -11455,6 +11792,7 @@ bool try_fsr2_translation_draw(
         p2_facts.claimer_is_current_taker = match_inst != 0 && match_inst == sdk234_take_cur;
         p2_facts.claimed_by_token_only = match_path == 2;
         p2_facts.output_belongs_to_claimer = output_belongs_to_instance;
+        p2_facts.input_belongs_to_claimer = claim_input_owned;
         p2_facts.claim_has_generation = call_gen != 0;
         p2_facts.same_size_token_candidates = match_token_candidates;
         p2_facts.claimer_has_ownership = st != nullptr && (st->out_a != 0 || st->out_b != 0);
@@ -11463,12 +11801,41 @@ bool try_fsr2_translation_draw(
         if (match_inst != 0 && st != nullptr &&
             fsr2_family_takeover::p1_refuse_token_only_claim(p2_facts))
         {
-            il2cpp_callsite::consume_render_token_for(match_inst, call_gen);
+            // ★★ 本批（2026-09-29）关键改动：拒绝时**不再消费 token**。
+            // 为什么（实机 86% 被拒的机制，代码 + 数据逐条对齐）：
+            //   拒绝的语义是"这次认领**不是本实例自己的**"（既无输出归属、也无输入归属）——
+            //   那么 `call_gen` 指向的那个代次就**不是**这次认领的"已用掉"的代次，而是
+            //   **认领者自己那一帧的 Render 代次**。它被这里消费掉之后，同一帧内紧接着的
+            //   "本实例自己的那个累积 draw"就再也认不出自己（路径 1 要求有未消费 token，
+            //   路径 2 的"代次最新"此时已落到**另一路**）⇒ 被误派给另一路放行原生
+            //   ⇒ 本路整帧走原生（实机：接管者 86% 的累积 draw 走了 pass_refuse，两路之间的
+            //   交错使那半屏在 FSR4 / 原生之间来回切 = 可见抖动）。
+            //   不消费之后：那一帧的 Render 代次仍然属于本实例自己的 draw（它认领到即消费）；
+            //   而外来 draw 每次认领它都会走到这里（照旧放行原生，不消费）⇒ 语义更准确：
+            //   **拒绝 = 放行这一 draw，但不动我们的 Render 代次**。
+            //   （代价：外来 draw 每次都会再命中一次本判据 —— 与现在同样的日志/计数节奏；
+            //     另一路的 token 环可能因此攒到 4 槽上限（`pending_overflow` 会涨），
+            //     但另一路**本来就不消费**这些代次（它从不派发）⇒ 无功能影响。）
+            //
+            // 记下这次拒绝没有退休代次（现场可读：老读数 = 旧语义，新读数 = 本批语义）。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+            ++st->acc_pass_refuse; // 【仅诊断】② 多义拒绝 ⇒ 放行原生（按实例记账）
+#endif
             static std::atomic_uint64_t sdk234_ambiguous_count { 0 };
             const std::uint64_t ac =
                 sdk234_ambiguous_count.fetch_add(1, std::memory_order_relaxed) + 1;
             if (g_config.ffx12_single_instance_diag && (ac <= 8 || ac % 256 == 0))
             {
+                // 【仅诊断 · B124】双方输入键：直接看出"这个 draw 采的是**别人**的 G-buffer"
+                //   （`token_kept=1` 是"拒绝不再消费认领者代次"的现场标识）。
+                // ⚠️ 不能把 `#if` 直接写在 LOG_INFO 的实参表里（C2121：宏实参内不允许预处理指令）
+                //   ⇒ 先在这里拼成一段**可空**的字段串，发布构建里它是空串 ⇒ 该行与基线逐字相同。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                const std::string refuse_evidence_fields = " claim_color=" + hex64(claim_color_ptr) +
+                    " claimer_color=" + hex64(st->acc_in_color) + " token_kept=1";
+#else
+                const std::string refuse_evidence_fields;
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（多义拒绝行的双方输入键 —— 只喂日志）
                 LOG_INFO(blog::cat::upscale, "ffx12_ambiguous_bootstrap count=" + std::to_string(ac) +
                     " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
                     " take=" + hex64(sdk234_take_cur & 0xFFFFFFFFull) +
@@ -11476,6 +11843,7 @@ bool try_fsr2_translation_draw(
                     " token_ghosts=" + std::to_string(match_token_ghosts) +
                     " out=" + hex64(draw_out_ptr) +
                     " out_a=" + hex64(st->out_a) + " out_b=" + hex64(st->out_b) +
+                    refuse_evidence_fields +
                     " dispatch_age_ms=" + std::to_string(sdk234_now - st->last_dispatch_tick) +
                     " frame=" + std::to_string(call_params.frame_index) +
                     " action=passthrough_native");
@@ -11495,6 +11863,9 @@ bool try_fsr2_translation_draw(
             match_inst == sdk234_take_cur && call_gen != 0)
         {
             il2cpp_callsite::consume_render_token_for(match_inst, call_gen);
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+            ++st->acc_pass_strict; // 【仅诊断】② E2 严格匹配 ⇒ 放行原生（按实例记账）
+#endif
             static std::atomic_uint64_t sdk234_strict_skip_count { 0 };
             const std::uint64_t sc = sdk234_strict_skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
             if (sc <= 8 || sc % 256 == 0)
@@ -11606,6 +11977,9 @@ bool try_fsr2_translation_draw(
                     source_desc.SampleDesc.Quality == target_desc.SampleDesc.Quality;
                 if (copy_compatible)
                 {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                    ++st->acc_dispatch_repair; // 【仅诊断】①' 输出修复拷贝（不推进历史）
+#endif
                     const bool same_output = st->last_sdk_output == output_tex;
                     if (!same_output)
                         context->CopyResource(output_tex, st->last_sdk_output);
@@ -11670,6 +12044,9 @@ bool try_fsr2_translation_draw(
                         prior_desc.SampleDesc.Quality == target_desc.SampleDesc.Quality;
                     if (copy_compatible)
                     {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                        ++st->acc_dispatch_reuse; // 【仅诊断】①'' 同代次复用拷贝（不推进历史）
+#endif
                         const bool same_output = st->last_sdk_output == output_tex;
                         if (!same_output)
                             context->CopyResource(output_tex, st->last_sdk_output);
@@ -11997,6 +12374,24 @@ bool try_fsr2_translation_draw(
                 }
                 st->prev_jx = jit_src_x;
                 st->prev_jy = jit_src_y;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                // 【仅诊断 · B125】记录**本帧实际喂进去**的抖动 + 它的新鲜度。
+                // 判据本体是纯函数 `classify_jitter_freshness`（可离线单测），
+                // 这里只更新计数与两行日志字段，**不改任何决策**（抖动来源、模式、数值全不变）。
+                {
+                    const fsr2_family_takeover::JitterFreshness jitter_fresh =
+                        fsr2_family_takeover::classify_jitter_freshness(
+                            sdk_in.jitter_x, sdk_in.jitter_y,
+                            st->jit_last_x, st->jit_last_y, st->jit_last_valid,
+                            st->acc_in_jit_frozen);
+                    st->acc_in_jit_x = sdk_in.jitter_x;
+                    st->acc_in_jit_y = sdk_in.jitter_y;
+                    st->acc_in_jit_frozen = jitter_fresh.frozen_frames;
+                    st->jit_last_x = sdk_in.jitter_x;
+                    st->jit_last_y = sdk_in.jitter_y;
+                    st->jit_last_valid = true;
+                }
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（in_jit= / jit_frozen= 的读数 —— 只喂日志）
                 // OptiScaler 输出定向修复——XeSS/DLSS 的 jitter 需 ≤±0.5
                 // （xessD3D12Execute 报 Invalid Argument：jitterOffset 超界）。仅 XeSS/DLSS
                 // 激活时把像素 jitter 夹紧到 ±0.5（子像素），FSR 输出保持原样（互不干扰）。
@@ -12123,13 +12518,22 @@ bool try_fsr2_translation_draw(
 #endif
 
                 // ---- P2 诊断 D5b：输入纹理归属别名检测（Ffx12SingleInstanceDiag=1）----
-                // 若本次要派发的 (color,depth) 与**另一个实例**上次派发用的是同一对纹理，
-                // 说明这两路的输入在视图归属上被混用了（两路 render 尺寸相同时尤其危险）。
-                // 只记录、不改行为。
+                // ⚠️ 判据本体（本批**补全口径**，不改行为）：只比较**两个裸指针**——
+                //    `另一个实例上次派发记下的 (color,depth)` == `本 draw 现场绑定的 (color,depth)`。
+                //    它**没有**活性/新鲜度条件：那条记录可以来自**早已停止派发**（甚至已被游戏
+                //    销毁）的老实例 ⇒ 同一路视图在**场景/视图切换后重建实例**（新指针 + 复用输入
+                //    纹理）也会命中。因此它**不能**单独作为"两路在共用同一份输入纹理"的证据。
+                // 本批：把命中分成"另一实例**仍在派发**"（真·并发共用）与"只是一条**陈旧记录**"
+                //   两类，并把两边的输入/输出指针、两条记录的时刻与归属路径一起打出来 ⇒
+                //   一次实机即可判定"同键是哪个决策点造成的"。仍然只记录、不改行为。
                 if (g_config.ffx12_single_instance_diag && st != nullptr)
                 {
                     const std::uint64_t c_ptr = reinterpret_cast<std::uint64_t>(color_tex);
                     const std::uint64_t d_ptr = reinterpret_cast<std::uint64_t>(depth_tex);
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                    // 【仅诊断 · B123】"并发 / 陈旧分类"要读另一实例那条记录的时刻（只喂日志）。
+                    const std::uint64_t alias_now = GetTickCount64();
+#endif
                     for (std::size_t j = 0; j < sdk234_inst_count; ++j)
                     {
                         const Sdk234InstState &c = sdk234_insts[j];
@@ -12137,18 +12541,75 @@ bool try_fsr2_translation_draw(
                             continue;
                         if (c.dbg_color == c_ptr && c.dbg_depth == d_ptr)
                         {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                            // 【仅诊断 · B123】"另一实例仍在派发"的两条证据：活性表口径 + 它的
+                            // 上一条记录的时刻；判据本体在纯函数 `classify_input_alias` 里。
+                            const bool other_live = p1_instance_is_live(c.instance);
+                            const std::uint64_t other_age = c.acc_in_tick != 0 && alias_now >= c.acc_in_tick
+                                ? alias_now - c.acc_in_tick : 0;
+                            fsr2_family_takeover::InputAliasFacts alias_facts {};
+                            alias_facts.current_color = c_ptr;
+                            alias_facts.current_depth = d_ptr;
+                            alias_facts.other_color = c.dbg_color;
+                            alias_facts.other_depth = c.dbg_depth;
+                            alias_facts.other_record_tick = c.acc_in_tick;
+                            alias_facts.now_ms = alias_now;
+                            alias_facts.recent_ms = k_input_alias_recent_ms;
+                            alias_facts.other_currently_live = other_live;
+                            const fsr2_family_takeover::InputAliasKind kind =
+                                fsr2_family_takeover::classify_input_alias(alias_facts);
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（并发/陈旧分类 —— 只喂日志）
                             static std::atomic_uint64_t sdk234_alias_count { 0 };
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                            static std::atomic_uint64_t sdk234_alias_concurrent { 0 };
+                            static std::atomic_uint64_t sdk234_alias_stale { 0 };
+#endif
                             const std::uint64_t ac =
                                 sdk234_alias_count.fetch_add(1, std::memory_order_relaxed) + 1;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                            if (kind == fsr2_family_takeover::InputAliasKind::Concurrent)
+                                sdk234_alias_concurrent.fetch_add(1, std::memory_order_relaxed);
+                            else
+                                sdk234_alias_stale.fetch_add(1, std::memory_order_relaxed);
+#endif
                             if (ac <= 16 || ac % 128 == 0)
                             {
+                                // 【仅诊断 · B123】这一行的增强字段（发布构建里两段都是空串
+                                //   ⇒ `ffx12_input_alias` 该行与 2.3 基线逐字相同）：
+                                //   · `kind=` —— 真·并发共用 vs 陈旧记录/指针复用；
+                                //   · 另一实例的记录年龄/活性/自身输入键与归属路径。
+                                // ⚠️ `#if` 不能写在 LOG_INFO 的实参表里（C2121）⇒ 先在门控外拼串。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                                const std::string alias_kind_field = " kind=" + std::string(
+                                    kind == fsr2_family_takeover::InputAliasKind::Concurrent
+                                        ? "concurrent" : "stale_record");
+                                const std::string alias_tail_fields =
+                                    " other_age_ms=" + std::to_string(other_age) +
+                                    " other_live=" + std::to_string(other_live ? 1 : 0) +
+                                    " other_in=" + hex64(c.acc_in_color) + "/" + hex64(c.acc_in_depth) +
+                                    "/" + hex64(c.acc_in_motion) + "/" + hex64(c.acc_in_out) +
+                                    " other_path=" + std::to_string(c.acc_in_match_path) +
+                                    " other_slots=" + std::to_string((c.acc_in_slots >> 24) & 0xFFu) + "/" +
+                                    std::to_string((c.acc_in_slots >> 16) & 0xFFu) + "/" +
+                                    std::to_string((c.acc_in_slots >> 8) & 0xFFu) + "/" +
+                                    std::to_string(c.acc_in_slots & 0xFFu) +
+                                    " conc_total=" + std::to_string(
+                                        sdk234_alias_concurrent.load(std::memory_order_relaxed)) +
+                                    " stale_total=" + std::to_string(
+                                        sdk234_alias_stale.load(std::memory_order_relaxed)) +
+                                    " cur_path=" + std::to_string(match_path);
+#else
+                                const std::string alias_kind_field;
+                                const std::string alias_tail_fields;
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（kind= / other_* / conc_total / stale_total —— 只喂日志）
                                 LOG_INFO(blog::cat::upscale, "ffx12_input_alias count=" +
-                                    std::to_string(ac) +
+                                    std::to_string(ac) + alias_kind_field +
                                     " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
                                     " other=" + hex64(c.instance & 0xFFFFFFFFull) +
                                     " color=" + hex64(c_ptr) + " depth=" + hex64(d_ptr) +
                                     " match_path=" + std::to_string(match_path) +
                                     " token_cands=" + std::to_string(match_token_candidates) +
+                                    alias_tail_fields +
                                     " frame=" + std::to_string(call_params.frame_index));
                             }
                             break;
@@ -12160,6 +12621,53 @@ bool try_fsr2_translation_draw(
 
                 if (ffx12::dispatch(sdk_in, context, call_params.instance))
                 {
+                    // ---- 【功能 · B124】① 记下本路**自己的** color 采样来源 ----
+                    // ⚠️ 这一行**不是诊断**：它是 B124 归属修法的"输入归属证据"
+                    //   （路径 2 的候选选择与多义拒绝的豁免判据 `claim_input_owned` 都读它）
+                    //   ⇒ 发布构建必须保留。口径：只在**派发成功**时更新（"上次派发用的那张"
+                    //   才有归属含义）。
+                    st->acc_in_color = reinterpret_cast<std::uint64_t>(color_tex);
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                    // 【仅诊断 · B123】① 进了 dispatch + 记下本路其余的输入/输出资源键、
+                    // 归属路径与槽位（供 `ffx12_accum_dest` 对账行与别名分类使用）。
+                    // 只记字段，不改任何决策。
+                    ++st->acc_dispatch;
+                    st->acc_in_depth = reinterpret_cast<std::uint64_t>(depth_tex);
+                    st->acc_in_motion = reinterpret_cast<std::uint64_t>(motion_tex);
+                    st->acc_in_out = draw_out_ptr;
+                    st->acc_in_tick = GetTickCount64();
+                    st->acc_in_frame = call_params.frame_index;
+                    st->acc_in_match_path = match_path;
+                    st->acc_in_slots = (color_slot & 0xFFu) | ((depth_slot & 0xFFu) << 8) |
+                        ((motion_slot & 0xFFu) << 16) | ((output_slot & 0xFFu) << 24);
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（去向计数 + 输入/输出键 + 归属路径/槽位 —— 只喂日志）
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                    // ---- 【仅诊断 · B124 验收探针】凭**输入归属**被认下的派发 ----
+                    // 语义：这次认领是 match_path==2（仅 token）、输出**不属于**本实例已记过的
+                    //   缓冲，但它采样的 color 就是我们自己的 ⇒ 这正是"接管者写自己第二个输出
+                    //   缓冲"的那一帧。允许它派发 ⇒ `out_b` 被学会 ⇒ 之后同一路的 draw 都走
+                    //   路径 1（输出归属）⇒ `pass_refuse` 回到 ~0。
+                    // 判据（实机）：本行只在切换/首帧出现几次，**稳态下不再增长**；
+                    //   同时 `ffx12_accum_dest` 的 disp 应持续增长、pass_refuse 应 ≈0。
+                    // ⚠️ 只门控**日志输出**：`claim_input_owned` 的判定与它的消费者（豁免判据）
+                    //   是功能，留在门外。
+                    if (g_config.ffx12_single_instance_diag && claim_input_owned)
+                    {
+                        static std::atomic_uint64_t sdk234_input_owned_count { 0 };
+                        const std::uint64_t ioc =
+                            sdk234_input_owned_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (ioc <= 16 || ioc % 256 == 0)
+                        {
+                            LOG_INFO(blog::cat::upscale, "ffx12_input_own count=" + std::to_string(ioc) +
+                                " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
+                                " out=" + hex64(draw_out_ptr) +
+                                " color=" + hex64(reinterpret_cast<std::uint64_t>(color_tex)) +
+                                " gen=" + std::to_string(call_gen) +
+                                " frame=" + std::to_string(call_params.frame_index) +
+                                " action=dispatch_input_owned");
+                        }
+                    }
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（ffx12_input_own —— 只喂日志）
                     // 仅成功输出后才消费 generation；失败不得让下一次重试拿到旧 history。
                     st->last_gen = call_gen;
                     st->last_dispatched_frame = call_params.frame_index;
@@ -12406,6 +12914,36 @@ bool try_fsr2_translation_draw(
                     g_sdk234_output_ptr = reinterpret_cast<std::uint64_t>(sdk234_out_res);
                     g_sdk234_output_tick.store(GetTickCount64(), std::memory_order_relaxed);
                     // 输出关联（draw→实例 确定性匹配）：双缓冲交替输出都记录（含各自派发时间）
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                    // ---- 【仅诊断 · B124 验收探针】"学会一个新的输出缓冲"的时刻 ----
+                    //   语义：out_a/out_b 里都还没有它 ⇒ 在此之前，写这个缓冲的 draw 只能被拒
+                    //   （自锁，实机 86%）；这一帧之后它们全部走路径 1（输出归属）⇒ 本路稳定走 FSR4。
+                    //   判据（实机）：本行只在视图/场景切换后出现几次（稳态不增长），
+                    //   且从此 `ffx12_accum_dest` 的 pass_refuse 不再增长。
+                    //   ⚠️ 只挂在**主派发**路径上：repair 路径要求输出已属于本实例（不可能新）；
+                    //      reuse 路径可写新缓冲，但它的次数是配对 draw 量级，本批未插桩。
+                    //   ⚠️ 只门控**日志输出**：把新输出记进 out_a/out_b（下面的功能代码）不变。
+                    if (g_config.ffx12_single_instance_diag && draw_out_ptr != 0 &&
+                        st->out_a != draw_out_ptr && st->out_b != draw_out_ptr)
+                    {
+                        static std::atomic_uint64_t sdk234_output_learn_count { 0 };
+                        const std::uint64_t olc =
+                            sdk234_output_learn_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (olc <= 16 || olc % 256 == 0)
+                        {
+                            LOG_INFO(blog::cat::upscale, "ffx12_output_learn count=" +
+                                std::to_string(olc) +
+                                " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
+                                " out=" + hex64(draw_out_ptr) +
+                                " prev_out_a=" + hex64(st->out_a) +
+                                " prev_out_b=" + hex64(st->out_b) +
+                                " in_path=" + std::to_string(match_path) +
+                                " gen=" + std::to_string(call_gen) +
+                                " frame=" + std::to_string(call_params.frame_index) +
+                                " action=record_new_output");
+                        }
+                    }
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（ffx12_output_learn —— 只喂日志）
                     if (st->out_a == 0 || st->out_a == draw_out_ptr)
                     {
                         st->out_a = draw_out_ptr;
@@ -12452,12 +12990,23 @@ bool try_fsr2_translation_draw(
                             " sdk_msgs=" + (msgs.empty() ? std::string("none") : narrow(msgs)));
                     }
                     invalidate_direct_attempt("DISPATCH_FAILED");
+                    // 【本批新增 · 问题 A】⑤ 其它：派发失败 —— 默认 **fail-open 交回原生**
+                    // （下面 return false）；`Ffx12FailClosed=1` 时改为 fail-closed 吞掉 ⇒ 计入
+                    // fail_closed 桶。两者互斥，保证"每 draw 只落一个桶"（对账行不会重复计数）。
+                    // ⚠️ 门控的只是两侧的**计数**；`Ffx12FailClosed` 的分支与 return 值（功能）
+                    //   逐字不变。
+                    if (g_config.ffx12_fail_closed)
+                    {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                        ++st->acc_fail_closed;
+#endif
+                        return true;
+                    }
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                    ++st->acc_dispatch_failed;
+#endif
                     // 旧翻译层已停用——sdk234 未接管时直接放行
                     // （新架构仅 ffx12 一条链路；OptiScaler 后续以 ffx12 为基底重新接入）。
-                    // Ffx12FailClosed=1 时禁止回退原生（跳过原始 draw，
-                    // 画面显式异常暴露故障，用于 SDK 缺失/路由错误等测试）。
-                    if (g_config.ffx12_fail_closed)
-                        return true;
                     return false;
                 }
                 }
@@ -12478,6 +13027,11 @@ bool try_fsr2_translation_draw(
                         " output=" + std::to_string(output_tex ? 1 : 0) +
                             " frame=" + std::to_string(call_params.frame_index));
                 }
+                // 【仅诊断 · 问题 A】⑤ 子原因标签（**不单独占桶**）：最终去向由函数末的
+                // fail-closed 记账，这里只标"吞掉的原因是纹理没取全"（对账行的 tex_missing=）。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                ++st->acc_texture_missing;
+#endif
                 invalidate_direct_attempt("RESOURCES_INVALID");
             }
             if (color_tex) color_tex->Release();
@@ -12488,6 +13042,16 @@ bool try_fsr2_translation_draw(
             // 失败由 invalidate_direct_attempt 终结旧 token；函数末的 direct-only gate
             // 继续截断原生 accumulate draw，等待下一枚有效 token 以 reset 重建历史。
         }
+        // 【本批新增 · 问题 A】③ 位置就在这里定案：能走到本行的、且 `st != nullptr` 的 draw，
+        // 只剩最后那条 fail-closed 出口（`return true` ⇒ 既不派发、也不放行）——
+        // 上面所有"派发/放行"的分支都已经 return。这正是此前**完全不可见**的那一类
+        // （`ffx12_skip` 在"最近 50ms 派发过"时被刻意抑制 ⇒ 典型形态一条都打不出来）。
+        // 判据等价性：`release_untagged_accumulate` 只可能由 `match_inst == 0`（即 st == nullptr）
+        // 的分支置位 ⇒ 本行不可能把它误记成 fail-closed。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+        if (st != nullptr)
+            ++st->acc_fail_closed;
+#endif
         // 诊断：sdk234 未接管原因（低频，只读，已抽为独立函数）
         log_sdk234_skip_reason(st, match_inst, draw_out_ptr, sdk234_now,
             st != nullptr ? st->last_dispatch_tick : 0,

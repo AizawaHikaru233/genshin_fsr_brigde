@@ -228,6 +228,16 @@ if(DX11FSRBRIDGE_BUILD_FAMILY_TEST)
         UNICODE
         _UNICODE
     )
+    # ⚠️ 本 test target 必须与主 target **用同一个诊断开关**（2026-10-01 收尾清理）：
+    #   `Fsr2FamilyTakeover.h/.cpp` 里那批"只喂日志"的纯函数（累积 draw 去向分类 / 输入别名
+    #   分类 / 共享几何输入分类 / 抖动新鲜度）现由 `DX11FSRBRIDGE_ENABLE_DIAGNOSTICS` 门控，
+    #   而它们**正是**本测试第 10 / 11 / 13 节的被测对象 ⇒ 不带上这个宏，诊断构建里这几节
+    #   连编译都过不了。口径与 `fsrbridge_configure_test`（第 268 行附近）一致：
+    #   测试 target 与 DLL 必须同开关。（发布构建 `DX11FSRBRIDGE_DIAGNOSTICS=OFF`
+    #   ⇒ 本 target 根本不建 ⇒ 对发布产物零影响。）
+    if(DX11FSRBRIDGE_DIAGNOSTICS_ON)
+        target_compile_definitions(Fsr2FamilyTakeoverTest PRIVATE DX11FSRBRIDGE_ENABLE_DIAGNOSTICS=1)
+    endif()
 endif()
 
 # ---- 单元测试接入（2026-09-19：此前被跟踪但从不编译）----
