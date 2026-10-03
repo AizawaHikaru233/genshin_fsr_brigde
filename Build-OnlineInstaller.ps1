@@ -551,9 +551,9 @@ try {
     [IO.File]::WriteAllText((Join-Path $stage 'Package-Version.txt'), "$version`r`n", [Text.UTF8Encoding]::new($false))
 
     $config = Get-Content -LiteralPath (Join-Path $fufuSource 'config.ini') -Raw -Encoding UTF8
-    $config = ([regex]'(?m)^Name\s*=.*$').Replace($config, 'Name = 原神FSR2桥接插件', 1)
-    $config = ([regex]'(?m)^Developer\s*=.*$').Replace($config, 'Developer = シリアCelia', 1)
-    $config = ([regex]'(?m)^Version\s*=.*$').Replace($config, "Version = $version", 1)
+    $config = ([regex]'(?m)^Name\s*=[^\r\n]*').Replace($config, 'Name = 原神FSR2桥接插件', 1)
+    $config = ([regex]'(?m)^Developer\s*=[^\r\n]*').Replace($config, 'Developer = シリアCelia', 1)
+    $config = ([regex]'(?m)^Version\s*=[^\r\n]*').Replace($config, "Version = $version", 1)
     [IO.File]::WriteAllText((Join-Path $stage 'config.ini'), $config, [Text.UTF8Encoding]::new($false))
 
     $payload = Join-Path $stage 'payload'

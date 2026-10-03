@@ -155,7 +155,6 @@ struct Config
     std::uint32_t final_scene_probe_signature_limit = 128;
     bool final_scene_snapshot = false;
     std::uint32_t final_scene_snapshot_interval_frames = 240;
-    bool final_scene_optifg_input = false;
     int dlssg_dxgi_workaround = -1;
     // Exposes HDR10 capability to the game while keeping the physical output
     // on the SDR color space. This is an isolated experimental path.
@@ -5849,7 +5848,7 @@ class ScopedContextVtableBypass
 #if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
 void update_final_scene_probe_backbuffers(IDXGISwapChain *swapchain)
 {
-    if ((!g_config.final_scene_probe && !g_config.final_scene_snapshot && !g_config.final_scene_optifg_input) ||
+    if ((!g_config.final_scene_probe && !g_config.final_scene_snapshot) ||
         swapchain == nullptr)
         return;
 
@@ -5875,10 +5874,9 @@ void update_final_scene_probe_backbuffers(IDXGISwapChain *swapchain)
 bool matches_final_scene_boundary(
     UINT element_count,
     bool indexed,
-    std::uint64_t &frame_index,
-    bool apply_snapshot_interval)
+    std::uint64_t &frame_index)
 {
-    if ((!g_config.final_scene_snapshot && !g_config.final_scene_optifg_input) || !indexed ||
+    if (!g_config.final_scene_snapshot || !indexed ||
         element_count != 3 || g_internal_bridge_dispatch)
         return false;
 
@@ -5911,27 +5909,8 @@ bool matches_final_scene_boundary(
         target.width == viewport_width && target.height == viewport_height && is_backbuffer;
     const bool sample_matches = g_config.ffx12_feature_fallback &&
         pixel_shader_hash == k_final_scene_ps && vertex_shader_hash == k_final_scene_vs;
-    const bool matches = (feature_matches || sample_matches) &&
-        (!apply_snapshot_interval ||
-            (g_config.final_scene_snapshot &&
-                frame_index % g_config.final_scene_snapshot_interval_frames == 0));
-    if (!matches)
-    {
-        // The OptiFG handoff is opt-in; emit one diagnostic only when the known scene shader is observed.
-        static std::atomic_bool logged_expected_shader_mismatch { false };
-        if (!apply_snapshot_interval && pixel_shader_hash == k_final_scene_ps &&
-            vertex_shader_hash == k_final_scene_vs &&
-            !logged_expected_shader_mismatch.exchange(true, std::memory_order_relaxed))
-        {
-            LOG_INFO(blog::cat::probe, "final_scene_optifg_boundary_rejected target=" + hex64(target.resource_key) +
-                " backbuffer=" + std::to_string(is_backbuffer ? 1 : 0) +
-                " size=" + std::to_string(target.width) + "x" + std::to_string(target.height) +
-                " viewport=" + std::to_string(viewport_width) + "x" + std::to_string(viewport_height));
-        }
-        return false;
-    }
-
-    return true;
+    return (feature_matches || sample_matches) &&
+        frame_index % g_config.final_scene_snapshot_interval_frames == 0;
 }
 
 bool final_scene_snapshot_desc_matches(const D3D11_TEXTURE2D_DESC &desc)
@@ -6052,53 +6031,10 @@ void queue_final_scene_snapshot(ID3D11DeviceContext *context, std::uint64_t fram
         " source=post_scene_pre_ui");
 }
 
-void submit_final_scene_to_optiscaler(ID3D11DeviceContext *context, std::uint64_t frame_index)
-{
-    if (!g_config.final_scene_optifg_input || context == nullptr)
-        return;
-
-    using submit_final_scene_fn = BOOL(WINAPI *)(ID3D11Resource *, UINT64);
-    static submit_final_scene_fn submit = nullptr;
-    static HMODULE module = nullptr;
-    static std::atomic_bool missing_export_logged { false };
-    static std::atomic_uint64_t accepted_count { 0 };
-
-    if (module == nullptr)
-    {
-        module = GetModuleHandleW(L"OptiScaler.dll");
-        if (module != nullptr)
-            submit = reinterpret_cast<submit_final_scene_fn>(
-                GetProcAddress(module, "OptiScalerSubmitFinalSceneD3D11"));
-    }
-    if (submit == nullptr)
-    {
-        if (!missing_export_logged.exchange(true, std::memory_order_relaxed))
-            LOG_INFO(blog::cat::probe, "final_scene_optifg_input_unavailable export=OptiScalerSubmitFinalSceneD3D11");
-        return;
-    }
-
-    ID3D11RenderTargetView *render_target = nullptr;
-    context->OMGetRenderTargets(1, &render_target, nullptr);
-    if (render_target == nullptr)
-        return;
-    ID3D11Resource *scene = nullptr;
-    render_target->GetResource(&scene);
-    render_target->Release();
-    if (scene == nullptr)
-        return;
-
-    const BOOL accepted = submit(scene, frame_index);
-    scene->Release();
-    if (accepted)
-    {
-        const std::uint64_t count = accepted_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (count == 1 || count % 240 == 0)
-        {
-            LOG_INFO(blog::cat::probe, "final_scene_optifg_input_accepted frame=" + std::to_string(frame_index) +
-                " count=" + std::to_string(count));
-        }
-    }
-}
+// 【B130 清理】原 `submit_final_scene_to_optiscaler()`（把最终场景 RTV 经
+// `OptiScalerSubmitFinalSceneD3D11` 交给 OptiScaler 当 OptiFG 输入）已删除：OptiScaler v10 的
+// 946 个导出里没有任何 `OptiScaler*` 名字 ⇒ 该导出【必然取不到】，而原逻辑取不到就跳过 ⇒ 删除
+// 不改变任何行为；`final_scene_optifg_input` 开关与判据函数里的 OptiFG 分支已一并移除。
 
 void poll_final_scene_snapshot(IDXGISwapChain *swapchain)
 {
@@ -13621,17 +13557,11 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
 #if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
     bool final_scene_snapshot_boundary = false;
     std::uint64_t final_scene_snapshot_frame = 0;
-    bool final_scene_optifg_boundary = false;
-    std::uint64_t final_scene_optifg_frame = 0;
     final_scene_snapshot_boundary =
-        matches_final_scene_boundary(index_count, true, final_scene_snapshot_frame, true);
-    final_scene_optifg_boundary =
-        matches_final_scene_boundary(index_count, true, final_scene_optifg_frame, false);
+        matches_final_scene_boundary(index_count, true, final_scene_snapshot_frame);
 #endif
     g_original_draw_indexed(context, index_count, start_index_location, base_vertex_location);
 #if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
-    if (final_scene_optifg_boundary)
-        submit_final_scene_to_optiscaler(context, final_scene_optifg_frame);
     if (final_scene_snapshot_boundary)
         queue_final_scene_snapshot(context, final_scene_snapshot_frame);
 #endif
@@ -13735,17 +13665,11 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
 #if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
     bool final_scene_snapshot_boundary = false;
     std::uint64_t final_scene_snapshot_frame = 0;
-    bool final_scene_optifg_boundary = false;
-    std::uint64_t final_scene_optifg_frame = 0;
     final_scene_snapshot_boundary =
-        matches_final_scene_boundary(vertex_count, false, final_scene_snapshot_frame, true);
-    final_scene_optifg_boundary =
-        matches_final_scene_boundary(vertex_count, false, final_scene_optifg_frame, false);
+        matches_final_scene_boundary(vertex_count, false, final_scene_snapshot_frame);
 #endif
     g_original_draw(context, vertex_count, start_vertex_location);
 #if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
-    if (final_scene_optifg_boundary)
-        submit_final_scene_to_optiscaler(context, final_scene_optifg_frame);
     if (final_scene_snapshot_boundary)
         queue_final_scene_snapshot(context, final_scene_snapshot_frame);
 #endif
@@ -14363,7 +14287,7 @@ void update_swapchain_backbuffer_resources(IDXGISwapChain *swapchain)
 bool swapchain_present_hook_needed()
 {
     return g_config.hook_present || g_config.final_scene_probe || g_config.final_scene_snapshot ||
-        g_config.final_scene_optifg_input || g_config.hdr_composite_probe ||
+        g_config.hdr_composite_probe ||
         // 呈现诊断需要 Present 钩子才能观测 sync_interval/flags/帧间隔
         g_config.ffx12_present_probe;
 }
