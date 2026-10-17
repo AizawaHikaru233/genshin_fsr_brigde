@@ -72,7 +72,7 @@ install.write_config(plugin_dir, {
         Description = "支持把原神的FSR2转换为FSR4（A卡7000/9000）、DLSS/XeSS/FSR4 INT8（其余显卡）",
         Developer = "シリアCelia",
         File = "FSR-Bridge-Plugin.dll",
-        Version = "2.3.0"
+        Version = "2.3.1"
     },
     EnableBridge = {
         Name = "启用 FSR Bridge",

@@ -529,6 +529,26 @@ function Build-FpsPackage {
     }
 }
 
+function Assert-FufuInstallerVersionSynced {
+    # Lua 安装脚本里的 Version 不是"包内清单的副本"，而是宿主最终写进插件清单
+    # config.ini 的**权威值**：install.write_config(plugin_dir, 表) 拿整张表重渲染
+    # config.ini，会把包内随附的那份整份覆盖（包内写得对也没用）。
+    # 2026-10-16：2.3.1 升版只改了 config.ini，两个 Lua 仍写 2.3.0 ⇒ 安装/启动后
+    # 插件版本号被写回 2.3.0（用户实机复现）。这里与 Fufu DLL 同级做同步断言。
+    param([Parameter(Mandatory)][string]$Version)
+    foreach ($name in @('Install-FufuPlugin.lua', 'Install-FufuPlugin-Marketplace.lua')) {
+        $path = Join-Path $fufuSource $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "缺少 Fufu 安装脚本：$path" }
+        $text = [IO.File]::ReadAllText($path)
+        $found = [regex]::Match($text, '(?m)^\s*Version\s*=\s*"([^"]*)"')
+        if (-not $found.Success) { throw "$name 里找不到 Version = `"x.y.z`" 行：$path" }
+        if ($found.Groups[1].Value -ne $Version) {
+            throw "$name 版本未同步：实际 $($found.Groups[1].Value)，期望 $Version" +
+                "（该值会在安装时被写进插件清单 config.ini，覆盖包内随附的那份）"
+        }
+    }
+}
+
 function Build-FufuMarketplacePackage {
 param([Parameter(Mandatory)][string]$Version)
 $version = $Version
@@ -542,6 +562,7 @@ if (-not (Test-Path -LiteralPath $fufuDll -PathType Leaf)) { throw "插件编译
 if ((Get-Item -LiteralPath $fufuDll).VersionInfo.FileVersion -ne "$version.0") {
     throw "FSR-Bridge-Plugin.dll 版本未同步：实际 $((Get-Item $fufuDll).VersionInfo.FileVersion)，期望 $version.0"
 }
+Assert-FufuInstallerVersionSynced -Version $version
 
 $stage = Join-Path $dist '.fufu-marketplace-stage'
 Reset-Stage -Path $stage
