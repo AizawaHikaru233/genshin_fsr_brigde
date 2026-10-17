@@ -27,7 +27,7 @@ For the Chinese documentation, see [README.md](README.md).
 
 | Overview | Usage | Development & Support |
 | :--- | :--- | :--- |
-| [Support Scope and Risk Notice](#support-scope-and-risk-notice)<br>[Demo](#demo)<br>[Features](#features)<br>[GPU Support and NVIDIA Caveats](#gpu-support-and-nvidia-caveats) | [Release Packages](#release-packages)<br>[Frame-Generation Branch](#frame-generation-branch)<br>[FuFu Launcher Plugin Source and Local Build](#fufu-launcher-plugin-source-and-local-build)<br>[Usage](#usage)<br>[Logs and Issue Feedback](#logs-and-issue-feedback) | [Repository Layout](#repository-layout)<br>[Build](#build)<br>[Third-Party Components](#third-party-components)<br>[License](#license) |
+| [Support Scope and Risk Notice](#support-scope-and-risk-notice)<br>[Demo](#demo)<br>[Features](#features)<br>[GPU Support and NVIDIA Caveats](#gpu-support-and-nvidia-caveats) | [Release Packages](#release-packages)<br>[FuFu Launcher Plugin Source and Local Build](#fufu-launcher-plugin-source-and-local-build)<br>[Usage](#usage)<br>[Logs and Issue Feedback](#logs-and-issue-feedback) | [Repository Layout](#repository-layout)<br>[Build](#build)<br>[Third-Party Components](#third-party-components)<br>[License](#license) |
 
 ## Support Scope and Risk Notice
 
@@ -67,11 +67,6 @@ For the Chinese documentation, see [README.md](README.md).
 </table>
 
 <sub>In-game captures; click to open the full 3840×2160 image.</sub>
-
-## Frame-Generation Branch
-
-> [!NOTE]
-> The frame-generation feature in the `frame-generation` branch is built against `OptiScaler 0.10.0-pre1`. OptiScaler versions earlier than `0.10.0-pre1` do not support this frame-generation feature.
 
 ## Release Packages
 
