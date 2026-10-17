@@ -6,7 +6,7 @@
   <img alt="Platform: Windows DX11" src="https://img.shields.io/badge/platform-Windows%20DX11-6f42c1?logo=windows&amp;logoColor=white">
   <img alt="FSR4 / FSR3 / FSR2" src="https://img.shields.io/badge/FSR-4%20%7C%203%20%7C%202-f97316">
   <img alt="AMD FFX12 SDK" src="https://img.shields.io/badge/AMD-FFX12%20SDK-ED1C24?logo=amd&amp;logoColor=white">
-  <img alt="Genshin 7.0" src="https://img.shields.io/badge/Genshin-7.0-0ea5e9">
+  <img alt="Genshin 7.1+" src="https://img.shields.io/badge/Genshin-7.1%2B-0ea5e9">
 </p>
 
 <p align="center">
@@ -32,10 +32,11 @@
 ## 支持范围与风险声明
 
 - 目标支持原神中国服与全球服的 Windows DX11 客户端。
-- 已适配原神 `7.0` 并实测通过。**新版本游戏更新后需要重新验证**：本项目 hook 的是
-  游戏内部的 FSR2 调用与 il2cpp 方法（含 RVA 与序言字节匹配），游戏更新可能改变这些
-  内部结构。桥会在特征不匹配时放弃 hook 并回退（不会崩溃），但**超分可能随之失效**，
-  需等本项目跟进适配。详见 [GPU 支持与 N 卡注意事项](#gpu-支持与-n-卡注意事项)。
+- 已适配原神 `7.0`、`7.1` 并实测通过。桥通过**动态特征识别**定位游戏内部的 FSR2 调用与
+  il2cpp 方法，不依赖写死的 RVA / 序言字节，因此**并不局限于已实测的版本**：后续游戏更新
+  只要没有大改（FSR2 调用路径与相关内部结构保持稳定）即可直接支持，无需等待本项目更新。
+- 若某次更新确实改动了这些内部结构，桥会在特征不匹配时放弃 hook 并回退（不会崩溃），
+  此时**超分可能失效**，需等本项目跟进适配。详见 [GPU 支持与 N 卡注意事项](#gpu-支持与-n-卡注意事项)。
 - 功能与硬件前提：FSR4/FSR3/FSR2 的实际可用档位取决于**显卡型号与驱动版本**
   （例如 FSR4 需要 RDNA4 及对应驱动）。文中"在支持的显卡上"均指该节所列范围，
   请先对照确认自己的显卡在列。

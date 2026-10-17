@@ -6,7 +6,7 @@
   <img alt="Platform: Windows DX11" src="https://img.shields.io/badge/platform-Windows%20DX11-6f42c1?logo=windows&amp;logoColor=white">
   <img alt="FSR4 / FSR3 / FSR2" src="https://img.shields.io/badge/FSR-4%20%7C%203%20%7C%202-f97316">
   <img alt="AMD FFX12 SDK" src="https://img.shields.io/badge/AMD-FFX12%20SDK-ED1C24?logo=amd&amp;logoColor=white">
-  <img alt="Genshin 7.0" src="https://img.shields.io/badge/Genshin-7.0-0ea5e9">
+  <img alt="Genshin 7.1+" src="https://img.shields.io/badge/Genshin-7.1%2B-0ea5e9">
 </p>
 
 <p align="center">
@@ -32,12 +32,14 @@ For the Chinese documentation, see [README.md](README.md).
 ## Support Scope and Risk Notice
 
 - Intended for the Chinese and Global Windows DX11 clients of Genshin Impact.
-- Adapted for and verified against Genshin Impact `7.0`. **New game versions require
-  re-verification**: this project hooks the game's internal FSR2 calls and il2cpp methods
-  (including RVA and prologue byte matching), and game updates may change those internal
-  structures. The bridge abandons the hook and falls back when signatures no longer match
-  (it will not crash), but **upscaling may stop working** until this project is updated.
-  See [GPU Support and NVIDIA Caveats](#gpu-support-and-nvidia-caveats).
+- Adapted for and verified against Genshin Impact `7.0` and `7.1`. The bridge locates the game's
+  internal FSR2 calls and il2cpp methods through **dynamic signature recognition** instead of
+  hard-coded RVA / prologue bytes, so it is **not limited to the versions tested so far**: later
+  game updates keep working as long as nothing major changes (the FSR2 call path and the related
+  internal structures stay stable), with no update from this project required.
+- If an update does change those internal structures, the bridge abandons the hook and falls back
+  when signatures no longer match (it will not crash), but **upscaling may stop working** until
+  this project catches up. See [GPU Support and NVIDIA Caveats](#gpu-support-and-nvidia-caveats).
 - Feature and hardware prerequisites: which FSR tier (FSR4/FSR3/FSR2) is actually available
   depends on the **GPU model and driver version** (for example FSR4 requires RDNA4 and a
   matching driver). Every "on supported GPUs" statement below refers to the range listed in
