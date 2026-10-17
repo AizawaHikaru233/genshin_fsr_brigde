@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="Genshin DX11 native FSR2 calls bridged by Dx11FsrBridge to the AMD FFX12 SDK, producing FSR4 / FSR3 / FSR2 upscaling">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#070b16"/>
+      <stop offset="0.55" stop-color="#0b1528"/>
+      <stop offset="1" stop-color="#101f3a"/>
+    </linearGradient>
+    <linearGradient id="titleAccent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#eaf3ff"/>
+      <stop offset="0.55" stop-color="#7dd3fc"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+    <radialGradient id="glowCyan" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#22d3ee" stop-opacity="0.32"/>
+      <stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowViolet" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#8b5cf6" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#ffffff" stroke-opacity="0.035" stroke-width="1"/>
+    </pattern>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#5b7ea8"/>
+    </marker>
+  </defs>
+
+  <rect width="1280" height="320" rx="24" fill="url(#bg)"/>
+  <rect width="1280" height="320" rx="24" fill="url(#grid)"/>
+  <circle cx="1120" cy="20" r="240" fill="url(#glowViolet)"/>
+  <circle cx="60" cy="320" r="220" fill="url(#glowCyan)"/>
+  <rect x="0.5" y="0.5" width="1279" height="319" rx="23.5" fill="none" stroke="#ffffff" stroke-opacity="0.09"/>
+
+  <g font-family="Segoe UI, Helvetica Neue, Arial, sans-serif">
+    <!-- top-left tag -->
+    <rect x="64" y="52" width="212" height="30" rx="15" fill="#22d3ee" fill-opacity="0.10" stroke="#22d3ee" stroke-opacity="0.35"/>
+    <text x="170" y="72" text-anchor="middle" font-size="12" letter-spacing="2.4" fill="#7dd3fc">WINDOWS · DX11 · GPL-3.0</text>
+
+    <!-- hero -->
+    <text x="64" y="148" font-size="54" font-weight="700" letter-spacing="-0.5" fill="url(#titleAccent)">FSR4 · FSR3 · FSR2</text>
+    <text x="66" y="190" font-size="22" fill="#9db4d0">Genshin DX11 · native FSR2 → AMD FFX12 SDK upscaling</text>
+
+    <!-- feature chips -->
+    <g font-size="14">
+      <rect x="64" y="216" width="150" height="38" rx="19" fill="#ffffff" fill-opacity="0.05" stroke="#ffffff" stroke-opacity="0.12"/>
+      <text x="139" y="241" text-anchor="middle" fill="#cfe3ff">Windows DX11</text>
+      <rect x="226" y="216" width="176" height="38" rx="19" fill="#ffffff" fill-opacity="0.05" stroke="#ffffff" stroke-opacity="0.12"/>
+      <text x="314" y="241" text-anchor="middle" fill="#cfe3ff">No external plugin</text>
+      <rect x="414" y="216" width="136" height="38" rx="19" fill="#ffffff" fill-opacity="0.05" stroke="#ffffff" stroke-opacity="0.12"/>
+      <text x="482" y="241" text-anchor="middle" fill="#cfe3ff">Genshin 7.0</text>
+    </g>
+
+    <text x="64" y="294" font-size="12" letter-spacing="1.2" fill="#5f7a99">AMD FFX12 SDK · Microsoft Detours · 3DMigoto-compatible texture loading</text>
+
+    <!-- pipeline -->
+    <rect x="748" y="56" width="468" height="208" rx="20" fill="#ffffff" fill-opacity="0.03" stroke="#ffffff" stroke-opacity="0.10"/>
+    <text x="776" y="88" font-size="11" letter-spacing="2.4" fill="#6b8bb0">RENDER PIPELINE</text>
+
+    <!-- node 1 -->
+    <rect x="776" y="104" width="120" height="88" rx="14" fill="#0e1a2e" stroke="#22d3ee" stroke-opacity="0.45"/>
+    <text x="836" y="136" text-anchor="middle" font-size="10" letter-spacing="1.6" fill="#6b8bb0">GAME</text>
+    <text x="836" y="165" text-anchor="middle" font-size="21" font-weight="700" fill="#eaf3ff">FSR2</text>
+
+    <!-- arrow 1 -->
+    <line x1="898" y1="148" x2="918" y2="148" stroke="#5b7ea8" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+    <!-- node 2 -->
+    <rect x="922" y="104" width="120" height="88" rx="14" fill="#0e1a2e" stroke="#60a5fa" stroke-opacity="0.5"/>
+    <text x="982" y="136" text-anchor="middle" font-size="10" letter-spacing="1.6" fill="#6b8bb0">BRIDGE</text>
+    <text x="982" y="165" text-anchor="middle" font-size="21" font-weight="700" fill="#eaf3ff">HOOK</text>
+
+    <!-- arrow 2 -->
+    <line x1="1044" y1="148" x2="1064" y2="148" stroke="#5b7ea8" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+    <!-- node 3 -->
+    <rect x="1068" y="104" width="120" height="88" rx="14" fill="#0e1a2e" stroke="#a78bfa" stroke-opacity="0.5"/>
+    <text x="1128" y="136" text-anchor="middle" font-size="10" letter-spacing="1.6" fill="#6b8bb0">FFX12</text>
+    <text x="1128" y="165" text-anchor="middle" font-size="21" font-weight="700" fill="#eaf3ff">FSR4</text>
+
+    <!-- optional branch -->
+    <rect x="776" y="212" width="412" height="30" rx="15" fill="#8b5cf6" fill-opacity="0.08" stroke="#8b5cf6" stroke-opacity="0.30" stroke-dasharray="4 4"/>
+    <text x="792" y="232" font-size="12" fill="#a9a4d6">Optional: OptiScaler → DLSS / XeSS / FSR4 INT8</text>
+
+    <text x="1216" y="294" text-anchor="end" font-size="12" fill="#5f7a99">github.com/AizawaHikaru233</text>
+  </g>
+</svg>
