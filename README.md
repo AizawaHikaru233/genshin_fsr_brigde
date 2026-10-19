@@ -62,11 +62,28 @@
   </tr>
 </table>
 
-<sub>实机截图，点击可查看原图（3840×2160）。</sub>
+<table>
+  <tr>
+    <td width="50%" align="center" valign="top">
+      <a href="assets/readme/installer-home.jpg"><img src="assets/readme/installer-home.jpg" alt="安装器 · 主页" width="100%"></a>
+      <br>
+      <sub><b>安装器 · 主页</b> · 游戏目录、帧率上限、安装内容，一屏改完</sub>
+    </td>
+    <td width="50%" align="center" valign="top">
+      <a href="assets/readme/installer-plugins.jpg"><img src="assets/readme/installer-plugins.jpg" alt="安装器 · 插件配置" width="100%"></a>
+      <br>
+      <sub><b>安装器 · 插件配置</b> · 组件版本切换、Mods 目录、解帧工具选项</sub>
+    </td>
+  </tr>
+</table>
+
+<sub>上两图为实机游戏截图（3840×2160），下两图为安装器界面（2564×1604）；点击均可查看原图。</sub>
 
 ## 发布包
 
-包由构建脚本直接组装：安装器脚本位于 `tools/FpsUnlockInstaller/`，反馈与组件清单位于 `assets/FpsUnlockPackage/`，运行资源和默认配置位于 `SharedResources/`。GitHub 发布包不会内置 NVIDIA DLSS 组件与 ReShade 二进制，安装时由脚本从各自官方上游获取（DLSS 来自 NVIDIA Streamline、ReShade 来自 reshade.me）；本地分发包需要自行补齐相应组件。
+包由构建脚本直接组装，安装器默认就是 `Installer/` 里的图形安装器（详见 `Installer/README.md`）；旧的 PowerShell 安装脚本（`tools/FpsUnlockInstaller/`）已不参与发布包，源码暂时保留，需要时可加 `-ScriptInstaller` 打一个旧流程的包。反馈与组件清单位于 `assets/FpsUnlockPackage/`，运行资源和默认配置位于 `SharedResources/`。包根 `README.md` 就是本文件，`assets/readme/` 里的演示图会一起带上。
+
+GitHub 发布包不会内置 ReShade 二进制与 NVIDIA DLSS 运行时：勾了 ReShade 才从 reshade.me 取；勾了 OptiScaler 且检测到 RTX 显卡时，从 NVIDIA 官方 Streamline 取 `nvngx_dlss.dll` 放进 OptiScaler 的组件目录（GTX 16 只吃 FSR4 INT8，不部署 DLSS）。本地分发包里哪些组件需要自行补齐，按包内实际内容处理。
 
 要生成 GitHub 发布包，请在 Windows 上运行：
 
@@ -74,7 +91,7 @@
 powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release -GithubOnly
 ```
 
-构建结果位于 `dist\原神解帧FSR插件包_v*.7z`，GitHub 发布目录生成 `dist\github-release\GenshinFSRBridge_v*.zip`。GitHub Actions 只构建和发布这个 GitHub 发布包，不生成芙芙包。
+构建结果位于 `dist\原神解帧FSR插件包_v*.7z`，GitHub 发布目录生成 `dist\github-release\GenshinFSRBridge_v*.7z`。GitHub Actions 只构建和发布这个 GitHub 发布包，不生成芙芙包。
 
 ## 芙芙启动器插件包源码与本地构建
 
@@ -184,38 +201,41 @@ flowchart LR
 | `AntiPlayerMosaic/` | 反虚化、隐藏 UID 与水下马赛克修复插件。 |
 | `FufuGraphicsPlugin/` | 芙芙启动器的bootstrap、配置文件和安装脚本。 |
 | `TextureLoader/` | 3DMigoto 兼容纹理替换 / Mod 加载器（DDS + GDDS，**仅纯纹理贴图类 Mod**）。 |
+| `Installer/` | 图形安装器（Tauri 2 + Rust + WebView2）：管理注入链、组件版本、组件日志与插件包自更新。 |
 | `SharedResources/` | 随包分发的运行时资源与组件归档。原神专用 RenoDX HDR 滤镜 Add-on 及其再分发授权记录归档于 `SharedResources/ReShade/runtime/reshade-shaders/`。 |
 
 ## 使用方法
 
 > [!WARNING]
-> 本插件包**仅面向 Windows**，未做 Linux 兼容：安装脚本依赖 Windows 批处理与 PowerShell，
+> 本插件包**仅面向 Windows 10 1809+ / Windows 11**，未做 Linux 兼容：图形安装器依赖 WebView2 运行时，
 > 在 Wine / Proton 下无法运行（双击后立即退出）。Linux 用户请走下方的
 > **Linux 安装 / Windows 手动安装**流程。
 
-### Windows 脚本一键安装
+### Windows 图形安装器
 
 1. 从 [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases) 下载**最新版本**的插件包，
-   解压到**不含中文或非法字符**的目录。
-2. 运行安装脚本（按界面语言选择，两者功能相同）：
+   解压到**不含中文或非法字符**的目录（`GenshinFSRBridgeInstaller.exe` 必须和 `payload\` 同级）。
+2. 双击 `GenshinFSRBridgeInstaller.exe`。不需要管理员权限，也不会往系统目录写东西。
+3. 点「更换…」选择原神安装目录，安装器会自己扫注册表和常见路径。
+4. 勾选**要启用的组件**，点「保存」——这一步把选中组件的绝对路径写进
+   `payload\FpsUnlocker\fps_config.json` 的注入链（`DllList`），游戏目录里不会多出 DLL。
 
-   | 界面语言 | 文件名 |
-   |---|---|
-   | 中文 | `一键配置.bat` |
-   | English | `GenshinFSRBridgeTools.bat` |
+   - **只需替换超分模型** → 至少勾 **Dx11FsrBridge**（必装，默认已勾）
+   - **需要 DLSS 或 XeSS** → 再勾 **OptiScaler**
+   - **需要 HDR 增强** → 勾 **ReShade + RenoDX**（N 卡同时开 OptiScaler 会提示兼容性风险）
 
-   也可在安装器主菜单中随时切换中文 / English，选择会自动保存。
-3. 按提示填写**需要解锁的帧率**与**要安装的插件**：
-
-   - **只需替换超分模型** → 至少安装 **Bridge**
-   - **需要 DLSS 或 XeSS** → 还需安装 **OptiScaler**
+5. 点「启动游戏」。安装器会在 `payload\FpsUnlocker\` 原地拉起解帧工具，由它注入并启动游戏。
+   之后直接双击桌面快捷方式（安装时可选）或从启动器启动即可。
 
 > [!IMPORTANT]
 > **游戏内设置（必须）**：启用 `FSR2` 抗锯齿，且渲染精度需**低于 `1`**。
 
-GitHub 发布包内置 FPS Unlocker 与 OptiScaler；安装脚本会在运行时从官方上游获取
-[NVIDIA DLSS 超分组件（`nvngx_dlss.dll`）](https://github.com/NVIDIA-RTX/Streamline/releases) 与 ReShade。
+GitHub 发布包内置 FPS Unlocker 与 OptiScaler；缺组件时安装器会在「插件配置」里给出「下载」按钮，
+当场从官方上游补齐（ReShade 来自 reshade.me，其余来自本仓库 Releases），不需要重下整包。
 本地分发包需要自行补齐相应组件。
+
+旧的 PowerShell 安装脚本（`一键配置.bat` / `GenshinFSRBridgeTools.bat`）不再随包分发；
+需要旧流程时可用 `Build-OnlineInstaller.ps1 -ScriptInstaller` 自行打包。
 
 ### Linux 安装 / Windows 手动安装
 
@@ -267,6 +287,8 @@ ReShade 的着色器 / 纹理 / Preset / 截图路径均使用**相对路径**�
 ## 构建
 
 需要 Visual Studio（含 C++ 桌面开发组件）、Windows SDK 和 CMake 3.20 或更新版本（Ninja 生成器）。发布配置需要仓库内的 `Dx11FsrBridge\third_party` 目录，其中包含 FFX12 ffx-api 头文件和 Microsoft Detours 构建依赖。
+
+还要 Rust 工具链（`cargo`）来编图形安装器：先跑一次 `Installer\app\build-app.ps1` 生成 `Installer\app\GenshinFSRBridgeInstaller.exe`，打包脚本会直接取它；没有这个 exe 时会报错提示。
 
 先更新上游组件基线（仅需在组件版本变化时执行；脚本固定 OptiScaler v0.9.4，DLSS、ReShade、FPS Unlocker 获取各自最新正式版）：
 

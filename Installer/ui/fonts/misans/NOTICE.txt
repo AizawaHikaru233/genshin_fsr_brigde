@@ -1,0 +1,33 @@
+MiSans 字体资源 —— 来源与授权说明 (NOTICE)
+==========================================
+
+本目录包含 MiSans 可变字体 (Variable Font) 的 Web 分片资源，用于本应用
+离线界面 (WebView2 虚拟主机 https://app.local)。所有文件均为本地文件，
+运行时不需要任何网络访问。
+
+1. 资源来源
+   来源包:  npm 包 "misans"，版本 5.0.0
+   分发镜像: https://cdn.jsdelivr.net/npm/misans@5.0.0/
+   文件子集: /lib/Normal/MiSansVF.*.woff2 (56 个分片) 与 /lib/Normal/MiSansVF.min.css
+   打包作者: DSRKafuU (https://dsrkafuu.net/)
+   上游仓库: https://github.com/dsrkafuu/misans
+
+2. 授权
+   字体本体: MiSans，版权所有 (c) 小米科技 (Xiaomi Inc.)，小米官方声明
+             可免费商用 (MiSans 字体知识产权归小米所有，允许免费商用)。
+   打包/构建: npm 包 misans 以 Apache License 2.0 授权发布，全文见同目录
+             LICENSE.txt。
+
+3. 本目录文件
+   misans.css  由上游 MiSansVF.min.css 本地化改造：url() 改为同目录相对
+               文件名，font-family 统一为 "MiSans"，font-display 改为 block，
+               保留每条 @font-face 的 unicode-range。未做任何字形修改。
+   *.woff2     上游原始分片，未重新压缩或修改（SHA-256 与上游清单一致）。
+
+4. 下载日期
+   2026-10-17 (Asia/Shanghai)
+
+5. 说明
+   上游 Normal 子集为网页用途做过字符裁剪：覆盖 GB2312 全部常用汉字中的
+   6696/6763 个 (约 99%)，以及 CJK 基本区约 9901 个汉字；GB2312 之外
+   的生僻字不在分片内，浏览器会回退到系统字体渲染这些字符。

@@ -1,0 +1,28 @@
+[package]
+name = "gfsr-installer"
+version = "2.4.0"
+description = "Genshin FSR Bridge 安装器"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+window-vibrancy = "0.5"
+rfd = "0.15"
+winreg = "0.52"
+ureq = { version = "2", default-features = false, features = ["native-tls", "gzip"] }
+sevenz-rust = "0.6"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Graphics_Dwm", "Win32_Foundation"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主窗口权限：允许调用安装器命令，并监听后端事件（state / progress / installed 等）",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

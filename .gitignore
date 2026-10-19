@@ -144,3 +144,12 @@ scripts/strip-fx12-deadcode.ps1
 # FSR4 / OptiScaler 逆向研究脚本（本地分析工具，不属于发布内容）
 # 说明：只忽略研究脚本；scripts/ 下若有需要发布的脚本请显式 `!scripts/xxx.py` 放行。
 scripts/*.py
+
+# 安装器（Tauri）运行时用的离线包：约 200 MB，本地从发布包解出来即可，不提交
+Installer/payload/
+
+# 安装器（Tauri）：构建产物与生成物
+Installer/app/src-tauri/target/
+Installer/app/src-tauri/gen/
+Installer/app/*.exe
+Installer/tools/shots/

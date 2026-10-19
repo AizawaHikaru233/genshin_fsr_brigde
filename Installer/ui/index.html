@@ -1,0 +1,3071 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Genshin FSR Bridge · 安装器</title>
+<!-- MiSans 随 ui/ 一起分发，完全离线，不走 CDN -->
+<link rel="stylesheet" href="fonts/misans/misans.css">
+<style>
+  :root{
+    --bg:#F5F5F7;
+    --card:#FFFFFF;
+    --ink:#1D1D1F;
+    --ink2:#6E6E73;
+    --line:#E9E9EE;
+    --line2:#F0F0F3;
+    --blue:#0068D6;
+    --blue-dim:#3C8FE0;
+    --green:#2FA84F;
+    --green-ink:#1E7B39;
+    --red:#C7362B;
+    --sans:"MiSans","SF Pro Text",-apple-system,"Segoe UI Variable Text","Segoe UI","Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+    --mono:"SF Mono","Cascadia Mono",Consolas,"Noto Sans Mono",monospace;
+    --ease:cubic-bezier(.32,.72,0,1);
+    /* 外壳不透明度：mica / 亚克力生效时由 JS 调低，卡片始终不透明 */
+    --alpha:1;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{width:100%;height:100%;overflow:hidden;background:transparent}
+  body{
+    background:rgba(245,245,247,var(--alpha));font-family:var(--sans);color:var(--ink);
+    -webkit-font-smoothing:antialiased;display:flex;flex-direction:column;
+  }
+  button{font-family:var(--sans);cursor:pointer}
+
+  /* ── 顶栏：和左侧栏同一块面，空白处可拖动，右侧是 Windows 式窗口按钮 ── */
+  .topstrip{
+    position:fixed;top:0;left:0;right:0;height:36px;z-index:50;
+    display:flex;justify-content:flex-end;align-items:stretch;user-select:none;
+  }
+  .caption{display:flex;flex:none}
+  .cap{
+    width:46px;height:36px;border:0;padding:0;background:none;color:#3C3C43;
+    display:flex;align-items:center;justify-content:center;
+    transition:background .1s linear,color .1s linear;
+  }
+  .cap:hover{background:rgba(0,0,0,.06)}
+  .cap:active{background:rgba(0,0,0,.11)}
+  .cap-close:hover{background:#C42B1C;color:#fff}
+  .cap-close:active{background:#B32A1B;color:#fff}
+  .cap svg{width:10px;height:10px;display:block}
+
+  /* ── 主体 ── */
+  .stage{flex:1;display:flex;justify-content:center;align-items:center;padding:36px 0 4px;overflow:auto}
+
+  .mark{
+    width:56px;height:56px;border-radius:14px;flex:none;
+    background:linear-gradient(160deg,#4A4A50 0%,#2A2A2E 48%,#17171A 100%);
+    display:flex;align-items:center;justify-content:center;
+    box-shadow:0 1px 2px rgba(0,0,0,.18),0 6px 14px -6px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.16);
+  }
+  .appsub{font-size:13px;color:var(--ink2);margin-top:3px;letter-spacing:0}
+
+  .card{
+    background:var(--card);border-radius:18px;border:1px solid rgba(0,0,0,.075);
+    box-shadow:0 1px 2px rgba(0,0,0,.05),0 10px 26px -20px rgba(0,0,0,.34);
+    overflow:hidden;position:relative;
+  }
+
+  .row{display:grid;grid-template-columns:30px 1fr auto;align-items:center;gap:13px;padding:14px 18px;min-height:64px;border-bottom:1px solid var(--line)}
+  .card > .row:last-child{border-bottom:0}
+  .ico{width:30px;height:30px;border-radius:8px;background:#F2F2F5;display:flex;align-items:center;justify-content:center;color:#7C7C82;flex:none}
+  .rlabel{font-size:14px;font-weight:500;letter-spacing:0}
+  .rvalue{font-size:13px;color:var(--ink2);margin-top:3px;letter-spacing:0}
+  .rvalue.mono{font-family:var(--mono);font-size:12px;letter-spacing:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .rvalue.dim{color:var(--ink2)}
+  .ghost{font-size:13px;color:var(--ink);background:#F1F1F4;border:0;border-radius:8px;padding:6px 12px;transition:background .15s,transform .12s var(--ease),box-shadow .2s,color .15s}
+  .ghost:hover{background:#E8E8EC}
+  .ghost:active{transform:scale(.97)}
+  /* 还没选游戏目录时，这一个按钮是唯一该被点的地方 */
+  .ghost.cta{background:var(--blue);color:#fff;box-shadow:0 1px 2px rgba(0,104,214,.3),0 6px 16px -8px rgba(0,104,214,.6);animation:ctapulse 2.2s var(--ease) 3}
+  .ghost.cta:hover{background:#0058B8}
+.ghost.danger{color:var(--red);background:rgba(199,54,43,.08);box-shadow:inset 0 0 0 1px rgba(199,54,43,.28)}
+.ghost.danger:hover{background:rgba(199,54,43,.14)}
+  @keyframes ctapulse{0%,100%{box-shadow:0 1px 2px rgba(0,104,214,.3),0 6px 16px -8px rgba(0,104,214,.6),0 0 0 0 rgba(0,104,214,.22)}55%{box-shadow:0 1px 2px rgba(0,104,214,.3),0 6px 16px -8px rgba(0,104,214,.6),0 0 0 5px rgba(0,104,214,0)}}
+
+  /* 分段控件：一块会滑动的底板 */
+  .seg{position:relative;display:flex;background:#F0F0F3;border-radius:9px;padding:2px;transition:opacity .2s var(--ease)}
+  .locked{opacity:.45;pointer-events:none}
+  .segthumb{
+    position:absolute;top:2px;left:2px;height:calc(100% - 4px);border-radius:7px;background:#fff;
+    box-shadow:0 1px 2px rgba(0,0,0,.12),0 0 0 .5px rgba(0,0,0,.04);
+    transition:transform .24s var(--ease),width .24s var(--ease);
+  }
+  .seg button{
+    position:relative;z-index:1;border:0;background:none;color:#3C3C43;
+    font-size:13px;font-weight:500;padding:4px 11px;border-radius:7px;
+    letter-spacing:0;font-variant-numeric:tabular-nums;
+    transition:color .18s,transform .12s var(--ease);
+  }
+  .seg button:active:not([disabled]){transform:scale(.95)}
+  .seg button[aria-pressed="true"]{color:var(--ink);font-weight:600}
+
+  /* 帧率：预设 + 自定义输入 */
+  .fpsctl{display:flex;align-items:center;gap:8px}
+  .fpsinput{
+    width:62px;height:28px;padding:0 6px;border:0;border-radius:8px;background:#fff;
+    box-shadow:inset 0 0 0 1px rgba(0,0,0,.09);
+    color:var(--ink);font-family:var(--sans);font-size:13px;font-weight:600;text-align:center;
+    font-variant-numeric:tabular-nums;letter-spacing:0;outline:none;
+    transition:box-shadow .15s,background .15s;
+  }
+  .fpsinput::placeholder{color:#8E8E93;font-weight:500;font-size:12px}
+  .fpsinput:focus{box-shadow:inset 0 0 0 1.5px rgba(0,104,214,.75)}
+  .fpsctl.locked{opacity:.45;pointer-events:none}
+
+  /* 组件行 */
+  .comp{display:grid;grid-template-columns:18px 1fr auto;align-items:center;gap:13px;padding:0 18px 0 61px;height:44px;border-bottom:1px solid var(--line2)}
+  .comp:last-of-type{border-bottom:0}
+  .cname{display:block;font-size:13px;color:var(--ink);letter-spacing:0}
+  .cname em{font-style:normal;color:var(--ink2);font-size:12px;margin-left:8px;letter-spacing:0}
+  .cstat-end{padding-right:23px}
+  .cstat-end.has-sym{padding-right:0}
+  .cflag{font-size:12px;color:var(--ink2)}
+  .cflag.miss{color:var(--red)}
+  /* 组件文件缺失时的联网补齐入口 */
+  .cbtn{
+    margin-left:10px;height:24px;padding:0 10px;border:0;border-radius:7px;
+    background:rgba(0,104,214,.1);color:var(--blue);font-size:12px;font-weight:600;cursor:pointer;
+    transition:background .12s var(--ease),transform .12s var(--ease);
+  }
+  .cbtn:hover{background:rgba(0,104,214,.18)}
+  .cbtn:active{transform:scale(.96);transition-duration:.06s}
+  .cbtn[disabled]{opacity:.55;cursor:default;transform:none}
+  .cb{
+    width:17px;height:17px;border-radius:5px;border:1.5px solid #C9C9CF;background:#fff;
+    display:flex;align-items:center;justify-content:center;padding:0;
+    transition:background .16s var(--ease),border-color .16s var(--ease),transform .09s;
+  }
+  .cb svg{opacity:0}
+  .cb[aria-checked="true"]{background:var(--blue);border-color:var(--blue)}
+  .cb[aria-checked="true"] svg{opacity:1}
+  .cb svg path{stroke-dasharray:16;stroke-dashoffset:16;transition:stroke-dashoffset .2s var(--ease) .04s}
+  .cb[aria-checked="true"] svg path{stroke-dashoffset:0}
+  .cb:active{transform:scale(.9)}
+  .comp[data-st="off"] .cname{color:#6E6E73}
+  /* 必装项：勾着但改不了，用灰勾区别于可选项的蓝勾 */
+  .comp[data-locked="1"] .cb{pointer-events:none;cursor:default;background:#C7C7CC;border-color:#C7C7CC}
+  .comp[data-locked="1"] .cb:active{transform:none}
+  .comp[data-locked="1"] .cb svg{opacity:.9}
+  /* 自定义注入：列表底部一行入口，每加一个就在它上面长一行 */
+  .comp.custom[data-on="0"] .cname{color:#6E6E73}
+  .cflag.off{color:#8E8E93}
+  .comp.custom .cname em{color:var(--ink2)}
+  .cbtn{border:0;background:none;color:var(--ink2);font-size:12px;padding:4px 8px;border-radius:7px;cursor:pointer;font-family:inherit;transition:background .15s var(--ease),color .15s var(--ease)}
+  .cstat-end .cbtn{margin-left:8px}
+  .cbtn:hover{background:rgba(0,0,0,.05);color:var(--ink)}
+  .cbtn.danger:hover{color:var(--red)}
+  .comp.add .cplus{width:18px;height:18px;border-radius:5px;border:1px dashed #C7C7CC;display:flex;align-items:center;justify-content:center;font-size:12px;line-height:1;color:#8E8E93}
+  .comp.add .cname{color:var(--ink2)}
+  .comp.add .cbtn{color:var(--blue)}
+  .comp.add .cbtn:hover{background:rgba(0,104,214,.09);color:var(--blue)}
+  .comp[data-st="wait"] .cb{border-color:#DCDCE1}
+  .comp[data-st="wait"] .cname{color:#6E6E73}
+  .comp[data-st="off"] .cname em{color:#6E6E73}
+
+  /* 行内状态：写入中 / 已写入 / 失败 */
+  .cstat{font-size:12px;color:var(--ink2);display:flex;align-items:center;gap:9px}
+  .tick{width:17px;height:17px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:var(--green);opacity:0;transform:scale(.7);transition:opacity .2s var(--ease),transform .28s cubic-bezier(.2,1.5,.5,1)}
+  .comp[data-st="done"] .tick{opacity:1;transform:scale(1)}
+  .comp[data-st="active"] .cstat{color:var(--blue)}
+  .spin{width:12px;height:12px;border-radius:50%;border:1.6px solid rgba(0,104,214,.22);border-top-color:var(--blue);animation:spin .7s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .comp[data-st="fail"]{background:#FDF2F1;height:auto;padding-top:10px;padding-bottom:10px}
+  .cfail{display:block;font-size:12px;color:#8E4039;margin-top:3px;letter-spacing:0}
+  .comp[data-st="fail"] .cname{color:var(--red)}
+  .comp[data-st="fail"] .cname em{color:#9C4A43}
+  .xfail{width:17px;height:17px;border-radius:50%;background:var(--red);display:flex;align-items:center;justify-content:center}
+
+  /* 安装内容表头 + 进度线 */
+  .headrow{padding-bottom:13px;border-bottom:1px solid var(--line);position:relative}
+  .headrow .rvalue{margin-top:0}
+  .ready{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--green-ink)}
+  .ready i{width:6px;height:6px;border-radius:50%;background:var(--green);display:block}
+  .ready.warn{color:var(--ink2)}
+  .ready.warn i{background:#8E8E93}
+  .ready.bad{color:var(--red)}
+  .ready.bad i{background:var(--red)}
+  .pline{position:absolute;left:0;bottom:-1px;height:2px;background:var(--blue);width:0;transition:width .3s linear;border-radius:0 2px 2px 0}
+
+  /* ── 主界面：左侧导航 + 右侧内容页 ── */
+  .view[hidden]{display:none}
+  /* hidden 属性要压得住 .btn/.cap 的 display，否则「隐藏」按钮照样露出来 */
+  [hidden]{display:none !important}
+  .stage.wide{align-items:stretch;justify-content:flex-start;padding:0;overflow:hidden}
+  .app{display:flex;width:100%;height:100%;min-height:0}
+  .nav{
+    width:216px;flex:none;display:flex;flex-direction:column;
+    padding:46px 12px 14px;background:rgba(242,242,242,var(--alpha));
+  }
+  .navbrand{display:flex;align-items:center;gap:10px;padding:0 10px 20px 6px}
+  .mark.sm{width:34px;height:34px;border-radius:9px}
+  .brandname{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:0}
+  .navbrand .appsub{font-size:11px;margin-top:2px}
+  .navlist{display:flex;flex-direction:column;gap:1px}
+  .navitem{
+    display:flex;align-items:center;gap:9px;width:100%;border:0;background:none;
+    padding:8px 10px;border-radius:8px;font-size:13px;font-weight:500;color:#3C3C43;text-align:left;
+    transition:background .14s linear,color .14s linear,transform .12s var(--ease);
+  }
+  .navitem:active{transform:scale(.97)}
+  .navitem svg{width:16px;height:16px;flex:none;color:#8A8A90;transition:color .14s linear}
+  .navitem:hover{background:rgba(0,0,0,.045)}
+  .navitem[aria-current="page"]{background:rgba(0,0,0,.06);color:var(--ink);font-weight:600}
+  .navitem[aria-current="page"] svg{color:var(--ink)}
+
+  .pane{flex:1;min-width:0;overflow-y:auto;padding:44px 32px 32px;background:rgba(255,255,255,var(--alpha))}
+  .page{max-width:900px;margin:0 auto}
+  .page[hidden]{display:none}
+  .pagehead{margin-bottom:16px}
+  .pagehead h1{font-size:19px;font-weight:600;letter-spacing:0;line-height:1.3}
+  .pagehead p{font-size:13px;color:var(--ink2);margin-top:5px;line-height:1.55}
+  .verlist{display:flex;flex-wrap:wrap;gap:8px;padding:4px 18px 16px 61px}
+  .verchip{height:30px;padding:0 12px;border:0;border-radius:8px;background:#fff;box-shadow:inset 0 0 0 1px rgba(0,0,0,.1);font-size:13px;color:var(--ink);cursor:pointer;transition:background .15s ease,box-shadow .15s ease,transform .12s var(--ease)}
+  .verchip:active:not(:disabled){transform:scale(.96)}
+  .verchip:hover{background:#F6F6F8}
+  .verchip[aria-pressed="true"]{background:rgba(0,104,214,.1);box-shadow:inset 0 0 0 1px rgba(0,104,214,.55);color:#0059B8;font-weight:600}
+  .verchip:disabled{opacity:.45;cursor:default}
+  .verchip .vermeta{margin-left:7px;font-size:12px;color:var(--ink2);font-weight:400}
+  .verempty{padding:0 0 14px;font-size:13px;color:var(--ink2)}
+
+  /* ── 解帧工具选项：紧凑行（一行多个控件） ── */
+  .srow{display:flex;align-items:center;gap:14px;min-height:48px;padding:7px 18px;border-bottom:1px solid var(--line2)}
+  .srow:last-child{border-bottom:0}
+  .sname{flex:none;width:74px;font-size:12.5px;font-weight:500;color:var(--ink2);line-height:1.3}
+  .sgroup{display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-left:auto}
+  .switem{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ink);white-space:nowrap;cursor:pointer;user-select:none}
+  .switem.dim{opacity:.42;cursor:default}
+  .sw{position:relative;flex:none;width:34px;height:20px;padding:0;border:0;border-radius:10px;background:#D6D6DC;cursor:pointer;transition:background .18s ease,transform .12s var(--ease)}
+  .sw:active:not(:disabled){transform:scale(.94)}
+  .sw::after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.28);transition:transform .18s cubic-bezier(.3,1.2,.5,1)}
+  .sw[aria-checked="true"]{background:var(--blue)}
+  .sw[aria-checked="true"]::after{transform:translateX(14px)}
+  .sw:disabled{opacity:.4;cursor:default}
+  .seg.sm button{font-size:12.5px;padding:3px 10px}
+  .seg button[disabled]{opacity:.45;cursor:default}
+  .sinput{width:56px;height:26px;border:0;border-radius:7px;background:#fff;box-shadow:inset 0 0 0 1px rgba(0,0,0,.1);font-size:12.5px;font-weight:600;text-align:center;font-variant-numeric:tabular-nums;color:var(--ink)}
+  .sinput:disabled{background:#F5F5F7;color:#A1A1A6}
+  .sselect{height:26px;border:0;border-radius:7px;background:#fff;box-shadow:inset 0 0 0 1px rgba(0,0,0,.1);font-size:12.5px;color:var(--ink);padding:0 6px}
+  .sselect:disabled{background:#F5F5F7;color:#A1A1A6}
+  .sres{display:flex;align-items:center;gap:6px}
+  .sres span{font-size:12px;color:var(--ink2)}
+  .sfixed{font-size:12.5px;color:var(--ink2);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .sfixed b{font-weight:600;color:var(--ink)}
+  .slabel{font-size:12.5px;color:var(--ink2);white-space:nowrap}
+  .scard-note{padding:0 18px 12px;font-size:12px;color:var(--ink2);line-height:1.5}
+  .lnklist{padding:2px 18px 12px}
+  .lnkrow{display:flex;align-items:center;gap:10px;padding:7px 0}
+  .lnkrow + .lnkrow{border-top:1px solid var(--line2)}
+  .lname2{flex:none;width:88px;font-size:12.5px;font-weight:600;color:var(--ink)}
+  .ltext{flex:1;min-width:0;font-size:12px;color:var(--ink2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ltext.desc{white-space:normal;line-height:1.55;font-size:12.5px;font-family:inherit;color:var(--ink2)}
+  .ltext.desc{white-space:normal;line-height:1.55;font-size:12.5px;font-family:inherit}
+  .scard-note.bad{color:var(--red)}
+  .btnrow{display:flex;align-items:center;gap:8px}
+  .logrow{display:flex;align-items:center;gap:14px;padding:11px 18px 11px 61px;border-top:1px solid var(--line2)}
+  .logmain{flex:1;min-width:0}
+  .lname{font-size:13px;color:var(--ink);font-weight:600}
+  .lpath{font-size:11.5px;color:var(--ink2);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .lmeta{font-size:11.5px;color:var(--ink2);margin-top:2px}
+  .logrow.none .lname{color:var(--ink2)}
+  .logrow.none .lpath,.logrow.none .lmeta{color:#A1A1A6}
+  .logrow .ghost{flex:none}
+  .logrow.none .ghost{opacity:.45}
+  .page .card + .card{margin-top:14px}
+  .ltext{flex:1;min-width:0}
+
+  /* ── 配置卡 + 动作行：向导和主页共用同一份 DOM，切视图时整块搬过去 ── */
+  .cfgslot{display:flex;flex-direction:column}
+  .cfg{display:flex;flex-direction:column;gap:14px}
+  .actions{display:flex;align-items:center;gap:10px}
+  .env{font-size:12px;color:var(--ink2);letter-spacing:0;min-width:0;flex:1;margin-right:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .env b{font-weight:500;color:var(--ink2)}
+  .env .sep{margin:0 9px;color:#C9C9CF}
+  .env.bad b{color:var(--red)}
+  .primary{
+    margin-left:auto;height:37px;padding:0 22px;border:0;border-radius:10px;
+    background:var(--blue);color:#fff;font-size:14px;font-weight:600;letter-spacing:0;
+    box-shadow:0 1px 2px rgba(0,104,214,.28),0 6px 16px -8px rgba(0,104,214,.55);
+    transition:transform .09s var(--ease),background .18s,box-shadow .18s,color .18s;
+    display:flex;align-items:center;gap:8px;flex:none;
+  }
+  .primary:hover{background:#0058B8}
+  .primary:active{transform:scale(.98)}
+  .primary[disabled]{background:#EDEDF1;color:#8A8A8F;box-shadow:none;cursor:default;transform:none}
+  .secondary{height:37px;padding:0 16px;border:0;border-radius:10px;background:#fff;color:var(--ink);font-size:13px;font-weight:500;box-shadow:inset 0 0 0 1px rgba(0,0,0,.12),0 1px 1px rgba(0,0,0,.03);transition:background .15s,transform .09s;flex:none}
+  .secondary:hover{background:#F7F7F9}
+  .secondary:active{transform:scale(.98)}
+  .secondary[disabled]{background:#F0F0F3;color:#B0B0B5;box-shadow:inset 0 0 0 1px rgba(0,0,0,.06);cursor:default;transform:none}
+  .secondary[hidden]{display:none}
+  .btnspin{width:13px;height:13px;border-radius:50%;border:1.7px solid rgba(255,255,255,.3);border-top-color:#fff;animation:spin .75s linear infinite}
+  .primary[disabled] .btnspin{border-color:rgba(0,0,0,.12);border-top-color:#8A8A8F}
+
+  /* ── 设置页：外观控件 ── */
+  /* 白底胶囊统一由 .segthumb 画，切换时跟着滑动 */
+  .seg.plain button[aria-pressed="true"]{color:var(--ink);font-weight:600}
+  .seg.plain{border-radius:9px}
+  .opctl{display:flex;align-items:center;gap:10px}
+  .opctl input[type=range]{width:140px;height:18px;cursor:pointer;-webkit-appearance:none;appearance:none;background:none}
+  .opctl input[type=range]::-webkit-slider-runnable-track{height:4px;border-radius:2px;background:#E1E1E6}
+  .opctl input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;margin-top:-6px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.28),0 0 0 .5px rgba(0,0,0,.06)}
+  .opctl input[type=range]:disabled{opacity:.45}
+  .opctl input[type=range]:disabled::-webkit-slider-thumb{box-shadow:0 0 0 .5px rgba(0,0,0,.1)}
+  .opval{font-size:12px;color:var(--ink2);width:36px;text-align:right;font-variant-numeric:tabular-nums}
+
+  /* ── 目录选择浮层 ── */
+  .picker{
+    position:fixed;z-index:60;width:318px;background:#fff;border-radius:13px;
+    border:1px solid rgba(0,0,0,.1);
+    box-shadow:0 20px 52px -14px rgba(0,0,0,.4),0 4px 12px -4px rgba(0,0,0,.16),0 0 0 .5px rgba(0,0,0,.05);
+    padding:6px;transform-origin:top right;
+    transition:opacity .16s var(--ease),transform .2s var(--ease);
+  }
+  .picker[hidden]{display:none}
+  .picker.closing{opacity:0;transform:scale(.96) translateY(-4px)}
+  .picker .ph{font-size:11px;color:var(--ink2);padding:7px 10px 6px;letter-spacing:0}
+  .picker button{display:flex;align-items:center;gap:9px;width:100%;text-align:left;border:0;background:none;border-radius:8px;padding:8px 10px;font-size:13px;color:var(--ink);position:relative}
+  .picker button + button::before{content:'';position:absolute;left:10px;right:10px;top:0;height:1px;background:var(--line2)}
+  .picker button:hover{background:#F1F1F4}
+  .picker .path{font-family:var(--mono);font-size:12px;color:var(--ink2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
+  .picker .cur{color:var(--blue);flex:none;margin-left:auto}
+  .picker .sub{font-size:11px;color:#6E6E73}
+  .picker .browse{color:var(--blue)}
+
+  /* ── 检查更新弹窗 ── */
+  .modal{position:fixed;inset:0;z-index:80;display:flex;align-items:center;justify-content:center}
+  .modal[hidden]{display:none}
+  .modalscrim{position:absolute;inset:0;background:rgba(0,0,0,.26);animation:fadein .16s var(--ease) both}
+  .modalbox{position:relative;width:524px;background:var(--card);border-radius:16px;border:1px solid rgba(0,0,0,.08);box-shadow:0 26px 60px -18px rgba(0,0,0,.42),0 6px 18px -8px rgba(0,0,0,.18);animation:popin .2s var(--ease) both;overflow:hidden}
+  @keyframes fadein{from{opacity:0}to{opacity:1}}
+  @keyframes popin{from{opacity:0;transform:scale(.985) translateY(6px)}to{opacity:1;transform:none}}
+  .modalhead{display:flex;align-items:center;gap:10px;padding:14px 12px 12px 18px;border-bottom:1px solid var(--line2)}
+  .modalhead h2{font-size:14px;font-weight:600;margin:0;flex:1}
+  .modalhead .cap{width:30px;height:30px;border-radius:7px}
+  .upmain{padding:16px 18px 0}
+  .upline{display:flex;align-items:center;gap:12px;min-height:30px}
+  .upstate{font-size:13px;color:var(--ink2);flex:1;line-height:1.55}
+  .upstate b{color:var(--ink);font-weight:600}
+  .upstate.bad{color:var(--red)}
+  .upprogress{height:3px;border-radius:2px;background:var(--line2);margin-top:12px;overflow:hidden;opacity:0;transition:opacity .16s var(--ease)}
+  .upprogress.on{opacity:1}
+  .upprogress span{display:block;height:100%;width:100%;background:var(--blue);border-radius:2px;transform-origin:left;transform:scaleX(0);transition:transform .3s var(--ease)}
+  .upprogress.anon span{width:34%;animation:slide 1.15s var(--ease) infinite}
+  @keyframes slide{from{transform:translateX(-110%)}to{transform:translateX(330%)}}
+  .upmsg{font-size:12px;color:var(--ink2);margin-top:9px;min-height:17px;line-height:1.5}
+  .upmanual{padding:14px 18px 16px;border-top:1px solid var(--line2);margin-top:14px;background:rgba(0,0,0,.014)}
+  .uplabel{font-size:12px;color:var(--ink2);margin-bottom:9px}
+  .upbtns{display:flex;flex-wrap:wrap;gap:8px}
+
+  /* ── 显卡兼容性提醒弹窗 ── */
+  .warnbody{padding:16px 22px 4px;font-size:13px;line-height:1.7;color:var(--ink2)}
+  .warnfoot{display:flex;justify-content:flex-end;gap:10px;padding:16px 20px 18px}
+  .warnfoot .ghost{color:var(--ink2)}
+  /* ── 首次出场 ── */
+  @keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  .intro{animation:rise .3s var(--ease) both}
+
+  /* 切选项卡：内容整体淡入上浮，和页内其它动效同一套缓动与节奏 */
+  .page.swap{animation:pagein .28s var(--ease) both}
+  @keyframes pagein{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
+
+  /* ── 深色：跟随系统或手动指定。只覆盖需要变色的面，浅色规则一律不动 ── */
+  :root[data-theme="dark"]{
+    --bg:#1B1B1D;--card:#26262A;--ink:#EDEDF0;--ink2:#9C9CA3;
+    --line:#34343A;--line2:#2C2C31;
+    --blue:#2E8BE6;--blue-dim:#5AA0E8;--green:#37B45C;--green-ink:#4FD47A;--red:#E0655A;
+    color-scheme:dark;
+  }
+  :root[data-theme="dark"] body{background:rgba(27,27,29,var(--alpha))}
+  :root[data-theme="dark"] .nav{background:rgba(30,30,33,var(--alpha))}
+  :root[data-theme="dark"] .pane{background:rgba(38,38,42,var(--alpha))}
+  :root[data-theme="dark"] .card{border-color:rgba(255,255,255,.07);box-shadow:0 1px 2px rgba(0,0,0,.4),0 10px 26px -20px rgba(0,0,0,.9)}
+  :root[data-theme="dark"] .cap{color:#D6D6DE}
+  :root[data-theme="dark"] .cap:hover{background:rgba(255,255,255,.08)}
+  :root[data-theme="dark"] .cap:active{background:rgba(255,255,255,.13)}
+  :root[data-theme="dark"] .ico{background:rgba(255,255,255,.07);color:#A9A9B3}
+  :root[data-theme="dark"] .ghost{background:rgba(255,255,255,.09)}
+  :root[data-theme="dark"] .ghost:hover{background:rgba(255,255,255,.14)}
+  :root[data-theme="dark"] .seg{background:rgba(255,255,255,.09)}
+  :root[data-theme="dark"] .segthumb{background:#3F3F47;box-shadow:0 1px 2px rgba(0,0,0,.5),0 0 0 .5px rgba(255,255,255,.06)}
+  :root[data-theme="dark"] .seg button{color:#CFCFD7}
+  :root[data-theme="dark"] .fpsinput{background:rgba(255,255,255,.08);box-shadow:inset 0 0 0 1px rgba(255,255,255,.12)}
+  :root[data-theme="dark"] .fpsinput::placeholder{color:#8A8A93}
+  :root[data-theme="dark"] .cb{background:transparent;border-color:#5E5E67}
+  :root[data-theme="dark"] .cb[aria-checked="true"]{background:var(--blue);border-color:var(--blue)}
+  :root[data-theme="dark"] .comp[data-locked="1"] .cb{background:#5E5E67;border-color:#5E5E67}
+  :root[data-theme="dark"] .comp.add .cplus{border-color:rgba(255,255,255,.24);color:#9A9AA3}
+  :root[data-theme="dark"] .comp[data-st="fail"]{background:rgba(224,101,90,.12)}
+  :root[data-theme="dark"] .cfail{color:#EE9A92}
+  :root[data-theme="dark"] .comp[data-st="fail"] .cname em{color:#D98A83}
+  :root[data-theme="dark"] .comp[data-st="wait"] .cb{border-color:#4A4A52}
+  :root[data-theme="dark"] .navitem{color:#C6C6CE}
+  :root[data-theme="dark"] .navitem svg{color:#93939C}
+  :root[data-theme="dark"] .navitem:hover{background:rgba(255,255,255,.06)}
+  :root[data-theme="dark"] .navitem[aria-current="page"]{background:rgba(255,255,255,.1)}
+  :root[data-theme="dark"] .verchip{background:rgba(255,255,255,.06);box-shadow:inset 0 0 0 1px rgba(255,255,255,.14)}
+  :root[data-theme="dark"] .verchip:hover{background:rgba(255,255,255,.1)}
+  :root[data-theme="dark"] .verchip[aria-pressed="true"]{background:rgba(46,139,230,.18);box-shadow:inset 0 0 0 1px rgba(46,139,230,.6);color:#8FC2F5}
+  :root[data-theme="dark"] .sw{background:#4C4C55}
+  :root[data-theme="dark"] .sw::after{background:#F2F2F7}
+  :root[data-theme="dark"] .sinput,:root[data-theme="dark"] .sselect{background:rgba(255,255,255,.08);box-shadow:inset 0 0 0 1px rgba(255,255,255,.14);color:var(--ink)}
+  :root[data-theme="dark"] .sinput:disabled,:root[data-theme="dark"] .sselect:disabled{background:rgba(255,255,255,.04);color:#71717A}
+  :root[data-theme="dark"] .secondary{background:rgba(255,255,255,.08);box-shadow:inset 0 0 0 1px rgba(255,255,255,.16)}
+  :root[data-theme="dark"] .secondary:hover{background:rgba(255,255,255,.14)}
+  :root[data-theme="dark"] .secondary[disabled]{background:rgba(255,255,255,.05);color:#71717A;box-shadow:inset 0 0 0 1px rgba(255,255,255,.07)}
+  :root[data-theme="dark"] .primary[disabled]{background:rgba(255,255,255,.08);color:#7A7A83}
+  :root[data-theme="dark"] .picker{background:#2B2B31;border-color:rgba(255,255,255,.1)}
+  :root[data-theme="dark"] .picker button:hover{background:rgba(255,255,255,.08)}
+  :root[data-theme="dark"] .modalbox{border-color:rgba(255,255,255,.08)}
+  :root[data-theme="dark"] .upmanual{background:rgba(255,255,255,.03)}
+  :root[data-theme="dark"] .opctl input[type=range]::-webkit-slider-runnable-track{background:rgba(255,255,255,.18)}
+  :root[data-theme="dark"] .opctl input[type=range]::-webkit-slider-thumb{background:#F2F2F7;box-shadow:0 1px 3px rgba(0,0,0,.6),0 0 0 .5px rgba(255,255,255,.1)}
+  :root[data-theme="dark"] .logrow.none .lpath,:root[data-theme="dark"] .logrow.none .lmeta{color:#6F6F78}
+  :root[data-theme="dark"] .env .sep{color:#5A5A63}
+  
+  :root[data-theme="dark"] .ready.warn i{background:#8A8A93}
+  :root[data-theme="dark"] .cbtn:hover{background:rgba(255,255,255,.08)}
+  :root[data-theme="dark"] .comp.add .cbtn:hover{background:rgba(46,139,230,.16)}  @media (prefers-reduced-motion: reduce){
+    *{animation-duration:.001s !important;transition-duration:.001s !important}
+  }
+</style>
+</head>
+<body>
+
+<div class="topstrip" id="topstrip">
+  <div class="caption">
+    <button class="cap" id="capmin" aria-label="最小化" title="最小化">
+      <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><path d="M.5 5.5h9"/></svg>
+    </button>
+    <button class="cap" id="capmax" aria-label="最大化" title="最大化">
+      <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1" id="maxglyph"><rect x=".5" y=".5" width="9" height="9" rx="1"/></svg>
+    </button>
+    <button class="cap cap-close" id="capclose" aria-label="关闭" title="关闭">
+      <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><path d="M.5 .5l9 9M9.5 .5l-9 9"/></svg>
+    </button>
+  </div>
+</div>
+
+<main class="stage wide">
+
+  <!-- 主界面：左侧导航 + 右侧内容页 -->
+  <div class="view app" id="view-main">
+
+    <aside class="nav">
+      <div class="navbrand">
+        <div class="mark sm">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#F5F5F7" stroke-width="1.5" stroke-linejoin="round">
+            <path d="M4 15.4 12 4.2l8 11.2-8 4.4-8-4.4Z"/>
+            <path d="M12 4.6v14.4" opacity=".55"/>
+          </svg>
+        </div>
+        <div class="brandtxt">
+          <div class="brandname">Genshin FSR Bridge</div>
+          <div class="appsub" id="mainsub">已配置</div>
+        </div>
+      </div>
+
+      <nav class="navlist" id="navlist">
+        <button class="navitem" data-page="home" aria-current="page">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10.6 12 4l8 6.6V19a1.4 1.4 0 0 1-1.4 1.4h-3.2v-5.4H8.6v5.4H5.4A1.4 1.4 0 0 1 4 19Z"/></svg>
+          主页
+        </button>
+        <button class="navitem" data-page="versions">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.6 20 8v8l-8 4.4L4 16V8Z"/><path d="M12 12.1 20 8M12 12.1V20.4M12 12.1 4 8"/></svg>
+          插件配置
+        </button>
+        <button class="navitem" data-page="settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.1"/><path d="M12 3.4v2.2M12 18.4v2.2M4.9 7.9l1.9 1.1M17.2 15l1.9 1.1M4.9 16.1l1.9-1.1M17.2 9l1.9-1.1"/></svg>
+          设置
+        </button>
+        <button class="navitem" data-page="about">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.2"/><path d="M12 11v5.2"/><circle cx="12" cy="8.1" r=".9" fill="currentColor" stroke="none"/></svg>
+          关于
+        </button>
+      </nav>
+    </aside>
+
+    <div class="pane" id="panebox">
+
+      <!-- 主页：整块配置（游戏目录 / 帧率上限 / 安装内容） -->
+      <section class="page" data-page="home">
+        <header class="pagehead">
+          <h1>主页</h1>
+          <p id="homeintro">—</p>
+        </header>
+
+        <div class="cfgslot" id="slot-home">
+      <div class="cfg" id="cfg">
+      <section class="card">
+  
+        <!-- 游戏目录 -->
+        <div class="row intro" style="animation-delay:40ms">
+          <div class="ico">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3.5 7.2a2 2 0 0 1 2-2h3.3l2 2.3h7.7a2 2 0 0 1 2 2v8.3a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2Z"/>
+            </svg>
+          </div>
+          <div style="min-width:0">
+            <div class="rlabel">游戏目录</div>
+            <div class="rvalue mono" data-dir-path>正在查找原神安装位置…</div>
+          </div>
+          <button class="ghost" data-dir-btn>更换…</button>
+        </div>
+  
+        <!-- 帧率上限 -->
+        <div class="row intro" style="animation-delay:80ms">
+          <div class="ico">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4.5 17.5a8 8 0 1 1 15 0"/><path d="M12 12.6l4-3.4"/><circle cx="12" cy="13.6" r="1.5"/>
+            </svg>
+          </div>
+          <div>
+            <div class="rlabel">帧率上限</div>
+          </div>
+          <div class="fpsctl" data-fpsctl>
+            <div class="seg"><span class="segthumb"></span></div>
+            <input class="fpsinput" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" maxlength="4" placeholder="自定义" aria-label="自定义帧率上限">
+          </div>
+        </div>
+  
+        <!-- 安装内容 -->
+        <div class="row headrow intro" style="animation-delay:120ms">
+          <div class="ico">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3.6 20 8v8l-8 4.4L4 16V8Z"/><path d="M12 12.1 20 8M12 12.1V20.4M12 12.1 4 8"/>
+            </svg>
+          </div>
+          <div>
+            <div class="rlabel">安装内容</div>
+            <div class="rvalue" id="compsum">正在读取组件…</div>
+          </div>
+          <div class="ready" id="ready"><i></i>全部就绪</div>
+          <div class="pline" id="pline"></div>
+        </div>
+  
+        <div id="comps"></div>
+  
+      </section>
+  
+      <div class="actions">
+        <div class="env" id="env"></div>
+        <button class="secondary" id="btncancel" hidden>取消</button>
+        <button class="secondary" id="btnlog" hidden>查看日志</button>
+        <button class="secondary" id="btnsave" hidden disabled>保存</button>
+        <button class="primary" id="btnlaunch" hidden>启动游戏</button>
+        </div>
+      </div><!-- /#cfg -->
+        </div>
+      </section>
+
+      <!-- 插件配置：Bridge / OptiScaler 多版本切换 -->
+      <section class="page" data-page="versions" hidden>
+        <header class="pagehead">
+          <h1>插件配置</h1>
+          <p>payload 里放多份组件目录时，可以在这里切换当前使用的版本；切换会立刻写进解帧工具的注入链。</p>
+        </header>
+
+        <section class="card">
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3.6 20 8v8l-8 4.4L4 16V8Z"/><path d="M12 12.1 20 8M12 12.1V20.4M12 12.1 4 8"/>
+              </svg>
+            </div>
+            <div style="min-width:0">
+              <div class="rlabel">Dx11FsrBridge</div>
+              <div class="rvalue">识别 payload 里以 Bridge 开头的文件夹</div>
+            </div>
+            <div class="rvalue mono" id="ver-bridge-cur">—</div>
+          </div>
+          <div class="verlist" id="ver-bridge-list"></div>
+        </section>
+
+        <section class="card">
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3.6" y="3.6" width="7.4" height="7.4" rx="1.6"/><rect x="13" y="3.6" width="7.4" height="7.4" rx="1.6"/><rect x="3.6" y="13" width="7.4" height="7.4" rx="1.6"/><rect x="13" y="13" width="7.4" height="7.4" rx="1.6"/>
+              </svg>
+            </div>
+            <div style="min-width:0">
+              <div class="rlabel">OptiScaler</div>
+              <div class="rvalue">识别 payload 里以 OptiScaler 开头的文件夹；0.10 起是嵌套布局，超分后端路径自动按布局写 ini</div>
+            </div>
+            <div class="rvalue mono" id="ver-opti-cur">—</div>
+          </div>
+          <div class="verlist" id="ver-opti-list"></div>
+        </section>
+
+        <section class="card">
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3.5 7.2a2 2 0 0 1 2-2h3.3l2 2.3h7.7a2 2 0 0 1 2 2v8.3a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2Z"/>
+              </svg>
+            </div>
+            <div style="min-width:0">
+              <div class="rlabel">组件目录</div>
+              <div class="rvalue mono" id="payloadpath">—</div>
+            </div>
+            <button class="ghost" id="btn-open-payload">打开</button>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3.5" y="3.5" width="17" height="17" rx="3"/><path d="M3.5 9.2h17M9.2 20.5v-11"/>
+              </svg>
+            </div>
+            <div style="min-width:0">
+              <div class="rlabel">TextureLoader Mods 目录</div>
+              <div class="rvalue mono" id="modspath">—</div>
+            </div>
+            <div class="btnrow">
+              <button class="ghost" id="btn-mods-reset" hidden>用默认</button>
+              <button class="ghost" id="btn-mods-pick">选择…</button>
+            </div>
+          </div>
+          <div class="scard-note" id="modsnote">留空即用 TextureLoader 同目录的 Mods 文件夹；选好会立刻写进 payload\TextureLoader\TextureLoader.ini，重启游戏生效。</div>
+        </section>
+
+        <section class="card">
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="17" r="2"/>
+              </svg>
+            </div>
+            <div style="min-width:0">
+              <div class="rlabel">解帧工具选项</div>
+              <div class="rvalue">写进 fps_config.json，下次启动游戏时生效</div>
+            </div>
+          </div>
+          <div id="unlockerbox"></div>
+        </section>
+      </section>
+
+      <!-- 设置 -->
+      <section class="page" data-page="settings" hidden>
+        <header class="pagehead">
+          <h1>设置</h1>
+          <p>游戏目录、帧率上限和组件都在主页上改。</p>
+        <section class="card">
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 5.6h16M4 12h16M4 18.4h16"/>
+              </svg>
+            </div>
+            <div>
+              <div class="rlabel">界面语言</div>
+              <div class="rvalue">跟随系统时，系统是中文就显示中文，其它语言显示英文</div>
+            </div>
+            <div class="seg plain" id="langseg" role="group" aria-label="界面语言">
+              <span class="segthumb"></span>
+              <button data-lang="system" aria-pressed="true">跟随系统</button>
+              <button data-lang="zh" aria-pressed="false">中文</button>
+              <button data-lang="en" aria-pressed="false">English</button>
+            </div>
+          </div>
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="4.2"/><path d="M12 3v2.2M12 18.8V21M3 12h2.2M18.8 12H21M5.6 5.6l1.6 1.6M16.8 16.8l1.6 1.6M5.6 18.4l1.6-1.6M16.8 7.2l1.6-1.6"/>
+              </svg>
+            </div>
+            <div>
+              <div class="rlabel">明暗主题</div>
+              <div class="rvalue">跟随系统时随 Windows 的浅色 / 深色自动切换</div>
+            </div>
+            <div class="seg plain" id="themeseg" role="group" aria-label="明暗主题">
+              <span class="segthumb"></span>
+              <button data-theme="system" aria-pressed="true">跟随系统</button>
+              <button data-theme="light" aria-pressed="false">浅色</button>
+              <button data-theme="dark" aria-pressed="false">深色</button>
+            </div>
+          </div>
+        </section>
+        </header>
+
+        <section class="card">
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3.4" y="4.6" width="17.2" height="14.8" rx="2.2"/><path d="M3.4 9.6h17.2"/>
+              </svg>
+            </div>
+            <div>
+              <div class="rlabel">背景效果</div>
+              <div class="rvalue">Mica 透出桌面壁纸，亚克力更偏玻璃；系统不支持时自动回退纯色</div>
+            </div>
+            <div class="seg plain" id="backdropseg" role="group" aria-label="窗口背景效果">
+              <span class="segthumb"></span>
+              <button data-backdrop="off" aria-pressed="false">关闭</button>
+              <button data-backdrop="acrylic" aria-pressed="false">亚克力</button>
+              <button data-backdrop="mica" aria-pressed="true">Mica</button>
+            </div>
+          </div>
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16Z" fill="currentColor" stroke="none" opacity=".45"/>
+              </svg>
+            </div>
+            <div>
+              <div class="rlabel">背景不透明度</div>
+              <div class="rvalue">只调窗口底色，卡片始终保持不透明</div>
+            </div>
+            <div class="opctl">
+              <input type="range" id="opacityrange" min="40" max="100" step="5" value="80" aria-label="背景不透明度">
+              <span class="opval" id="opacityval">80%</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3.5 7.2a2 2 0 0 1 2-2h3.3l2 2.3h7.7a2 2 0 0 1 2 2v8.3a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2Z"/>
+              </svg>
+            </div>
+            <div>
+              <div class="rlabel">游戏目录</div>
+              <div class="rvalue">在文件资源管理器里打开当前安装位置</div>
+            </div>
+            <button class="ghost" id="btn-open-game">打开</button>
+          </div>
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M6.5 3.6h7.2l4.8 4.8v11a1.6 1.6 0 0 1-1.6 1.6H6.5a1.6 1.6 0 0 1-1.6-1.6V5.2a1.6 1.6 0 0 1 1.6-1.6Z"/><path d="M13.4 3.8v5h5"/>
+              </svg>
+            </div>
+            <div>
+              <div class="rlabel">组件日志</div>
+              <div class="rvalue">安装器、Bridge、OptiScaler、TextureLoader 各写一份，出错时先看它们</div>
+            </div>
+            <button class="ghost" id="btn-bundle-logs">打包全部…</button>
+          </div>
+          <div id="logsbox"></div>
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4.2 11.4a7.8 7.8 0 1 1 2.2 5.4"/><path d="M3.7 6.6v4.3h4.3"/>
+              </svg>
+            </div>
+            <div>
+              <div class="rlabel">插件恢复默认设置</div>
+              <div class="rvalue">用随包默认值覆盖 Bridge、OptiScaler、ReShade、TextureLoader 的 ini，并重新写一遍注入链</div>
+            </div>
+            <button class="ghost" id="btn-restore">恢复…</button>
+          </div>
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M10.2 6.6H6.4A2.4 2.4 0 0 0 4 9v8.6A2.4 2.4 0 0 0 6.4 20h8.6a2.4 2.4 0 0 0 2.4-2.4v-3.8"/><path d="M13.4 4h6.6v6.6"/><path d="M20 4l-7.4 7.4"/>
+              </svg>
+            </div>
+            <div>
+              <div class="rlabel">桌面快捷方式</div>
+              <div class="rvalue">安装组件时在桌面放一个启动图标，双击就启动游戏（注入链一起生效）</div>
+            </div>
+            <button class="sw" id="sw-shortcut" role="switch" aria-checked="true" aria-label="桌面快捷方式"></button>
+          </div>
+        </section>
+      </section>
+
+      <!-- 关于 -->
+      <section class="page" data-page="about" hidden>
+        <header class="pagehead">
+          <h1>关于</h1>
+          <p>本地安装器：把解帧工具和插件写进原神目录，只在你点恢复或检查更新时联网。</p>
+        </header>
+
+        <section class="card">
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3.6 20 8v8l-8 4.4L4 16V8Z"/><path d="M12 12.1 20 8M12 12.1V20.4M12 12.1 4 8"/>
+              </svg>
+            </div>
+            <div>
+              <div class="rlabel">随附组件</div>
+              <div class="rvalue" id="aboutcomps">—</div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3.5 7.2a2 2 0 0 1 2-2h3.3l2 2.3h7.7a2 2 0 0 1 2 2v8.3a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2Z"/>
+              </svg>
+            </div>
+            <div style="min-width:0">
+              <div class="rlabel">配置目录</div>
+              <div class="rvalue mono">%LOCALAPPDATA%\GenshinFsrBridge</div>
+            </div>
+            <button class="ghost" id="btn-open-config">打开</button>
+          </div>
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 4v11"/><path d="m7.6 10.6 4.4 4.4 4.4-4.4"/><path d="M4.6 19.4h14.8"/>
+              </svg>
+            </div>
+            <div style="min-width:0">
+              <div class="rlabel">插件包</div>
+              <div class="rvalue" id="pkgversion">—</div>
+            </div>
+            <button class="ghost" id="btn-check-update">检查更新</button>
+          </div>
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M6.5 3.6h7.2l4.8 4.8v11a1.6 1.6 0 0 1-1.6 1.6H6.5a1.6 1.6 0 0 1-1.6-1.6V5.2a1.6 1.6 0 0 1 1.6-1.6Z"/><path d="M13.4 3.8v5h5"/>
+              </svg>
+            </div>
+            <div>
+              <div class="rlabel">许可</div>
+              <div class="rvalue">各组件版权归原作者，许可证随组件文件一起留在管理器目录</div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="8.2"/><path d="M12 7.4v5l3.2 1.9"/>
+              </svg>
+            </div>
+            <div>
+              <div class="rlabel">安装器版本</div>
+              <div class="rvalue" id="installerversion">—</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9.6 14.4 14.4 9.6"/><path d="M12.6 6.6l1.7-1.7a3.6 3.6 0 1 1 5.1 5.1l-1.7 1.7"/><path d="M11.4 17.4l-1.7 1.7a3.6 3.6 0 1 1-5.1-5.1l1.7-1.7"/>
+              </svg>
+            </div>
+            <div>
+              <div class="rlabel">与其他启动器联动</div>
+              <div class="rvalue">在启动器里把「启动游戏」指到解帧工具，注入链才不会被绕过</div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3.5 7.2a2 2 0 0 1 2-2h3.3l2 2.3h7.7a2 2 0 0 1 2 2v8.3a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2Z"/>
+              </svg>
+            </div>
+            <div style="min-width:0">
+              <div class="rlabel">解帧工具目录</div>
+              <div class="rvalue mono" id="unlockerdir">—</div>
+            </div>
+            <button class="ghost" id="btn-copy-unlocker">复制路径</button>
+          </div>
+          <div class="lnklist">
+            <div class="lnkrow">
+              <div class="lname2">Starward</div>
+          <div class="ltext desc">原神-游戏设置-启动参数-自定义启动程序-选中上面路径里的 unlockfps_nc.exe</div>
+            </div>
+            <div class="lnkrow">
+              <div class="lname2">BetterGI</div>
+          <div class="ltext desc">启动选项卡-同时启动原神-原神安装位置-选中上面路径里的 unlockfps_nc.exe</div>
+            </div>
+            <div class="lnkrow">
+              <div class="lname2">芙芙启动器</div>
+              <div class="ltext">插件商城里下载「原神FSR2桥接插件」，之后用芙芙启动器启动游戏就行</div>
+            </div>
+          </div>
+          <div class="scard-note">两个启动器都是先起解帧工具，再由它带着注入链启动游戏；芙芙启动器的插件已上架商城，装完直接用它启动。</div>
+        </section>
+      </section>
+    </div>
+  </div>
+</main>
+
+<div class="modal" id="warnmodal" hidden>
+  <div class="modalscrim" id="warnscrim"></div>
+  <div class="modalbox" role="dialog" aria-modal="true" aria-labelledby="warntitle" style="width:468px">
+    <header class="modalhead">
+      <h2 id="warntitle">显卡兼容性提示</h2>
+      <button class="cap cap-close" id="warnclose" aria-label="关闭" title="关闭">
+        <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.1"><path d="M.6.6l8.8 8.8M9.4.6L.6 9.4"/></svg>
+      </button>
+    </header>
+    <div class="warnbody" id="warnbody"></div>
+    <div class="warnfoot">
+      <button class="ghost" id="warnnever">不再提醒</button>
+      <button class="primary" id="warnok">确认</button>
+    </div>
+  </div>
+</div>
+<div class="modal" id="upmodal" hidden>
+  <div class="modalscrim" id="upscrim"></div>
+  <div class="modalbox" role="dialog" aria-modal="true" aria-labelledby="upmtitle">
+    <header class="modalhead">
+      <h2 id="upmtitle">检查更新</h2>
+      <button class="cap cap-close" id="upmclose" aria-label="关闭" title="关闭">
+        <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.1"><path d="M.6.6l8.8 8.8M9.4.6L.6 9.4"/></svg>
+      </button>
+    </header>
+    <div class="upmain">
+      <div class="upline">
+        <div class="upstate" id="upstate">正在查询 GitHub 最新版本…</div>
+        <button class="primary" id="btn-update-now" disabled>立即更新</button>
+      </div>
+      <div class="upprogress" id="upprogress"><span></span></div>
+      <div class="upmsg" id="upmsg"></div>
+    </div>
+    <div class="upmanual">
+      <div class="uplabel">手动更新</div>
+      <div class="upbtns">
+        <button class="ghost" data-url="https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases">GitHub Releases</button>
+        <button class="ghost" data-url="https://wwbkk.lanzoub.com/b0rb9q1ni">蓝奏云【CN】</button>
+        <button class="ghost" data-url="https://pan.quark.cn/s/ecff02573a07">夸克网盘【CN】</button>
+      </div>
+      <div class="upmsg" style="margin-top:10px">国内网盘镜像，蓝奏云密码 549a。下载后解压覆盖到安装器目录即可。</div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var FPS = [60,120,240];   // 预设值；更高/其它值走右侧自定义输入框
+  var FPS_MIN = 30, FPS_MAX = 1000;
+  var DEFAULT_ON = [];   // 初始什么都不勾（必装项由后端补）
+
+  var state = {
+    fps: 240,
+    dir: '',
+    comps: [],
+    custom: [],         // 用户自己加进注入链的 DLL（{path,name,present}）
+    on: {},
+    installed: {},
+    payload: true,
+    fetching: {},        // 正在联网补齐的组件 id → true
+    updateBusy: false,   // 正在下载/覆盖插件包
+    phase: 'idle',      // idle | installing | done | error
+    selected: [],
+    running: false,     // 解帧工具是否在跑
+    maximized: false,
+    view: 'wizard',     // wizard | main
+    page: 'home',       // home | updates | settings | about
+    dirty: false,       // 主界面有没保存的改动
+    backdrop: 'mica',   // 窗口背景效果
+    opacity: 80,        // 外壳不透明度百分比
+    gpu: 'other',       // 主显卡厂商：nvidia | amd | intel | other
+    warned: [],         // 已经点过「不再提醒」的警告 id
+    modsDir: '',        // TextureLoader 自定义 Mods 目录（空 = 默认）
+    uiLang: 'system',    // 界面语言：system | zh | en
+    theme: 'system',     // 明暗主题：system | light | dark
+    shortcutOn: true,    // 安装时创建桌面快捷方式
+    unlockerDir: '',     // 解帧工具目录（payload\FpsUnlocker）
+    shortcutName: '',    // 快捷方式文件名（跟随界面语言）
+    modsDefault: ''     // 默认 Mods 目录（payload\TextureLoader\Mods）
+  };
+
+  var $ = function(s){ return document.querySelector(s); };
+  var compsEl = $('#comps');
+  var cfgEl = $('#cfg'), slotHome = $('#slot-home');
+  var btnLog = $('#btnlog'), btnSave = $('#btnsave');
+  var btnCancel = $('#btncancel'), btnLaunch = $('#btnlaunch');
+  var ready = $('#ready'), compsum = $('#compsum'), pline = $('#pline');
+  var env = $('#env'), mainsub = $('#mainsub');
+  var homeintro = $('#homeintro');
+  var aboutcomps = $('#aboutcomps');
+  var viewMain = $('#view-main');
+  var stageEl = document.querySelector('.stage');
+  var navItems = document.querySelectorAll('.navitem');
+  var pageEls = document.querySelectorAll('.page');
+  var dirPaths = document.querySelectorAll('[data-dir-path]');
+  var dirBtns = document.querySelectorAll('[data-dir-btn]');
+  var fpsControls = [];
+
+  /* ── 宿主通道：Tauri 里走 Rust 命令，WebView2 里走 C++，浏览器里走本地模拟 ── */
+  // 只跑在 Tauri 宿主里。没有宿主就别装成能跑的样子，直接报错。
+  var host = (function(){
+    var T = window.__TAURI__;
+    if (!T || !T.core || !T.event) {
+      throw new Error('需要在 GenshinFSRBridgeInstaller 里运行');
+    }
+    var listening = null;
+    return {
+      send: function(msg){
+        var payload = (typeof msg === 'string') ? JSON.parse(msg) : msg;
+        T.core.invoke('bridge', { msg: payload });
+      },
+      on: function(fn){
+        listening = T.event.listen('msg', function(e){ fn(e.payload); });
+      },
+      // 事件监听是异步注册的，init 要等它挂上再发，否则第一条 state 会丢
+      ready: function(){ return listening || Promise.resolve(); }
+    };
+  })();
+
+  /* ── 标题栏：Windows 式最小化 / 最大化 / 关闭 ── */
+  var GLYPH_MAX = '<rect x=".5" y=".5" width="9" height="9" rx="1"/>';
+  var GLYPH_RESTORE = '<path d="M3 3V1.4h5.6V7"/><rect x="1.4" y="3" width="5.6" height="5.6" rx=".9"/>';
+  var capMax = $('#capmax'), maxGlyph = $('#maxglyph');
+
+  function syncMaximized(){
+    maxGlyph.innerHTML = state.maximized ? GLYPH_RESTORE : GLYPH_MAX;
+    capMax.setAttribute('aria-label', state.maximized ? '还原' : '最大化');
+    capMax.title = state.maximized ? '还原' : '最大化';
+  }
+
+  $('#capclose').addEventListener('click', function(){ host.send({type:'window', action:'close'}); });
+  $('#capmin').addEventListener('click', function(){ host.send({type:'window', action:'minimize'}); });
+  capMax.addEventListener('click', function(){ host.send({type:'window', action:'maximize'}); });
+  $('#topstrip').addEventListener('mousedown', function(e){
+    if (e.target.closest('.cap')) return;
+    if (e.button !== 0) return;
+    // 连按两下：第一次已经拖完，第二次 detail=2，按 Windows 习惯切成最大化/还原
+    if (e.detail >= 2){ host.send({type:'window', action:'maximize'}); return; }
+    host.send({type:'window', action:'drag'});
+  });
+
+  /* ── 单界面：打开即主界面（左侧导航 + 内容页），没有首次配置向导 ── */
+  function showView(){
+    state.view = 'main';
+    stageEl.classList.add('wide');
+    slotHome.appendChild(cfgEl);
+    btnCancel.hidden = true;
+    btnSave.hidden = false;
+    btnLaunch.hidden = false;
+    showPage(state.page);
+    syncFpsUI();
+    placeAllThumbs();
+  }
+
+  /* ── 插件配置页：Bridge / OptiScaler 多版本切换 ── */
+  function renderVersionList(listEl, curEl, component, versions, current){
+    if (!listEl) return;
+    listEl.textContent = '';
+    if (curEl) curEl.textContent = current || '—';
+    if (!versions || !versions.length){
+      var empty = document.createElement('div');
+      empty.className = 'verempty';
+      empty.textContent = 'payload 里只找到一份，放进更多版本目录后会出现在这里';
+      listEl.appendChild(empty);
+      return;
+    }
+    versions.forEach(function(v){
+      var b = document.createElement('button');
+      b.className = 'verchip';
+      b.type = 'button';
+      b.dataset.component = component;
+      b.dataset.dir = v.dir;
+      var isCur = !!v.current;
+      b.setAttribute('aria-pressed', isCur ? 'true' : 'false');
+      b.appendChild(document.createTextNode(v.dir));
+      var meta = document.createElement('span');
+      meta.className = 'vermeta';
+      meta.textContent = v.nested ? '嵌套布局' : (component === 'opti' ? '平铺布局' : '');
+      if (meta.textContent) b.appendChild(meta);
+      b.disabled = isCur || state.phase === 'installing';
+      b.addEventListener('click', function(){
+        if (b.disabled) return;
+        host.send({type:'switchVersion', component: component, dir: v.dir});
+      });
+      listEl.appendChild(b);
+    });
+  }
+
+  function buildVersions(msg){
+    var versions = msg.versions || {};
+    renderVersionList($('#ver-bridge-list'), $('#ver-bridge-cur'), 'bridge',
+      versions.bridge || [], msg.bridgeDir || '');
+    renderVersionList($('#ver-opti-list'), $('#ver-opti-cur'), 'opti',
+      versions.opti || [], msg.optiDir || '');
+  }
+
+  /* ── TextureLoader 的 Mods 目录（写 TextureLoader.ini 的 mods_dir） ── */
+  function renderMods(dir, fallback){
+    var el = $('#modspath');
+    if (!el) return;
+    if (dir){
+      el.textContent = dir;
+      el.title = dir;
+      el.classList.remove('dim');
+      $('#btn-mods-reset').hidden = false;
+      $('#modsnote').textContent = '当前用这个目录里的 Mod（递归扫描其中的 ini）；清空后回到默认的 Mods 文件夹。';
+    } else {
+      el.textContent = '默认 · ' + (fallback || 'Mods');
+      el.title = fallback || '';
+      el.classList.add('dim');
+      $('#btn-mods-reset').hidden = true;
+      $('#modsnote').textContent = '留空即用 TextureLoader 同目录的 Mods 文件夹；选好会立刻写进 payload\\TextureLoader\\TextureLoader.ini，重启游戏生效。';
+    }
+  }
+
+  /* ── 组件日志：安装器 / Bridge / OptiScaler / TextureLoader ── */
+  function bytesText(n){
+    if (!n) return '0 B';
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1024 / 1024).toFixed(1) + ' MB';
+  }
+
+  function buildLogs(list){
+    var box = $('#logsbox');
+    if (!box) return;
+    box.textContent = '';
+    (list || []).forEach(function(item){
+      var row = document.createElement('div');
+      row.className = 'logrow' + (item.exists ? '' : ' none');
+      var shown = item.exists ? item.file : item.dir;
+      var meta = item.exists
+        ? bytesText(item.bytes) + ' · ' + item.time + (item.count > 1 ? ' · ' + item.count + ' 个文件' : '')
+        : '还没有生成日志，启动一次游戏再看';
+      var name = document.createElement('div');
+      name.className = 'lname';
+      name.textContent = item.name;
+      var path = document.createElement('div');
+      path.className = 'lpath mono';
+      path.textContent = shown || '';
+      path.title = shown || '';
+      var info = document.createElement('div');
+      info.className = 'lmeta';
+      info.textContent = meta;
+      var main = document.createElement('div');
+      main.className = 'logmain';
+      main.appendChild(name);
+      main.appendChild(path);
+      main.appendChild(info);
+      var btn = document.createElement('button');
+      btn.className = 'ghost';
+      btn.setAttribute('data-log', item.id);
+      btn.textContent = '打开';
+      btn.disabled = !item.exists;
+      row.appendChild(main);
+      row.appendChild(btn);
+      box.appendChild(row);
+    });
+  }
+
+  /* ── 解帧工具选项（fps_config.json 的其余键） ── */
+  var UNLOCKER_GROUPS = [
+    {t:'启动',   keys:[['autoStart','即开游戏'], ['autoClose','随游戏退出'], ['startMinimized','启动最小化']]},
+    {t:'兼容',   keys:[['powerSave','省电模式'], ['mobileUI','移动端 UI'], ['suspendLoad','挂起加载']]}
+  ];
+  var MODE_ITEMS = [['windowed','窗口化'], ['borderless','无边框'], ['full','全屏'], ['exclusive','独占全屏']];
+  var PRIORITY_ITEMS = ['实时', '高', '高于正常', '正常', '低于正常', '低'];
+
+  function srow(label){
+    var el = document.createElement('div');
+    el.className = 'srow';
+    var name = document.createElement('div');
+    name.className = 'sname';
+    name.textContent = label;
+    el.appendChild(name);
+    var group = document.createElement('div');
+    group.className = 'sgroup';
+    el.appendChild(group);
+    el.group = group;
+    return el;
+  }
+
+  // 分段控件：外观卡那套白底胶囊，一行里塞得下多个互斥选项
+  function seg(group, items, value, disabled, onPick){
+    var box = document.createElement('div');
+    box.className = 'seg plain sm';
+    box.setAttribute('role', 'group');
+    var thumb = document.createElement('span');
+    thumb.className = 'segthumb';
+    box.appendChild(thumb);
+    items.forEach(function(it){
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = it[1];
+      b.dataset.v = it[0];
+      b.setAttribute('aria-pressed', it[0] === value ? 'true' : 'false');
+      b.disabled = !!disabled;
+      b.addEventListener('click', function(){
+        // 选中的判定要看当前 aria-pressed，不能用建节点时的 value——
+        // 切走再切回来时那个值是旧的，会把点击吞掉
+        if (b.disabled || b.getAttribute('aria-pressed') === 'true') return;
+        onPick(it[0]);
+      });
+      box.appendChild(b);
+    });
+    group.appendChild(box);
+    // 挂上 DOM 之后才有宽度可量
+    requestAnimationFrame(function(){ syncSegThumb(box, false); });
+    return box;
+  }
+
+  // 白色胶囊跟着选中项走；animate=false 用于首次定位（不滑动）
+  // hideIfNone=true：没有选中项时收起胶囊（帧率填了自定义值的情形）
+  function syncSegThumb(box, animate, hideIfNone){
+    if (!box) return;
+    var thumb = box.querySelector('.segthumb');
+    if (!thumb) return;
+    var active = box.querySelector('button[aria-pressed="true"]');
+    if (!active){
+      if (hideIfNone) thumb.style.opacity = '0';
+      return;
+    }
+    thumb.style.opacity = '1';
+    if (!active.offsetWidth) return;   // 页面还没显示出来，等 showPage 再量
+    if (!animate) thumb.style.transition = 'none';
+    thumb.style.width = active.offsetWidth + 'px';
+    thumb.style.transform = 'translateX(' + (active.offsetLeft - 2) + 'px)';
+    if (!animate){ void thumb.offsetWidth; thumb.style.transition = ''; }
+  }
+
+  // 一组分段控件的选中态：改 aria-pressed + 让胶囊滑过去
+  function setSegValue(box, value, disabled){
+    if (!box) return;
+    [].forEach.call(box.querySelectorAll('button'), function(b){
+      b.setAttribute('aria-pressed', b.dataset.v === value ? 'true' : 'false');
+      b.disabled = !!disabled;
+    });
+    syncSegThumb(box, true);
+  }
+
+  function swItem(group, key, label, on, disabled, onPick){
+    var wrap = document.createElement('div');
+    wrap.className = 'switem' + (disabled ? ' dim' : '');
+    var sw = document.createElement('button');
+    sw.type = 'button';
+    sw.className = 'sw';
+    sw.dataset.key = key;
+    sw.setAttribute('role', 'switch');
+    sw.setAttribute('aria-label', label);
+    sw.setAttribute('aria-checked', on ? 'true' : 'false');
+    sw.disabled = !!disabled;
+    var cap = document.createElement('span');
+    cap.textContent = label;
+    wrap.appendChild(sw);
+    wrap.appendChild(cap);
+    if (!disabled){
+      wrap.addEventListener('click', function(e){
+        if (e.target === sw) return;
+        sw.click();
+      });
+    }
+    sw.addEventListener('click', function(){ if (!sw.disabled) onPick(); });
+    group.appendChild(wrap);
+    return wrap;
+  }
+
+  function patchUnlocker(patch){
+    host.send({type:'unlockerConfig', patch: patch});
+  }
+
+  function flashUnlocker(text, bad){
+    var note = $('#unlockernote');
+    if (!note) return;
+    note.dataset.flashing = '1';
+    note.textContent = text;
+    note.className = 'scard-note' + (bad ? ' bad' : '');
+    clearTimeout(flashUnlocker.timer);
+    flashUnlocker.timer = setTimeout(function(){
+      delete note.dataset.flashing;
+      note.textContent = '改完立刻生效，下次启动游戏时应用。';
+      note.className = 'scard-note';
+    }, 1800);
+  }
+
+  function unlockerMode(cfg){
+    if (cfg.exclusive) return 'exclusive';
+    if (cfg.fullscreen) return 'full';
+    if (cfg.borderless) return 'borderless';
+    return 'windowed';
+  }
+
+  function buildUnlocker(cfg){
+    var box = $('#unlockerbox');
+    if (!box || !cfg) return;
+    // 结构只建一次，之后只改状态——否则每次回包重建节点，开关/胶囊的过渡动画全没了
+    if (!box.dataset.built){
+      buildUnlockerRows(box, cfg);
+      box.dataset.built = '1';
+    }
+    updateUnlocker(cfg);
+  }
+
+  function buildUnlockerRows(box, cfg){
+    var ui = {};
+    box.textContent = '';
+
+    // 窗口模式：无边框 / 全屏 / 独占全屏 本是三个布尔，合成一组互斥选项
+    var modeRow = srow('窗口模式');
+    ui.modeSeg = seg(modeRow.group, MODE_ITEMS, unlockerMode(cfg), false, function(v){
+      patchUnlocker({
+        borderless: v === 'borderless',
+        fullscreen: v === 'full' || v === 'exclusive',
+        exclusive: v === 'exclusive'
+      });
+    });
+    box.appendChild(modeRow);
+
+    // 分辨率：跟随游戏 / 自定义，数字框只在自定义时可填
+    var resRow = srow('分辨率');
+    ui.resSeg = seg(resRow.group, [['game', '跟随游戏'], ['custom', '自定义']], cfg.customRes ? 'custom' : 'game', false, function(v){
+      patchUnlocker({customRes: v === 'custom'});
+    });
+    var resWrap = document.createElement('div');
+    resWrap.className = 'sres';
+    var rx = document.createElement('input');
+    rx.className = 'sinput';
+    rx.type = 'text';
+    rx.inputMode = 'numeric';
+    rx.maxLength = 4;
+    rx.dataset.field = 'resX';
+    rx.value = String(cfg.resX);
+    var sep = document.createElement('span');
+    sep.textContent = '×';
+    var ry = document.createElement('input');
+    ry.className = 'sinput';
+    ry.type = 'text';
+    ry.inputMode = 'numeric';
+    ry.maxLength = 4;
+    ry.dataset.field = 'resY';
+    ry.value = String(cfg.resY);
+    [rx, ry].forEach(function(inp){
+      inp.addEventListener('keydown', function(e){ if (e.key === 'Enter') inp.blur(); });
+      inp.addEventListener('blur', function(){
+        var n = parseInt(inp.value, 10);
+        var key = inp.dataset.field;
+        var hi = key === 'resX' ? 7680 : 4320;
+        if (!isFinite(n)) { inp.value = String(state.unlocker[key]); return; }
+        n = Math.min(hi, Math.max(200, n));
+        inp.value = String(n);
+        if (n !== state.unlocker[key]){
+          var patch = {};
+          patch[key] = n;
+          patchUnlocker(patch);
+        }
+      });
+    });
+    ui.rx = rx;
+    ui.ry = ry;
+    resWrap.appendChild(rx);
+    resWrap.appendChild(sep);
+    resWrap.appendChild(ry);
+    resRow.group.appendChild(resWrap);
+    box.appendChild(resRow);
+
+    // 启动 / 兼容：一行三个开关
+    ui.sws = {};
+    UNLOCKER_GROUPS.forEach(function(g){
+      var row = srow(g.t);
+      g.keys.forEach(function(pair){
+        ui.sws[pair[0]] = swItem(row.group, pair[0], pair[1], cfg[pair[0]], false, function(){
+          var patch = {};
+          patch[pair[0]] = !state.unlocker[pair[0]];
+          patchUnlocker(patch);
+        });
+      });
+      box.appendChild(row);
+    });
+
+    // 其它：显示器序号 + 进程优先级 + HDR（只读）
+    var miscRow = srow('其它');
+    var monLabel = document.createElement('span');
+    monLabel.className = 'slabel';
+    monLabel.textContent = '显示器';
+    var mon = document.createElement('input');
+    mon.className = 'sinput';
+    mon.type = 'text';
+    mon.inputMode = 'numeric';
+    mon.maxLength = 2;
+    mon.value = String(cfg.monitor);
+    mon.addEventListener('keydown', function(e){ if (e.key === 'Enter') mon.blur(); });
+    mon.addEventListener('blur', function(){
+      var n = parseInt(mon.value, 10);
+      if (!isFinite(n)) { mon.value = String(state.unlocker.monitor); return; }
+      n = Math.min(16, Math.max(1, n));
+      mon.value = String(n);
+      if (n !== state.unlocker.monitor) patchUnlocker({monitor: n});
+    });
+    var priLabel = document.createElement('span');
+    priLabel.className = 'slabel';
+    priLabel.textContent = '优先级';
+    var sel = document.createElement('select');
+    sel.className = 'sselect';
+    PRIORITY_ITEMS.forEach(function(label, i){
+      var opt = document.createElement('option');
+      opt.value = String(i);
+      opt.textContent = label;
+      if (i === cfg.priority) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    sel.addEventListener('change', function(){
+      patchUnlocker({priority: parseInt(sel.value, 10)});
+    });
+    var hdr = document.createElement('span');
+    hdr.className = 'sfixed';
+    hdr.innerHTML = 'HDR ' + (cfg.hdr ? '<b>已开启</b>' : '关闭');
+    miscRow.group.appendChild(monLabel);
+    miscRow.group.appendChild(mon);
+    miscRow.group.appendChild(priLabel);
+    miscRow.group.appendChild(sel);
+    miscRow.group.appendChild(hdr);
+    box.appendChild(miscRow);
+
+    var note = document.createElement('div');
+    note.className = 'scard-note';
+    note.id = 'unlockernote';
+    box.appendChild(note);
+
+    ui.mon = mon;
+    ui.sel = sel;
+    ui.hdr = hdr;
+    ui.note = note;
+    box._ui = ui;
+  }
+
+  // 只改值，不动结构：开关的圆点、胶囊的位移都能走 CSS 过渡
+  function updateUnlocker(cfg){
+    var box = $('#unlockerbox');
+    var ui = box && box._ui;
+    if (!ui) return;
+    state.unlocker = cfg;
+    var ready = cfg.ready !== false;
+    var locked = !ready || state.phase === 'installing';
+
+    setSegValue(ui.modeSeg, unlockerMode(cfg), locked);
+    setSegValue(ui.resSeg, cfg.customRes ? 'custom' : 'game', locked);
+
+    ui.rx.disabled = locked || !cfg.customRes;
+    ui.ry.disabled = locked || !cfg.customRes;
+    if (document.activeElement !== ui.rx) ui.rx.value = String(cfg.resX);
+    if (document.activeElement !== ui.ry) ui.ry.value = String(cfg.resY);
+
+    Object.keys(ui.sws).forEach(function(key){
+      var wrap = ui.sws[key];
+      var sw = wrap.querySelector('.sw');
+      sw.setAttribute('aria-checked', cfg[key] ? 'true' : 'false');
+      sw.disabled = locked;
+      wrap.classList.toggle('dim', locked);
+    });
+
+    ui.mon.disabled = locked;
+    if (document.activeElement !== ui.mon) ui.mon.value = String(cfg.monitor);
+    ui.sel.disabled = locked;
+    ui.sel.value = String(cfg.priority);
+    ui.hdr.innerHTML = 'HDR ' + (cfg.hdr ? '<b>已开启</b>' : '关闭');
+
+    if (!ui.note.dataset.flashing){
+      ui.note.textContent = ready
+        ? '改完立刻生效，下次启动游戏时应用。'
+        : '完成一次安装（写入注入链）后就能在这里调整。';
+    }
+  }
+
+  // 页内元素从上到下依次浮现：换了选项卡就重放一次
+  function staggerRows(page){
+    var items = page.querySelectorAll('.card > .row, .card > .verlist, .card > .scard-note, #unlockerbox > .srow, #logsbox > .logrow, #comps > .comp');
+    var i = 0;
+    [].forEach.call(items, function(el){
+      el.classList.remove('intro');
+      void el.offsetWidth;
+      el.style.animationDelay = Math.min(i++, 18) * 26 + 'ms';
+      el.classList.add('intro');
+    });
+  }
+
+  function showPage(name){
+    name = name || 'home';
+    state.page = name;
+    var target = null;
+    [].forEach.call(pageEls, function(p){
+      p.hidden = p.dataset.page !== name;
+      if (!p.hidden) target = p;
+    });
+    // 每次切换都重放一次进入动画：先摘掉 class 抖一下布局，动画才会重启
+    if (target){
+      target.classList.remove('swap');
+      void target.offsetWidth;
+      target.classList.add('swap');
+      staggerRows(target);
+      // 页刚显示出来，分段控件的胶囊才有宽度可量
+      [].forEach.call(target.querySelectorAll('.seg'), function(s){
+        syncSegThumb(s, false, !!s.closest('.fpsctl'));
+      });
+    }
+    [].forEach.call(navItems, function(b){
+      if (b.dataset.page === name) b.setAttribute('aria-current', 'page');
+      else b.removeAttribute('aria-current');
+    });
+    var pane = $('#panebox');
+    if (pane) pane.scrollTop = 0;
+    // 「保存」「启动游戏」跟着配置卡走，只在主页露出
+    var home = name === 'home';
+    btnSave.hidden = !home;
+    btnLaunch.hidden = !home;
+    refreshSave();
+  }
+
+  // 勾了、文件也在 payload 里，但注入链里还没有 → 值得点一次保存
+  function pendingWrite(){
+    return state.comps.filter(function(c){
+      return state.on[c.id] && c.present && !c.installed;
+    }).length;
+  }
+
+  function refreshSave(){
+    if (!btnSave) return;
+    var busy = state.phase === 'installing';
+    btnSave.disabled = busy ? true : (!state.dirty && !pendingWrite());
+    if (!busy) btnSave.textContent = T('保存','Save');
+  }
+
+  // 主界面的「保存」：写配置，再把手上有、盘上没有的组件补写一遍
+  function saveAll(){
+    if (state.phase === 'installing') return;
+    var ids = selectedIds();
+    if (!state.dir || !ids.length) return;
+    state.dirty = false;
+    // 有没写进注入链的组件就走安装流程（install 消息里带着目录/帧率/勾选，
+    // 后端会一并存盘并写 fps_config.json）；否则只刷新配置。
+    var missing = state.comps.filter(function(c){ return state.on[c.id] && !c.present; });
+    var pending = state.comps.filter(function(c){ return state.on[c.id] && c.present && !c.installed; });
+    if (missing.length){
+      refreshSave();
+      updateSummary();
+      env.className = 'env bad';
+      env.innerHTML = '<b>缺少组件文件</b><span class="sep">·</span>' + missing.length + ' 个组件不在 payload 里';
+      return;
+    }
+    if (pending.length){
+      startInstall();
+      return;
+    }
+    host.send({type:'save', dir: state.dir, fps: state.fps, selected: ids});
+    refreshSave();
+    updateSummary();
+    env.className = 'env';
+    env.innerHTML = '<b>已保存</b><span class="sep">·</span>帧率上限 ' + state.fps + ' FPS';
+  }
+
+  /* ── 外观：背景效果与不透明度。后端负责真正设窗口材质，这里只负责画 ── */
+  var backdropSeg = $('#backdropseg');
+  var opacityRange = $('#opacityrange'), opacityVal = $('#opacityval');
+
+  function applyAppearance(){
+    var mode = state.backdrop || 'mica';
+    var pct = state.opacity || 80;
+    var alpha = mode === 'off' ? 1 : Math.max(0, Math.min(1, pct / 100));
+    document.documentElement.style.setProperty('--alpha', String(alpha));
+    Array.prototype.forEach.call(backdropSeg.querySelectorAll('button'), function(b){
+      b.setAttribute('aria-pressed', b.getAttribute('data-backdrop') === mode ? 'true' : 'false');
+    });
+    syncSegThumb(backdropSeg, true);
+    opacityRange.value = String(pct);
+    opacityVal.textContent = pct + '%';
+    opacityRange.disabled = mode === 'off';
+    opacityRange.title = mode === 'off' ? '选 Mica 或亚克力后才有可调的底色' : '';
+  }
+
+  function setAppearance(patch){
+    if (patch.backdrop) state.backdrop = patch.backdrop;
+    if (patch.opacity) state.opacity = patch.opacity;
+    applyAppearance();
+    host.send({type:'appearance', backdrop: state.backdrop, opacity: state.opacity});
+  }
+
+  backdropSeg.addEventListener('click', function(e){
+    var b = e.target.closest('button[data-backdrop]');
+    if (b) setAppearance({backdrop: b.getAttribute('data-backdrop')});
+  });
+  opacityRange.addEventListener('input', function(){
+    opacityVal.textContent = opacityRange.value + '%';
+    document.documentElement.style.setProperty('--alpha', String(Number(opacityRange.value) / 100));
+  });
+  opacityRange.addEventListener('change', function(){ setAppearance({opacity: Number(opacityRange.value)}); });
+
+  /* ── 帧率控件：预设分段 + 自定义输入（向导和主界面各一份，状态共用） ── */
+  function clampFps(v){
+    if (!isFinite(v) || v <= 0) return state.fps;
+    return Math.max(FPS_MIN, Math.min(FPS_MAX, Math.round(v)));
+  }
+
+  // 预设值命中时输入框留空（显示「自定义」提示），否则显示当前自定义值
+  function fpsInputText(){
+    return FPS.indexOf(state.fps) >= 0 ? '' : String(state.fps);
+  }
+
+  // 帧率预设的分段控件也走 syncSegThumb，全程序只维护这一套胶囊位移
+  function placeThumb(ctl, animate){
+    syncSegThumb(ctl.seg, animate, true);
+  }
+
+  function placeAllThumbs(){
+    fpsControls.forEach(function(c){ placeThumb(c, false); });
+  }
+
+  function syncFpsUI(){
+    fpsControls.forEach(function(c){
+      [].forEach.call(c.seg.querySelectorAll('button'), function(b){
+        b.setAttribute('aria-pressed', String(Number(b.dataset.fps) === state.fps));
+      });
+      if (document.activeElement !== c.input) c.input.value = fpsInputText();
+      placeThumb(c, true);
+    });
+  }
+
+  function createFpsControl(root){
+    var ctl = {root: root, seg: root.querySelector('.seg'), thumb: root.querySelector('.segthumb'), input: root.querySelector('.fpsinput')};
+    FPS.forEach(function(v){
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = v;
+      b.dataset.fps = v;
+      b.setAttribute('aria-pressed', String(v === state.fps));
+      b.addEventListener('click', function(){ setFps(v); });
+      ctl.seg.appendChild(b);
+    });
+    // 自定义帧率：边输边生效，只有合法数字才落地
+    ctl.input.addEventListener('input', function(){
+      if (state.phase === 'installing'){ ctl.input.value = fpsInputText(); return; }
+      var digits = ctl.input.value.replace(/[^\d]/g, '').slice(0, 4);
+      if (digits !== ctl.input.value) ctl.input.value = digits;
+      if (!digits) return;
+      setFps(parseInt(digits, 10));
+    });
+    ctl.input.addEventListener('focus', function(){ ctl.input.select(); });
+    ctl.input.addEventListener('blur', function(){ setFps(clampFps(parseInt(ctl.input.value, 10))); });
+    ctl.input.addEventListener('keydown', function(e){
+      if (e.key === 'Enter') ctl.input.blur();
+      else if (e.key === 'ArrowUp' || e.key === 'ArrowDown'){
+        e.preventDefault();
+        setFps(state.fps + (e.key === 'ArrowUp' ? 30 : -30));
+      }
+    });
+    fpsControls.push(ctl);
+    return ctl;
+  }
+
+  [].forEach.call(document.querySelectorAll('[data-fpsctl]'), function(el){ createFpsControl(el); });
+
+  // 装完之后改帧率：底部结论行跟着变，别让两处数字打架。
+  function refreshDoneEnv(){
+    if (state.phase !== 'done') return;
+    env.className = 'env';
+    env.innerHTML = '<b>帧率上限 ' + state.fps + ' FPS</b><span class="sep">·</span>' + state.dir;
+  }
+
+  // 改一项只标脏，点「保存」才落盘，改到一半不会先写进配置
+  function commitChange(){
+    state.dirty = true;
+    refreshSave();
+  }
+
+  function setFps(v){
+    if (state.phase === 'installing') return;
+    state.fps = clampFps(v);
+    syncFpsUI();
+    commitChange();
+    refreshDoneEnv();
+    updateMain();
+  }
+
+  /* ── 组件行：向导和主页共用同一套结构 ── */
+  function makeRow(c, i, animate){
+    var row = document.createElement('div');
+    row.className = animate ? 'comp intro' : 'comp';
+    row.dataset.id = c.id;
+    row.dataset.locked = c.mandatory ? '1' : '0';
+    if (animate) row.style.animationDelay = (160 + i * 40) + 'ms';
+    var checked = c.mandatory ? true : !!state.on[c.id];
+    row.innerHTML =
+      '<button class="cb" role="checkbox" aria-checked="' + checked + '"' +
+        (c.mandatory ? ' aria-disabled="true" tabindex="-1"' : '') +
+        ' aria-label="' + c.name + '">' +
+        '<svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="#fff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M2.4 6.3 4.9 8.8 9.6 3.7"/></svg>' +
+      '</button>' +
+      '<span class="cname">' + c.name + ' <em>' + c.note + '</em></span>' +
+      '<span class="cstat-end" data-end>' + endHTML(c) + '</span>';
+    if (!c.mandatory){
+      row.querySelector('.cb').addEventListener('click', function(){ toggle(c.id, row); });
+    }
+    return row;
+  }
+
+  function buildRows(){
+    compsEl.innerHTML = '';
+    var animate = !state.rowsBuilt;
+    state.rowsBuilt = true;
+    // FPS Unlocker 是解帧工具本体，不在安装内容里列出来
+    visibleComps().forEach(function(c, i){ compsEl.appendChild(makeRow(c, i, animate)); });
+    (state.custom || []).forEach(function(entry){ compsEl.appendChild(makeCustomRow(entry)); });
+    compsEl.appendChild(makeAddRow());
+  }
+
+  function visibleComps(){
+    return state.comps.filter(function(c){ return c.id !== 'fpsun'; });
+  }
+
+  function customFlag(entry){
+    if (!entry.present) return '<span class="cflag miss">文件不存在</span>';
+    if (entry.on === false) return '<span class="cflag off">未启用</span>';
+    return '<span class="cflag">已注入</span>';
+  }
+
+  function makeCustomRow(entry){
+    var row = document.createElement('div');
+    row.className = 'comp custom';
+    row.dataset.path = entry.path;
+    row.dataset.on = entry.on === false ? '0' : '1';
+    var on = entry.on !== false;
+    row.innerHTML =
+      '<button class="cb" role="checkbox" aria-checked="' + on + '" aria-label="' + entry.name + '">' +
+        '<svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="#fff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M2.4 6.3 4.9 8.8 9.6 3.7"/></svg>' +
+      '</button>' +
+      '<span class="cname">' + entry.name + ' <em>自定义注入</em></span>' +
+      '<span class="cstat-end">' +
+        customFlag(entry) +
+        '<button class="cbtn danger" type="button">删除</button>' +
+      '</span>';
+    row.querySelector('.cb').addEventListener('click', function(){
+      if (state.phase === 'installing') return;
+      var next = row.dataset.on !== '1';
+      row.dataset.on = next ? '1' : '0';
+      row.querySelector('.cb').setAttribute('aria-checked', next ? 'true' : 'false');
+      entry.on = next;
+      row.querySelector('.cstat-end').innerHTML = customFlag(entry) +
+        '<button class="cbtn danger" type="button">删除</button>';
+      bindRemove(row, entry);
+      host.send({type: 'setCustomOn', path: entry.path, on: next});
+    });
+    bindRemove(row, entry);
+    return row;
+  }
+
+  function bindRemove(row, entry){
+    var del = row.querySelector('.cbtn');
+    if (!del) return;
+    del.addEventListener('click', function(){
+      if (state.phase === 'installing') return;
+      host.send({type: 'removeCustomDll', path: entry.path});
+    });
+  }
+
+  // 入口永远在列表最下方，加进来一个就往上长一行
+  function makeAddRow(){
+    var row = document.createElement('div');
+    row.className = 'comp add';
+    row.innerHTML =
+      '<span class="cplus">+</span>' +
+      '<span class="cname">自定义注入 <em>把其它 DLL 追加到注入链末尾</em></span>' +
+      '<span class="cstat-end"><button class="cbtn" type="button">选择 DLL…</button></span>';
+    row.querySelector('.cbtn').addEventListener('click', function(){
+      if (state.phase === 'installing') return;
+      host.send({type: 'pickCustomDll'});
+    });
+    return row;
+  }
+
+  // 只有一份清单，行查询不再区分向导还是主页
+  function rowOf(id){
+    return compsEl.querySelector('[data-id="' + id + '"]');
+  }
+  function compOf(id){ return state.comps.filter(function(c){ return c.id === id; })[0]; }
+
+  // ── N 卡兼容性提醒：勾选时先解释风险，确认后才真的勾上 ──
+  var warnPending = null;
+
+  function warnFor(id){
+    if (state.gpu !== 'nvidia') return null;
+    if (id === 'texture') {
+      return { id: 'nvidia-texture',
+        body: 'NVIDIA 显卡在使用 TextureLoader 加载纹理贴图时，极大概率会导致贴图渲染丢失；也有小概率完全正常、与 AMD 显卡表现一致，原因未知。' };
+    }
+    if (id === 'reshade' && state.on.opti) {
+      return { id: 'nvidia-reshade-opti',
+        body: 'NVIDIA 显卡上 ReShade 与 OptiScaler 同时启用，可能存在不稳定现象。' };
+    }
+    return null;
+  }
+
+  function applyToggle(id, row, want){
+    state.on[id] = want;
+    row.querySelector('.cb').setAttribute('aria-checked', String(want));
+    updateSummary();
+    commitChange();
+  }
+
+  function openWarn(comp, row, warn){
+    warnPending = { comp: comp, row: row, warn: warn };
+    $('#warnbody').textContent = warn.body;
+    $('#warnmodal').hidden = false;
+  }
+
+  function closeWarn(accept, remember){
+    var p = warnPending;
+    warnPending = null;
+    $('#warnmodal').hidden = true;
+    if (!p || !accept) return;      // ❌ / 遮罩 / Esc：保持未勾选
+    if (remember) host.send({ type: 'suppressWarn', id: p.warn.id });
+    applyToggle(p.comp, p.row, true);
+  }
+
+  function toggle(id, row){
+    if (state.phase === 'installing') return;
+    var c = compOf(id);
+    if (!c || c.mandatory) return;
+    var want = !state.on[id];
+    if (want) {
+      var w = warnFor(id);
+      if (w && state.warned.indexOf(w.id) < 0) { openWarn(id, row, w); return; }
+    }
+    applyToggle(id, row, want);
+  }
+
+  function selectedIds(){
+    return state.comps.filter(function(c){ return c.mandatory || state.on[c.id]; }).map(function(c){ return c.id; });
+  }
+
+  // 组件文件不全时给一个联网补齐入口
+  function fetchBtn(id){
+    var busy = !!state.fetching[id];
+    return '<button class="cbtn" data-fetch="' + id + '"' + (busy ? ' disabled' : '') + '>' +
+      (busy ? '下载中…' : '下载') + '</button>';
+  }
+
+  function markFetching(id, on){
+    if (on) state.fetching[id] = true; else delete state.fetching[id];
+    var btns = document.querySelectorAll('[data-fetch="' + id + '"]');
+    [].forEach.call(btns, function(b){
+      b.disabled = !!on;
+      b.textContent = on ? '下载中…' : '下载';
+    });
+  }
+
+  // 行右侧：勾了但注入链里没有 → 提醒还没写进去；不再显示体积
+  function endHTML(c){
+    if (!c.present) return '<span class="cflag miss">缺少文件</span>' + fetchBtn(c.id);
+    // 还没选游戏目录时谈不上「已安装/未写入」，行尾留空
+    if (!state.dir) return '';
+    if (!state.on[c.id]) return '';
+    return c.installed
+      ? '<span class="cflag">已安装</span>'
+      : '<span class="cflag miss">未写入</span>';
+  }
+
+  // 表头与行状态：向导、主页同一套逻辑（同一份 DOM）
+  function updateSummary(){
+    if (!state.comps.length) return;
+    compsum.textContent = summaryLine();
+
+    state.comps.forEach(function(c){
+      var r = rowOf(c.id);
+      if (!r) return;
+      if (r.dataset.st !== 'active' && r.dataset.st !== 'done' && r.dataset.st !== 'fail'){
+        r.dataset.st = state.on[c.id] ? 'on' : 'off';
+      }
+    });
+    var list = visibleComps();
+    list.forEach(function(c){
+      var r = rowOf(c.id);
+      if (!r) return;
+      var end = r.querySelector('[data-end]');
+      if (!end) return;
+      if (!c.present){
+        // 文件不全：清掉可能残留的对勾，换成「缺少文件 + 下载」
+        r.dataset.st = state.on[c.id] ? 'on' : 'off';
+        renderStatus(r, 'idle');
+        end.innerHTML = endHTML(c);
+        return;
+      }
+      if (!end.classList.contains('has-sym') && r.dataset.st !== 'active' && r.dataset.st !== 'wait'){
+        end.innerHTML = endHTML(c);
+      }
+    });
+    if (state.phase === 'installing') return;
+
+    var broken = list.filter(function(c){ return state.on[c.id] && !c.present; });
+    var missing = list.filter(function(c){ return state.on[c.id] && c.present && !c.installed; });
+    var dropped = list.filter(function(c){ return !c.mandatory && !state.on[c.id] && c.installed; });
+    if (!state.dir){
+      ready.className = 'ready';
+      ready.innerHTML = '<i></i>先选择游戏目录';
+    } else if (!state.payload || broken.length){
+      ready.className = 'ready bad'; ready.innerHTML = '<i></i>缺少组件文件';
+    } else if (state.phase === 'error'){
+      ready.className = 'ready bad'; ready.innerHTML = '<i></i>写入被中断';
+    } else if (missing.length){
+      ready.className = 'ready warn'; ready.innerHTML = '<i></i>待写入 ' + missing.length + ' 个';
+    } else if (dropped.length){
+      ready.className = 'ready warn'; ready.innerHTML = '<i></i>已取消 ' + dropped.length + ' 个';
+    } else {
+      ready.className = 'ready';
+      ready.innerHTML = '<i></i>已安装 ' +
+        list.filter(function(c){ return c.installed; }).length + ' / ' + list.length;
+    }
+  }
+
+  /* ── 目录选择 ── */
+  var picker = null, pickerAnchor = null;
+  [].forEach.call(dirBtns, function(b){
+    b.addEventListener('click', function(e){
+      e.stopPropagation();
+      if (picker){ closePicker(); return; }
+      pickerAnchor = b;
+      host.send({type:'scan'});
+    });
+  });
+
+  function openPicker(dirs){
+    closePicker();
+    var anchor = pickerAnchor || dirBtns[0];
+    picker = document.createElement('div');
+    picker.className = 'picker';
+    var head = '<div class="ph">扫描到的安装位置</div>';
+    var items = (dirs || []).map(function(d){
+      var cur = d.toLowerCase() === (state.dir || '').toLowerCase();
+      return '<button data-dir="' + d + '"><span style="flex:1;min-width:0">' +
+        '<span class="path">' + d + '</span>' +
+        '<span class="sub">YuanShen.exe</span>' +
+        '</span>' + (cur ? '<span class="cur">当前</span>' : '') + '</button>';
+    }).join('');
+    var browse = '<button data-browse="1"><span style="flex:1;min-width:0" class="browse">浏览…</span></button>';
+    picker.innerHTML = head + (items || '<div class="ph" style="color:#6E6E73">没有自动找到，手动选择</div>') + browse;
+
+    // 挂到 body 上用视口坐标定位：向导和主界面都能用，也不会被卡片/滚动容器裁掉。
+    document.body.appendChild(picker);
+    var r = anchor.getBoundingClientRect();
+    picker.style.left = Math.max(8, Math.min(window.innerWidth - 326, r.right - 318)) + 'px';
+    var top = r.bottom + 8;
+    if (top + picker.offsetHeight > window.innerHeight - 8) {
+      top = Math.max(8, r.top - picker.offsetHeight - 8);
+    }
+    picker.style.top = top + 'px';
+    picker.style.opacity = '0';
+    picker.style.transform = 'scale(.96) translateY(-4px)';
+    requestAnimationFrame(function(){ picker.style.opacity = '1'; picker.style.transform = 'none'; });
+
+    [].forEach.call(picker.querySelectorAll('button'), function(b){
+      b.addEventListener('click', function(e2){
+        e2.stopPropagation();
+        if (b.dataset.browse){ closePicker(); host.send({type:'pickFolder'}); return; }
+        setDir(b.dataset.dir);
+        closePicker();
+      });
+    });
+  }
+
+  function setDir(dir){
+    state.dir = dir;
+    [].forEach.call(dirPaths, function(el){
+      el.textContent = dir + '\\YuanShen.exe';
+      el.animate([{opacity:0},{opacity:1}], {duration:200, easing:'ease-out'});
+    });
+    persist();
+    updateMain();
+  }
+
+  function closePicker(){
+    if (!picker) return;
+    var p = picker; picker = null;
+    p.classList.add('closing');
+    setTimeout(function(){ p.remove(); }, 160);
+  }
+  // 组件文件缺失 → 联网补齐：ReShade 走官网安装器，其余走本项目的 GitHub Releases 整包
+  document.addEventListener('click', function(e){
+    var btn = e.target && e.target.closest ? e.target.closest('[data-fetch]') : null;
+    if (!btn) return;
+    var id = btn.getAttribute('data-fetch');
+    if (!id || state.fetching[id] || state.phase === 'installing') return;
+    markFetching(id, true);
+    env.className = 'env';
+    env.innerHTML = '正在准备下载…';
+    host.send({type:'fetchComponent', id: id});
+  });
+
+  // 组件日志：直接打开对应文件（没有日志时后端会退回打开目录）
+  document.addEventListener('click', function(e){
+    var btn = e.target && e.target.closest ? e.target.closest('[data-log]') : null;
+    if (!btn || btn.disabled) return;
+    host.send({type:'openLog', id: btn.getAttribute('data-log')});
+  });
+
+  document.addEventListener('click', function(){ closePicker(); });
+  document.addEventListener('keydown', function(e){ if (e.key === 'Escape'){ closePicker(); closeWarn(false, false); closeUpdate(); } });
+
+  /* ── 主界面：主页上的整块配置 ── */
+
+  function summaryLine(){
+    var n = visibleComps().length;
+    var extra = (state.custom || []).filter(function(e){ return e.on !== false; }).length;
+    return n + ' 个组件' + (extra ? ' · ' + extra + ' 个自定义注入' : '');
+  }
+
+  function updateMain(){
+    if (!state.comps.length) return;
+    var sel = visibleComps().filter(function(c){ return state.on[c.id]; });
+    var done = sel.filter(function(c){ return c.installed; }).length;
+    var pending = sel.length - done;
+
+    homeintro.textContent = !state.dir
+      ? '先选一个游戏目录，再来这里启动。'
+      : (pending
+          ? '还有 ' + pending + ' 个已勾选的组件没写入，点右下角保存补上。'
+          : (state.running ? '解帧工具正在运行，关掉游戏后它会自己退出。' : '解帧工具和插件都已就位，直接启动游戏。'));
+    aboutcomps.textContent = names(state.comps);
+    mainsub.textContent = !state.dir ? '未配置' : (pending ? '待写入 ' + pending + ' 个' : '已配置');
+    // 没有游戏目录时，唯一该点的就是这个按钮
+    [].forEach.call(dirBtns, function(b){ b.classList.toggle('cta', !state.dir); });
+    btnLaunch.textContent = state.running ? '游戏运行中' : '启动游戏';
+    btnLaunch.disabled = state.running || !state.dir;
+    updateSummary();
+    refreshSave();
+  }
+
+  // 名单：名字点出来就够了
+  function names(list){
+    return list.map(function(c){ return c.name; }).join(' · ');
+  }
+
+  // 取消：写入过程中中断写入，已经写好的文件留着
+  btnCancel.addEventListener('click', function(){
+    if (state.phase === 'installing'){ host.send({type:'stop'}); return; }
+  });
+
+  /* ── 主界面导航与动作 ── */
+  [].forEach.call(navItems, function(b){
+    b.addEventListener('click', function(){ showPage(b.dataset.page); });
+  });
+  $('#btn-open-game').addEventListener('click', function(){ host.send({type:'openPath', what:'folder'}); });
+  $('#btn-bundle-logs').addEventListener('click', function(){
+    if (state.phase === 'installing') return;
+    env.className = 'env';
+    env.innerHTML = '正在打开保存位置…';
+    host.send({type:'bundleLogs'});
+  });
+  $('#btn-open-payload').addEventListener('click', function(){ host.send({type:'openPath', what:'payload'}); });
+  $('#btn-mods-pick').addEventListener('click', function(){
+    if (state.phase === 'installing') return;
+    host.send({type:'pickMods'});
+  });
+  $('#btn-mods-reset').addEventListener('click', function(){
+    if (state.phase === 'installing') return;
+    host.send({type:'modsDir', dir:''});
+  });
+  // 「恢复默认设置」是破坏性操作，点两次才执行（4 秒内没确认就复位）
+  var btnRestore = $('#btn-restore'), restoreArmed = false, restoreTimer = 0;
+  function disarmRestore(){
+    restoreArmed = false;
+    clearTimeout(restoreTimer);
+    btnRestore.textContent = '恢复…';
+    btnRestore.classList.remove('danger');
+  }
+  btnRestore.addEventListener('click', function(){
+    if (state.phase === 'installing') return;
+    if (!restoreArmed){
+      restoreArmed = true;
+      btnRestore.textContent = '确认恢复';
+      btnRestore.classList.add('danger');
+      restoreTimer = setTimeout(disarmRestore, 4000);
+      return;
+    }
+    disarmRestore();
+    env.className = 'env';
+    env.innerHTML = '<b>正在恢复默认设置…</b>';
+    host.send({type:'restoreDefaults'});
+  });
+  /* ── 桌面快捷方式 + 与其他启动器联动 ── */
+  var swShortcut = $('#sw-shortcut');
+  var unlockerDirEl = $('#unlockerdir');
+
+  function renderShortcut(){
+    if (swShortcut){
+      swShortcut.setAttribute('aria-checked', state.shortcutOn === false ? 'false' : 'true');
+      swShortcut.disabled = state.phase === 'installing';
+    }
+    if (unlockerDirEl) unlockerDirEl.textContent = state.unlockerDir || '—';
+  }
+
+  function copyToClipboard(text){
+    if (!text){ return; }
+    var done = function(){
+      env.className = 'env';
+      env.innerHTML = '<b>已复制</b><span class="sep">·</span>粘贴到启动器里就可以了';
+    };
+    var fallback = function(){
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      if (ok){ done(); }
+      else { env.className = 'env bad'; env.textContent = '复制失败，请手动选中后复制'; }
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(done, fallback);
+    } else {
+      fallback();
+    }
+  }
+
+  if (swShortcut) swShortcut.addEventListener('click', function(){
+    if (state.phase === 'installing') return;
+    var next = swShortcut.getAttribute('aria-checked') !== 'true';
+    swShortcut.setAttribute('aria-checked', next ? 'true' : 'false');
+    host.send({type:'setShortcut', enabled: next});
+  });
+  if ($('#btn-copy-unlocker')) $('#btn-copy-unlocker').addEventListener('click', function(){
+    copyToClipboard(state.unlockerDir || '');
+  });
+
+  /* ── 检查更新：关于页入口 → 弹窗 ── */
+  var upModal = $('#upmodal');
+  var upState = $('#upstate');
+  var upMsg = $('#upmsg');
+  var upProgress = $('#upprogress');
+  var upBar = upProgress.querySelector('span');
+  var btnUpdateNow = $('#btn-update-now');
+  var updateInfo = null;
+
+  function updateReset(){
+    updateInfo = null;
+    upState.className = 'upstate';
+    upState.innerHTML = '正在查询 GitHub 最新版本…';
+    upMsg.textContent = '';
+    upProgress.className = 'upprogress';
+    upBar.style.transform = 'scaleX(0)';
+    btnUpdateNow.disabled = true;
+    btnUpdateNow.textContent = '立即更新';
+  }
+
+  function openUpdate(){
+    updateReset();
+    upModal.hidden = false;
+    host.send({type:'checkUpdate'});
+  }
+
+  function closeUpdate(){
+    if (state.updateBusy) return;   // 写入中不允许关闭，避免进度无处可看
+    upModal.hidden = true;
+  }
+
+  function onUpdate(msg){
+    if (msg.phase === 'checking'){
+      updateReset();
+      return;
+    }
+    if (msg.phase === 'checked'){
+      var info = msg.info || {};
+      updateInfo = info;
+      if (!info.ok){
+        upState.className = 'upstate bad';
+        upState.innerHTML = T('检查失败：', 'Check failed: ') + (info.error || T('未知错误', 'unknown error'));
+        return;
+      }
+      if (info.newer){
+        upState.innerHTML = T('发现新版本 ', 'New version ') + '<b>v' + info.remote + '</b>' + T('（当前 v', ' (current v') + info.local + T('）', ')');
+        btnUpdateNow.disabled = false;
+      } else {
+        upState.innerHTML = '<b>' + T('已是最新版本', 'Up to date') + '</b> · v' + info.local;
+        btnUpdateNow.disabled = true;
+      }
+      return;
+    }
+    if (msg.phase === 'working'){
+      state.updateBusy = true;
+      upProgress.className = 'upprogress on anon';
+      upMsg.textContent = msg.message || '正在更新…';
+      btnUpdateNow.disabled = true;
+      return;
+    }
+    if (msg.phase === 'done'){
+      state.updateBusy = false;
+      var info2 = msg.info || {};
+      var ver = info2.version || (updateInfo && updateInfo.remote) || '';
+      upProgress.className = 'upprogress on';
+      upBar.style.transform = 'scaleX(1)';
+      upState.className = 'upstate';
+      upState.innerHTML = T('已更新到 ', 'Updated to ') + '<b>v' + ver + '</b>';
+      var tail = info2.switched && info2.switched.length ? T(' · 版本切到 ', ' · switched to ') + info2.switched.join(' / ') : '';
+      var iniCount = info2.inis && info2.inis.length ? info2.inis.length : 0;
+      upMsg.textContent = T('覆盖 ', 'Overwrote ') + (info2.files || 0) + T(' 个文件', ' file(s)') + (iniCount ? T('，回填 ', ', restored ') + iniCount + T(' 个 ini', ' ini file(s)') : '') + tail;
+      btnUpdateNow.disabled = true;
+      btnUpdateNow.textContent = '已是最新';
+      host.send({type:'init'});
+      return;
+    }
+    if (msg.phase === 'error'){
+      state.updateBusy = false;
+      upProgress.className = 'upprogress';
+      upState.className = 'upstate bad';
+      upState.innerHTML = msg.message || '更新失败';
+      btnUpdateNow.disabled = !(updateInfo && updateInfo.newer);
+    }
+  }
+
+  $('#btn-check-update').addEventListener('click', openUpdate);
+  $('#btn-update-now').addEventListener('click', function(){
+    if (state.updateBusy) return;
+    state.updateBusy = true;
+    upProgress.className = 'upprogress on anon';
+    upMsg.textContent = '正在查询最新版本…';
+    btnUpdateNow.disabled = true;
+    host.send({type:'applyUpdate'});
+  });
+  $('#upmclose').addEventListener('click', closeUpdate);
+  $('#upscrim').addEventListener('click', closeUpdate);
+$('#warnok').addEventListener('click', function(){ closeWarn(true, false); });
+$('#warnnever').addEventListener('click', function(){ closeWarn(true, true); });
+$('#warnclose').addEventListener('click', function(){ closeWarn(false, false); });
+$('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); });
+  document.addEventListener('click', function(e){
+    var b = e.target && e.target.closest ? e.target.closest('[data-url]') : null;
+    if (!b) return;
+    host.send({type:'openUrl', url: b.getAttribute('data-url')});
+  });
+  $('#btn-open-config').addEventListener('click', function(){ host.send({type:'openPath', what:'config'}); });
+  btnLaunch.addEventListener('click', launchGame);
+  btnSave.addEventListener('click', saveAll);
+
+  /* ── 安装流程 ── */
+  var progressComp = null;
+
+  function startInstall(){
+    if (state.phase === 'installing') return;
+    var ids = selectedIds();
+    if (!ids.length || !state.dir) return;
+    closePicker();
+    state.phase = 'installing';
+    state.selected = ids;
+    state.dirty = false;
+
+    lockControls(true);
+    btnLog.hidden = true;
+    // 写入期间不换皮：按钮文案、行状态、提示都保持原样，只让进度条动
+    btnCancel.hidden = true;
+    progressComp = null;
+    btnSave.disabled = true;
+    var p0 = progOf();
+    p0.line.style.opacity = '1';
+    p0.line.style.width = '0';
+    p0.line.style.transition = 'width .3s linear';
+
+    host.send({type:'install', dir: state.dir, fps: state.fps, selected: ids});
+  }
+
+  // 进度只写一处：卡片表头的进度条、结论行与底栏「保存」按钮
+  function progOf(){
+    return { line: pline, sum: compsum, readyEl: ready, btn: btnSave, busy: '写入中 ' };
+  }
+
+  function onProgress(msg){
+    var idx = state.selected.indexOf(msg.component) + 1;
+    var total = state.selected.length;
+    if (idx <= 0) return;
+    var p = progOf();
+    p.line.style.width = Math.round((idx / total) * 100) + '%';
+    void p.sum; void p.readyEl; void p.btn; void p.busy;
+  }
+
+  function renderStatus(row, st){
+    var end = row.querySelector('[data-end]');
+    if (st === 'done'){
+      end.classList.add('has-sym');
+      end.innerHTML = '<span class="cstat">' +
+        '<span class="tick"><svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M2.4 6.3 4.9 8.8 9.6 3.7"/></svg></span></span>';
+      // 装完勾选框留着，随时能取消勾选再去保存
+      row.querySelector('.cb').style.visibility = '';
+    } else if (st === 'active'){
+      end.classList.add('has-sym');
+      end.innerHTML = '<span class="cstat"><span class="spin"></span>写入中</span>';
+      row.querySelector('.cb').style.visibility = 'hidden';
+    } else {
+      end.classList.remove('has-sym');
+      end.innerHTML = '';
+      row.querySelector('.cb').style.visibility = '';
+    }
+  }
+
+  function onInstalled(msg){
+    if (!msg.ok){
+      if (msg.cancelled){ state.phase = 'idle'; return; }
+      if (msg.missing && msg.missing.length){ showPayloadError(msg.missing, msg.error); return; }
+      showError(msg.failedComponent || progressComp, msg.error);
+      return;
+    }
+    // 后端回的已安装标记与组件顺序一一对应，主界面的状态条直接用它
+    if (msg.installed && msg.installed.length){
+      state.comps.forEach(function(c, i){ c.installed = msg.installed[i] === '1'; });
+    }
+    finish();
+    // 首次写入链之后 fps_config.json 才存在，解帧工具选项这时才可改
+    host.send({type:'init'});
+  }
+
+  /* 离线包不完整：把缺文件的组件逐行标红，底部给结论，不再假装能重试。 */
+  function showPayloadError(ids, message){
+    var p = progOf();
+    state.phase = 'error';
+    unlockControls();
+    btnCancel.hidden = true;
+    ids.forEach(function(id){
+      var r = rowOf(id);
+      if (!r) return;
+      r.dataset.st = 'fail';
+      r.querySelector('.cb').style.visibility = 'hidden';
+      renderFail(r, '离线包缺少该组件文件', '缺少文件');
+      var c = compOf(id);
+      if (c && !c.present) r.querySelector('[data-end]').insertAdjacentHTML('beforeend', fetchBtn(id));
+    });
+    p.readyEl.className = 'ready bad'; p.readyEl.innerHTML = '<i></i>缺少组件文件';
+    btnSave.disabled = false;
+    btnSave.textContent = T('保存','Save');
+    btnLog.hidden = false;
+    env.className = 'env bad';
+    env.innerHTML = '<b>' + (message || '离线包不完整') + '</b>';
+  }
+
+  function finish(restored){
+    var p = progOf();
+    state.phase = 'done';
+    state.selected.forEach(function(id){
+      var r = rowOf(id);
+      // 文件不全的组件不打勾：它得留着「缺少文件 + 下载」让用户补齐
+      var c = compOf(id);
+      if (!r || (c && !c.present)) return;
+      r.dataset.st = 'done';
+      renderStatus(r, 'done');
+    });
+    if (!restored){
+      p.line.style.width = '100%';
+      p.line.style.transition = 'width .3s linear, opacity .6s .5s';
+      setTimeout(function(){ p.line.style.opacity = '0'; }, 500);
+    }
+    p.readyEl.className = 'ready';
+    p.readyEl.innerHTML = '<i></i>已写入';
+    p.sum.textContent = state.selected.length + ' 个组件 · 已安装';
+    unlockControls();
+    btnCancel.hidden = true;
+    btnLog.hidden = true;
+    btnLog.textContent = '查看日志';
+    btnLog.onclick = null;
+    env.className = 'env';
+    env.innerHTML = '<b>帧率上限 ' + state.fps + ' FPS</b><span class="sep">·</span>' + state.dir;
+
+    state.dirty = false;
+    btnSave.innerHTML = T('保存','Save');
+    updateMain();
+  }
+
+  function showError(failId, message){
+    var p = progOf();
+    state.phase = 'error';
+    unlockControls();
+    btnCancel.hidden = true;
+    var row = failId ? rowOf(failId) : null;
+
+    state.selected.forEach(function(id){
+      if (id === failId) return;
+      var r = rowOf(id);
+      if (r && r.dataset.st === 'done'){ r.dataset.st = 'wait'; renderStatus(r, 'idle'); }
+    });
+
+    if (row){
+      renderFail(row, message);
+      p.sum.textContent = '写入被中断';
+    } else {
+      p.sum.textContent = '安装没有开始';
+    }
+
+    var doneN = state.selected.filter(function(id){
+      var r = rowOf(id); return r && r.dataset.st === 'done';
+    }).length;
+
+    p.readyEl.className = 'ready bad';
+    p.readyEl.innerHTML = '<i></i>' + (doneN ? '已中断 · 完成 ' + doneN + ' 个' : '未安装');
+    p.line.style.width = '0';
+    p.btn.disabled = false;
+    p.btn.textContent = T('保存','Save');
+    btnLog.hidden = false;
+    btnLog.textContent = '查看日志';
+    btnLog.onclick = function(){ host.send({type:'openPath', what:'log'}); };
+    env.className = 'env bad';
+    env.innerHTML = '安装已中断<span class="sep">·</span>详见日志';
+  }
+
+  /* 把一行标成失败：勾选框让位、名字下方写原因、右侧换成红叉。 */
+  function renderFail(row, message, label){
+    var tag = label || '写入失败';
+    row.dataset.st = 'fail';
+    row.querySelector('.cb').style.visibility = 'hidden';
+    row.querySelector('[data-end]').classList.add('has-sym');
+    var c = compOf(row.dataset.id);
+    row.children[1].innerHTML = c.name + ' <em>' + c.note + '</em>' +
+      '<span class="cfail">' + (message || '写入失败') + '</span>';
+    row.querySelector('[data-end]').innerHTML =
+      '<span class="cstat" style="color:#C7362B;gap:9px">' + tag +
+      '<span class="xfail"><svg width="9" height="9" viewBox="0 0 12 12" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"><path d="M3 3l6 6M9 3l-6 6"/></svg></span></span>';
+  }
+
+  function lockControls(on){
+    fpsControls.forEach(function(c){ c.root.classList.toggle('locked', on); });
+    [].forEach.call(dirBtns, function(b){ b.classList.toggle('locked', on); });
+  }
+
+  function unlockControls(){
+    lockControls(false);
+  }
+
+  /* ── 启动游戏（交给原版解帧工具） ── */
+  function launchGame(){
+    if (state.phase === 'installing') return;
+    btnLaunch.disabled = true;
+    btnLaunch.innerHTML = '<span class="btnspin"></span>正在启动';
+    env.className = 'env';
+    env.innerHTML = '正在启动解帧工具…';
+    host.send({type:'launch', dir: state.dir, fps: state.fps, selected: selectedIds()});
+  }
+
+  function onUnlock(msg){
+    var text = {
+      launching: '正在启动解帧工具…',
+      started: '解帧工具已启动 · 游戏马上打开',
+      exited: '解帧工具已退出',
+      error: msg.message || '解帧工具启动失败',
+      idle: ''
+    }[msg.status] || msg.message;
+
+    env.className = 'env' + (msg.status === 'error' ? ' bad' : '');
+    env.innerHTML = msg.status === 'started'
+      ? '<b>帧率上限 ' + state.fps + ' FPS</b><span class="sep">·</span>' + text
+      : '<b>' + text + '</b>';
+
+    if (msg.status === 'started'){
+      state.running = true;
+      // 工具在跑，再点一次只会得到「已经在运行」，按钮就停在运行态。
+      btnLaunch.disabled = true;
+      btnLaunch.textContent = '游戏运行中';
+      btnLog.hidden = false;
+    } else if (msg.status === 'exited' || msg.status === 'error' || msg.status === 'idle'){
+      state.running = false;
+      btnLaunch.disabled = !state.dir;
+      btnLaunch.textContent = '启动游戏';
+      if (msg.status === 'error'){
+        btnLog.hidden = false;
+        btnLog.textContent = '查看日志';
+        btnLog.onclick = function(){ host.send({type:'openPath', what:'log'}); };
+      }
+    }
+    updateMain();
+  }
+
+  /* ── 后端消息 ── */
+  host.on(function(raw){
+    var msg;
+    try { msg = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (e) { return; }
+
+    if (msg.type === 'state'){
+      // 主界面点保存时后端会先回一帧 state。这时候写入已经在跑了，
+      // 重建行会把逐行进度清掉，切视图还会闪一下首次配置——所以这帧只更新摘要。
+      if (state.phase === 'installing'){
+        state.payload = !!msg.payloadAvailable;
+        state.running = !!msg.unlocking;
+        updateMain();
+        return;
+      }
+      state.dir = msg.dir || '';
+      state.fps = clampFps(msg.fps || 240);
+      state.gpu = msg.gpuVendor || 'other';
+    state.warned = msg.suppressWarnings || [];
+    state.uiLang = msg.uiLang || 'system';
+      state.theme = msg.theme || 'system';
+      state.comps = msg.components || [];
+      state.custom = msg.custom || [];
+      buildLogs(msg.logs);
+      state.payload = !!msg.payloadAvailable;
+      $('#payloadpath').textContent = msg.payloadDir || '—';
+      var pkgVer = msg.packageVersion || msg.version || '';
+      $('#pkgversion').textContent = pkgVer ? 'v' + pkgVer : '未知版本';
+      $('#installerversion').textContent = pkgVer ? 'v' + pkgVer + '（跟随插件包）' : '未知版本';
+      buildVersions(msg);
+      buildUnlocker(msg.unlocker);
+      state.modsDir = msg.modsDir || '';
+      state.modsDefault = msg.modsDefault || '';
+      renderMods(state.modsDir, state.modsDefault);
+      state.shortcutOn = msg.desktopShortcut !== false;
+      state.unlockerDir = msg.unlockerDir || '';
+      state.shortcutName = msg.shortcutName || '';
+      renderShortcut();
+      state.installed = {};
+      state.on = {};
+      (msg.selected || []).forEach(function(id){ state.on[id] = true; });
+      // 必装项永远在勾选态；后端没回选择时按默认（桥接 + 纹理）
+      state.comps.forEach(function(c){
+        if (c.mandatory) state.on[c.id] = true;
+        if (c.present === undefined) c.present = true;
+      });
+      if (!msg.selected || !msg.selected.length){
+        DEFAULT_ON.forEach(function(id){ state.on[id] = true; });
+      }
+
+      [].forEach.call(dirPaths, function(el){
+        el.textContent = state.dir ? state.dir + '\\YuanShen.exe' : '未找到原神，点击「更换…」选择目录';
+      });
+      applyTheme();
+      applyLang();
+      if (!prefsSent){ prefsSent = true; pushPrefs(); }
+
+      state.running = !!msg.unlocking;
+      state.maximized = !!msg.maximized;
+      state.backdrop = msg.backdrop || 'mica';
+      state.opacity = (typeof msg.opacity === 'number') ? msg.opacity : 80;
+      syncMaximized();
+      applyAppearance();
+      syncFpsUI();
+      buildRows();
+      updateSummary();
+      updateMain();
+      env.innerHTML = state.payload
+        ? T('本地安装','Local install') + '<span class="sep">·</span>' + T('不上传任何数据','no data leaves this machine')
+        : '<b>' + T('缺少 payload 组件目录','payload folder missing') + '</b>';
+      env.className = 'env' + (state.payload ? '' : ' bad');
+      // 全部组件已落在游戏目录 → 直接进「已安装」，别让用户重装一遍。
+      var need = state.comps.filter(function(c){ return state.on[c.id]; });
+      var allThere = !!state.dir && need.length > 0 && need.every(function(c){ return c.installed; });
+      if (msg.unlocking){
+        state.phase = 'done';
+        env.className = 'env';
+        env.innerHTML = '<b>帧率上限 ' + state.fps + ' FPS</b><span class="sep">·</span>解帧工具已启动 · 游戏马上打开';
+        updateMain();
+      }
+      else if (allThere){ state.selected = selectedIds(); finish(true); }
+      else { updateMain(); }
+    }
+    else if (msg.type === 'dirs'){ openPicker(msg.dirs || []); }
+    else if (msg.type === 'picked'){
+      if (msg.ok){ setDir(msg.dir); }
+      else { env.className = 'env bad'; env.innerHTML = '<b>' + (msg.message || '没有找到游戏') + '</b>'; }
+    }
+    else if (msg.type === 'progress'){ onProgress(msg); }
+    else if (msg.type === 'installed'){ onInstalled(msg); }
+    else if (msg.type === 'unlock'){ onUnlock(msg); }
+    else if (msg.type === 'windowstate'){
+      state.maximized = !!msg.maximized;
+      syncMaximized();
+    }
+    else if (msg.type === 'appearance'){
+      state.backdrop = msg.applied || state.backdrop;
+      if (typeof msg.opacity === 'number') state.opacity = msg.opacity;
+      applyAppearance();
+      if (msg.fallback){
+        env.className = 'env';
+        env.innerHTML = '<b>这台系统不支持该背景效果</b><span class="sep">·</span>已回退纯色';
+      }
+    }
+    else if (msg.type === 'saved'){
+      if (state.phase === 'installing') return;   // 安装流程自己会汇报进度
+      if (msg.failed && msg.failed.length){
+        var why = (msg.failed[0].errors && msg.failed[0].errors[0]) || '有文件删除失败';
+        env.className = 'env bad';
+        env.innerHTML = '<b>' + why + '</b>';
+        return;
+      }
+      if (msg.removed && msg.removed.length){
+        env.className = 'env';
+        env.innerHTML = '<b>已停用 ' + msg.removed.length + ' 个组件</b><span class="sep">·</span>文件仍留在管理器目录';
+      } else {
+        env.className = 'env';
+        env.innerHTML = '<b>已保存</b><span class="sep">·</span>帧率上限 ' + state.fps + ' FPS';
+      }
+    }
+    else if (msg.type === 'switched'){
+      env.className = 'env' + (msg.ok ? '' : ' bad');
+      env.innerHTML = msg.ok
+        ? '<b>已切换到 ' + (msg.dir || '') + '</b><span class="sep">·</span>注入链已同步'
+        : '<b>' + (msg.error || '切换失败') + '</b>';
+    }
+    else if (msg.type === 'shortcut'){
+      state.shortcutOn = msg.ok ? state.shortcutOn : state.shortcutOn;
+      if (msg.ok){
+        env.className = 'env';
+        env.innerHTML = msg.path
+          ? '<b>已在桌面创建快捷方式</b><span class="sep">·</span>' + state.shortcutName
+          : '<b>已删除桌面快捷方式</b>';
+      } else {
+        env.className = 'env bad';
+        env.innerHTML = '<b>' + (msg.error || '快捷方式操作失败') + '</b>';
+        host.send({type:'init'});
+      }
+    }
+    else if (msg.type === 'unlocker'){
+      if (msg.ok){
+        buildUnlocker(msg.config);
+        flashUnlocker('已保存到 fps_config.json');
+      } else {
+        flashUnlocker(msg.error || '保存失败', true);
+        // 失败时回读一次真实状态，别让界面停在乐观更新的值上
+        host.send({type:'init'});
+      }
+    }
+    else if (msg.type === 'update'){
+      onUpdate(msg);
+    }
+    else if (msg.type === 'fetch'){
+      if (msg.status === 'start' || msg.status === 'working'){
+        env.className = 'env';
+        env.innerHTML = msg.message || '正在下载…';
+        markFetching(msg.id, true);
+      } else if (msg.status === 'done'){
+        delete state.fetching[msg.id];
+        env.className = 'env';
+        env.innerHTML = '<b>已补齐 ' + (msg.count || 0) + ' 个文件</b><span class="sep">·</span>可以继续勾选安装了';
+        host.send({type:'init'});
+      } else {
+        delete state.fetching[msg.id];
+        env.className = 'env bad';
+        env.innerHTML = '<b>下载失败</b><span class="sep">·</span>' + (msg.message || '');
+        markFetching(msg.id, false);
+      }
+    }
+    else if (msg.type === 'mods'){
+      if (msg.ok){
+        renderMods(msg.dir || '', state.modsDefault || '');
+        env.className = 'env';
+        env.innerHTML = msg.dir
+          ? '<b>Mods 目录已写入 TextureLoader.ini</b><span class="sep">·</span>重启游戏生效'
+          : '<b>已恢复默认 Mods 目录</b><span class="sep">·</span>重启游戏生效';
+      } else {
+        env.className = 'env bad';
+        env.innerHTML = '<b>' + (msg.error || '写入失败') + '</b>';
+        host.send({type:'init'});
+      }
+    }
+    else if (msg.type === 'custom'){
+      if (msg.cancelled) return;
+      if (msg.ok){
+        env.className = 'env';
+        env.innerHTML = msg.removed
+          ? '<b>已移除 ' + (msg.removed.split('\\').pop()) + '</b><span class="sep">·</span>注入链已同步'
+          : '<b>已加入注入链</b><span class="sep">·</span>' + ((msg.path || '').split('\\').pop() || '');
+      } else {
+        // 失败时后端没有改任何状态，别用 init 回读（那会把这条错误提示顶掉）
+        env.className = 'env bad';
+        env.innerHTML = '<b>' + (msg.error || '自定义注入失败') + '</b>';
+      }
+    }
+    else if (msg.type === 'restored'){
+      if (msg.ok){
+        var count = (msg.files || []).length;
+        env.className = 'env';
+        env.innerHTML = '<b>已恢复默认设置</b><span class="sep">·</span>' + count + ' 个 ini 已还原，重新打开游戏生效';
+      } else {
+        env.className = 'env bad';
+        env.innerHTML = '<b>' + (msg.error || '恢复失败') + '</b>';
+      }
+    }
+    else if (msg.type === 'logs'){
+      if (msg.cancelled) {
+        env.className = 'env';
+        env.innerHTML = '';
+        return;
+      }
+      if (msg.ok){
+        var file = String(msg.path || '').split('\\').pop();
+        env.className = 'env';
+        env.innerHTML = '<b>已打包 ' + msg.count + ' 个日志文件</b><span class="sep">·</span>' + file;
+      } else {
+        env.className = 'env bad';
+        env.innerHTML = '<b>' + (msg.error || '打包失败') + '</b>';
+      }
+    }
+    else if (msg.type === 'error'){
+      state.phase = 'idle';
+      unlockControls();
+      env.className = 'env bad';
+      env.innerHTML = '<b>' + (msg.message || '出错了') + '</b>';
+    }
+  });
+
+  window.addEventListener('resize', function(){ placeAllThumbs(); });
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(function(){ placeAllThumbs(); });
+
+  /* ── 语言与明暗：默认跟随系统，设置里可以手动指定 ── */
+  var langSeg = $('#langseg'), themeSeg = $('#themeseg');
+  var darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
+  var prefsSent = false;
+
+  function sysLang(){
+    return (navigator.language || '').toLowerCase().indexOf('zh') === 0 ? 'zh' : 'en';
+  }
+  function langNow(){
+    return (state.uiLang === 'zh' || state.uiLang === 'en') ? state.uiLang : sysLang();
+  }
+  function isDark(){
+    if (state.theme === 'dark') return true;
+    if (state.theme === 'light') return false;
+    return !!darkQuery.matches;
+  }
+
+  /* 英文词表：键是中文原文，动态拼出来的句子走下面的模式表 */
+  var EN_EXACT = {
+    '显卡兼容性提示':'Graphics compatibility', '不再提醒':'Don’t remind again', '确认':'OK',
+    'NVIDIA 显卡在使用 TextureLoader 加载纹理贴图时，极大概率会导致贴图渲染丢失；也有小概率完全正常、与 AMD 显卡表现一致，原因未知。':'On NVIDIA GPUs, loading textures through TextureLoader very often makes textures disappear; occasionally it works fine, just like on AMD. The cause is unknown.',
+    'NVIDIA 显卡上 ReShade 与 OptiScaler 同时启用，可能存在不稳定现象。':'On NVIDIA GPUs, running ReShade and OptiScaler at the same time may be unstable.',    '主页':'Home', '插件配置':'Plugins', '设置':'Settings', '关于':'About',
+    '已配置':'Configured', '未配置':'Not configured',
+    '游戏目录':'Game folder', '正在查找原神安装位置…':'Locating Genshin…', '更换…':'Change…',
+    '帧率上限':'Frame rate cap', '安装内容':'Injection list', '保存':'Save',
+    '启动游戏':'Launch game', '游戏运行中':'Game running',
+    '先选一个游戏目录，再来这里启动。':'Pick the game folder first, then launch from here.',
+    '解帧工具正在运行，关掉游戏后它会自己退出。':'The unlocker is running; it exits when the game closes.',
+    '解帧工具和插件都已就位，直接启动游戏。':'Everything is in place — launch the game.',
+    '解帧和插件注入（必装）':'Unlock + plugin injection (required)',
+    'FSR4 超分桥接插件（必装）':'FSR4 upscaling bridge (required)',
+    'DLSS/XESS/FSR4 INT8 超分扩展（选装）':'DLSS/XESS/FSR4 INT8 upscaling (optional)',
+    'HDR 增强（选装）':'HDR enhancement (optional)',
+    '纹理 Mod 加载（选装）':'Texture mod loader (optional)',
+    '反虚化 · 隐藏 UID（选装）':'Anti-mosaic · hide UID (optional)',
+    '自定义注入 · 把其它 DLL 追加到注入链末尾':'Custom injection — append another DLL to the chain',
+    '自定义注入':'Custom injection', '已注入':'Injected', '未写入':'Not injected', '未启用':'Disabled',
+    '已安装':'Installed', '缺少文件':'Missing file', '下载':'Download', '下载中…':'Downloading…',
+    '删除':'Remove', '选择 DLL…':'Choose DLL…',
+    '全部就绪':'All set', '缺少组件文件':'Components missing', '写入被中断':'Write interrupted',
+    '先选择游戏目录':'Choose the game folder first', '写入中':'Writing',
+    '插件包':'Plugin package', '安装器版本':'Installer version', '安装器':'Installer', '随附组件':'Bundled components',
+    '把其它 DLL 追加到注入链末尾':'append another DLL to the chain',
+    '取消':'Cancel',
+    '已保存':'Saved', '下载失败':'Download failed', '已恢复默认设置':'Defaults restored',
+    '文件仍留在管理器目录':'files stay in the manager folder',
+    '可以继续勾选安装了':'you can keep selecting now',
+    '安装已中断':'Install interrupted', '详见日志':'see the log',
+    '这台系统不支持该背景效果':'This backdrop is not supported here', '已回退纯色':'fell back to a solid colour',
+    '离线包不完整':'Incomplete offline package', '没有找到游戏':'Game not found',
+    '写入失败':'Write failed', '自定义注入失败':'Custom injection failed', '恢复失败':'Restore failed',
+    '打包失败':'Bundling failed', '出错了':'Something went wrong', '正在下载…':'Downloading…',
+    '正在准备下载…':'Preparing download…', '正在打开保存位置…':'Opening the save dialog…',
+    '正在恢复默认设置…':'Restoring defaults…', '正在启动解帧工具…':'Starting the unlocker…',
+    '解帧工具已启动 · 游戏马上打开':'Unlocker started — the game is opening',
+    '正在写入组件…':'Writing components…', '文件仍留在管理器目录。':'Files stay in the manager folder.',
+    '蓝奏云【CN】':'Lanzou【CN】', '夸克网盘【CN】':'Quark【CN】',
+    '国内网盘镜像，蓝奏云密码 549a。下载后解压覆盖到安装器目录即可。':'Mainland mirrors — Lanzou password 549a; unzip over the installer folder.',
+    '已开启':'On', '已关闭':'Off',
+    '本地安装器：把解帧工具和插件写进原神目录，只在你点恢复或检查更新时联网。':'Local installer — it writes the unlocker and plugins into the Genshin folder and only goes online when you restore defaults or check for updates.',
+    '配置目录':'Config folder', '许可':'Licenses', '检查更新':'Check for updates',
+    '各组件版权归原作者，许可证随组件文件一起留在管理器目录':'Each component belongs to its author; licenses stay in the manager folder.',
+    '安装器、Bridge、OptiScaler、TextureLoader 各写一份，出错时先看它们':'One log each for the installer, Bridge, OptiScaler and TextureLoader.',
+    '打包全部…':'Bundle all…', '打开':'Open', '查看日志':'View log',
+    '还没有生成日志，启动一次游戏再看':'No log yet — launch the game once.',
+    'TextureLoader Mods 目录':'TextureLoader mods folder', '用默认':'Use default', '选择…':'Choose…',
+    '默认 · ':'Default · ',
+    '留空即用 TextureLoader 同目录的 Mods 文件夹；选好会立刻写进 payload\\TextureLoader\\TextureLoader.ini，重启游戏生效。':'Leave empty to use the Mods folder next to TextureLoader; a choice is written to payload\\TextureLoader\\TextureLoader.ini and applies after a restart.',
+    '当前用这个目录里的 Mod（递归扫描其中的 ini）；清空后回到默认的 Mods 文件夹。':'Using the mods in this folder (ini files scanned recursively); clear it to go back to the default Mods folder.',
+    '插件恢复默认设置':'Restore plugin defaults', '恢复…':'Restore…', '确认恢复':'Confirm restore',
+    '用随包默认值覆盖 Bridge、OptiScaler、ReShade、TextureLoader 的 ini，并重新写一遍注入链':'Overwrite the Bridge, OptiScaler, ReShade and TextureLoader ini files with the bundled defaults and rewrite the injection chain.',
+    '界面语言':'Language', '跟随系统':'Follow system', '中文':'Chinese',
+    '跟随系统时，系统是中文就显示中文，其它语言显示英文':'Follow the system language: Chinese when the system is Chinese, English otherwise.',
+    '明暗主题':'Appearance', '浅色':'Light', '深色':'Dark',
+    '跟随系统时随 Windows 的浅色 / 深色自动切换':'Follow the Windows light / dark setting.',
+    '背景效果':'Backdrop', '关闭':'Off', '亚克力':'Acrylic',
+    'Mica 透出桌面壁纸，亚克力更偏玻璃；系统不支持时自动回退纯色':'Mica shows the wallpaper through; acrylic looks more like glass. Falls back to a solid colour.',
+    '桌面快捷方式':'Desktop shortcut',
+    '安装组件时在桌面放一个启动图标，双击就启动游戏（注入链一起生效）':'Puts a launch icon on the desktop when components are installed, so a double click starts the game with the injection chain.',
+    '与其他启动器联动':'Use with other launchers',
+    '在启动器里把「启动游戏」指到解帧工具，注入链才不会被绕过':'Point the launcher at the unlocker so the injection chain is not bypassed.',
+    '解帧工具目录':'Unlocker folder', '复制路径':'Copy path', '复制':'Copy',
+    '芙芙启动器':'FuFuLauncher',
+    '插件商城里下载「原神FSR2桥接插件」，之后用芙芙启动器启动游戏就行':'Install FSR-Bridge-Plugin from the FuFuLauncher plugin store, then start the game with FuFuLauncher.',
+    '两个启动器都是先起解帧工具，再由它带着注入链启动游戏；芙芙启动器的插件已上架商城，装完直接用它启动。':'Both launchers start the unlocker first, then it launches the game with the injection chain. The FuFuLauncher plugin is already on its store.',
+    '原神-游戏设置-启动参数-自定义启动程序-选中上面路径里的 unlockfps_nc.exe':'Genshin - Game Setting - Startup Arguments - Custom Startup Executable',
+    '启动选项卡-同时启动原神-原神安装位置-选中上面路径里的 unlockfps_nc.exe':'Launch tab - Launch Genshin at the same time - Genshin install location - pick unlockfps_nc.exe from the folder above',
+    '已复制':'Copied', '粘贴到启动器里就可以了':'paste it into the launcher.',
+    '复制失败，请手动选中后复制':'Copy failed — select and copy manually.',
+    '已在桌面创建快捷方式':'Desktop shortcut created', '已删除桌面快捷方式':'Desktop shortcut removed',
+    '快捷方式操作失败':'Shortcut action failed',
+    '背景不透明度':'Backdrop opacity', '只调窗口底色，卡片始终保持不透明':'Only the shell fades; cards stay opaque.',
+    '在文件资源管理器里打开当前安装位置':'Open the current install folder in Explorer',
+    '组件日志':'Component logs', '解帧工具选项':'Unlocker options',
+    '写进 fps_config.json，下次启动游戏时生效':'Stored in fps_config.json; applies on the next launch.',
+    '改完立刻生效，下次启动游戏时应用。':'Changes apply immediately and take effect next launch.',
+    '完成一次安装（写入注入链）后就能在这里调整。':'Finish one install (writes the injection chain) to edit these.',
+    '已保存到 fps_config.json':'Saved to fps_config.json', '保存失败':'Save failed',
+    '窗口模式':'Window mode', '窗口化':'Windowed', '无边框':'Borderless', '全屏':'Fullscreen', '独占全屏':'Exclusive fullscreen',
+    '分辨率':'Resolution', '跟随游戏':'Follow game', '自定义':'Custom',
+    '启动':'Startup', '即开游戏':'Auto-launch game', '随游戏退出':'Exit with game', '启动最小化':'Start minimized',
+    '兼容':'Compatibility', '省电模式':'Power saving', '移动端 UI':'Mobile UI', '挂起加载':'Suspend load',
+    '其它':'Other', '显示器':'Monitor', '优先级':'Priority',
+    '实时':'Realtime', '高':'High', '高于正常':'Above normal', '正常':'Normal', '低于正常':'Below normal', '低':'Low',
+    '插件包里没有可切换的版本':'No switchable versions in the payload',
+    '识别 payload 里以 Bridge 开头的文件夹':'Folders in payload starting with “Bridge”.',
+    '识别 payload 里以 OptiScaler 开头的文件夹；0.10 起是嵌套布局，超分后端路径自动按布局写 ini':'Folders in payload starting with “OptiScaler”. From 0.10 the layout is nested and the backend path is written accordingly.',
+    '嵌套布局':'nested', '平铺布局':'flat', '当前':'Current',
+    '组件目录':'Component folder',
+    'payload 里放多份组件目录时，可以在这里切换当前使用的版本；切换会立刻写进解帧工具的注入链。':'With several component folders in the payload you can switch here; the injection chain is rewritten immediately.',
+    '正在查询 GitHub 最新版本…':'Checking GitHub for the latest version…',
+    '立即更新':'Update now', '已是最新':'Up to date', '正在更新…':'Updating…', '更新失败':'Update failed',
+    '手动更新':'Manual update', '国内网盘镜像，蓝奏云密码 549a。下载后解压覆盖到安装器目录即可。':'Mainland mirrors — Lanzou password 549a. Unzip over the installer folder.',
+    '扫描到的安装位置':'Found installs', '没有自动找到，手动选择':'Not found automatically — choose manually',
+    '浏览…':'Browse…', '正在准备下载…':'Preparing download…', '正在下载…':'Downloading…',
+    '正在打开保存位置…':'Opening the save dialog…', '正在恢复默认设置…':'Restoring defaults…',
+    '正在启动解帧工具…':'Starting the unlocker…', '解帧工具已启动 · 游戏马上打开':'Unlocker started — the game is opening',
+    '解帧工具已退出':'Unlocker exited', '解帧工具启动失败':'Unlocker failed to start',
+    '正在查找原神安装位置…':'Locating Genshin…', '正在读取组件…':'Reading components…',
+    '出错了':'Something went wrong', '没有找到游戏':'Game not found', '文件不存在':'File not found',
+    '文件仍留在管理器目录':'files stay in the manager folder', '游戏目录、帧率上限和组件都在主页上改。':'The game folder, frame cap and components live on the Home page.',
+    '正在读取组件…':'Reading components…', '刷新':'Refresh'
+  };
+
+  var EN_PAT = [
+    [/^已安装 (\d+) \/ (\d+)$/, 'Installed $1 / $2'],
+    [/^已选 (\d+) \/ (\d+)$/, 'Selected $1 / $2'],
+    [/^(\d+) 个组件$/, '$1 components'],
+    [/^(\d+) 个组件 · (\d+) 个自定义注入$/, '$1 components · $2 custom'],
+    [/^(\d+) 个组件 · 已安装$/, '$1 components · installed'],
+    [/^待写入 (\d+) 个$/, '$1 pending'],
+    [/^已取消 (\d+) 个$/, '$1 deselected'],
+    [/^已停用 (\d+) 个组件 · 文件仍留在管理器目录$/, '$1 component(s) disabled · files stay in the manager folder'],
+    [/^已卸载 (\d+) 个组件$/, '$1 component(s) removed'],
+    [/^已恢复默认设置 · (\d+) 个 ini 已还原，重新打开游戏生效$/, 'Defaults restored · $1 ini file(s) back, reopen the game'],
+    [/^已补齐 (\d+) 个文件$/, 'Fetched $1 file(s)'],
+    [/^已打包 (\d+) 个日志文件 · (.*)$/, 'Bundled $1 log file(s) · $2'],
+    [/^已保存 · 帧率上限 (\d+) FPS$/, 'Saved · frame cap $1 FPS'],
+    [/^帧率上限 (\d+) FPS$/, 'Frame cap $1 FPS'],
+    [/^缺少 (\d+) 个组件文件，可在组件右侧点「下载」联网补齐$/, 'Missing $1 component file(s) — click Download to fetch them'],
+    [/^payload 里没有 (.+)$/, 'payload has no $1'],
+    [/^游戏目录里找不到 YuanShen\.exe$/, 'YuanShen.exe not found in the game folder'],
+    [/^正在写入，稍后再试$/, 'Writing in progress — try again later'],
+    [/^已有安装任务在进行$/, 'Another install is already running'],
+    [/^请先选择原神安装目录$/, 'Choose the Genshin install folder first'],
+    [/^安装器缺少组件文件（payload 目录）$/, 'Installer is missing component files (payload)'],
+    [/^这个目录不存在$/, 'That folder does not exist'],
+    [/^这个文件不存在$/, 'That file does not exist'],
+    [/^只能注入 \.dll 文件$/, 'Only .dll files can be injected'],
+    [/^这个组件还没有生成日志$/, 'This component has no log yet'],
+    [/^这个目录里没有 YuanShen\.exe$/, 'No YuanShen.exe in that folder'],
+    [/^未知的组件$/, 'Unknown component'],
+    [/^解帧工具已退出$/, 'Unlocker exited'],
+    [/^解帧工具启动失败$/, 'Unlocker failed to start'],
+    [/^已经是最新版本（(.+)）$/, 'Already up to date ($1)'],
+    [/^正在准备下载…$/, 'Preparing download…'],
+    [/^正在写入组件，稍后再试$/, 'Writing components — try again later'],
+    [/^已切换到 (.*) · 注入链已同步$/, 'Switched to $1 · injection chain updated'],
+    [/^已加入注入链 · (.*)$/, 'Added to the injection chain · $1'],
+    [/^已移除 (.*) · 注入链已同步$/, 'Removed $1 · injection chain updated'],
+    [/^正在写入 (\d+) 个组件…$/, 'Writing $1 component(s)…'],
+    [/^还有 (\d+) 个已勾选的组件没写入，点右下角保存补上。$/, '$1 selected component(s) still need writing — hit Save.'],
+    [/^正在 (.+)$/, 'Working: $1'],
+    [/^(\d+(?:\.\d+)?) (KB|MB|GB|B) · (.*)$/, '$1 $2 · $3'],
+    [/^(\d+(?:\.\d+)?) (KB|MB|GB|B) · (.*) · (\d+) 个文件$/, '$1 $2 · $3 · $4 files'],
+    [/^发现新版本 v(.*)（当前 v(.*)）$/, 'New version v$1 (current v$2)'],
+    [/^已是最新版本 · v(.*)$/, 'Up to date · v$1'],
+    [/^默认 · (.*)$/, 'Default · $1'],
+    [/^v(.*)（跟随插件包）$/, 'v$1 (follows package)'],
+    [/^v(.*)（跟随安装器）$/, 'v$1 (follows installer)'],
+    [/^已停用 (\d+) 个组件$/, '$1 component(s) disabled'],
+    [/^已打包 (\d+) 个日志文件$/, '$1 log file(s) bundled'],
+    [/^已补齐 (\d+) 个文件$/, 'Fetched $1 file(s)'],
+    [/^(\d+) 个组件不在 payload 里$/, '$1 component(s) missing from the payload'],
+    [/^(\d+) 个 ini 已还原，重新打开游戏生效$/, '$1 ini file(s) restored — reopen the game'],
+    [/^还有 (\d+) 个已勾选的组件没写入，点右下角保存补上。$/, '$1 selected component(s) still need writing — hit Save.'],
+    [/^帧率上限 (\d+) FPS$/, 'Frame cap $1 FPS'],
+    [/^缺少 (\d+) 个组件文件，可在组件右侧点「下载」联网补齐$/, 'Missing $1 component file(s) — click Download to fetch them'],
+    [/^payload 里没有 (.+)$/, 'payload has no $1'],
+    [/^游戏目录里找不到 YuanShen\.exe$/, 'YuanShen.exe not found in the game folder'],
+    [/^正在写入，稍后再试$/, 'Writing in progress — try again later'],
+    [/^已有安装任务在进行$/, 'Another install is already running'],
+    [/^请先选择原神安装目录$/, 'Choose the Genshin install folder first'],
+    [/^安装器缺少组件文件（payload 目录）$/, 'Installer is missing component files (payload)'],
+    [/^这个目录不存在$/, 'That folder does not exist'],
+    [/^这个文件不存在$/, 'That file does not exist'],
+    [/^只能注入 \.dll 文件$/, 'Only .dll files can be injected'],
+    [/^这个组件还没有生成日志$/, 'This component has no log yet'],
+    [/^这个目录里没有 YuanShen\.exe$/, 'No YuanShen.exe in that folder'],
+    [/^未知的组件$/, 'Unknown component'],
+    [/^解帧工具已退出$/, 'Unlocker exited'],
+    [/^解帧工具启动失败$/, 'Unlocker failed to start'],
+    [/^已经是最新版本（(.+)）$/, 'Already up to date ($1)'],
+    [/^正在准备下载…$/, 'Preparing download…'],
+    [/^正在写入组件，稍后再试$/, 'Writing components — try again later'],
+    [/^已更新到 v(.*)$/, 'Updated to v$1'],
+    [/^覆盖 (\d+) 个文件，回填 (\d+) 个 ini$/, 'Overwrote $1 file(s), restored $2 ini file(s)'],
+    [/^覆盖 (\d+) 个文件$/, 'Overwrote $1 file(s)'],
+    [/^HDR (已开启|关闭)$/, function(m){ return 'HDR ' + (m[1] === '已开启' ? 'on' : 'off'); }],
+    [/^主机: (.*)$/, 'Host: $1']
+  ];
+
+  var i18nOn = false, i18nNodes = [], i18nAttrs = [], i18nMO = null, i18nBusy = false;
+
+  function T(zh, en){ return i18nOn ? en : zh; }
+
+  function trText(key){
+    if (!i18nOn) return key;
+    var hit = EN_EXACT[key];
+    if (hit != null) return hit;
+    for (var i = 0; i < EN_PAT.length; i++){
+      var m = key.match(EN_PAT[i][0]);
+      if (m){
+        var rep = EN_PAT[i][1];
+        if (typeof rep === 'function') return rep(m);
+        return rep.replace(/\$(\d)/g, function(_, d){ return m[Number(d)]; });
+      }
+    }
+    return key;
+  }
+
+  function trNodeText(node){
+    var raw = node.nodeValue;
+    if (!raw) return;
+    var key = raw.trim();
+    if (!key) return;
+    var out = trText(key);
+    if (out === key) return;
+    if (node.__i18nOrig === undefined){ node.__i18nOrig = raw; i18nNodes.push(node); }
+    node.nodeValue = raw.replace(key, out);
+  }
+
+  function trAttr(el){
+    ['title', 'aria-label', 'placeholder'].forEach(function(a){
+      var v = el.getAttribute && el.getAttribute(a);
+      if (!v) return;
+      var key = v.trim();
+      var out = trText(key);
+      if (out === key) return;
+      if (!el.__i18nAttr) el.__i18nAttr = {};
+      if (el.__i18nAttr[a] === undefined){ el.__i18nAttr[a] = v; i18nAttrs.push([el, a]); }
+      el.setAttribute(a, out);
+    });
+  }
+
+  function trDeep(root){
+    if (!root) return;
+    if (root.nodeType === 3){ trNodeText(root); return; }
+    if (root.nodeType !== 1) return;
+    var tag = root.tagName;
+    if (tag === 'SCRIPT' || tag === 'STYLE') return;
+    trAttr(root);
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+    var batch = [];
+    while (walker.nextNode()) batch.push(walker.currentNode);
+    batch.forEach(trNodeText);
+    [].forEach.call(root.querySelectorAll('[title],[aria-label],[placeholder]'), trAttr);
+  }
+
+  function restoreI18n(){
+    i18nNodes.forEach(function(n){
+      if (n.__i18nOrig !== undefined){ n.nodeValue = n.__i18nOrig; delete n.__i18nOrig; }
+    });
+    i18nAttrs.forEach(function(pair){
+      var el = pair[0], a = pair[1];
+      if (el.__i18nAttr && el.__i18nAttr[a] !== undefined){ el.setAttribute(a, el.__i18nAttr[a]); delete el.__i18nAttr[a]; }
+    });
+    i18nNodes = [];
+    i18nAttrs = [];
+  }
+
+  function setI18n(on){
+    i18nOn = on;
+    if (on){
+      trDeep(document.body);
+      setTimeout(function(){
+        [].forEach.call(document.querySelectorAll('.seg.plain'), function(s){ syncSegThumb(s, false); });
+      }, 0);
+      if (!i18nMO){
+        i18nMO = new MutationObserver(function(list){
+          if (i18nBusy) return;
+          i18nBusy = true;
+          try {
+            list.forEach(function(m){
+              if (m.type === 'characterData') trNodeText(m.target);
+              else if (m.type === 'childList') [].forEach.call(m.addedNodes, trDeep);
+              else if (m.type === 'attributes') trAttr(m.target);
+            });
+          } finally { i18nBusy = false; }
+        });
+        i18nMO.observe(document.body, {
+          subtree: true, childList: true, characterData: true,
+          attributes: true, attributeFilter: ['title', 'aria-label', 'placeholder']
+        });
+      }
+    } else if (i18nMO){
+      i18nMO.disconnect();
+      i18nMO = null;
+      restoreI18n();
+    }
+  }
+
+  function syncSegState(box, attr, value){
+    if (!box) return;
+    [].forEach.call(box.querySelectorAll('button'), function(b){
+      b.setAttribute('aria-pressed', b.getAttribute('data-' + attr) === value ? 'true' : 'false');
+    });
+    syncSegThumb(box, true);
+  }
+
+  function applyTheme(){
+    document.documentElement.dataset.theme = isDark() ? 'dark' : 'light';
+    syncSegState(themeSeg, 'theme', state.theme || 'system');
+  }
+
+  function applyLang(){
+    var l = langNow();
+    document.documentElement.lang = l === 'zh' ? 'zh-CN' : 'en';
+    syncSegState(langSeg, 'lang', state.uiLang || 'system');
+    setI18n(l === 'en');
+    // 底栏空闲文案与保存按钮是 JS 现写的，切语言时按当前语言重写一次
+    var t = env ? (env.innerText || '') : '';
+    if (t.indexOf('Local install') >= 0 || t.indexOf('本地安装') >= 0){
+      env.innerHTML = state.payload
+        ? T('本地安装','Local install') + '<span class="sep">·</span>' + T('不上传任何数据','no data leaves this machine')
+        : '<b>' + T('缺少 payload 组件目录','payload folder missing') + '</b>';
+    }
+    if (btnSave && !btnSave.querySelector('.btnspin')) btnSave.textContent = T('保存','Save');
+  }
+
+  function pushPrefs(){
+    host.send({type:'prefs', uiLang: state.uiLang || 'system', theme: state.theme || 'system', dark: isDark()});
+  }
+
+  function syncPrefs(){
+    applyTheme();
+    applyLang();
+    pushPrefs();
+    placeAllThumbs();
+  }
+
+  if (langSeg){
+    langSeg.addEventListener('click', function(e){
+      var b = e.target.closest('button[data-lang]');
+      if (!b) return;
+      state.uiLang = b.getAttribute('data-lang');
+      syncPrefs();
+    });
+  }
+  if (themeSeg){
+    themeSeg.addEventListener('click', function(e){
+      var b = e.target.closest('button[data-theme]');
+      if (!b) return;
+      state.theme = b.getAttribute('data-theme');
+      syncPrefs();
+    });
+  }
+  applyTheme();
+  applyLang();
+
+  if (darkQuery.addEventListener){
+    darkQuery.addEventListener('change', function(){
+      if ((state.theme || 'system') === 'system'){ applyTheme(); pushPrefs(); }
+    });
+  }
+
+
+  // 打开就是主界面：没有首次配置向导这一层
+  showView();
+
+  var boot = host.ready ? host.ready() : null;
+  if (boot && boot.then) boot.then(function(){ host.send({type:'init'}); });
+  else host.send({type:'init'});
+})();
+</script>
+</body>
+</html>

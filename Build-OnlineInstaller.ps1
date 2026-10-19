@@ -26,15 +26,32 @@ param(
     [string]$Configuration = 'Release',
     [switch]$GithubOnly,
     [switch]$FetchUpstream,
-    [string]$SevenZipPath
+    [string]$SevenZipPath,
+    # 默认用 Tauri GUI 安装器（Installer\app）：包根放 GenshinFSRBridgeInstaller.exe，
+    # 解帧工具收进 payload\FpsUnlocker（安装器原地启动它），其余（payload 组件、license、
+    # Package-Version.txt 等）与旧包一致。要回到旧的 PS1 安装脚本，加 -ScriptInstaller。
+    [switch]$ScriptInstaller,
+    # 旧行为（PS1 安装脚本）已不再是默认，保留 -GuiInstaller 只为兼容旧命令行，可省略。
+    [switch]$GuiInstaller,
+    # GUI 安装器 exe 路径；留空则用 Installer\app\GenshinFSRBridgeInstaller.exe。
+    [string]$GuiInstallerExe
 )
-
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
 $root = [IO.Path]::GetFullPath((Split-Path -Parent $PSCommandPath))
 $installerSource = Join-Path $root 'tools\FpsUnlockInstaller'
+$guiInstallerSource = Join-Path $root 'Installer\app'
+if (-not $ScriptInstaller) {
+    $guiInstallerExe = if ([string]::IsNullOrWhiteSpace($GuiInstallerExe)) {
+        Join-Path $guiInstallerSource 'GenshinFSRBridgeInstaller.exe'
+    }
+    else { [IO.Path]::GetFullPath($GuiInstallerExe) }
+    if (-not (Test-Path -LiteralPath $guiInstallerExe -PathType Leaf)) {
+        throw "找不到 GUI 安装器 exe：$guiInstallerExe（先跑 Installer\app\build-app.ps1）"
+    }
+}
 $packageAssets = Join-Path $root 'assets\FpsUnlockPackage'
 $fufuSource = Join-Path $root 'FufuGraphicsPlugin'
 $fufuBuild = Join-Path $root 'build-package-fufu-graphics'
@@ -65,10 +82,10 @@ $script:tloaderDll = $null
 #   dist\原神解帧FSR插件包Lite_* / Full_*.7z|.zip     历史命名（保留兼容）
 #   dist\芙芙启动器插件包Lite_* / Full_*.zip          历史命名（保留兼容）
 #   dist\FSR-Bridge-Plugin.v<ver>.zip                芙芙启动器商城包
-#   dist\GenshinFSRBridge_v<ver>.zip                 GitHub 发布包在 dist 的中间产物
+#   dist\GenshinFSRBridge_v<ver>.7z                  GitHub 发布包在 dist 的中间产物
 #                                                    （-GithubOnly 时会留在 dist）
 #   dist\GenshinFSRBridge_v<ver>\                    同名目录：手工解压该包做验证时的遗留
-#   dist\github-release\GenshinFSRBridge_v<ver>.zip  GitHub 发布目录（整目录由本脚本重建）
+#   dist\github-release\GenshinFSRBridge_v<ver>.7z   GitHub 发布目录（整目录由本脚本重建）
 #   dist\.fps-full-stage\ .fps-github-stage\ .fufu-marketplace-stage\  中间 stage 目录
 $script:distArtifactPatterns = @(
     '原神解帧FSR插件包_v*',
@@ -333,26 +350,42 @@ function Assert-PackageSizeLimit {
 function Prepare-FpsStage {
     param([string]$Stage, [switch]$LocalFull, [Parameter(Mandatory)][string]$Version)
     Reset-Stage -Path $Stage
-    Copy-Item -LiteralPath (Join-Path $installerSource 'Installer.ps1') -Destination $Stage -Force
-    # 打包产物根目录 README 与仓库根 README 保持同步（单一事实来源）
-    Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $Stage 'README.md') -Force
-    Copy-Item -LiteralPath (Join-Path $installerSource 'Configure-Launcher.bat') -Destination (Join-Path $Stage '一键配置.bat') -Force
-    Copy-Item -LiteralPath (Join-Path $installerSource 'Configure-Launcher.en.bat') -Destination (Join-Path $Stage 'GenshinFSRBridgeTools.bat') -Force
-    $stageScripts = Join-Path $Stage 'scripts'
-    New-Item -ItemType Directory -Path $stageScripts -Force | Out-Null
-    foreach ($scriptName in @('Configure.ps1', 'Localization.ps1', 'InstallerCommon.ps1', 'ReShadeResources.ps1', 'Apply-PackageUpdate.ps1')) {
-        Copy-Item -LiteralPath (Join-Path $installerSource $scriptName) -Destination (Join-Path $stageScripts $scriptName) -Force
+    if (-not $ScriptInstaller) {
+        # GUI 安装器代替 Installer.ps1 + 一键配置.bat + scripts\*.ps1；
+        # 包根 README 换成 GUI 安装器自己的说明（旧包 README 描述的是 PS1 流程）。
+        Copy-Item -LiteralPath $guiInstallerExe -Destination (Join-Path $Stage 'GenshinFSRBridgeInstaller.exe') -Force
+        # 包根 README 用仓库主 README（单一事实来源），不打包安装器自己的 README
+        Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $Stage 'README.md') -Force
+    }
+    else {
+        Copy-Item -LiteralPath (Join-Path $installerSource 'Installer.ps1') -Destination $Stage -Force
+        # 打包产物根目录 README 与仓库根 README 保持同步（单一事实来源）
+        Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $Stage 'README.md') -Force
+        Copy-Item -LiteralPath (Join-Path $installerSource 'Configure-Launcher.bat') -Destination (Join-Path $Stage '一键配置.bat') -Force
+        Copy-Item -LiteralPath (Join-Path $installerSource 'Configure-Launcher.en.bat') -Destination (Join-Path $Stage 'GenshinFSRBridgeTools.bat') -Force
+        $stageScripts = Join-Path $Stage 'scripts'
+        New-Item -ItemType Directory -Path $stageScripts -Force | Out-Null
+        foreach ($scriptName in @('Configure.ps1', 'Localization.ps1', 'InstallerCommon.ps1', 'ReShadeResources.ps1', 'Apply-PackageUpdate.ps1')) {
+            Copy-Item -LiteralPath (Join-Path $installerSource $scriptName) -Destination (Join-Path $stageScripts $scriptName) -Force
+        }
+    }
+    # 主 README 里引用了 assets/readme 的演示图，一起带上，包内看图不会 404
+    $readmeAssets = Join-Path $root 'assets\readme'
+    if (Test-Path -LiteralPath $readmeAssets -PathType Container) {
+        Copy-Item -LiteralPath $readmeAssets -Destination (Join-Path $Stage 'assets\readme') -Recurse -Force
     }
     Copy-Item -LiteralPath (Join-Path $packageAssets 'Feedback.txt') -Destination $Stage -Force
     [IO.File]::WriteAllText((Join-Path $Stage 'Package-Version.txt'), "$Version`r`n", [Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText((Join-Path $Stage 'NonFrameGeneration.edition'), "`r`n", [Text.UTF8Encoding]::new($false))
     # 上游版本基线（Configure.ps1 / ReShadeResources.ps1 按此下载缺失组件，保持构建基线一致）。
     $upstreamVersions = Join-Path $root 'SharedResources\upstream-versions.json'
     if (Test-Path -LiteralPath $upstreamVersions -PathType Leaf) {
         Copy-Item -LiteralPath $upstreamVersions -Destination (Join-Path $Stage 'upstream-versions.json') -Force
     }
     # FPS Unlocker（MIT 许可，随包分发合规）。UnlockerStub.dll 由 unlockfps 运行时自动生成，不随包。
-    Copy-Item -LiteralPath (Join-Path $unlockerRuntime 'unlockfps_nc.exe') -Destination $Stage -Force
+    # GUI 安装器不把解帧工具放包根：它按 payload\FpsUnlocker\ 原地启动（见下）。
+    if ($ScriptInstaller) {
+        Copy-Item -LiteralPath (Join-Path $unlockerRuntime 'unlockfps_nc.exe') -Destination $Stage -Force
+    }
 
     $payload = Join-Path $Stage 'payload'
     $stagePayloadBridge = Join-Path $payload 'Bridge'
@@ -363,6 +396,11 @@ function Prepare-FpsStage {
     $stageAmd = Join-Path $payload 'AMD'
     $stageDefaults = Join-Path $payload 'default_config'
     New-Item -ItemType Directory -Path $payload, $stagePayloadBridge, $stagePayloadAnti, $stagePayloadReShade, $stagePayloadTextureLoader, $stageOpti, $stageAmd, $stageDefaults -Force | Out-Null
+    if (-not $ScriptInstaller) {
+        $stageFpsUnlocker = Join-Path $payload 'FpsUnlocker'
+        New-Item -ItemType Directory -Path $stageFpsUnlocker -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $unlockerRuntime 'unlockfps_nc.exe') -Destination $stageFpsUnlocker -Force
+    }
     Copy-Item -LiteralPath $bridgeDll -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.dll') -Force
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.ini') -Force
     Copy-Item -LiteralPath $antiDll -Destination (Join-Path $stagePayloadAnti 'AntiPlayerMosaic.dll') -Force
@@ -436,6 +474,10 @@ function Prepare-FpsStage {
     Copy-Item -LiteralPath (Join-Path $optiRuntime 'OptiScaler.ini'), (Join-Path $optiRuntime 'OptiScaler-UpscalingFiles.json') -Destination $stageDefaults -Force
     Copy-Item -LiteralPath (Join-Path $reshadeRuntime 'ReShade.ini'), (Join-Path $reshadeRuntime 'ReShadePreset.ini') -Destination $stageDefaults -Force
     Copy-Item -LiteralPath ($tloaderConfig) -Destination (Join-Path $stageDefaults 'TextureLoader.ini') -Force
+    # 版本基线：GUI 的「恢复默认设置」按当前启用的版本目录去找 `default_config\<目录名>.ini`。
+    # Bridge 的目录叫 Bridge、模板却叫 Dx11FsrBridge.ini，所以额外存一份同名的；
+    # OptiScaler 的目录名与模板名一致（OptiScaler.ini），不需要再复制。
+    Copy-Item -LiteralPath (Join-Path $stageDefaults 'Dx11FsrBridge.ini') -Destination (Join-Path $stageDefaults 'Bridge.ini') -Force
 
     # 外部组件 license 集中到独立 license 文件夹：只放"外部单模块"的 license
     # （OptiScaler/ReShade/FPSUnlocker）；模块内部依赖的 license 留在模块文件夹内
@@ -474,11 +516,21 @@ function Build-FpsPackage {
     $stage = Join-Path $dist $stageName
     Prepare-FpsStage -Stage $stage -LocalFull:$LocalFull -Version $Version
     try {
+        # 安装入口按模式不同：GUI 安装器 = 包根 exe + payload\FpsUnlocker\unlockfps_nc.exe；
+        # 旧 PS1 = 一键配置.bat / GenshinFSRBridgeTools.bat / scripts\*.ps1 + 包根 unlockfps_nc.exe。
+        $installerFiles = if (-not $ScriptInstaller) {
+            @('GenshinFSRBridgeInstaller.exe', 'payload\FpsUnlocker\unlockfps_nc.exe')
+        }
+        else {
+            @(
+                '一键配置.bat', 'GenshinFSRBridgeTools.bat', 'scripts\Configure.ps1', 'scripts\ReShadeResources.ps1',
+                'scripts\Apply-PackageUpdate.ps1', 'scripts\Localization.ps1', 'scripts\InstallerCommon.ps1',
+                'unlockfps_nc.exe'
+            )
+        }
         $required = @(
-            '一键配置.bat', 'GenshinFSRBridgeTools.bat', 'scripts\Configure.ps1', 'scripts\ReShadeResources.ps1',
-            'scripts\Apply-PackageUpdate.ps1', 'scripts\Localization.ps1', 'scripts\InstallerCommon.ps1',
-            'Feedback.txt', 'Package-Version.txt', 'NonFrameGeneration.edition', 'upstream-versions.json',
-            'unlockfps_nc.exe',
+            'Feedback.txt', 'Package-Version.txt', 'upstream-versions.json'
+        ) + $installerFiles + @(
             'license\OptiScaler-LICENSE.txt', 'license\FPSUnlocker-LICENSE.txt', 'license\ReShade-LICENSE.txt',
             'payload\Bridge\Dx11FsrBridge.dll', 'payload\Bridge\Dx11FsrBridge.ini',
             'payload\AntiPlayerMosaic\AntiPlayerMosaic.dll',
@@ -729,8 +781,8 @@ $githubReleaseDist = Join-Path $dist 'github-release'
 # 该目录完全由本脚本生成（$script:distOwnedDirectories），其旧内容已由编译前的
 # Remove-DistArtifacts 整目录清除（含 github-release\GenshinFSRBridge_v*）。这里只保证存在。
 New-Item -ItemType Directory -Path $githubReleaseDist -Force | Out-Null
-$githubArchive = Join-Path $githubReleaseDist "GenshinFSRBridge_v$version.zip"
-$githubSourceArchive = Build-FpsPackage -Version $version -ArchiveFormat Zip
+$githubArchive = Join-Path $githubReleaseDist "GenshinFSRBridge_v$version.7z"
+$githubSourceArchive = Build-FpsPackage -Version $version -ArchiveFormat SevenZip
 Copy-Item -LiteralPath $githubSourceArchive -Destination $githubArchive -Force
 if (-not $GithubOnly) { Remove-Item -LiteralPath $githubSourceArchive -Force }
 

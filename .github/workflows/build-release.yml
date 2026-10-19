@@ -4,7 +4,7 @@ name: Build GitHub Release Package
 #   本 workflow 手动构建**面向 GitHub 的发布包**：
 #     - 触发方式：仅 workflow_dispatch（手动 Run workflow），不随 push / PR 自动运行
 #     - 构建命令：./Build-OnlineInstaller.ps1 -Configuration Release -GithubOnly
-#     - 构建产物：dist/github-release/GenshinFSRBridge_v<version>.zip
+#     - 构建产物：dist/github-release/GenshinFSRBridge_v<version>.7z
 #     - 上传 artifact 名：GenshinFSRBridge-Package
 #     - 可选发布：publish_release=true 且填 release_tag 时，用 softprops/action-gh-release
 #       把该 zip 发到对应 tag 的 GitHub Release
@@ -80,7 +80,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: GenshinFSRBridge-Package
-          path: dist/github-release/GenshinFSRBridge_v*.zip
+          path: dist/github-release/GenshinFSRBridge_v*.7z
           if-no-files-found: error
 
       - name: Validate release tag
@@ -97,4 +97,4 @@ jobs:
           generate_release_notes: false
           body: ${{ inputs.release_notes }}
           files: |
-            dist/github-release/GenshinFSRBridge_v*.zip
+            dist/github-release/GenshinFSRBridge_v*.7z
