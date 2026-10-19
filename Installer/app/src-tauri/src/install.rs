@@ -296,17 +296,11 @@ fn prepare_opti(settings: &Settings) -> Result<(), String> {
     write("Log", "SingleFile", "true")?;
     write("Log", "LogAsync", "false")?;
     write("Log", "LogAsyncThreads", "1")?;
-    let non_frame_generation = paths::exe_dir().join("NonFrameGeneration.edition").is_file()
-        || paths::payload_dir().join("NonFrameGeneration.edition").is_file();
-    if non_frame_generation {
-        write("FrameGen", "Enabled", "false")?;
-        write("FrameGen", "FGInput", "nofg")?;
-        write("FrameGen", "FGOutput", "nofg")?;
-    } else {
-        write("FrameGen", "Enabled", "auto")?;
-        write("FrameGen", "FGInput", "auto")?;
-        write("FrameGen", "FGOutput", "auto")?;
-    }
+    // 只有一种发布形态：2.4.0 起不再打"非帧生成版"（NonFrameGeneration.edition 已不再打包），
+    // 帧生成交给 OptiScaler 按显卡自己探测，安装器不再写死禁用。
+    write("FrameGen", "Enabled", "auto")?;
+    write("FrameGen", "FGInput", "auto")?;
+    write("FrameGen", "FGOutput", "auto")?;
 
     log::write(&format!(
         "OptiScaler 版本 {} · {} · OptiDllPath={}",
