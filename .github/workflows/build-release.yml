@@ -7,10 +7,10 @@ name: Build GitHub Release Package
 #     - 构建产物：dist/github-release/GenshinFSRBridge_v<version>.7z
 #     - 上传 artifact 名：GenshinFSRBridge-Package
 #     - 可选发布：publish_release=true 且填 release_tag 时，用 softprops/action-gh-release
-#       把该 zip 发到对应 tag 的 GitHub Release
+#       把该 7z 发到对应 tag 的 GitHub Release
 #
 #   文件名说明：本文件名沿用自一个**已移除的旧包概念**（历史上的 "Lite 包"），
-#   本 workflow 与该旧概念无关 —— 它只产出上面那一个 zip。
+#   本 workflow 与该旧概念无关 —— 它只产出上面那一个 7z。
 #
 #   ⚠️ 关键前置：Dx11FsrBridge 的 CMake 配置需要 AMD FidelityFX SDK 头文件
 #   （Dx11FsrBridge/CMakeLists.txt 第 13-37 行，默认取
@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       publish_release:
-        description: Publish the generated ZIP to GitHub Releases
+        description: Publish the generated 7z to GitHub Releases
         required: true
         default: false
         type: boolean

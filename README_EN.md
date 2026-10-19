@@ -66,11 +66,26 @@ For the Chinese documentation, see [README.md](README.md).
   </tr>
 </table>
 
-<sub>In-game captures; click to open the full 3840×2160 image.</sub>
+<table>
+  <tr>
+    <td width="50%" align="center" valign="top">
+      <a href="assets/readme/installer-home.jpg"><img src="assets/readme/installer-home.jpg" alt="Installer · Home" width="100%"></a>
+      <br>
+      <sub><b>Installer · Home</b> · game directory, frame-rate cap, and installed content in one screen</sub>
+    </td>
+    <td width="50%" align="center" valign="top">
+      <a href="assets/readme/installer-plugins.jpg"><img src="assets/readme/installer-plugins.jpg" alt="Installer · Plugins" width="100%"></a>
+      <br>
+      <sub><b>Installer · Plugins</b> · component version switch, Mods directory, frame-rate tool options</sub>
+    </td>
+  </tr>
+</table>
+
+<sub>The first two images are in-game captures (3840×2160), the last two are the installer UI (2564×1604); click to open the originals.</sub>
 
 ## Release Packages
 
-Packages are assembled directly by the build script: installer scripts live in `tools/FpsUnlockInstaller/`, package feedback and component metadata live in `assets/FpsUnlockPackage/`, and runtime resources and default configuration live in `SharedResources/`. GitHub release packages do not bundle the NVIDIA DLSS component or ReShade binaries; the installer downloads them from their official upstream sources at install time (DLSS from NVIDIA Streamline, ReShade from reshade.me). Local distributions must complete those components on their own.
+Packages are assembled directly by the build script, and the default installer is the graphical installer in `Installer/` (details in `Installer/README.md`). The old PowerShell installer scripts (`tools/FpsUnlockInstaller/`) are no longer part of the release package; the source is kept for now, and `-ScriptInstaller` still produces a legacy-flow package. Package feedback and component metadata live in `assets/FpsUnlockPackage/`, and runtime resources and default configuration live in `SharedResources/`. The package-root `README.md` is this file, and the demo images in `assets/readme/` are shipped with it. GitHub release packages do not bundle the NVIDIA DLSS runtime or ReShade binaries: ReShade is fetched from reshade.me only when it is ticked, and with OptiScaler ticked on an RTX card the installer fetches `nvngx_dlss.dll` from NVIDIA Streamline and places it in the OptiScaler component directory (GTX 16 only gets FSR4 INT8, DLSS is not deployed). Local distributions must complete those components on their own.
 
 To generate the GitHub release package, run the following command on Windows:
 
@@ -78,7 +93,7 @@ To generate the GitHub release package, run the following command on Windows:
 powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configuration Release -GithubOnly
 ```
 
-The output is written to `dist\原神解帧FSR插件包_v*.7z`, while the GitHub release directory contains `dist\github-release\GenshinFSRBridge_v*.zip`. GitHub Actions builds and publishes only this GitHub release package; it does not generate a FuFu package.
+The output is written to `dist\原神解帧FSR插件包_v*.7z`, while the GitHub release directory contains `dist\github-release\GenshinFSRBridge_v*.7z` (the GitHub package is 7z as well). GitHub Actions builds and publishes only this GitHub release package; it does not generate a FuFu package.
 
 ## FuFu Launcher Plugin Source and Local Build
 
@@ -185,38 +200,43 @@ The hashing algorithm is a verbatim port of 3DMigoto, so **pre-generated `hash=`
 | `AntiPlayerMosaic/` | Anti-aliasing blur removal, UID hiding, and underwater mosaic fix plugin. |
 | `FufuGraphicsPlugin/` | FuFu Launcher bootstrap, configuration files, and install scripts. |
 | `TextureLoader/` | 3DMigoto-compatible texture replacement / Mod loader (DDS + GDDS, **pure texture mods only**). |
+| `Installer/` | Graphical installer (Tauri 2 + Rust + WebView2): manages the injection chain, component versions, component logs, and self-update of the plugin package. |
 | `SharedResources/` | Runtime resources and component archives shipped with the package. The Genshin-specific RenoDX HDR shader add-on and its redistribution authorization record are archived under `SharedResources/ReShade/runtime/reshade-shaders/`. |
 
 ## Usage
 
 > [!WARNING]
-> This package is **Windows-only**. There is no Linux compatibility: the installer relies on Windows
-> batch files and PowerShell, so it cannot run under Wine / Proton (it closes immediately when launched).
+> This package is **Windows-only**, and there is no Linux compatibility: the graphical installer depends on
+> the WebView2 runtime, so it cannot run under Wine / Proton (it closes immediately when launched).
 > Linux users should follow **Linux install / Windows manual install** below.
 
-### Windows: one-click script install
+### Windows: graphical installer
 
 1. Download the **latest** package from [Releases](https://github.com/AizawaHikaru233/genshin_fsr_brigde/releases)
-   and extract it to a directory **without Chinese characters or illegal characters**.
-2. Run the installer script (pick by interface language; both are functionally identical):
+   and extract it to a directory **without Chinese characters or illegal characters**
+   (`GenshinFSRBridgeInstaller.exe` must sit next to `payload\`).
+2. Double-click `GenshinFSRBridgeInstaller.exe`. No administrator rights are needed, and nothing is written to system directories.
+3. Click **Change…** to pick the Genshin Impact install directory; the installer also scans the registry and common paths by itself.
+4. Tick the **components to enable** and click **Save** — this writes the absolute path of every selected component into the
+   injection chain (`DllList`) of `payload\FpsUnlocker\fps_config.json`, so no DLL is ever placed in the game directory.
 
-   | Interface language | File name |
-   |---|---|
-   | Chinese | `一键配置.bat` |
-   | English | `GenshinFSRBridgeTools.bat` |
+   - **Replacing the upscaler only** → at least **Dx11FsrBridge** (required, ticked by default)
+   - **DLSS or XeSS needed** → also tick **OptiScaler**
+   - **HDR enhancement needed** → tick **ReShade + RenoDX** (on NVIDIA cards the installer warns about running it together with OptiScaler)
 
-   You can also switch between Chinese and English at any time from the installer main menu; the selection is saved automatically.
-3. Enter the **frame rate you want to unlock** and **which plugins to install**:
-
-   - **Replacing the upscaler only** → install at least **Bridge**
-   - **DLSS or XeSS needed** → also install **OptiScaler**
+5. Click **Launch game**. The installer starts the frame-rate tool in place under `payload\FpsUnlocker\`, and that tool injects
+   and launches the game. Afterwards just use the desktop shortcut (optional during install) or your own launcher.
 
 > [!IMPORTANT]
 > **In-game settings (required)**: enable `FSR2` anti-aliasing and set the render scale **below `1`**.
 
-GitHub release packages include FPS Unlocker and OptiScaler; the installer downloads the
-[NVIDIA DLSS upscaling component (`nvngx_dlss.dll`)](https://github.com/NVIDIA-RTX/Streamline/releases) and ReShade
-from their official upstream sources at install time. Local distributions must complete the required components on their own.
+GitHub release packages include FPS Unlocker and OptiScaler; when a component is missing, the Plugins page offers a
+**Download** button that fetches it from its official upstream on the spot (ReShade from reshade.me, the rest from this
+repository Releases), instead of re-downloading the whole package. Local distributions must complete the required
+components on their own.
+
+The old PowerShell installer scripts (`一键配置.bat` / `GenshinFSRBridgeTools.bat`) are no longer shipped; to build the
+legacy flow yourself, pass `-ScriptInstaller` to `Build-OnlineInstaller.ps1`.
 
 ### Linux install / Windows manual install
 
@@ -273,6 +293,8 @@ ReShade directory, must use a dynamically generated absolute path when installed
 ## Build
 
 Visual Studio with the Desktop development with C++ workload, the Windows SDK, and CMake 3.20 or newer (Ninja generator) are required. The release configuration requires the repository's `Dx11FsrBridge\third_party` directory, which contains the FFX12 ffx-api headers and the Microsoft Detours build dependency.
+
+A Rust toolchain (`cargo`) is also required to build the graphical installer: run `Installer\app\build-app.ps1` once to produce `Installer\app\GenshinFSRBridgeInstaller.exe`; the packaging script takes that file directly and fails with a hint when it is missing.
 
 First refresh the upstream component baseline (only needed when component versions change; the script pins OptiScaler to v0.9.4 and fetches the latest official DLSS, ReShade, and FPS Unlocker releases):
 
