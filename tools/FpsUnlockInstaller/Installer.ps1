@@ -533,7 +533,7 @@ function Write-InstallCatalog {
     Write-Host ''
     Write-CatalogRow -Id '模块 ID' -Name '插件名' -Author '作者' -Version '当前版本' -Status '安装状态' -Header
     Write-CatalogRow -Id '------' -Name '--------------------' -Author '----------------' -Version '--------------------' -Status '------' -Header
-    Write-CatalogRow -Id '1.' -Name 'FSR Bridge（FSR4，7000/9000 A 卡）' -Author 'シリアCelia' -Version $bridgeVersion -Status $bridgeStatus
+    Write-CatalogRow -Id '1.' -Name 'FSR Bridge（FSR4，A 卡 6000/7000/9000 系与 RDNA3/3.5 核显）' -Author 'シリアCelia' -Version $bridgeVersion -Status $bridgeStatus
     Write-CatalogRow -Id '2.' -Name 'OptiScaler（DLSS/XeSS/FSR4 INT8，需 Bridge）' -Author 'OptiScaler' -Version $optiVersion -Status $optiStatus
     Write-CatalogRow -Id '3.' -Name '反虚化 / 隐藏 UID' -Author 'シリアCelia' -Version $antiVersion -Status $antiStatus
     Write-CatalogRow -Id '4.' -Name 'ReShade + RenoDX HDR' -Author 'crosire / Bilibili UID 3461582765951639' -Version "ReShade $reShadeVersion`nRenoDX $renoDxVersion" -Status $hdrStatus

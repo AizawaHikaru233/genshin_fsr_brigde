@@ -676,16 +676,25 @@ bool name_contains_series(
 // "AMD Radeon(TM) Graphics"，不含型号，名字匹配识别不到——Device ID 才是权威）。
 enum class Fsr4GpuClass { Unsupported, Fp8, Int8 };
 
-// AMD（VEN_1002）FSR4 分类：RDNA4 独显 → FP8；RDNA3/3.5 独显与核显 → INT8。
-// RDNA2 暂不处理（FSR4.0.2c 文件在线获取渠道尚未就绪）。
+// AMD（VEN_1002）FSR4 分类：RDNA4 独显 → FP8；RDNA2 独显与 RDNA3/3.5（独显+核显）→ INT8。
+// 2026-10：RDNA2 独显不再封锁（旧注释里"4.0.2c 文件渠道未就绪"的前提已不成立：
+// 官方 FSR4 由 Adrenalin 26.10.1+ 驱动提供，驱动不足时仍按 INT8 兼容路径跑）。
 // Device ID 来源于 GPU 硬件 ID 汇总表（AMD RDNA2-4）。
 static Fsr4GpuClass classify_amd_fsr4(std::uint32_t device_id)
 {
     static constexpr std::uint32_t fp8_ids[] = {
         0x7550, 0x7551, 0x7590, // RDNA4 Navi 48/44: RX 9070/9070 XT/9060 XT/9050, AI PRO R9700
     };
+    static constexpr std::uint32_t rdna2_dgpu_ids[] = {
+        // Navi 21 (RX 6900/6800) + Navi 22 (RX 6700/6750)
+        0x73BF, 0x73A5, 0x73AF, 0x73A2, 0x73AB, 0x73AE,
+        0x73DF, 0x73E3, 0x73E1, 0x73E4, 0x73DE,
+        // Navi 23 (RX 6600/6650) + Navi 24 (RX 6500/6400)
+        0x73FF, 0x73EF, 0x73F1, 0x73E9, 0x73E8, 0x73EA, 0x73E0, 0x73F0,
+        0x743F, 0x7422, 0x7421, 0x7423, 0x7424, 0x7431,
+    };
     static constexpr std::uint32_t int8_ids[] = {
-        // RDNA3 dGPU (RX 7000, Navi 3x)
+        // RDNA3 dGPU (RX 7000, Navi 3x) —— 0x73F0 是 Navi 23，归上面的 RDNA2 组
         0x744C, 0x7448, 0x7449, 0x744A, 0x744B, 0x745E, 0x7460, 0x7461,
         0x7470, 0x747E, 0x7480, 0x7481, 0x7483, 0x7487, 0x748B,
         0x7489, 0x7499, 0x749F,
@@ -697,6 +706,9 @@ static Fsr4GpuClass classify_amd_fsr4(std::uint32_t device_id)
     for (const std::uint32_t id : fp8_ids)
         if (device_id == id)
             return Fsr4GpuClass::Fp8;
+    for (const std::uint32_t id : rdna2_dgpu_ids)
+        if (device_id == id)
+            return Fsr4GpuClass::Int8;
     for (const std::uint32_t id : int8_ids)
         if (device_id == id)
             return Fsr4GpuClass::Int8;
@@ -901,13 +913,17 @@ DetectedFsr4Policy detect_fsr4_gpu_policy()
                 else if (name_contains_series(name, L"RX", { L"7" }) || name_contains_series(name, L"PRO", { L"W7" }))
                     int8 = true;
                 else if (name_contains_series(name, L"RX", { L"6" }))
-                    rdna2 = true; // RX 6000 系（Device ID 未收录时的型号兜底）
+                {
+                    // RX 6000 系（Device ID 未收录时的型号兜底）：RDNA2 独显同样吃 FSR4 INT8
+                    int8 = true;
+                    rdna2 = true;
+                }
             }
         }
 
         if (!fp8 && !int8 && !rdna2)
             continue;
-        // RDNA2 只记录架构标志（FSR4 本身不支持它），不参与 supported/prefer_fp8 竞争。
+        // rdna2 标志只用于 Ffx12AsyncUpscale 的同步判定；FSR4 能力已由上面的 int8 分支给出。
         if (rdna2)
             best.rdna2 = true;
         if (!best.supported || (fp8 && !best.prefer_fp8))
@@ -988,7 +1004,7 @@ bool apply_optiscaler_managed_settings(
     std::string force_int8 = read_policy_value(policy_path, L"Fsr4ForceEnableInt8", L"auto");
 
     // 策略值为 auto（安装脚本未识别型号或策略文件缺失）时，在此按 PCI 厂商 +
-    // 系列前缀宽松匹配解析：NVIDIA RTX 20/30/40/50、AMD RX 7/RX 9 与 RDNA3/3.5
+    // 系列前缀宽松匹配解析：NVIDIA RTX 20/30/40/50、AMD RX 6/RX 7/RX 9 与 RDNA3/3.5
     // 核显、Intel Arc 全部放行。非 auto 的显式值（安装脚本命中或用户手改）优先。
     if (fsr4_update == "auto" || upscaler_index == "auto" || force_int8 == "auto")
     {

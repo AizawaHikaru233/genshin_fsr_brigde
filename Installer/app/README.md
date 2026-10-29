@@ -263,6 +263,17 @@ Windows 的 `curl.exe` 并不保证存在（本机 `System32` 里就没有）。
   - 关掉弹窗（❌ / Esc / 点遮罩）＝保持不勾选。
   - 「不再提醒」记在 `settings.json` 的 `suppressWarnings`，按条目（`nvidia-texture` /
     `nvidia-reshade-opti`）分别记住。
+- **AMD 驱动提示**（安装成功后弹窗，只有「确认」）：装机平台是 **RDNA2 独显**（RX 6000 系）或
+  **RDNA3.5 核显**（890M/880M/860M/840M/8060S/8050S/8040S）时，**首次安装 OptiScaler 成功**后弹一次，
+  提示把 AMD 显卡驱动更新到 **Adrenalin 26.10.1+** 才能开启官方 FSR4（更旧的驱动只能走 FSR4 INT8 兼容路径）。
+  - 由后端事件 `{type:'fsr4DriverNotice', gpu, platform, minDriver}` 触发，界面元素是 `#drvmodal`。
+  - 只弹一次：弹过就把 `settings.json` 的 `fsr4DriverNoticeShown` 落成 `true`，**不复用** N 卡的
+    `suppressWarnings`（那是"用户点的不再提醒"，语义不同）。
+  - 平台判定与 FSR4 托管键同源（`gpu::needs_fsr4_driver_notice()` ← `gpu::info().platform`），
+    混合机型（RDNA4 独显 + RDNA3.5 核显）按"最优那张卡"算，不会误弹。
 - 显卡厂商与 FSR4 策略来自同一个 `gpu::info()`（开机算一次并缓存）：`install::apply` 写
   `OptiScaler.ini` 的 `Fsr4Update` / `UpscalerIndex` / `Fsr4ForceEnableInt8` 用它，界面提示也用它的
   `vendor`，不会出现两边判断不一致。
+- 档位判定收在纯函数 `gpu::classify_device(vendor, device, name)`：RDNA4 独显 → `Fp8`；RDNA3 独显、
+  RDNA3/3.5 核显、**RDNA2 独显**、N 卡 16-50 系、Intel Arc → `Int8`；RDNA2 核显与未知卡 → `Auto`
+  （2026-10 起 RDNA2 独显 / RDNA3.5 核显不再落 `Auto`，即不再封锁 FSR4）。

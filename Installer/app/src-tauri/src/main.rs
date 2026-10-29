@@ -198,6 +198,38 @@ fn ensure_dlss(app: &AppHandle, s: &settings::Settings) {
     });
 }
 
+/// 首次装 OptiScaler 且显卡属于「官方 FSR4 要新驱动」的两类平台（RDNA2 独显 / RDNA3.5 核显）：
+/// 提示把 Adrenalin 更新到 26.10.1+。每台机器只弹一次，记在 settings.json 的
+/// `fsr4DriverNoticeShown`，不跟 N 卡的「不再提醒」混在一起。
+fn maybe_notice_fsr4_driver(app: &AppHandle, selected: &[String]) {
+    if !selected.iter().any(|id| id == "opti") || !gpu::needs_fsr4_driver_notice() {
+        return;
+    }
+    let st = app.state::<AppState>();
+    let (settings_now, name, platform) = {
+        let mut guard = st.settings.lock().unwrap();
+        if guard.fsr4_driver_notice_shown {
+            return;
+        }
+        guard.fsr4_driver_notice_shown = true;
+        let info = gpu::info();
+        (guard.clone(), info.name.clone(), info.platform.id())
+    };
+    settings::save(&settings_now);
+    log::write(&format!(
+        "[notice] 首次安装 OptiScaler：提示升级驱动（platform={platform}, gpu={name}）"
+    ));
+    send(
+        app,
+        json!({
+            "type": "fsr4DriverNotice",
+            "gpu": name,
+            "platform": platform,
+            "minDriver": "26.10.1",
+        }),
+    );
+}
+
 fn take_selection(msg: &Value) -> Vec<String> {    let ids: Vec<String> = msg["selected"]
         .as_array()
         .map(|list| {
@@ -439,6 +471,8 @@ fn on_install(app: &AppHandle, msg: &Value) {
         if outcome.ok && !outcome.cancelled {
             ensure_shortcut(&settings_for_thread);
             ensure_dlss(&app_handle, &settings_for_thread);
+            // 提示放最后：先把「已安装」推给界面，弹窗再来。
+            maybe_notice_fsr4_driver(&app_handle, &selected);
         }
         st.busy.store(false, Ordering::SeqCst);
     });

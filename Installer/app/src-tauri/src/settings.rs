@@ -32,6 +32,8 @@ pub struct Settings {
     pub desktop_shortcut: bool,
     /// 已经点过「不再提醒」的警告 id（nvidia-reshade-opti / nvidia-texture）
     pub suppress_warnings: Vec<String>,
+    /// 首次装 OptiScaler 的驱动提示已经弹过（RDNA2 独显 / RDNA3.5 核显：Adrenalin 26.10.1+ 才有官方 FSR4）
+    pub fsr4_driver_notice_shown: bool,
     /// 自定义注入里当前勾选的路径（取消勾选就不再写进注入链，文件仍留着）。
     /// `None` 表示老配置文件没这个字段：那时自定义注入都是启用的，按全开处理。
     pub custom_on: Option<Vec<String>>,
@@ -55,6 +57,7 @@ impl Default for Settings {
             theme: "system".into(),
             desktop_shortcut: true,
         suppress_warnings: Vec::new(),
+            fsr4_driver_notice_shown: false,
             custom_on: None,
         }
     }

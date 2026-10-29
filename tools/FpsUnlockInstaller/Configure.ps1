@@ -313,6 +313,18 @@ $script:AmdRdna2DevIds = @(
     '1638','164C','1681'
 )
 
+# RDNA2 独显（只要 Navi 21/22/23/24 独显，核显另算）：2026-10 起不再封锁，走 FSR4 INT8。
+# 官方 FSR4 要 Adrenalin 26.10.1+，图形安装器首次装 OptiScaler 时会提示升级驱动。
+$script:AmdRdna2DgpuDevIds = @(
+    '73BF','73A5','73AF','73A2','73AB','73AE',
+    '73DF','73E3','73E1','73E4','73DE',
+    '73FF','73EF','73F1','73E9','73E8','73EA','73E0','73F0',
+    '743F','7422','7421','7423','7424','7431'
+)
+
+# RDNA3.5 核显（Strix Point / Strix Halo / Krackan）：同类解封，走 FSR4 INT8。
+$script:AmdRdna35IgpuDevIds = @('150E', '1586', '1114', '1902')
+
 function Test-AmdRdna2Gpu {
     # 任一张 RDNA2 卡存在即视为需要同步模式（保守：优先避免闪烁）
     foreach ($controller in @(Get-VideoControllersOnce)) {
@@ -331,7 +343,7 @@ function Test-AmdRdna2Gpu {
 # 不含型号，名字匹配识别不到）。Device ID 来源于 GPU 硬件 ID 汇总表。
 $script:AmdFp8DevIds = @('7550', '7551', '7590')
 $script:AmdInt8DevIds = @(
-    '744C','7448','7449','744A','744B','745E','7460','7461','7470','747E','73F0','7480','7481','7483','7487','748B','7489','7499','749F',
+    '744C','7448','7449','744A','744B','745E','7460','7461','7470','747E','7480','7481','7483','7487','748B','7489','7499','749F',
     '15BF','15C8','164F','1900','1901',
     '150E','1586','1114','1902'
 )
@@ -381,6 +393,14 @@ function Get-Fsr4GpuPolicy {
             if ($dev -in $script:AmdFp8DevIds) {
                 $mode = 'fp8'; $reason = 'AMD RDNA4'
             }
+            elseif ($dev -in $script:AmdRdna2DgpuDevIds) {
+                # 2026-10：RDNA2 独显不再封锁（此前落到 auto ⇒ Fsr4Update=false）
+                $mode = 'int8'; $reason = 'AMD RDNA2'
+            }
+            elseif ($dev -in $script:AmdRdna35IgpuDevIds) {
+                # 2026-10：RDNA3.5 核显不再封锁
+                $mode = 'int8'; $reason = 'AMD RDNA3.5 核显'
+            }
             elseif ($dev -in $script:AmdInt8DevIds) {
                 $mode = 'int8'; $reason = 'AMD RDNA3/3.5'
             }
@@ -389,6 +409,9 @@ function Get-Fsr4GpuPolicy {
             }
             elseif ($name -match '(?i)\bRX\s*7\d{3}(?!\d)|\bPRO\s+W7\d{3}(?!\d)|\b(7[468]0|8[4689]0)M\b|\b80[456]0S\b') {
                 $mode = 'int8'; $reason = 'AMD RDNA3/3.5'
+            }
+            elseif ($name -match '(?i)\bRX\s*6\d{3}(?!\d)') {
+                $mode = 'int8'; $reason = 'AMD RDNA2'
             }
         }
         elseif ($vendor -eq '10DE' -or $name -match '(?i)NVIDIA|GeForce') {
@@ -1502,7 +1525,7 @@ if ($nvidiaGpu -and $textureLoaderEnabled) {
 $unlockerMode = Select-SourceMode -Label 'FPS Unlocker' -RequestedMode $UnlockerSource -ExistingAvailable (Test-Path -LiteralPath $unlocker -PathType Leaf)
 Install-Unlocker -Mode $unlockerMode -ManualPath $UnlockerPackagePath
 
-# Bridge 独立（FSR4——A 卡 7000/9000）：OptiScaler 开启时捆绑强制启用 Bridge
+# Bridge 独立（FSR4——A 卡 6000/7000/9000 系与 RDNA3/3.5 核显）：OptiScaler 开启时捆绑强制启用 Bridge
 $bridgeEnabled = -not $DisableBridge -or -not $DisableOptiScaler
 if ($bridgeEnabled) {
     Assert-File -Path $bridgeDll

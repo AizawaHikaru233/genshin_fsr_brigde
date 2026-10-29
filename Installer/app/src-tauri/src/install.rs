@@ -309,9 +309,10 @@ fn prepare_opti(settings: &Settings) -> Result<(), String> {
         opti_dll_path
     ));
     log::write(&format!(
-        "FSR4 GPU policy: {:?} / {} / {}",
+        "FSR4 GPU policy: {:?} / {} / {} / platform={}",
         policy.mode,
         policy.reason,
+        policy.platform.id(),
         if policy.name.is_empty() { "unknown" } else { &policy.name }
     ));
     Ok(())

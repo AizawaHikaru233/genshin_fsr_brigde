@@ -905,6 +905,21 @@
     </div>
   </div>
 </div>
+<div class="modal" id="drvmodal" hidden>
+  <div class="modalscrim" id="drvscrim"></div>
+  <div class="modalbox" role="dialog" aria-modal="true" aria-labelledby="drvtitle" style="width:468px">
+    <header class="modalhead">
+      <h2 id="drvtitle">显卡驱动提示</h2>
+      <button class="cap cap-close" id="drvclose" aria-label="关闭" title="关闭">
+        <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.1"><path d="M.6.6l8.8 8.8M9.4.6L.6 9.4"/></svg>
+      </button>
+    </header>
+    <div class="warnbody" id="drvbody"></div>
+    <div class="warnfoot">
+      <button class="primary" id="drvok">确认</button>
+    </div>
+  </div>
+</div>
 <div class="modal" id="upmodal" hidden>
   <div class="modalscrim" id="upscrim"></div>
   <div class="modalbox" role="dialog" aria-modal="true" aria-labelledby="upmtitle">
@@ -1809,6 +1824,25 @@
     applyToggle(p.comp, p.row, true);
   }
 
+  // 首次装 OptiScaler 的驱动提示（RDNA2 独显 / RDNA3.5 核显）：
+  // 官方 FSR4 要 Adrenalin 26.10.1+；只弹一次，弹过与否由后端的 fsr4DriverNoticeShown 决定。
+  function showDrvNotice(msg){
+    var gpu = msg.gpu || 'AMD';
+    var plat = msg.platform === 'rdna2_dgpu'
+      ? T('RDNA2 独显', 'RDNA2 discrete GPU')
+      : T('RDNA3.5 核显', 'RDNA3.5 integrated GPU');
+    var min = msg.minDriver || '26.10.1';
+    $('#drvbody').textContent = T(
+      '检测到 ' + gpu + '（' + plat + '）。本包已为这块显卡启用 FSR4；要开启官方 FSR4 支持，请把 AMD 显卡驱动更新到 Adrenalin ' + min + ' 或以上版本。驱动低于该版本时只能走 FSR4 INT8 兼容路径。',
+      'Detected ' + gpu + ' (' + plat + '). FSR4 is enabled for this GPU. For official FSR4 support, update the AMD driver to Adrenalin ' + min + ' or newer; older drivers can only use the FSR4 INT8 compatibility path.'
+    );
+    $('#drvmodal').hidden = false;
+  }
+
+  function closeDrvNotice(){
+    $('#drvmodal').hidden = true;
+  }
+
   function toggle(id, row){
     if (state.phase === 'installing') return;
     var c = compOf(id);
@@ -1990,7 +2024,7 @@
   });
 
   document.addEventListener('click', function(){ closePicker(); });
-  document.addEventListener('keydown', function(e){ if (e.key === 'Escape'){ closePicker(); closeWarn(false, false); closeUpdate(); } });
+  document.addEventListener('keydown', function(e){ if (e.key === 'Escape'){ closePicker(); closeWarn(false, false); closeUpdate(); closeDrvNotice(); } });
 
   /* ── 主界面：主页上的整块配置 ── */
 
@@ -2221,6 +2255,9 @@ $('#warnok').addEventListener('click', function(){ closeWarn(true, false); });
 $('#warnnever').addEventListener('click', function(){ closeWarn(true, true); });
 $('#warnclose').addEventListener('click', function(){ closeWarn(false, false); });
 $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); });
+  $('#drvok').addEventListener('click', closeDrvNotice);
+  $('#drvclose').addEventListener('click', closeDrvNotice);
+  $('#drvscrim').addEventListener('click', closeDrvNotice);
   document.addEventListener('click', function(e){
     var b = e.target && e.target.closest ? e.target.closest('[data-url]') : null;
     if (!b) return;
@@ -2551,6 +2588,7 @@ $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); }
     }
     else if (msg.type === 'progress'){ onProgress(msg); }
     else if (msg.type === 'installed'){ onInstalled(msg); }
+    else if (msg.type === 'fsr4DriverNotice'){ showDrvNotice(msg); }
     else if (msg.type === 'unlock'){ onUnlock(msg); }
     else if (msg.type === 'windowstate'){
       state.maximized = !!msg.maximized;
@@ -2711,7 +2749,7 @@ $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); }
 
   /* 英文词表：键是中文原文，动态拼出来的句子走下面的模式表 */
   var EN_EXACT = {
-    '显卡兼容性提示':'Graphics compatibility', '不再提醒':'Don’t remind again', '确认':'OK',
+    '显卡兼容性提示':'Graphics compatibility', '显卡驱动提示':'Graphics driver notice', '不再提醒':'Don’t remind again', '确认':'OK',
     'NVIDIA 显卡在使用 TextureLoader 加载纹理贴图时，极大概率会导致贴图渲染丢失；也有小概率完全正常、与 AMD 显卡表现一致，原因未知。':'On NVIDIA GPUs, loading textures through TextureLoader very often makes textures disappear; occasionally it works fine, just like on AMD. The cause is unknown.',
     'NVIDIA 显卡上 ReShade 与 OptiScaler 同时启用，可能存在不稳定现象。':'On NVIDIA GPUs, running ReShade and OptiScaler at the same time may be unstable.',    '主页':'Home', '插件配置':'Plugins', '设置':'Settings', '关于':'About',
     '已配置':'Configured', '未配置':'Not configured',
