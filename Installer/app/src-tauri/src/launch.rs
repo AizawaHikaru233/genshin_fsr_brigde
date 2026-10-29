@@ -214,6 +214,44 @@ pub fn write_config(game_exe: &Path, fps: i32, dlls: &[PathBuf]) -> Result<(), S
     Ok(())
 }
 
+/// 只修路径：`GamePath` / `DllList` 有变化才落盘。
+///
+/// 与 `write_config` 的区别是**不碰取值**：`FPSTarget` / `UseHDR` 以及界面上的开关
+/// 一律保持现状。文件不存在时什么都不做 —— 配置由「安装 / 保存」创建。
+/// 返回是否真的写了盘。
+pub fn repair_paths(game_exe: Option<&Path>, dlls: Option<&[PathBuf]>) -> Result<bool, String> {
+    if !config_path().is_file() {
+        return Ok(false);
+    }
+    let mut config = config_map();
+    let mut changed = false;
+
+    if let Some(exe) = game_exe {
+        let wanted = exe.to_string_lossy().into_owned();
+        if config.get("GamePath").and_then(Value::as_str).unwrap_or_default() != wanted {
+            config.insert("GamePath".into(), json!(wanted));
+            changed = true;
+        }
+    }
+
+    if let Some(list) = dlls {
+        let wanted: Vec<String> = list
+            .iter()
+            .map(|d| d.to_string_lossy().into_owned())
+            .collect();
+        if dll_list() != wanted {
+            config.insert("DllList".into(), json!(wanted));
+            changed = true;
+        }
+    }
+
+    if changed {
+        save_config(&config)?;
+        log::write("已修正 fps_config.json 里的路径（其余键未改动）");
+    }
+    Ok(changed)
+}
+
 /// 当前注入链（来自 fps_config.json）。文件缺失时为空。
 pub fn dll_list() -> Vec<String> {
     let Ok(bytes) = fs::read(config_path()) else {

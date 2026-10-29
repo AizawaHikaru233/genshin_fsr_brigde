@@ -88,7 +88,8 @@ GenshinFSRBridge\
 ### 版本目录（Bridge / OptiScaler）
 
 `payload\` 里以 `Bridge` / `OptiScaler` 开头的文件夹都算一个可选版本，
-在「插件配置」页可切换，切换后立刻改写 `fps_config.json` 的 `DllList` 与该版本的 ini。
+在「插件配置」页可切换。切换后**只**改写被切那一版的 ini 与 `fps_config.json` 的 `DllList`：
+另一版、ReShade、TextureLoader 等组件的配置一概不动，`FPSTarget` / `UseHDR` 也不动。
 
 - OptiScaler 0.9.x 是**平铺**布局：`OptiScaler_v0.9.4\OptiScaler.dll` 与
   `amd_fidelityfx_upscaler_dx12.dll` 同级，`OptiDllPath` 写版本目录本身。
@@ -135,10 +136,15 @@ GenshinFSRBridge\
 组件文件缺失时（例如只拿走了一份 `GenshinFSRBridgeInstaller.exe`），插件配置里那一行会显示
 「缺少文件」并在右侧出现「下载」按钮，点它当场补齐，不需要重下整包。
 
-> **启动时自愈**：每次打开安装器，`setup()` 里会跑一遍 `reapply()` —— 按当前设置重写
-> OptiScaler 的 `OptiDllPath`、ReShade 的 `AddonPath` / `EffectSearchPaths` / `TextureSearchPaths`、
-> 以及解帧工具 `fps_config.json` 的注入链 `DllList`，顺手把已经不存在的条目清掉。
-> 组件文件本身不复制；没有游戏目录或 payload 时只写一行日志跳过。
+> **启动时只修路径**：每次打开安装器，`setup()` 里跑一遍 `install::repair_paths()` ——
+> 只按本机实际位置校正 OptiScaler 的 `OptiDllPath`、ReShade 的 `AddonPath` / `EffectSearchPaths` /
+> `TextureSearchPaths`（`PresetPath` / `SavePath` 仅在为空时补），以及 `fps_config.json` 的
+> `GamePath` / `DllList`，顺手把已经不存在的条目清掉。
+> **功能键一律不动**：`Ffx12AsyncUpscale`、`Fsr4Update` / `UpscalerIndex` / `Fsr4ForceEnableInt8` /
+> `FsrNonLinearColorSpace` / `Spoofing.Dxgi` / `Log.*` / `FrameGen.*`、`FPSTarget` / `UseHDR`、
+> 解帧工具的各个开关都保持现状 —— 那些是「安装 / 保存」与「恢复默认设置」的事。
+> 值没变的文件不落盘；不创建缺失的 ini；也不碰游戏目录的 `ReShadePreset.ini`。
+> 组件文件本身不复制；没有游戏目录时只修 payload 内那几份。
 
 - **只补缺的**：目标文件已存在就跳过，用户自己换过版本不会被覆盖。
 - **ReShade**：从 reshade.me 下官方安装器（PA 里挂了 zip），按 512 字节对齐扫 `PK\x03\x04`
@@ -176,6 +182,9 @@ Windows 的 `curl.exe` 并不保证存在（本机 `System32` 里就没有）。
 - 恢复只覆盖 ini，随后立刻重跑一次写入（托管键 `OptiDllPath` / `Ffx12AsyncUpscale` /
   ReShade 的三个搜索路径按当前环境重算）并重写注入链——基线里的路径是打包时的相对布局，
   不能直接留在用户机器上。
+- **`ReShadePreset.ini` 只有这里会覆盖**：安装 / 保存 / 打开安装器 / 切版本 / 包自更新都不碰它
+  （游戏目录没有它时才从 `default_config\` 复制一份）⇒ 用户在 ReShade 里调好的 Preset 只有点
+  这个按钮才会被换掉。
 - `settings.json` 的 `modsDir` 一并清空（它对应 `TextureLoader.ini` 的 `mods_dir`，文件已还原）。
 
 ## 组件日志

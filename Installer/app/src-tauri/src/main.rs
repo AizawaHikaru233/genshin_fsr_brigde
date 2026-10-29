@@ -655,30 +655,24 @@ fn on_switch_version(app: &AppHandle, msg: &Value) {
     // 第一次见到这版就把它的 ini 留一份当出厂基线（已存在则不动）。
     let _ = install::snapshot_baseline(&component, &settings_now);
 
+    // 只写**被切换的那一个**组件：其他插件的 ini 一概不动。
     let selected = pkg::with_mandatory(&settings_now.selected);
     let mut error = String::new();
-    if let Err((id, message)) = install::prepare_ini(&selected, &settings_now) {
-        log::write(&format!("[switch] {id}: {message}"));
+    if let Err(message) = install::prepare_component_ini(&component, &settings_now) {
+        log::write(&format!("[switch] {component}: {message}"));
         error = message;
     }
+    if error.is_empty() && pkg::payload_available() {
+        // 注入链里的绝对路径跟着版本目录换了：只改 DllList（不动 FPSTarget / UseHDR）。
+        let dlls = pkg::dll_list(&selected, &settings_now);
+        if let Err(message) = launch::repair_paths(None, Some(&dlls)) {
+            log::write(&format!("[switch] 注入链: {message}"));
+            error = message;
+        }
+    }
     if error.is_empty() {
-        let game_dir = PathBuf::from(&settings_now.game_dir);
-        if let Some(game_exe) = gamepath::find_game_exe(&game_dir) {
-            let cancel = AtomicBool::new(false);
-            let outcome = install::apply(
-                &game_exe,
-                settings_now.fps,
-                &selected,
-                &settings_now,
-                &cancel,
-                |_| {},
-            );
-            error = outcome.error;
-        }
-        if error.is_empty() {
-            // 换到新版本目录后，那个目录可能还没有 DLSS 运行时。
-            ensure_dlss(app, &settings_now);
-        }
+        // 换到新版本目录后，那个目录可能还没有 DLSS 运行时。
+        ensure_dlss(app, &settings_now);
     }
 
     post_state(app);
@@ -1317,15 +1311,25 @@ fn main() {
                 });
             }
 
-            // 启动时按当前设置自愈一次：OptiScaler 的 OptiDllPath、ReShade 的搜索路径、
-            // 解帧工具的注入链（DllList）都按本机实际路径重写，顺手清掉已经不存在的条目。
+            // 启动时**只修路径**：OptiScaler 的 OptiDllPath、ReShade 的三个搜索路径、
+            // fps_config.json 的 GamePath / DllList 按本机实际位置校正，
+            // 顺手清掉已经不存在的条目。功能键（FSR4 策略、日志、帧生成、FPSTarget 等）
+            // 一律不动 —— 那是「安装 / 保存」与「恢复默认设置」的事。
             let heal = handle.clone();
             std::thread::spawn(move || {
-                let err = reapply(&heal);
-                if err.is_empty() {
-                    log::write("[startup] 已按当前设置重写注入链与插件 ini");
-                } else {
-                    log::write(&format!("[startup] 跳过路径自愈: {err}"));
+                let s = snapshot(&heal);
+                let selected = pkg::with_mandatory(&s.selected);
+                let game_exe = gamepath::find_game_exe(Path::new(&s.game_dir));
+                match install::repair_paths(&selected, &s, game_exe.as_deref()) {
+                    Ok(changed) if changed.is_empty() => {
+                        log::write("[startup] 配置路径无需修正");
+                    }
+                    Ok(changed) => log::write(&format!(
+                        "[startup] 已修正 {} 个配置文件里的路径: {}",
+                        changed.len(),
+                        changed.join(" / ")
+                    )),
+                    Err(err) => log::write(&format!("[startup] 路径修正失败: {err}")),
                 }
                 post_state(&heal);
             });

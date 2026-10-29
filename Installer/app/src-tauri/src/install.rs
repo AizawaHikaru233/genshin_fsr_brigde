@@ -208,19 +208,133 @@ pub fn write_mods_dir(value: &str) -> Result<String, String> {
     Ok(text)
 }
 
-/// 切版本时只需要重写各组件自己的 ini（不需要游戏目录）。
-pub fn prepare_ini(selected: &[String], settings: &Settings) -> Result<(), (String, String)> {
-    for id in selected {
-        let step = match id.as_str() {
-            "bridge" => prepare_bridge(settings),
-            "opti" => prepare_opti(settings),
-            _ => Ok(()),
-        };
-        if let Err(message) = step {
-            return Err((id.clone(), message));
+/// 打开安装器时的「只修路径」：只重写由安装位置决定的路径值，功能键一律保持用户现状。
+///
+/// 覆盖范围：
+/// · `OptiScaler.ini` —— `[Libraries] OptiDllPath`
+/// · `ReShade.ini` —— `[ADDON] AddonPath` / `[GENERAL] EffectSearchPaths` /
+///   `TextureSearchPaths`，以及**仅当为空时**写 `PresetPath` / `SavePath`
+/// · `fps_config.json` —— `GamePath` / `DllList`
+///
+/// 刻意不做的：创建缺失的 ini、复制 ini 模板、写 `ReShadePreset.ini`、
+/// 改 `Ffx12DllPath`（留空=随包默认，属用户语义）与 `mods_dir`（用户选的目录）。
+/// 返回值是真正被改动的文件（值没变的文件不落盘，也不进这个列表）。
+pub fn repair_paths(
+    selected: &[String],
+    settings: &Settings,
+    game_exe: Option<&Path>,
+) -> Result<Vec<String>, String> {
+    let mut changed: Vec<String> = Vec::new();
+
+    if selected.iter().any(|id| id == "opti") {
+        if let Some(version) = pkg::resolve("opti", settings) {
+            let path = version.path.join("OptiScaler.ini");
+            if path.is_file() {
+                let wanted = paths::to_display(&version.component_dir)
+                    .trim_end_matches('\\')
+                    .to_string();
+                set_if_changed(&path, "Libraries", "OptiDllPath", &wanted, &mut changed)?;
+            }
+        }
+    }
+
+    if selected.iter().any(|id| id == "reshade") {
+        if let Some(dir) = game_exe.and_then(Path::parent) {
+            repair_reshade_paths(dir, &mut changed)?;
+        }
+    }
+
+    if launch::config_path().is_file() {
+        // 注入链全是绝对路径：payload 换位置后必须重写，顺带清掉已不存在的条目。
+        // payload 不完整时不动 DllList（宁可留着旧值，也不把链清空）。
+        let dlls = pkg::payload_available().then(|| pkg::dll_list(selected, settings));
+        if launch::repair_paths(game_exe, dlls.as_deref())? {
+            changed.push(paths::to_display(&launch::config_path()));
+        }
+    }
+
+    changed.sort();
+    changed.dedup();
+    Ok(changed)
+}
+
+/// ReShade.ini 里由安装位置决定的三项路径；指向游戏目录的两项只在为空时写
+/// （它们是用户在 ReShade 界面里可能改过的值）。文件不存在就直接返回 ——
+/// 打开安装器不创建任何 ini，也不碰 `ReShadePreset.ini`。
+fn repair_reshade_paths(game_dir: &Path, changed: &mut Vec<String>) -> Result<(), String> {
+    let ini_path = game_dir.join("ReShade.ini");
+    if !ini_path.is_file() {
+        return Ok(());
+    }
+    let shader_dir = paths::payload_dir().join("ReShade").join("reshade-shaders");
+    set_if_changed(
+        &ini_path,
+        "ADDON",
+        "AddonPath",
+        &paths::to_display(&shader_dir.join("Addons")),
+        changed,
+    )?;
+    set_if_changed(
+        &ini_path,
+        "GENERAL",
+        "EffectSearchPaths",
+        &paths::to_display(&shader_dir.join("Shaders")),
+        changed,
+    )?;
+    set_if_changed(
+        &ini_path,
+        "GENERAL",
+        "TextureSearchPaths",
+        &paths::to_display(&shader_dir.join("Textures")),
+        changed,
+    )?;
+    let defaults = [
+        (
+            "GENERAL",
+            "PresetPath",
+            paths::to_display(&game_dir.join("ReShadePreset.ini")),
+        ),
+        (
+            "SCREENSHOT",
+            "SavePath",
+            paths::to_display(&game_dir.join("Screenshots")),
+        ),
+    ];
+    for (section, key, value) in defaults {
+        let now = ini::get(&ini_path, section, key).unwrap_or_default();
+        if now.trim().is_empty() {
+            ini::set(&ini_path, section, key, &value)
+                .map_err(|e| format!("无法写入 ReShade.ini（{section}.{key}）：{e}"))?;
+            changed.push(paths::to_display(&ini_path));
         }
     }
     Ok(())
+}
+
+/// 只在值真的变了才写盘：值没变就不动文件，免得每次启动都刷新 ini 的修改时间。
+fn set_if_changed(
+    path: &Path,
+    section: &str,
+    key: &str,
+    value: &str,
+    changed: &mut Vec<String>,
+) -> Result<(), String> {
+    if ini::get(path, section, key).as_deref() == Some(value) {
+        return Ok(());
+    }
+    ini::set(path, section, key, value)
+        .map_err(|e| format!("无法写入 {}（{section}.{key}）：{e}", path.display()))?;
+    changed.push(paths::to_display(path));
+    Ok(())
+}
+
+/// 切版本时只重写**被切换的那一个**组件的 ini —— 其他插件的配置一概不动。
+pub fn prepare_component_ini(id: &str, settings: &Settings) -> Result<(), String> {
+    match id {
+        "bridge" => prepare_bridge(settings),
+        "opti" => prepare_opti(settings),
+        _ => Ok(()),
+    }
 }
 
 /// Dx11FsrBridge.ini 只有一项：RDNA2 关掉异步超分（与旧脚本一致）。
@@ -430,3 +544,303 @@ fn has_fx(dir: &Path, depth: usize) -> bool {
     false
 }
 
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use super::{prepare_component_ini, repair_paths};
+    use crate::ini;
+    use crate::settings::Settings;
+
+    /// `paths::payload_dir()` 读的是进程级环境变量，这些测试必须串行。
+    /// 其他测试模块（gpu / fetch）不碰 payload 目录，所以不会互相干扰。
+    fn payload_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct Sandbox {
+        root: PathBuf,
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// 一次性的假 payload：两个版本目录 + Bridge 的 AMD 后端，够 `resolve` / `dll_list` 用。
+    fn sandbox(name: &str) -> Sandbox {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "gfsr-install-{}-{}-{}",
+            std::process::id(),
+            name,
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        std::env::set_var("GFSR_PAYLOAD", root.join("payload"));
+        let payload = root.join("payload");
+        for (dir, dll) in [
+            ("Bridge_v2.4.0", "Dx11FsrBridge.dll"),
+            ("OptiScaler_v0.9.4", "OptiScaler.dll"),
+        ] {
+            fs::create_dir_all(payload.join(dir)).unwrap();
+            fs::write(payload.join(dir).join(dll), b"x").unwrap();
+            fs::write(
+                payload.join(dir).join("amd_fidelityfx_upscaler_dx12.dll"),
+                b"x",
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(payload.join("AMD")).unwrap();
+        fs::write(
+            payload.join("AMD").join("amd_fidelityfx_upscaler_dx12.dll"),
+            b"x",
+        )
+        .unwrap();
+        Sandbox { root }
+    }
+
+    fn read(path: &Path) -> String {
+        fs::read_to_string(path).unwrap_or_default()
+    }
+
+    /// 打开安装器：只修路径，功能键一个都不许动。
+    #[test]
+    fn repair_paths_leaves_feature_keys_alone() {
+        let _guard = payload_lock();
+        let sandbox = sandbox("keys");
+        let payload = sandbox.root.join("payload");
+        let opti = payload.join("OptiScaler_v0.9.4").join("OptiScaler.ini");
+        fs::write(
+            &opti,
+            "[FSR]\nFsr4Update=false\nUpscalerIndex=auto\n[Libraries]\n\
+             OptiDllPath=D:\\old\\OptiScaler\n[Log]\nLogLevel=5\n",
+        )
+        .unwrap();
+
+        let selected = vec![
+            "fpsun".to_string(),
+            "bridge".to_string(),
+            "opti".to_string(),
+        ];
+        let changed = repair_paths(&selected, &Settings::default(), None).unwrap();
+
+        let wanted = payload.join("OptiScaler_v0.9.4");
+        assert_eq!(
+            ini::get(&opti, "Libraries", "OptiDllPath").as_deref(),
+            Some(wanted.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            ini::get(&opti, "FSR", "Fsr4Update").as_deref(),
+            Some("false"),
+            "Fsr4Update 属于 FSR4 策略，启动时不许改"
+        );
+        assert_eq!(
+            ini::get(&opti, "FSR", "UpscalerIndex").as_deref(),
+            Some("auto")
+        );
+        assert_eq!(
+            ini::get(&opti, "Log", "LogLevel").as_deref(),
+            Some("5"),
+            "日志等级属于功能键，启动时不许改"
+        );
+        assert_eq!(changed.len(), 1, "只该报出 OptiScaler.ini 一个文件");
+    }
+
+    /// 已经是正确路径就不落盘（不刷 mtime，也不进 changed）。
+    #[test]
+    fn repair_paths_skips_files_already_correct() {
+        let _guard = payload_lock();
+        let sandbox = sandbox("idempotent");
+        let payload = sandbox.root.join("payload");
+        let opti = payload.join("OptiScaler_v0.9.4").join("OptiScaler.ini");
+        let wanted = payload.join("OptiScaler_v0.9.4");
+        fs::write(
+            &opti,
+            format!("[Libraries]\nOptiDllPath={}\n", wanted.to_string_lossy()),
+        )
+        .unwrap();
+        let before = fs::metadata(&opti).unwrap().modified().unwrap();
+
+        let selected = vec!["opti".to_string()];
+        let changed = repair_paths(&selected, &Settings::default(), None).unwrap();
+
+        assert!(changed.is_empty(), "值没变就不该报改动");
+        assert_eq!(fs::metadata(&opti).unwrap().modified().unwrap(), before);
+    }
+
+    /// ReShade：只改三项随安装位置走的路径；游戏目录的 preset 不创建、不覆写。
+    #[test]
+    fn repair_paths_never_writes_reshade_preset() {
+        let _guard = payload_lock();
+        let sandbox = sandbox("reshade");
+        let payload = sandbox.root.join("payload");
+        let game = sandbox.root.join("game");
+        fs::create_dir_all(&game).unwrap();
+        let exe = game.join("YuanShen.exe");
+        fs::write(&exe, b"x").unwrap();
+        let ini_path = game.join("ReShade.ini");
+        fs::write(
+            &ini_path,
+            "[ADDON]\nAddonPath=D:\\old\\Addons\n[GENERAL]\nEffectSearchPaths=D:\\old\\Shaders\n\
+             TextureSearchPaths=D:\\old\\Textures\nPresetPath=\n[SCREENSHOT]\nSavePath=\n",
+        )
+        .unwrap();
+        let preset = game.join("ReShadePreset.ini");
+        fs::write(&preset, "Techniques=user\n").unwrap();
+
+        let selected = vec!["reshade".to_string()];
+        let changed = repair_paths(&selected, &Settings::default(), Some(&exe)).unwrap();
+
+        let shaders = payload.join("ReShade").join("reshade-shaders");
+        assert_eq!(
+            ini::get(&ini_path, "ADDON", "AddonPath").as_deref(),
+            Some(shaders.join("Addons").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            ini::get(&ini_path, "GENERAL", "EffectSearchPaths").as_deref(),
+            Some(shaders.join("Shaders").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            ini::get(&ini_path, "GENERAL", "TextureSearchPaths").as_deref(),
+            Some(shaders.join("Textures").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            ini::get(&ini_path, "GENERAL", "PresetPath").as_deref(),
+            Some(preset.to_string_lossy().as_ref()),
+            "空值才补，非空保留"
+        );
+        assert_eq!(
+            ini::get(&ini_path, "SCREENSHOT", "SavePath").as_deref(),
+            Some(game.join("Screenshots").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            read(&preset),
+            "Techniques=user\n",
+            "游戏目录已有 ReShadePreset.ini ⇒ 不覆写"
+        );
+        assert_eq!(
+            changed
+                .iter()
+                .filter(|p| p.ends_with("ReShade.ini"))
+                .count(),
+            1,
+            "同一个文件多次改动只报一次"
+        );
+
+        // 空游戏目录：不创建 ReShade.ini，也不凭空造一个 ReShadePreset.ini。
+        let bare = sandbox.root.join("bare");
+        fs::create_dir_all(&bare).unwrap();
+        let bare_exe = bare.join("YuanShen.exe");
+        fs::write(&bare_exe, b"x").unwrap();
+        repair_paths(&selected, &Settings::default(), Some(&bare_exe)).unwrap();
+        assert!(!bare.join("ReShade.ini").exists());
+        assert!(!bare.join("ReShadePreset.ini").exists());
+    }
+
+    /// 切版本：只写被切的那一个组件的 ini。
+    #[test]
+    fn prepare_component_ini_touches_only_that_component() {
+        let _guard = payload_lock();
+        let sandbox = sandbox("switch");
+        let payload = sandbox.root.join("payload");
+        let bridge = payload.join("Bridge_v2.4.0").join("Dx11FsrBridge.ini");
+        let opti = payload.join("OptiScaler_v0.9.4").join("OptiScaler.ini");
+        fs::write(&bridge, "[Dx11FsrBridge]\nFfx12AsyncUpscale=3\n").unwrap();
+        fs::write(&opti, "[FSR]\nFsr4Update=false\n[Log]\nLogLevel=7\n").unwrap();
+
+        prepare_component_ini("opti", &Settings::default()).unwrap();
+
+        assert_eq!(
+            ini::get(&bridge, "Dx11FsrBridge", "Ffx12AsyncUpscale").as_deref(),
+            Some("3"),
+            "只切 OptiScaler ⇒ Bridge 的 ini 不许动"
+        );
+        assert_eq!(
+            ini::get(&opti, "Log", "LogLevel").as_deref(),
+            Some("2"),
+            "被切的那个照样按托管键写"
+        );
+
+        fs::write(&opti, "[FSR]\nFsr4Update=false\n[Log]\nLogLevel=7\n").unwrap();
+        prepare_component_ini("bridge", &Settings::default()).unwrap();
+
+        assert_eq!(
+            ini::get(&opti, "Log", "LogLevel").as_deref(),
+            Some("7"),
+            "只切 Bridge ⇒ OptiScaler 的 ini 不许动"
+        );
+        assert_ne!(
+            ini::get(&bridge, "Dx11FsrBridge", "Ffx12AsyncUpscale").as_deref(),
+            Some("3")
+        );
+    }
+
+    /// fps_config.json：只修 GamePath / DllList，FPSTarget / UseHDR / 其他开关保持现状。
+    #[test]
+    fn repair_paths_fixes_injection_chain_only() {
+        let _guard = payload_lock();
+        let sandbox = sandbox("fpsconfig");
+        let payload = sandbox.root.join("payload");
+        let game = sandbox.root.join("game");
+        fs::create_dir_all(&game).unwrap();
+        let exe = game.join("YuanShen.exe");
+        fs::write(&exe, b"x").unwrap();
+        let unlocker = payload.join("FpsUnlocker");
+        fs::create_dir_all(&unlocker).unwrap();
+        let config = unlocker.join("fps_config.json");
+        fs::write(
+            &config,
+            "{\n  \"GamePath\": \"D:\\\\old\\\\YuanShen.exe\",\n  \"FPSTarget\": 144,\n  \
+             \"UseHDR\": false,\n  \"AutoStart\": false,\n  \
+             \"DllList\": [\"D:\\\\old\\\\Dx11FsrBridge.dll\"]\n}\n",
+        )
+        .unwrap();
+
+        let selected = vec![
+            "fpsun".to_string(),
+            "bridge".to_string(),
+            "opti".to_string(),
+        ];
+        repair_paths(&selected, &Settings::default(), Some(&exe)).unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&read(&config)).unwrap();
+        assert_eq!(
+            value["GamePath"].as_str(),
+            Some(exe.to_string_lossy().as_ref())
+        );
+        let dlls: Vec<String> = value["DllList"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            dlls,
+            vec![
+                payload
+                    .join("Bridge_v2.4.0")
+                    .join("Dx11FsrBridge.dll")
+                    .to_string_lossy()
+                    .into_owned(),
+                payload
+                    .join("OptiScaler_v0.9.4")
+                    .join("OptiScaler.dll")
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
+        );
+        assert_eq!(value["FPSTarget"].as_i64(), Some(144));
+        assert_eq!(value["UseHDR"].as_bool(), Some(false));
+        assert_eq!(value["AutoStart"].as_bool(), Some(false));
+    }
+}

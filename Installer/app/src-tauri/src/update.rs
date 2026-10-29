@@ -192,12 +192,13 @@ pub fn apply(s: &mut Settings, report: Report) -> Result<Value, String> {
 }
 
 /// 需要备份/回填的 ini 种类。
-const KINDS: &[&str] = &["reshade", "reshade_preset", "bridge", "opti", "texture"];
+/// 刻意**不含** `ReShadePreset.ini`：它在游戏目录、由用户自己调（ReShade 界面 / 手改），
+/// 包更新不该碰它；只有「恢复默认设置」才会覆盖。
+const KINDS: &[&str] = &["reshade", "bridge", "opti", "texture"];
 
 fn backup_name(kind: &str) -> &'static str {
     match kind {
         "reshade" => "ReShade.ini",
-        "reshade_preset" => "ReShadePreset.ini",
         "bridge" => "Bridge.ini",
         "opti" => "OptiScaler.ini",
         _ => "TextureLoader.ini",
@@ -212,13 +213,6 @@ fn live_path(kind: &str, s: &Settings) -> Option<PathBuf> {
                 None
             } else {
                 Some(PathBuf::from(&s.game_dir).join("ReShade.ini"))
-            }
-        }
-        "reshade_preset" => {
-            if s.game_dir.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(&s.game_dir).join("ReShadePreset.ini"))
             }
         }
         "bridge" => Some(pkg::dll_path_of("bridge", s).parent()?.join("Dx11FsrBridge.ini")),
