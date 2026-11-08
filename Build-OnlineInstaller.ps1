@@ -58,6 +58,15 @@ $fufuBuild = Join-Path $root 'build-package-fufu-graphics'
 $fufuDll = Join-Path $fufuBuild 'FSR-Bridge-Plugin.dll'
 $dist = Join-Path $root 'dist'
 $optiRuntime = Join-Path $root 'SharedResources\OptiScaler\runtime'
+# FFX 运行时优先用 AMD 官方 release 的 signedbin 版本（tools\Update-UpstreamComponents.ps1 -Component FfxSdk），
+# 缺失时回退到 OptiScaler 自带的那份（兼容旧包）。
+$ffxRuntime = Join-Path $root 'SharedResources\AMD'
+$ffxDll = if (Test-Path -LiteralPath (Join-Path $ffxRuntime 'amd_fidelityfx_upscaler_dx12.dll') -PathType Leaf) {
+    Join-Path $ffxRuntime 'amd_fidelityfx_upscaler_dx12.dll'
+}
+else {
+    Join-Path $optiRuntime 'amd_fidelityfx_upscaler_dx12.dll'
+}
 $dlssRuntime = Join-Path $root 'SharedResources\NVIDIA\DLSS'
 $unlockerRuntime = Join-Path $root 'SharedResources\FpsUnlocker\runtime'
 $reshadeRuntime = Join-Path $root 'SharedResources\ReShade\runtime'
@@ -286,6 +295,63 @@ function Assert-CleanPackage {
     }
 }
 
+# 清单 ↔ 包内实物一致性：清单是 GUI 下载校验的唯一期望值来源，包里的文件必须对得上。
+function Assert-ManifestMatchesStagedFiles {
+    param(
+        [Parameter(Mandatory)][string]$Stage,
+        [Parameter(Mandatory)][string]$ManifestPath
+    )
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        throw "缺少上游版本清单: $ManifestPath（先跑 tools\Update-UpstreamComponents.ps1）"
+    }
+    $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+
+    if ($null -eq $manifest.dlss -or [string]::IsNullOrWhiteSpace([string]$manifest.dlss.Tag) -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.dlss.Asset) -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.dlss.ArchiveSha256)) {
+        throw '清单 dlss.Tag / dlss.Asset / dlss.ArchiveSha256 不全：GUI 无法锁定并校验 DLSS 下载'
+    }
+    if ($null -eq $manifest.ffx -or [string]::IsNullOrWhiteSpace([string]$manifest.ffx.DllSha256)) {
+        throw '清单缺少 ffx.DllSha256：FFX 运行时无法校验（先跑 tools\Update-UpstreamComponents.ps1 -Component FfxSdk）'
+    }
+    if ($null -eq $manifest.reshade -or [string]::IsNullOrWhiteSpace([string]$manifest.reshade.SetupUrl) -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.reshade.SetupSha256)) {
+        throw '清单 reshade.SetupUrl / SetupSha256 不全：GUI 无法锁定并校验 ReShade 下载'
+    }
+
+    $checks = @(
+        @{ Rel = 'payload\NVIDIA\DLSS\nvngx_dlss.dll'; Expected = [string]$manifest.dlss.DllSha256; Label = 'DLSS 运行时' },
+        @{ Rel = 'payload\ReShade\ReShade64.dll'; Expected = [string]$manifest.reshade.DllSha256; Label = 'ReShade64.dll' },
+        @{ Rel = 'payload\AMD\amd_fidelityfx_upscaler_dx12.dll'; Expected = [string]$manifest.ffx.DllSha256; Label = 'FFX 运行时' },
+        @{ Rel = 'payload\OptiScaler\amd_fidelityfx_upscaler_dx12.dll'; Expected = [string]$manifest.ffx.DllSha256; Label = 'FFX 运行时（OptiScaler）' },
+        @{ Rel = 'payload\FpsUnlocker\unlockfps_nc.exe'; Expected = [string]$manifest.fpsunlock.Sha256; Label = 'FPS Unlocker' },
+        @{ Rel = 'unlockfps_nc.exe'; Expected = [string]$manifest.fpsunlock.Sha256; Label = 'FPS Unlocker（包根）' }
+    )
+    foreach ($check in $checks) {
+        $target = Join-Path $Stage $check.Rel
+        if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { continue }
+        if ([string]::IsNullOrWhiteSpace($check.Expected)) {
+            throw "$($check.Label)：清单里没有 SHA-256，无法校验包内文件"
+        }
+        $actual = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+        if (-not [string]::Equals($actual, $check.Expected, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "$($check.Label) 与清单不一致：清单 $($check.Expected)，实际 $actual（清单与包内文件不同源）"
+        }
+        Write-Host "  清单一致: $($check.Label)" -ForegroundColor DarkGray
+    }
+
+    if ($null -ne $manifest.optiscaler -and -not [string]::IsNullOrWhiteSpace([string]$manifest.optiscaler.FileVersion)) {
+        $optiDll = Join-Path $Stage 'payload\OptiScaler\OptiScaler.dll'
+        if (Test-Path -LiteralPath $optiDll -PathType Leaf) {
+            $actualVersion = [string](Get-Item -LiteralPath $optiDll).VersionInfo.FileVersion
+            if ($actualVersion -notlike "$($manifest.optiscaler.FileVersion)*") {
+                throw "OptiScaler.dll 版本与清单不一致：清单 $($manifest.optiscaler.FileVersion)，实际 $actualVersion"
+            }
+            Write-Host "  清单一致: OptiScaler $actualVersion" -ForegroundColor DarkGray
+        }
+    }
+}
+
 function New-ZipArchive {
     param([string]$SourceDirectory, [string]$ArchivePath)
     if (Test-Path -LiteralPath $ArchivePath) { Remove-Item -LiteralPath $ArchivePath -Force }
@@ -465,8 +531,11 @@ function Prepare-FpsStage {
     Remove-Item -LiteralPath (Join-Path $stagePayloadReShade 'ReShade.ini'), (Join-Path $stagePayloadReShade 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
     # 完整组件包：OptiScaler 运行时全家桶（FFX SDK / XeSS / XeLL / D3D12Core / Licenses）始终内置。
     Copy-DirectoryContents -Source $optiRuntime -Destination $stageOpti
+    # 临时方案：OptiScaler 自带的 FFX 运行时替换成 AMD 官方 release 版本（与 payload\AMD 同一份）。
+    # 上游 OptiScaler 更新后应复核兼容性，再决定是否保留这行。
+    Copy-Item -LiteralPath $ffxDll -Destination (Join-Path $stageOpti 'amd_fidelityfx_upscaler_dx12.dll') -Force
     # 桥默认 FSR SDK 路径（Ffx12DllPath 留空时使用 payload\AMD\）。
-    Copy-Item -LiteralPath (Join-Path $optiRuntime 'amd_fidelityfx_upscaler_dx12.dll') -Destination (Join-Path $stageAmd 'amd_fidelityfx_upscaler_dx12.dll') -Force
+    Copy-Item -LiteralPath $ffxDll -Destination (Join-Path $stageAmd 'amd_fidelityfx_upscaler_dx12.dll') -Force
     # AMD FFX12 SDK license（FSR4 = FFX API 2.x，从 OptiScaler\Licenses 复制）。
     Copy-Item -LiteralPath (Join-Path $optiRuntime 'Licenses\FidelityFX_v2_LICENSE.md') -Destination (Join-Path $stageAmd 'FidelityFX_v2_LICENSE.md') -Force
     # The package defaults are generated from the exact component resources used in this build.
@@ -559,6 +628,7 @@ function Build-FpsPackage {
             )
         }
         Assert-RequiredFiles -Path $stage -RelativePaths $required
+        Assert-ManifestMatchesStagedFiles -Stage $stage -ManifestPath (Join-Path $root 'SharedResources\upstream-versions.json')
         Assert-CleanPackage -Path $stage
         $extension = if ($ArchiveFormat -eq 'SevenZip') { '7z' } else { 'zip' }
         $name = if ($LocalFull) { "原神解帧FSR插件包_v$Version.$extension" } else { "GenshinFSRBridge_v$Version.$extension" }
@@ -642,7 +712,9 @@ try {
     Copy-Item -LiteralPath $bridgeDll -Destination (Join-Path $bridge 'Dx11FsrBridge.dll') -Force
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $bridge 'Dx11FsrBridge.ini') -Force
     Copy-DirectoryContents -Source $optiRuntime -Destination $opti
-    Copy-Item -LiteralPath (Join-Path $optiRuntime 'amd_fidelityfx_upscaler_dx12.dll') -Destination (Join-Path $amd 'amd_fidelityfx_upscaler_dx12.dll') -Force
+    # 临时方案：同上，芙芙包里的 OptiScaler 也换成 AMD 官方 FFX 运行时。
+    Copy-Item -LiteralPath $ffxDll -Destination (Join-Path $opti 'amd_fidelityfx_upscaler_dx12.dll') -Force
+    Copy-Item -LiteralPath $ffxDll -Destination (Join-Path $amd 'amd_fidelityfx_upscaler_dx12.dll') -Force
     # AMD FFX12 SDK license（FSR4 = FFX API 2.x，从 OptiScaler\Licenses 复制）。
     Copy-Item -LiteralPath (Join-Path $optiRuntime 'Licenses\FidelityFX_v2_LICENSE.md') -Destination (Join-Path $amd 'FidelityFX_v2_LICENSE.md') -Force
     Copy-Item -LiteralPath (Join-Path $dlssRuntime 'nvngx_dlss.dll') -Destination $nvidia -Force
@@ -716,6 +788,7 @@ try {
         'payload\default_config\OptiScaler-UpscalingFiles.json', 'payload\default_config\ReShade.ini',
         'payload\default_config\ReShadePreset.ini', 'payload\default_config\TextureLoader.ini'
     )
+    Assert-ManifestMatchesStagedFiles -Stage $stage -ManifestPath (Join-Path $root 'SharedResources\upstream-versions.json')
     Assert-CleanPackage -Path $stage
 
     $archive = Join-Path $dist "FSR-Bridge-Plugin.v$version.zip"

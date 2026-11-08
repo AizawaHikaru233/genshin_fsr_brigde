@@ -1003,28 +1003,11 @@ bool apply_optiscaler_managed_settings(
     std::string upscaler_index = read_policy_value(policy_path, L"UpscalerIndex", L"auto");
     std::string force_int8 = read_policy_value(policy_path, L"Fsr4ForceEnableInt8", L"auto");
 
-    // 策略值为 auto（安装脚本未识别型号或策略文件缺失）时，在此按 PCI 厂商 +
-    // 系列前缀宽松匹配解析：NVIDIA RTX 20/30/40/50、AMD RX 6/RX 7/RX 9 与 RDNA3/3.5
-    // 核显、Intel Arc 全部放行。非 auto 的显式值（安装脚本命中或用户手改）优先。
+    // 2026-11-08：插件**不再按显卡型号判定 FSR4 支持**（原来的 auto 解析已删除）。
+    // 三键保持 auto，由 OptiScaler 自己问驱动决定；FSR4Policy.ini 里被显式写成
+    // true / false / 数字 的（旧安装脚本命中或用户手改）仍然照旧尊重。
     if (fsr4_update == "auto" || upscaler_index == "auto" || force_int8 == "auto")
-    {
-        const DetectedFsr4Policy detected = detect_fsr4_gpu_policy();
-        if (detected.supported)
-        {
-            if (fsr4_update == "auto")
-                fsr4_update = "true";
-            if (upscaler_index == "auto")
-                upscaler_index = "0";
-            if (force_int8 == "auto")
-                force_int8 = detected.prefer_fp8 ? "false" : "true";
-            write_log("fsr4_policy_auto_resolved gpu=" + wide_to_utf8(detected.gpu_name) +
-                " mode=" + (detected.prefer_fp8 ? "fp8" : "int8"));
-        }
-        else
-        {
-            write_log("fsr4_policy_auto_unresolved keeping_auto_defaults");
-        }
-    }
+        write_log("fsr4_policy_delegated_to_optiscaler");
 
     // 与 FPS 安装脚本（Configure.ps1 Set-OptiScalerManagedSettings）保持同一收敛集：
     // FSR4 策略 + OptiDllPath + Log 三项 + 帧生成版型（芙芙场景固定非帧生成）。

@@ -313,18 +313,6 @@ $script:AmdRdna2DevIds = @(
     '1638','164C','1681'
 )
 
-# RDNA2 独显（只要 Navi 21/22/23/24 独显，核显另算）：2026-10 起不再封锁，走 FSR4 INT8。
-# 官方 FSR4 要 Adrenalin 26.10.1+，图形安装器首次装 OptiScaler 时会提示升级驱动。
-$script:AmdRdna2DgpuDevIds = @(
-    '73BF','73A5','73AF','73A2','73AB','73AE',
-    '73DF','73E3','73E1','73E4','73DE',
-    '73FF','73EF','73F1','73E9','73E8','73EA','73E0','73F0',
-    '743F','7422','7421','7423','7424','7431'
-)
-
-# RDNA3.5 核显（Strix Point / Strix Halo / Krackan）：同类解封，走 FSR4 INT8。
-$script:AmdRdna35IgpuDevIds = @('150E', '1586', '1114', '1902')
-
 function Test-AmdRdna2Gpu {
     # 任一张 RDNA2 卡存在即视为需要同步模式（保守：优先避免闪烁）
     foreach ($controller in @(Get-VideoControllersOnce)) {
@@ -339,14 +327,6 @@ function Test-AmdRdna2Gpu {
     return $false
 }
 
-# Device ID 精确分类（核显名字通常只是 "AMD Radeon(TM) Graphics"，
-# 不含型号，名字匹配识别不到）。Device ID 来源于 GPU 硬件 ID 汇总表。
-$script:AmdFp8DevIds = @('7550', '7551', '7590')
-$script:AmdInt8DevIds = @(
-    '744C','7448','7449','744A','744B','745E','7460','7461','7470','747E','7480','7481','7483','7487','748B','7489','7499','749F',
-    '15BF','15C8','164F','1900','1901',
-    '150E','1586','1114','1902'
-)
 $script:NvidiaInt8DevIds = @(
     '1E02','1E03','1E04','1E07','1E81','1E82','1E84','1E87','1E89','1EC2','1EC7','1F02','1F03','1F06','1F07','1F08','1F42','1F47',
     '2182','2184','2187','2188','21C4','1F82','1F83',
@@ -366,115 +346,22 @@ $script:NvidiaGtx16DevIds = @(
     '2191','21D1','2192','1F91','1F92','1F94','1F96','1F99','1F9D','1F95','1FD9','1FDD','1F97','1F98','1F9C','1F9F','1FA0'
 )
 
-function Get-Fsr4GpuPolicy {
-    param([object[]]$InputControllers)
-    if ($null -ne $InputControllers) {
-        $controllers = @($InputControllers)
-    }
-    else {
-        $controllers = @(Get-VideoControllersOnce)
-    }
-
-    # 遍历全部显卡取"最优"策略（fp8 优先于 int8），不依赖 AdapterRAM 排序：
-    # WMI 的 AdapterRAM 在 4GB 以上会截断，混合平台（RDNA4 独显 + RDNA3 核显）
-    # 按内存排序可能先命中核显而错发 int8。
-    # 型号匹配统一用 (?!\d) 结尾而非 \b：RX 7600M / 7700S / RTX 4090D 这类
-    # 数字后紧跟字母的型号在 \b 下会漏配。
-    $bestPolicy = $null
-    foreach ($controller in $controllers) {
-        $name = [string]$controller.Name
-        $pnp = [string]$controller.PNPDeviceID
-        $vendor = if ($pnp -match '(?i)VEN_([0-9A-F]{4})') { $matches[1].ToUpperInvariant() } else { '' }
-        $mode = 'auto'
-        $reason = 'unsupported'
-
-        if ($vendor -eq '1002' -or $name -match '(?i)AMD|Radeon') {
-            $dev = if ($pnp -match '(?i)DEV_([0-9A-F]{4})') { $matches[1].ToUpperInvariant() } else { '' }
-            if ($dev -in $script:AmdFp8DevIds) {
-                $mode = 'fp8'; $reason = 'AMD RDNA4'
-            }
-            elseif ($dev -in $script:AmdRdna2DgpuDevIds) {
-                # 2026-10：RDNA2 独显不再封锁（此前落到 auto ⇒ Fsr4Update=false）
-                $mode = 'int8'; $reason = 'AMD RDNA2'
-            }
-            elseif ($dev -in $script:AmdRdna35IgpuDevIds) {
-                # 2026-10：RDNA3.5 核显不再封锁
-                $mode = 'int8'; $reason = 'AMD RDNA3.5 核显'
-            }
-            elseif ($dev -in $script:AmdInt8DevIds) {
-                $mode = 'int8'; $reason = 'AMD RDNA3/3.5'
-            }
-            elseif ($name -match '(?i)\bRX\s*9\d{3}(?!\d)|\bPRO\s+W9\d{3}(?!\d)') {
-                $mode = 'fp8'; $reason = 'AMD RDNA4'
-            }
-            elseif ($name -match '(?i)\bRX\s*7\d{3}(?!\d)|\bPRO\s+W7\d{3}(?!\d)|\b(7[468]0|8[4689]0)M\b|\b80[456]0S\b') {
-                $mode = 'int8'; $reason = 'AMD RDNA3/3.5'
-            }
-            elseif ($name -match '(?i)\bRX\s*6\d{3}(?!\d)') {
-                $mode = 'int8'; $reason = 'AMD RDNA2'
-            }
-        }
-        elseif ($vendor -eq '10DE' -or $name -match '(?i)NVIDIA|GeForce') {
-            $dev = if ($pnp -match '(?i)DEV_([0-9A-F]{4})') { $matches[1].ToUpperInvariant() } else { '' }
-            if ($dev -in $script:NvidiaInt8DevIds) {
-                $mode = 'int8'; $reason = 'NVIDIA 16-50 系'
-            }
-            elseif ($name -match '(?i)\bRTX\s*(20|30|40|50)\d{2}(?!\d)' -or
-                $name -match '(?i)\bGTX\s*16\d{2}(?!\d)') {
-                $mode = 'int8'; $reason = 'NVIDIA RTX 20+ / GTX 16 Turing'
-            }
-        }
-        elseif ($vendor -eq '8086' -or $name -match '(?i)Intel') {
-            $dev = if ($pnp -match '(?i)DEV_([0-9A-F]{4})') { $matches[1].ToUpperInvariant() } else { '' }
-            $devInt = if ($dev -ne '') { [Convert]::ToInt32($dev, 16) } else { -1 }
-            if (($devInt -ge 0x5600 -and $devInt -le 0x56FF) -or ($devInt -ge 0xE200 -and $devInt -le 0xE2FF)) {
-                $mode = 'int8'; $reason = 'Intel Arc'
-            }
-            elseif ($name -match '(?i)\bArc\b') {
-                $mode = 'int8'; $reason = 'Intel Arc'
-            }
-        }
-
-        if ($mode -eq 'auto') { continue }
-        $candidate = [pscustomobject]@{
-            Mode = $mode
-            Reason = $reason
-            Name = $name
-            Vendor = $vendor
-            PnpDeviceId = $pnp
-        }
-        if ($null -eq $bestPolicy -or ($mode -eq 'fp8' -and $bestPolicy.Mode -ne 'fp8')) {
-            $bestPolicy = $candidate
-        }
-    }
-    if ($null -ne $bestPolicy) { return $bestPolicy }
-
-    return [pscustomobject]@{
-        Mode = 'auto'
-        Reason = 'no whitelist match'
-        Name = ''
-        Vendor = ''
-        PnpDeviceId = ''
-    }
-}
-
 function Set-Fsr4GpuPolicy {
     param([string]$Path)
-    $policy = Get-Fsr4GpuPolicy
-    $supported = $policy.Mode -ne 'auto'
-    Set-IniValue -Path $Path -Section 'FSR' -Key 'Fsr4Update' -Value ($(if ($supported) { 'true' } else { 'false' }))
-    Set-IniValue -Path $Path -Section 'FSR' -Key 'UpscalerIndex' -Value ($(if ($supported) { '0' } else { 'auto' }))
-    Set-IniValue -Path $Path -Section 'FSR' -Key 'Fsr4ForceEnableInt8' -Value ($(if ($policy.Mode -eq 'int8') { 'true' } else { 'false' }))
+    # 2026-11-08：安装脚本**不再按显卡型号判定 FSR4 支持**。三键一律 auto，
+    # 由 OptiScaler 自己问驱动决定（新架构/新驱动不需要等脚本更新）。
+    Set-IniValue -Path $Path -Section 'FSR' -Key 'Fsr4Update' -Value 'auto'
+    Set-IniValue -Path $Path -Section 'FSR' -Key 'UpscalerIndex' -Value 'auto'
+    Set-IniValue -Path $Path -Section 'FSR' -Key 'Fsr4ForceEnableInt8' -Value 'auto'
     Set-IniValue -Path $Path -Section 'FSR' -Key 'FsrNonLinearColorSpace' -Value 'true'
-    $name = if ([string]::IsNullOrWhiteSpace($policy.Name)) { 'unknown' } else { $policy.Name }
-    Write-Host "FSR4 GPU policy: $($policy.Mode) / $($policy.Reason) / $name" -ForegroundColor Cyan
-    return $policy
+    Write-Host 'FSR4 策略: auto（交由 OptiScaler 按显卡自行判定）' -ForegroundColor DarkGray
+    return [pscustomobject]@{ Mode = 'auto'; Reason = 'delegated to OptiScaler'; Name = '' }
 }
 
 function Set-OptiScalerManagedSettings {
     param([string]$Path)
     # OptiScaler.ini 托管设置（与芙芙 bootstrap 保持一致）：
-    #   - FSR4 策略（Fsr4Update/UpscalerIndex/Fsr4ForceEnableInt8/FsrNonLinearColorSpace）
+    #   - FSR4 三键固定 auto（不按显卡型号判定，交给 OptiScaler）+ FsrNonLinearColorSpace
     #   - Spoofing.Dxgi=false（原神无 DLSS 场景——A 卡不伪装成 N 卡，防副作用）
     #   - Libraries.OptiDllPath 绝对路径
     #     ⚠️ 2026-09-20：必须是**超分组件实际所在目录**，不是 ini 所在目录。

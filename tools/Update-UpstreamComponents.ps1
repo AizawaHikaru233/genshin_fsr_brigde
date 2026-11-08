@@ -1,7 +1,7 @@
 ﻿[CmdletBinding()]
 param(
     [string]$WorkspaceRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $PSCommandPath) '..')),
-    [ValidateSet('All', 'OptiScaler', 'Dlss', 'ReShade', 'FpsUnlocker')]
+    [ValidateSet('All', 'OptiScaler', 'Dlss', 'ReShade', 'FpsUnlocker', 'FfxSdk')]
     [string]$Component = 'All'
 )
 
@@ -16,6 +16,7 @@ $optiRuntime = Join-Path $sharedRoot 'OptiScaler\runtime'
 $dlssRuntime = Join-Path $sharedRoot 'NVIDIA\DLSS'
 $fpsRuntime = Join-Path $sharedRoot 'FpsUnlocker\runtime'
 $reshadeRuntime = Join-Path $sharedRoot 'ReShade\runtime'
+$ffxRuntime = Join-Path $sharedRoot 'AMD'
 $versionsPath = Join-Path $sharedRoot 'upstream-versions.json'
 $userAgent = 'GenshinFsrBridge-UpstreamUpdater'
 
@@ -25,6 +26,8 @@ $userAgent = 'GenshinFsrBridge-UpstreamUpdater'
 #   - DLSS         : NVIDIA Streamline 最新正式版（提取 nvngx_dlss.dll + license）
 #   - ReShade      : reshade.me 官方最新正式版（Setup exe 提取 ReShade64.dll）
 #   - FPS Unlocker : 34736384/genshin-fps-unlock 最新正式版
+#   - FFX SDK      : GPUOpen-LibrariesAndSDKs/FidelityFX-SDK 最新 tag（AMD 官方渠道，
+#                    取 Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_dx12.dll + 许可证）
 #   - RenoDX       : 闭源组件，作者书面授权随包分发，不自动获取
 # 每次构建前运行本脚本更新 SharedResources 并生成 upstream-versions.json，
 # 安装脚本按同一基线下载缺失组件（不自由追 latest）。
@@ -294,22 +297,62 @@ function Update-ReShade {
     }
 }
 
+function Update-FfxSdk {
+    # FFX 运行时只认 AMD 官方渠道：FidelityFX-SDK 的 release tag（signedbin 是 AMD 签名版）。
+    Write-Host '--- FFX SDK (AMD 官方 release) ---' -ForegroundColor Cyan
+    $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases/latest' -Headers @{ 'User-Agent' = $userAgent } -TimeoutSec 60
+    $tag = [string]$release.tag_name
+    if ([string]::IsNullOrWhiteSpace($tag)) { throw '无法解析 FidelityFX-SDK 最新 tag。' }
+    $rawRoot = "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/$tag"
+    $work = Join-Path $env:TEMP ("GenshinUpstream-Ffx-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $work | Out-Null
+    try {
+        $dll = Join-Path $work 'amd_fidelityfx_upscaler_dx12.dll'
+        Write-Host "下载 FFX SDK $tag (signedbin/amd_fidelityfx_upscaler_dx12.dll)..."
+        Invoke-Download -Url "$rawRoot/Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_dx12.dll" -Destination $dll
+        # AMD 签名版：验签失败直接中止（这是"确实来自 AMD 官方渠道"的凭据）。
+        $sig = Get-AuthenticodeSignature -LiteralPath $dll
+        if ($sig.Status -ne [Management.Automation.SignatureStatus]::Valid) {
+            throw "FFX 运行时签名无效（status=$($sig.Status)），已中止。"
+        }
+        Write-Host "  签名者: $($sig.SignerCertificate.Subject)" -ForegroundColor DarkGray
+        New-Item -ItemType Directory -Force -Path $ffxRuntime | Out-Null
+        Copy-Item -LiteralPath $dll -Destination (Join-Path $ffxRuntime 'amd_fidelityfx_upscaler_dx12.dll') -Force
+        $licenseTarget = Join-Path $ffxRuntime 'FidelityFX-SDK-LICENSE.md'
+        foreach ($candidate in @('LICENSE.md', 'LICENSE', 'Kits/FidelityFX/LICENSE.md')) {
+            try {
+                Invoke-Download -Url "$rawRoot/$candidate" -Destination $licenseTarget
+                break
+            }
+            catch { }
+        }
+        $dllHash = Get-FileSha256 -Path (Join-Path $ffxRuntime 'amd_fidelityfx_upscaler_dx12.dll')
+        $dllVersion = [string](Get-Item -LiteralPath (Join-Path $ffxRuntime 'amd_fidelityfx_upscaler_dx12.dll')).VersionInfo.FileVersion
+        Write-Host "FFX 运行时已更新 ($tag, FileVersion=$dllVersion, SHA256=$dllHash)" -ForegroundColor Green
+        return [pscustomobject]@{ Tag = $tag; DllVersion = $dllVersion; DllSha256 = $dllHash }
+    }
+    finally {
+        if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+    }
+}
+
 # ---------------------------------------------------------------------------
 
 Write-Host '==============================================' -ForegroundColor Cyan
 Write-Host " 更新上游组件到 SharedResources（构建基线）[$Component]" -ForegroundColor Cyan
 Write-Host '==============================================' -ForegroundColor Cyan
 
-$opti = $null; $dlss = $null; $fps = $null; $reshade = $null
+$opti = $null; $dlss = $null; $fps = $null; $reshade = $null; $ffx = $null
 if ($Component -in @('All', 'OptiScaler')) { $opti = Update-OptiScaler }
 if ($Component -in @('All', 'Dlss')) { $dlss = Update-Dlss }
 if ($Component -in @('All', 'FpsUnlocker')) { $fps = Update-FpsUnlocker }
 if ($Component -in @('All', 'ReShade')) { $reshade = Update-ReShade }
+if ($Component -in @('All', 'FfxSdk')) { $ffx = Update-FfxSdk }
 
 # RenoDX：闭源，作者书面授权随包分发（NOTICE-RenoDX-genshin.txt + permission.png 归档于
 # SharedResources\ReShade\runtime\reshade-shaders\），不自动获取。
 $renodx = [pscustomobject]@{
-    Version = '0.2026.0714.1910'
+    Version = '0.2026.1012.0135'
     Source  = 'authorized-redistribution'
 }
 
@@ -322,6 +365,7 @@ if ($null -eq $opti -and $null -ne $existing) { $opti = $existing.optiscaler }
 if ($null -eq $dlss -and $null -ne $existing) { $dlss = $existing.dlss }
 if ($null -eq $fps -and $null -ne $existing) { $fps = $existing.fpsunlock }
 if ($null -eq $reshade -and $null -ne $existing -and $null -ne $existing.reshade) { $reshade = $existing.reshade }
+if ($null -eq $ffx -and $null -ne $existing -and $null -ne $existing.ffx) { $ffx = $existing.ffx }
 
 $versions = [ordered]@{
     generatedAt = [DateTime]::UtcNow.ToString('o')
@@ -329,9 +373,28 @@ $versions = [ordered]@{
     dlss        = $dlss
     fpsunlock   = $fps
     reshade     = $reshade
+    ffx         = $ffx
     renodx      = $renodx
 }
 $versions | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $versionsPath -Encoding UTF8
+
+# 自检：清单里写的哈希必须与**刚落盘的文件**一致。
+# GUI 的下载校验、打包脚本的"清单 ↔ 包内实物"断言都以这份清单为准 ⇒ 这里不一致就立刻失败。
+$selfChecks = @(
+    @{ Path = (Join-Path $dlssRuntime 'nvngx_dlss.dll'); Expected = [string]$versions.dlss.DllSha256; Label = 'nvngx_dlss.dll' },
+    @{ Path = (Join-Path $reshadeRuntime 'ReShade64.dll'); Expected = [string]$versions.reshade.DllSha256; Label = 'ReShade64.dll' },
+    @{ Path = (Join-Path $fpsRuntime 'unlockfps_nc.exe'); Expected = [string]$versions.fpsunlock.Sha256; Label = 'unlockfps_nc.exe' },
+    @{ Path = (Join-Path $ffxRuntime 'amd_fidelityfx_upscaler_dx12.dll'); Expected = [string]$versions.ffx.DllSha256; Label = 'amd_fidelityfx_upscaler_dx12.dll (FFX)' }
+)
+foreach ($item in $selfChecks) {
+    if ([string]::IsNullOrWhiteSpace($item.Expected)) { throw "清单自检失败：$($item.Label) 没有 SHA-256" }
+    if (-not (Test-Path -LiteralPath $item.Path -PathType Leaf)) { throw "清单自检失败：找不到 $($item.Path)" }
+    $actual = (Get-FileHash -LiteralPath $item.Path -Algorithm SHA256).Hash
+    if (-not [string]::Equals($actual, $item.Expected, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "清单自检失败：$($item.Label) 清单 $($item.Expected)，实际 $actual"
+    }
+    Write-Host "  清单自检通过: $($item.Label)" -ForegroundColor DarkGray
+}
 Write-Host ''
 Write-Host "上游版本基线已写入: $versionsPath" -ForegroundColor Green
 if ($null -ne $opti) { Write-Host "  OptiScaler : $($opti.Tag) (FileVersion $($opti.FileVersion))" }
