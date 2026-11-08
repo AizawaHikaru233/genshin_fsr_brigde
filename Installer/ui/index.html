@@ -920,6 +920,22 @@
     </div>
   </div>
 </div>
+<div class="modal" id="dlssmodal" hidden>
+  <div class="modalscrim" id="dlssscrim"></div>
+  <div class="modalbox" role="dialog" aria-modal="true" aria-labelledby="dlsstitle" style="width:500px">
+    <header class="modalhead">
+      <h2 id="dlsstitle">NVIDIA DLSS 组件缺失</h2>
+      <button class="cap cap-close" id="dlssclose" aria-label="关闭" title="关闭">
+        <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.1"><path d="M.6.6l8.8 8.8M9.4.6L.6 9.4"/></svg>
+      </button>
+    </header>
+    <div class="warnbody" id="dlssbody"></div>
+    <div class="warnfoot">
+      <button class="ghost" id="dlssopen">打开目录</button>
+      <button class="primary" id="dlssok">确认</button>
+    </div>
+  </div>
+</div>
 <div class="modal" id="upmodal" hidden>
   <div class="modalscrim" id="upscrim"></div>
   <div class="modalbox" role="dialog" aria-modal="true" aria-labelledby="upmtitle">
@@ -1833,14 +1849,33 @@
       : T('RDNA3.5 核显', 'RDNA3.5 integrated GPU');
     var min = msg.minDriver || '26.10.1';
     $('#drvbody').textContent = T(
-      '检测到 ' + gpu + '（' + plat + '）。本包已为这块显卡启用 FSR4；要开启官方 FSR4 支持，请把 AMD 显卡驱动更新到 Adrenalin ' + min + ' 或以上版本。驱动低于该版本时只能走 FSR4 INT8 兼容路径。',
-      'Detected ' + gpu + ' (' + plat + '). FSR4 is enabled for this GPU. For official FSR4 support, update the AMD driver to Adrenalin ' + min + ' or newer; older drivers can only use the FSR4 INT8 compatibility path.'
+      '检测到 ' + gpu + '（' + plat + '）。FSR4 是否启用由 OptiScaler 按驱动自行判断；要开启官方 FSR4 支持，请把 AMD 显卡驱动更新到 Adrenalin ' + min + ' 或以上版本。驱动低于该版本时只能走 FSR4 INT8 兼容路径。',
+      'Detected ' + gpu + ' (' + plat + '). Whether FSR4 is on is decided by OptiScaler (based on the driver). For official FSR4 support, update the AMD driver to Adrenalin ' + min + ' or newer; older drivers can only use the FSR4 INT8 compatibility path.'
     );
     $('#drvmodal').hidden = false;
   }
 
   function closeDrvNotice(){
     $('#drvmodal').hidden = true;
+  }
+
+  // DLSS 运行时补不齐：弹窗（给出目标路径 + 一键打开目录，用户可手放）
+  var dlssTargetDir = '';
+  function showDlssError(msg){
+    dlssTargetDir = msg.target || '';
+    $('#dlssbody').textContent = T(
+      'OptiScaler 需要 NVIDIA DLSS 运行时（nvngx_dlss.dll），但自动补齐失败：' + (msg.message || '未知原因') +
+        '。目标位置：' + (msg.target || '未知') +
+        '。可点「打开目录」后手动放入该文件，或稍后重试。',
+      'OptiScaler needs the NVIDIA DLSS runtime (nvngx_dlss.dll) but it could not be installed: ' + (msg.message || 'unknown error') +
+        '. Target: ' + (msg.target || 'unknown') +
+        '. Use "Open folder" to place the file manually, or try again later.'
+    );
+    $('#dlssmodal').hidden = false;
+  }
+
+  function closeDlssError(){
+    $('#dlssmodal').hidden = true;
   }
 
   function toggle(id, row){
@@ -2024,7 +2059,7 @@
   });
 
   document.addEventListener('click', function(){ closePicker(); });
-  document.addEventListener('keydown', function(e){ if (e.key === 'Escape'){ closePicker(); closeWarn(false, false); closeUpdate(); closeDrvNotice(); } });
+  document.addEventListener('keydown', function(e){ if (e.key === 'Escape'){ closePicker(); closeWarn(false, false); closeUpdate(); closeDrvNotice(); closeDlssError(); } });
 
   /* ── 主界面：主页上的整块配置 ── */
 
@@ -2255,6 +2290,10 @@ $('#warnok').addEventListener('click', function(){ closeWarn(true, false); });
 $('#warnnever').addEventListener('click', function(){ closeWarn(true, true); });
 $('#warnclose').addEventListener('click', function(){ closeWarn(false, false); });
 $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); });
+  $('#dlssok').addEventListener('click', closeDlssError);
+  $('#dlssclose').addEventListener('click', closeDlssError);
+  $('#dlssscrim').addEventListener('click', closeDlssError);
+  $('#dlssopen').addEventListener('click', function(){ host.send({type:'openPath', what:'opti'}); });
   $('#drvok').addEventListener('click', closeDrvNotice);
   $('#drvclose').addEventListener('click', closeDrvNotice);
   $('#drvscrim').addEventListener('click', closeDrvNotice);
@@ -2589,6 +2628,7 @@ $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); }
     else if (msg.type === 'progress'){ onProgress(msg); }
     else if (msg.type === 'installed'){ onInstalled(msg); }
     else if (msg.type === 'fsr4DriverNotice'){ showDrvNotice(msg); }
+    else if (msg.type === 'dlssError'){ showDlssError(msg); }
     else if (msg.type === 'unlock'){ onUnlock(msg); }
     else if (msg.type === 'windowstate'){
       state.maximized = !!msg.maximized;
@@ -2749,7 +2789,7 @@ $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); }
 
   /* 英文词表：键是中文原文，动态拼出来的句子走下面的模式表 */
   var EN_EXACT = {
-    '显卡兼容性提示':'Graphics compatibility', '显卡驱动提示':'Graphics driver notice', '不再提醒':'Don’t remind again', '确认':'OK',
+    '显卡兼容性提示':'Graphics compatibility', '显卡驱动提示':'Graphics driver notice', 'NVIDIA DLSS 组件缺失':'NVIDIA DLSS runtime missing', '不再提醒':'Don’t remind again', '确认':'OK',
     'NVIDIA 显卡在使用 TextureLoader 加载纹理贴图时，极大概率会导致贴图渲染丢失；也有小概率完全正常、与 AMD 显卡表现一致，原因未知。':'On NVIDIA GPUs, loading textures through TextureLoader very often makes textures disappear; occasionally it works fine, just like on AMD. The cause is unknown.',
     'NVIDIA 显卡上 ReShade 与 OptiScaler 同时启用，可能存在不稳定现象。':'On NVIDIA GPUs, running ReShade and OptiScaler at the same time may be unstable.',    '主页':'Home', '插件配置':'Plugins', '设置':'Settings', '关于':'About',
     '已配置':'Configured', '未配置':'Not configured',

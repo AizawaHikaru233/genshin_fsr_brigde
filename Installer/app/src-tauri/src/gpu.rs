@@ -13,12 +13,6 @@ pub enum Mode {
     Fp8,
 }
 
-impl Mode {
-    pub fn supported(self) -> bool {
-        !matches!(self, Mode::Auto)
-    }
-}
-
 /// 判定命中的显卡平台。FSR4 托管键与界面提示共用同一份结果，不会各判一套。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -54,13 +48,6 @@ impl Platform {
             Platform::Other => "other",
         }
     }
-}
-
-pub struct Policy {
-    pub mode: Mode,
-    pub reason: &'static str,
-    pub platform: Platform,
-    pub name: String,
 }
 
 struct Controller {
@@ -237,9 +224,8 @@ fn intel(device: u16, name: &str) -> (Mode, &'static str, Platform) {
 pub struct Info {
     /// nvidia | amd | intel | other
     pub vendor: &'static str,
-    /// FSR4 策略（Auto = 不支持）
+    /// FSR4 策略（Auto = 不支持；2026-11-08 起安装器不再据此写任何键）
     pub mode: Mode,
-    pub reason: &'static str,
     /// 命中的平台（Auto 时是 Other，核显等不启用 FSR4 的平台按实际填）
     pub platform: Platform,
     pub name: String,
@@ -276,10 +262,10 @@ fn compute_info() -> Info {
             Some(current) => mode == Mode::Fp8 && current.mode != Mode::Fp8,
         };
         if better {
+            let _ = reason;
             best = Some(Info {
                 vendor: vendor_of(controller),
                 mode,
-                reason,
                 platform,
                 name: controller.name.clone(),
             });
@@ -288,7 +274,6 @@ fn compute_info() -> Info {
     best.unwrap_or_else(|| Info {
         vendor: all.first().map(vendor_of).unwrap_or("other"),
         mode: Mode::Auto,
-        reason: "no whitelist match",
         platform: Platform::Other,
         name: String::new(),
     })
@@ -296,17 +281,6 @@ fn compute_info() -> Info {
 
 pub fn info() -> &'static Info {
     INFO.get_or_init(compute_info)
-}
-
-/// 遍历全部显卡取最优策略（fp8 优先于 int8）。
-pub fn policy() -> Policy {
-    let i = info();
-    Policy {
-        mode: i.mode,
-        reason: i.reason,
-        platform: i.platform,
-        name: i.name.clone(),
-    }
 }
 
 /// 主显卡厂商，界面上用来提示「N 卡 + 某些组件的已知问题」。

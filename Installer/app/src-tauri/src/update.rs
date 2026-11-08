@@ -94,6 +94,12 @@ pub fn apply(s: &mut Settings, report: Report) -> Result<Value, String> {
 
     let archive = tmp.join(&rel.name);
     let size = fetch::download_mirrored(&rel.url, &archive, "插件包", report)?;
+    // 只认 GitHub API 给的 sha256 摘要：没有摘要就拒绝安装。
+    let expected = rel
+        .sha256
+        .as_ref()
+        .ok_or_else(|| "GitHub 没有给该附件提供 SHA-256 摘要，已拒绝安装未校验的压缩包".to_string())?;
+    crate::verify::check_sha256(&archive, expected, "插件包")?;
     report(&format!("已下载 {}，正在解压", crate::fetch::human(size)));
 
     let extracted = tmp.join("x");

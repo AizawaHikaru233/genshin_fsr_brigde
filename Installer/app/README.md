@@ -140,8 +140,9 @@ GenshinFSRBridge\
 > 只按本机实际位置校正 OptiScaler 的 `OptiDllPath`、ReShade 的 `AddonPath` / `EffectSearchPaths` /
 > `TextureSearchPaths`（`PresetPath` / `SavePath` 仅在为空时补），以及 `fps_config.json` 的
 > `GamePath` / `DllList`，顺手把已经不存在的条目清掉。
-> **功能键一律不动**：`Ffx12AsyncUpscale`、`Fsr4Update` / `UpscalerIndex` / `Fsr4ForceEnableInt8` /
-> `FsrNonLinearColorSpace` / `Spoofing.Dxgi` / `Log.*` / `FrameGen.*`、`FPSTarget` / `UseHDR`、
+> **功能键一律不动**：`Ffx12AsyncUpscale`、`Fsr4Update` / `UpscalerIndex` / `Fsr4ForceEnableInt8`
+> （安装时固定写 `auto`，见下文「FSR4 由谁决定」）/ `FsrNonLinearColorSpace` / `Spoofing.Dxgi` /
+> `Log.*` / `FrameGen.*`、`FPSTarget` / `UseHDR`、
 > 解帧工具的各个开关都保持现状 —— 那些是「安装 / 保存」与「恢复默认设置」的事。
 > 值没变的文件不落盘；不创建缺失的 ini；也不碰游戏目录的 `ReShadePreset.ini`。
 > 组件文件本身不复制；没有游戏目录时只修 payload 内那几份。
@@ -280,9 +281,12 @@ Windows 的 `curl.exe` 并不保证存在（本机 `System32` 里就没有）。
     `suppressWarnings`（那是"用户点的不再提醒"，语义不同）。
   - 平台判定与 FSR4 托管键同源（`gpu::needs_fsr4_driver_notice()` ← `gpu::info().platform`），
     混合机型（RDNA4 独显 + RDNA3.5 核显）按"最优那张卡"算，不会误弹。
-- 显卡厂商与 FSR4 策略来自同一个 `gpu::info()`（开机算一次并缓存）：`install::apply` 写
-  `OptiScaler.ini` 的 `Fsr4Update` / `UpscalerIndex` / `Fsr4ForceEnableInt8` 用它，界面提示也用它的
-  `vendor`，不会出现两边判断不一致。
-- 档位判定收在纯函数 `gpu::classify_device(vendor, device, name)`：RDNA4 独显 → `Fp8`；RDNA3 独显、
-  RDNA3/3.5 核显、**RDNA2 独显**、N 卡 16-50 系、Intel Arc → `Int8`；RDNA2 核显与未知卡 → `Auto`
-  （2026-10 起 RDNA2 独显 / RDNA3.5 核显不再落 `Auto`，即不再封锁 FSR4）。
+- **FSR4 由谁决定（2026-11-08 起）**：安装器**不再按显卡型号判定 FSR4 支持**。`install::apply` 把
+  `OptiScaler.ini` 的 `Fsr4Update` / `UpscalerIndex` / `Fsr4ForceEnableInt8` **一律写成 `auto`**，
+  由 OptiScaler 自己问驱动决定是否启用（新架构/新驱动不需要等安装器更新）。
+  - 旧 PS1 流程（`Configure.ps1` 的 `Set-Fsr4GpuPolicy`）与芙芙 bootstrap 同步改成同一口径。
+  - `gpu::info()` 现在只用于**三件事**：`vendor` 界面提示、是否部署 DLSS 运行时（`has_rtx`）、
+    是否强制桥的同步交叠（`has_rdna2`）。`policy()` / `Mode::supported` 已删除。
+- 档位判定仍收在纯函数 `gpu::classify_device(vendor, device, name)`（只供上面三件事与驱动提示弹窗用）：
+  RDNA4 独显 → `Fp8`；RDNA3 独显、RDNA3/3.5 核显、**RDNA2 独显**、N 卡 16-50 系、Intel Arc → `Int8`；
+  RDNA2 核显与未知卡 → `Auto`。**它不再参与写任何 OptiScaler 键**。

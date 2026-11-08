@@ -19,7 +19,6 @@ use crate::{paths, pkg};
 
 use std::fs;
 
-const RESHADE_SETUP_URL: &str = "https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe";
 const RELEASE_API: &str =
     "https://api.github.com/repos/AizawaHikaru233/genshin_fsr_brigde/releases/latest";
 /// 与旧脚本 Configure.ps1 相同的候选线路：直连 + 三个 GitHub 加速前缀。
@@ -331,6 +330,8 @@ pub struct Release {
     pub tag: String,
     pub name: String,
     pub url: String,
+    /// GitHub API 给该附件的 sha256 摘要（缺失时调用方必须拒绝安装）。
+    pub sha256: Option<String>,
 }
 
 /// 查 GitHub 最新 release：版本号 + 优先 7z 的整包地址。走系统代理与加速线路。
@@ -367,7 +368,7 @@ fn latest_release_matching(api: &str, score: &dyn Fn(&str) -> u8) -> Result<Rele
     let assets = json["assets"]
         .as_array()
         .ok_or_else(|| "最新 release 里没有附件".to_string())?;
-    let mut best: Option<(u8, String, String)> = None;
+    let mut best: Option<(u8, String, String, Option<String>)> = None;
     for asset in assets {
         let (Some(name), Some(url)) = (
             asset["name"].as_str(),
@@ -379,19 +380,31 @@ fn latest_release_matching(api: &str, score: &dyn Fn(&str) -> u8) -> Result<Rele
         if asset_score == 0 {
             continue;
         }
+        let digest = asset["digest"]
+            .as_str()
+            .map(|v| v.trim().trim_start_matches("sha256:").to_uppercase())
+            .filter(|v| v.len() == 64);
         if best.as_ref().map(|b| asset_score > b.0).unwrap_or(true) {
-            best = Some((asset_score, name.to_string(), url.to_string()));
+            best = Some((asset_score, name.to_string(), url.to_string(), digest));
         }
     }
     match best {
-        Some((_, name, url)) => Ok(Release { tag, name, url }),
+        Some((_, name, url, sha256)) => Ok(Release { tag, name, url, sha256 }),
         None => Err("最新 release 里没有可用的附件".to_string()),
     }
 }
 
 /// 从 GitHub 最新 release 里挑一个整包（优先 7z，其次 zip）。
-fn release_asset() -> Result<(String, String), String> {
-    latest_release().map(|r| (r.url, r.name))
+fn release_asset() -> Result<Release, String> {
+    latest_release()
+}
+
+/// 校验从本项目 GitHub release 下载的整包：只认 API 给的 sha256 摘要（缺就失败关闭）。
+fn verify_release_archive(rel: &Release, archive: &Path) -> Result<(), String> {
+    let expected = rel.sha256.as_ref().ok_or_else(|| {
+        "GitHub 没有给该附件提供 SHA-256 摘要，已拒绝安装未校验的压缩包".to_string()
+    })?;
+    crate::verify::check_sha256(archive, expected, "插件包")
 }
 
 /* ── 解压 ── */
@@ -538,12 +551,19 @@ pub fn fetch_component(id: &str, settings: &Settings, report: Report) -> Result<
     let payload = paths::payload_dir();
     let reshade_dll = payload.join("ReShade\\ReShade64.dll");
     if id == "reshade" && !reshade_dll.is_file() {
+        // 期望值全部来自包内清单；清单缺失/下不到预期文件就失败关闭。
+        let (setup_url, setup_sha, dll_sha) = crate::manifest::reshade_expectation()?;
         report("正在从 ReShade 官网下载官方安装器…");
         let dir = temp_dir("reshade")?;
         let setup = dir.join("ReShade_Setup.exe");
-        download_direct(RESHADE_SETUP_URL, &setup, " ReShade 官方安装器", report)?;
+        download_direct(&setup_url, &setup, " ReShade 官方安装器", report)?;
+        crate::verify::check_sha256(&setup, &setup_sha, "ReShade 官方安装器")?;
         report("正在从官方安装器里解出 ReShade64.dll…");
         extract_reshade_dll(&setup, &reshade_dll)?;
+        if let Some(expected) = dll_sha.as_deref() {
+            crate::verify::check_sha256(&reshade_dll, expected, "ReShade64.dll")?;
+        }
+        // ReShade 官方二进制本身不带 Authenticode 签名，这里只认清单里的 SHA-256。
         copied.push(reshade_dll.display().to_string());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -558,10 +578,11 @@ pub fn fetch_component(id: &str, settings: &Settings, report: Report) -> Result<
     }
 
     report("正在查询 GitHub Releases 里的最新整包…");
-    let (url, name) = release_asset()?;
+    let rel = release_asset()?;
     let dir = temp_dir("release")?;
-    let archive = dir.join(&name);
-    download_mirrored(&url, &archive, &format!(" {name}"), report)?;
+    let archive = dir.join(&rel.name);
+    download_mirrored(&rel.url, &archive, &format!(" {}", rel.name), report)?;
+    verify_release_archive(&rel, &archive)?;
     report("正在解压…");
     let unpacked = dir.join("unpacked");
     extract_archive(&archive, &unpacked)?;
@@ -574,8 +595,6 @@ pub fn fetch_component(id: &str, settings: &Settings, report: Report) -> Result<
 }
 
 /* ── NVIDIA DLSS 运行时（RTX 显卡 + OptiScaler 才需要） ── */
-
-const STREAMLINE_API: &str = "https://api.github.com/repos/NVIDIA-RTX/Streamline/releases/latest";
 
 /// 递归收集目录下所有 `nvngx_dlss.dll`，跳过 development 目录、优先 `bin\x64\` 下的生产版。
 fn find_nvngx_dlss(root: &Path) -> Option<PathBuf> {
@@ -613,6 +632,20 @@ fn find_nvngx_dlss(root: &Path) -> Option<PathBuf> {
     found.into_iter().next()
 }
 
+/// 把本包内置的 DLSS 运行时复制到目标目录（启动 / 保存 / 安装 / 切版本共用）。
+/// 只在 payload 里确实有文件时才动手；没有就让调用方走联网那条路。
+pub fn install_bundled(dest: &Path) -> Result<(), String> {
+    let bundled = paths::payload_dir().join("NVIDIA").join("DLSS").join("nvngx_dlss.dll");
+    if !bundled.is_file() {
+        return Err("payload 里没有 NVIDIA\\DLSS\\nvngx_dlss.dll".to_string());
+    }
+    // 包内文件也要对得上清单（防打包错、防被替换）；清单缺失则不做这项检查。
+    if let Ok((_, _, _, Some(expected))) = crate::manifest::dlss_expectation() {
+        crate::verify::check_sha256(&bundled, &expected, "内置 nvngx_dlss.dll")?;
+    }
+    copy_dlss(&bundled, dest)
+}
+
 fn copy_dlss(src: &Path, dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("无法创建目录：{e}"))?;
@@ -638,31 +671,27 @@ pub fn fetch_dlss(dest: &Path, report: Report) -> Result<String, String> {
         return Ok("payload 里已有".to_string());
     }
 
-    report("正在查询 NVIDIA Streamline 最新版本…");
-    let release = latest_release_matching(STREAMLINE_API, &|name| {
-        let lower = name.to_lowercase();
-        if lower.starts_with("streamline-sdk-v") && lower.ends_with(".zip") {
-            1
-        } else {
-            0
-        }
-    })?;
+    // 版本与摘要全部锁定在包内清单：不去"取最新"，也不接受没有摘要的下载。
+    let (tag, asset, archive_sha, dll_sha) = crate::manifest::dlss_expectation()?;
+    let url = format!(
+        "https://github.com/NVIDIA-RTX/Streamline/releases/download/{tag}/{asset}"
+    );
     let dir = temp_dir("dlss")?;
-    let archive = dir.join(&release.name);
-    download_mirrored(
-        &release.url,
-        &archive,
-        &format!(" NVIDIA DLSS（{}）", release.tag),
-        report,
-    )?;
+    let archive = dir.join(&asset);
+    download_mirrored(&url, &archive, &format!(" NVIDIA DLSS（{tag}）"), report)?;
+    crate::verify::check_sha256(&archive, &archive_sha, "NVIDIA Streamline 压缩包")?;
     report("正在解压 NVIDIA Streamline 组件包…");
     let unpacked = dir.join("unpacked");
     extract_archive(&archive, &unpacked)?;
     let dll = find_nvngx_dlss(&unpacked)
         .ok_or_else(|| "NVIDIA Streamline 官方包中没有找到 nvngx_dlss.dll".to_string())?;
+    if let Some(expected) = dll_sha.as_deref() {
+        crate::verify::check_sha256(&dll, expected, "nvngx_dlss.dll")?;
+    }
+    crate::verify::require_authenticode(&dll, "nvngx_dlss.dll")?;
     copy_dlss(&dll, dest)?;
     let _ = fs::remove_dir_all(&dir);
-    Ok(format!("Streamline {}", release.tag))
+    Ok(format!("Streamline {tag}"))
 }
 
 #[cfg(test)]

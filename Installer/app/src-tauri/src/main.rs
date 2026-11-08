@@ -11,11 +11,13 @@ mod install;
 mod launch;
 mod log;
 mod logs;
+mod manifest;
 mod paths;
 mod pkg;
 mod settings;
 mod shortcut;
 mod update;
+mod verify;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -149,22 +151,70 @@ fn reapply(app: &AppHandle) -> String {
     install::apply(&game_exe, s.fps, &selected, &s, &cancel, |_| {}).error
 }
 
-/// RTX 卡 + 勾了 OptiScaler 时补 `nvngx_dlss.dll`：它得放进 OptiScaler 的组件目录，
-/// ini 里 `NvngxDlssPath = auto` 相对那个目录解析，放根层 N 卡上找不到 DLSS。
+/// DLSS 运行时的目标位置：OptiScaler 的**组件目录**（ini 里 `NvngxDlssPath = auto`
+/// 相对它解析，放版本根层在嵌套布局下找不到）。
+fn dlss_target(s: &settings::Settings) -> Option<PathBuf> {
+    pkg::dll_path_of("opti", s)
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join("nvngx_dlss.dll"))
+}
+
+/// 只有「勾了 OptiScaler + 判定为 RTX」才需要这份运行时；GTX 16 不部署 DLSS。
+fn dlss_applicable(s: &settings::Settings) -> bool {
+    s.selected.iter().any(|id| id == "opti") && gpu::has_rtx()
+}
+
+/// 补齐失败时**弹窗**（不再只是一条 toast）：把目标路径一起给界面，用户能直接打开目录手放。
+fn report_dlss_error(app: &AppHandle, target: &Path, reason: &str) {
+    log::write(&format!("[dlss] 补齐失败: {reason}"));
+    send(
+        app,
+        json!({
+            "type": "dlssError",
+            "message": reason,
+            "target": paths::to_display(target),
+        }),
+    );
+}
+
+/// RTX 卡 + 勾了 OptiScaler 时校验并补 `nvngx_dlss.dll`。
+///
+/// 四个时机共用这一个入口：**启动 / 保存 / 安装成功 / 切换 OptiScaler 版本**。
+/// 顺序：已有 → 跳过；payload 里有 → 同步复制；都没有 → 后台下载；下载失败 → 弹窗。
 fn ensure_dlss(app: &AppHandle, s: &settings::Settings) {
-    if !s.selected.iter().any(|id| id == "opti") || !gpu::has_rtx() {
+    if !dlss_applicable(s) {
         return;
     }
-    let component_dir = pkg::dll_path_of("opti", s)
-        .parent()
-        .map(Path::to_path_buf);
-    let Some(dir) = component_dir else {
+    let Some(target) = dlss_target(s) else {
         return;
     };
-    let dest = dir.join("nvngx_dlss.dll");
-    if dest.is_file() {
+    if target.is_file() {
         return;
     }
+    if paths::payload_dir().join("NVIDIA").join("DLSS").join("nvngx_dlss.dll").is_file() {
+        match fetch::install_bundled(&target) {
+            Ok(()) => {
+                log::write(&format!(
+                    "[dlss] 已从 payload 补齐 nvngx_dlss.dll -> {}",
+                    paths::to_display(&target)
+                ));
+                let message = if i18n::current() == "zh" {
+                    "已补齐 NVIDIA DLSS 组件（payload 里已有）".to_string()
+                } else {
+                    "NVIDIA DLSS runtime installed (bundled)".to_string()
+                };
+                send(
+                    app,
+                    json!({"type": "fetch", "id": "dlss", "status": "done", "message": message}),
+                );
+            }
+            Err(err) => report_dlss_error(app, &target, &format!("复制失败：{err}")),
+        }
+        return;
+    }
+
+    // 包内没有（GitHub 发布包常态）：后台联网补齐，失败必须让用户看见。
     let app_handle = app.clone();
     std::thread::spawn(move || {
         let reporter = app_handle.clone();
@@ -174,7 +224,7 @@ fn ensure_dlss(app: &AppHandle, s: &settings::Settings) {
                 json!({"type": "fetch", "id": "dlss", "status": "working", "message": text}),
             );
         };
-        match fetch::fetch_dlss(&dest, &report) {
+        match fetch::fetch_dlss(&target, &report) {
             Ok(source) => {
                 log::write(&format!("[dlss] 已补齐 nvngx_dlss.dll（{source}）"));
                 let message = if i18n::current() == "zh" {
@@ -187,13 +237,7 @@ fn ensure_dlss(app: &AppHandle, s: &settings::Settings) {
                     json!({"type": "fetch", "id": "dlss", "status": "done", "message": message}),
                 );
             }
-            Err(err) => {
-                log::write(&format!("[dlss] 补齐失败: {err}"));
-                send(
-                    &app_handle,
-                    json!({"type": "fetch", "id": "dlss", "status": "error", "message": format!("NVIDIA DLSS：{err}")}),
-                );
-            }
+            Err(err) => report_dlss_error(&app_handle, &target, &format!("下载失败：{err}")),
         }
     });
 }
@@ -895,6 +939,9 @@ fn on_open_path(app: &AppHandle, what: &str) {
         "folder" => PathBuf::from(&s.game_dir),
         "log" => paths::log_file(),
         "payload" => paths::payload_dir(),
+        "opti" => dlss_target(&s)
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| paths::payload_dir()),
         "config" => paths::config_dir(),
         _ => return,
     };
@@ -1330,6 +1377,17 @@ fn main() {
                         changed.join(" / ")
                     )),
                     Err(err) => log::write(&format!("[startup] 路径修正失败: {err}")),
+                }
+                // 与路径修正同一批次：N 卡 + 勾了 OptiScaler 时把 DLSS 运行时校验/补齐一次
+                // （缺且补不上会发 dlssError 弹窗）。
+                ensure_dlss(&heal, &s);
+                // 下载校验只认包内清单：启动时把"用的是哪份清单"记一行，便于排查。
+                match manifest::manifest_path() {
+                    Some(path) => log::write(&format!(
+                        "[verify] 版本清单: {}",
+                        paths::to_display(&path)
+                    )),
+                    None => log::write("[verify] 未找到 upstream-versions.json：联网下载将失败关闭"),
                 }
                 post_state(&heal);
             });

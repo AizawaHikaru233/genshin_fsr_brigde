@@ -381,23 +381,16 @@ fn prepare_opti(settings: &Settings) -> Result<(), String> {
         ));
     }
 
-    let policy = gpu::policy();
     let write = |section: &str, key: &str, value: &str| -> Result<(), String> {
         ini::set(&path, section, key, value)
             .map_err(|e| format!("无法写入 OptiScaler.ini（{section}.{key}）：{e}"))
     };
 
-    write("FSR", "Fsr4Update", if policy.mode.supported() { "true" } else { "false" })?;
-    write(
-        "FSR",
-        "UpscalerIndex",
-        if policy.mode.supported() { "0" } else { "auto" },
-    )?;
-    write(
-        "FSR",
-        "Fsr4ForceEnableInt8",
-        if policy.mode == gpu::Mode::Int8 { "true" } else { "false" },
-    )?;
+    // 2026-11-08：安装器**不再按显卡型号判定 FSR4 支持**，三键一律交回 OptiScaler（auto）。
+    // 显式值会把用户的 OptiScaler 设置压掉，也会让"新驱动/新架构"必须等安装器更新。
+    write("FSR", "Fsr4Update", "auto")?;
+    write("FSR", "UpscalerIndex", "auto")?;
+    write("FSR", "Fsr4ForceEnableInt8", "auto")?;
     write("FSR", "FsrNonLinearColorSpace", "true")?;
     write("Spoofing", "Dxgi", "false")?;
     // 0.9.x 是平铺（组件与主 DLL 同级），0.10 起是嵌套（组件在 OptiScaler\ 子目录）
@@ -422,13 +415,15 @@ fn prepare_opti(settings: &Settings) -> Result<(), String> {
         if version.nested { "嵌套布局" } else { "平铺布局" },
         opti_dll_path
     ));
-    log::write(&format!(
-        "FSR4 GPU policy: {:?} / {} / {} / platform={}",
-        policy.mode,
-        policy.reason,
-        policy.platform.id(),
-        if policy.name.is_empty() { "unknown" } else { &policy.name }
-    ));
+    // 只记录事实（显卡型号），不再据此下判断——FSR4 是否可用由 OptiScaler 自己问驱动。
+    {
+        let info = gpu::info();
+        log::write(&format!(
+            "FSR4 策略: auto（交由 OptiScaler 判定）· 检测到显卡: {} / platform={}",
+            if info.name.is_empty() { "unknown" } else { &info.name },
+            info.platform.id()
+        ));
+    }
     Ok(())
 }
 
