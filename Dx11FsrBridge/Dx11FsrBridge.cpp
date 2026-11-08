@@ -15,6 +15,9 @@
 #include "Il2CppCallSiteHook.h"
 #include "TransparentJitterHook.h"
 #include "Ffx12Backend.h"
+#include "NgxBackend.h"   // ngx::set_*（D13 九键）。只有 8 个 setter 有消费者；
+                          // 本头不含 NGX SDK 头，故 OFF 构型包含它也安全（REQ-08），
+                          // 但下面所有 ngx:: 调用点都被 DX11FSRBRIDGE_ENABLE_NGX 守卫。
 #include "Fsr2InputDump.h"
 #include "BridgeLogger.h"
 #include "PerfProbe.h"
@@ -4094,6 +4097,118 @@ void load_config()
     ffx12::set_async_upscale(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12AsyncUpscale", 1, config_path.c_str()) != 0);
     ffx12::set_hdr_input(g_config.ffx12_hdr_input);
+    // ---- D13 九键读取（SDS §3.13.1）：紧邻 Ffx12Hdr 的读取点 ----
+    // 此处 blog::init() 尚未执行 ⇒ 9 个 setter 只存值、一行日志都不打；
+    // 唯一需要输出的是非法值告警，它先进 pending_warnings，由 initialize() 回放。
+    //
+    // ⚠️ Ffx12Backend 只接受**精确小写**的 native / ngx：不 tolower、不 trim。
+    //    缺键（lpDefault=L"native"）与显式 native ⇒ native 且不告警；
+    //    显式空值 / NGX / Native / 拼错 ⇒ native + backend_invalid 告警。
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+    // ---- 键 1：Ffx12Backend（唯一走 ffx12 命名空间的键——不存在 ngx::set_backend）----
+    wchar_t backend_buf[64] {};
+    GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Backend", L"native",
+                             backend_buf, static_cast<DWORD>(std::size(backend_buf)),
+                             config_path.c_str());
+    const std::wstring backend_value(backend_buf);
+    const bool ngx_mode = (backend_value == L"ngx");
+    const bool native_mode = (backend_value == L"native");
+    if (!ngx_mode && !native_mode)
+        g_config.logging.pending_warnings.emplace_back(
+            "ngx_core backend=native config_warn bits=backend_invalid");
+    ffx12::set_backend(ngx_mode ? ffx12::BackendKind::Ngx : ffx12::BackendKind::Native);
+
+    // ---- 键 2：NgxApplicationId（uint64；0 → 1337，warn 位由 set_ 内部记）----
+    wchar_t appid_buf[32] {};
+    GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxApplicationId", L"1337",
+                             appid_buf, static_cast<DWORD>(std::size(appid_buf)),
+                             config_path.c_str());
+    const unsigned long long appid =
+        static_cast<unsigned long long>(_wcstoui64(appid_buf, nullptr, 10));
+    ngx::set_application_id(appid);
+
+    // ---- 键 3：NgxFeatureDirs（分号分隔；空 = 自动探测）----
+    wchar_t dirs_buf[2048] {};
+    GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxFeatureDirs", L"",
+                             dirs_buf, static_cast<DWORD>(std::size(dirs_buf)),
+                             config_path.c_str());
+    std::vector<std::wstring> ngx_dirs;   // 空 vector = 让 ensure_init 走自动探测
+    if (dirs_buf[0] != L'\0')
+    {
+        const std::wstring all(dirs_buf);
+        std::size_t pos = 0;
+        while (pos <= all.size())
+        {
+            const std::size_t sep = all.find(L';', pos);
+            const std::size_t end = (sep == std::wstring::npos) ? all.size() : sep;
+            if (end > pos) ngx_dirs.emplace_back(all, pos, end - pos);
+            if (sep == std::wstring::npos) break;
+            pos = sep + 1;
+        }
+    }
+    ngx::set_feature_dirs(ngx_dirs);
+
+    // ---- 键 4：NgxHdr（T-8 三态：auto / 1 / 0；默认 auto）----
+    // auto = 自动探测（**三级**：① swapchain color space > ② swapchain 缓冲格式 > ③ 输入纹理格式）；
+    // 1 = 强制 HDR；0 = 强制 SDR。旧配置写 1/0 仍然有效。
+    {
+        wchar_t hdr_buf[32] {};
+        GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxHdr", L"auto",
+                                 hdr_buf, static_cast<DWORD>(std::size(hdr_buf)),
+                                 config_path.c_str());
+        std::wstring hdr_s(hdr_buf);
+        // trim 两侧空白
+        const auto b = hdr_s.find_first_not_of(L" \t");
+        const auto e = hdr_s.find_last_not_of(L" \t");
+        hdr_s = (b == std::wstring::npos) ? std::wstring() : hdr_s.substr(b, e - b + 1);
+        for (auto &ch : hdr_s) ch = static_cast<wchar_t>(towlower(ch));
+        int hdr_mode = 0;   // auto
+        if (hdr_s == L"1" || hdr_s == L"true" || hdr_s == L"on")       hdr_mode = 1;
+        else if (hdr_s == L"0" || hdr_s == L"false" || hdr_s == L"off") hdr_mode = 2;
+        // 其它（含 "auto"、空、无法识别）一律 auto
+        ngx::set_hdr_mode(hdr_mode);
+    }
+
+    // ---- 键 5：NgxRenderPreset（默认 12 = L）----
+    const int ngx_preset =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxRenderPreset", 12, config_path.c_str());
+    ngx::set_render_preset(ngx_preset);
+
+    // ---- 键 6：NgxSetFrameTimeDelta（默认 1）----
+    const int ngx_dt =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxSetFrameTimeDelta", 1, config_path.c_str());
+    ngx::set_frame_time_delta(ngx_dt != 0);
+
+    // ---- 键 7：NgxUseReactiveMask（默认 0）----
+    const int ngx_react =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxUseReactiveMask", 0, config_path.c_str());
+    ngx::set_use_reactive_mask(ngx_react != 0);
+
+    // ---- 键 8：NgxLogLevel（默认 1；0=全关 1=error 2=info 3=debug）----
+    const int ngx_lv =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxLogLevel", 1, config_path.c_str());
+    ngx::set_log_level(ngx_lv);
+
+    // ---- 键 9：NgxPassthrough（默认 0）----
+    const int ngx_pt =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxPassthrough", 0, config_path.c_str());
+    ngx::set_passthrough(ngx_pt != 0);
+#else
+    // ---- REQ-08：NGX 未编译进本产物 ----
+    // 九个键里只有 Ffx12Backend 有消费者（后端选择器归 ffx12），其余 8 个 NGX 键在 OFF
+    // 构型下没有任何消费者，故不读。缺键 / 显式 native ⇒ 静默 native（不告警）；
+    // 任何其它取值（精确 ngx、非法值）⇒ 强制 Native + 一条固定告警。
+    {
+        wchar_t backend_buf[64] {};
+        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Backend", L"native",
+                                 backend_buf, static_cast<DWORD>(std::size(backend_buf)),
+                                 config_path.c_str());
+        if (std::wstring(backend_buf) != L"native")
+            g_config.logging.pending_warnings.emplace_back(
+                "ngx_core backend=native config_warn bits=ngx_not_compiled");
+        ffx12::set_backend(ffx12::BackendKind::Native);
+    }
+#endif
     ffx12::set_auto_exposure(g_config.ffx12_auto_exposure);
     ffx12::set_non_linear(g_config.ffx12_non_linear);
     ffx12::set_velocity_factor(g_config.ffx12_velocity_factor);
@@ -7310,6 +7425,10 @@ HRESULT STDMETHODCALLTYPE hooked_set_color_space1(
 {
     void *const caller = _ReturnAddress();
     const bool spoof = hdr_swapchain_spoof_active() && is_hdr10_color_space(color_space);
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+    // T-8：把 swapchain 的 HDR 状态告诉 NGX（本游戏 HDR 由注册表在启动时决定，不运行时切换）
+    ngx::set_swapchain_hdr(is_hdr10_color_space(color_space));
+#endif
     const DXGI_COLOR_SPACE_TYPE physical_color_space = spoof
         ? DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
         : color_space;
@@ -7348,32 +7467,35 @@ HRESULT STDMETHODCALLTYPE hooked_set_hdr_metadata(
             ? g_original_set_hdr_metadata(swapchain, type, size, metadata)
             : DXGI_ERROR_INVALID_CALL);
 
-    std::ostringstream message;
-    message << "dxgi_hdr_metadata swapchain=" << hex64(reinterpret_cast<std::uintptr_t>(swapchain))
-        << " caller=" << module_path_from_address(caller)
-        << " type=" << static_cast<unsigned>(type) << "/" << hdr_metadata_type_name(type)
-        << " size=" << size
-        << " physical_hr=" << hex64(static_cast<std::uint32_t>(physical_hr))
-        << " spoof=" << (spoof ? 1 : 0);
-    if (type == DXGI_HDR_METADATA_TYPE_HDR10 && metadata != nullptr && size >= sizeof(DXGI_HDR_METADATA_HDR10))
-    {
-        const auto &hdr10 = *static_cast<const DXGI_HDR_METADATA_HDR10 *>(metadata);
-        message << " red=" << hdr10.RedPrimary[0] << "," << hdr10.RedPrimary[1]
-            << " green=" << hdr10.GreenPrimary[0] << "," << hdr10.GreenPrimary[1]
-            << " blue=" << hdr10.BluePrimary[0] << "," << hdr10.BluePrimary[1]
-            << " white=" << hdr10.WhitePoint[0] << "," << hdr10.WhitePoint[1]
-            << " max_mastering=" << hdr10.MaxMasteringLuminance
-            << " min_mastering=" << hdr10.MinMasteringLuminance
-            << " max_cll=" << hdr10.MaxContentLightLevel
-            << " max_fall=" << hdr10.MaxFrameAverageLightLevel;
-    }
 #if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
     const bool should_log = true;
 #else
     const bool should_log = spoof;
 #endif
+    // 发布构建下 should_log 恒为假：拼串整体下沉进 if，避免每帧白做格式化与模块扫描
     if (should_log)
+    {
+        std::ostringstream message;
+        message << "dxgi_hdr_metadata swapchain=" << hex64(reinterpret_cast<std::uintptr_t>(swapchain))
+            << " caller=" << module_path_from_address(caller)
+            << " type=" << static_cast<unsigned>(type) << "/" << hdr_metadata_type_name(type)
+            << " size=" << size
+            << " physical_hr=" << hex64(static_cast<std::uint32_t>(physical_hr))
+            << " spoof=" << (spoof ? 1 : 0);
+        if (type == DXGI_HDR_METADATA_TYPE_HDR10 && metadata != nullptr && size >= sizeof(DXGI_HDR_METADATA_HDR10))
+        {
+            const auto &hdr10 = *static_cast<const DXGI_HDR_METADATA_HDR10 *>(metadata);
+            message << " red=" << hdr10.RedPrimary[0] << "," << hdr10.RedPrimary[1]
+                << " green=" << hdr10.GreenPrimary[0] << "," << hdr10.GreenPrimary[1]
+                << " blue=" << hdr10.BluePrimary[0] << "," << hdr10.BluePrimary[1]
+                << " white=" << hdr10.WhitePoint[0] << "," << hdr10.WhitePoint[1]
+                << " max_mastering=" << hdr10.MaxMasteringLuminance
+                << " min_mastering=" << hdr10.MinMasteringLuminance
+                << " max_cll=" << hdr10.MaxContentLightLevel
+                << " max_fall=" << hdr10.MaxFrameAverageLightLevel;
+        }
         LOG_INFO(blog::cat::hdr, message.str());
+    }
     return spoof ? S_OK : physical_hr;
 }
 
@@ -13006,8 +13128,16 @@ bool try_fsr2_translation_draw(
     // 判据都不成立 ⇒ 原有语义（切断原生 FSR2）逐字保留。
     if (g_config.ffx12 && il2cpp_callsite::active())
     {
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+        // ★ T-6 第一道 fail-open gate（SDS §3.3.3 / D9）：NGX 全局放手时放行累积 draw，
+        //   否则原生 FSR2 的输入缺失 ⇒ 画面冻在最后一帧（2026-09-28 实机冻屏回归的机理）。
+        //   should_release_all() 只读一个 std::atomic<bool>，不碰容器、不取锁。
+        if (release_untagged_accumulate || ngx::should_release_all())
+            return false;
+#else
         if (release_untagged_accumulate)
             return false;
+#endif
         return true;
     }
 
@@ -13289,6 +13419,18 @@ bool fsr2_family_should_skip_draw(ID3D11DeviceContext *context)
 {
     if (!g_config.fsr2_family_skip)
         return false;
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+    // ★ T-6 第二道 fail-open gate（SDS §3.3.3 / D9，**主要放手点**）：
+    //   NGX 全局放手时关闭「跳过原生 FSR2 3-draw 预处理 pass」的许可。
+    //   本门在 draw 钩子里**每 draw** 调用一次，且物理上取不到 ffx12::g_mutex
+    //   （它在 Ffx12Backend.cpp 的匿名命名空间内、Ffx12Backend.h 里查不到），
+    //   故只能读 ngx::should_release_all() —— 它只读一个 std::atomic<bool>，
+    //   不碰容器、不取任何锁。语义必须是「全局」：任一实例失败都要关掉全局 family skip，
+    //   否则正常实例继续被 skip 而失败实例不出图 ⇒ 冻屏。
+    //   ⚠️ 必须早于下方 cached_ps 热点块（那块每次 draw 都要 PSGetShader）。
+    if (ngx::should_release_all())
+        return false;
+#endif
     // P1 单实例接管：**当前**确有多个活跃实例时**禁止**跳过预处理 pass。
     // 该跳过的前提是"每次累积 pass 都被桥成功替换"，而 P1 只替换**一个**实例的累积
     // pass —— 放行给原生的那一路仍需要自己的预处理 pass（其输出被族内的原生累积 pass
@@ -14299,6 +14441,14 @@ bool swapchain_control_hook_needed()
 
 bool swapchain_color_hook_needed()
 {
+    // T-8：ngx 后端需要读 swapchain 的 color space 来判定 IsHDR 标志。
+    // 发布构建下 k_color_diagnostics_enabled / spoof / force 三者恒假，
+    // 若不在此加条件，set_color_space1 hook 永不安装 ⇒ ngx 的 auto 探测退化为
+    // 仅按输入纹理格式推导（不可靠：本机存在 10-bit SDR 会话）。
+    // 注：ffx12::backend() 与 BackendKind 在 Ffx12Backend.h 中无条件声明，
+    //     Ffx12Backend.cpp 无条件进 target_sources ⇒ OFF 构型也安全，不需要 #if 守卫。
+    if (ffx12::backend() == ffx12::BackendKind::Ngx)
+        return true;
     return k_color_diagnostics_enabled || hdr_swapchain_spoof_active() || hdr_swapchain_force_active();
 }
 
@@ -14423,6 +14573,20 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
                 " format=" + describe_dxgi_format(desc.BufferDesc.Format) +
                 " size=" + std::to_string(desc.BufferDesc.Width) + "x" + std::to_string(desc.BufferDesc.Height) +
                 " swapchain4=" + std::to_string(supports_hdr_metadata ? 1 : 0));
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+            // T-8 M4-b（路径 A）：把后缓冲格式主动交给 NGX 侧，作为 HDR 判定的第二来源。
+            // 为什么需要"主动"：DXGI **没有** GetColorSpace（IDXGISwapChain3 只有
+            //   CheckColorSpaceSupport / SetColorSpace1，已 grep Windows SDK
+            //   10.0.26100.0/shared/dxgi1_4.h:121/127 确认），读不回"当前" color space。
+            //   因此若游戏从不调用 SetColorSpace1，hooked_set_color_space1 永远不会跑，
+            //   ngx 的 auto 探测就只能退到"输入纹理格式"这一最不可靠的来源。
+            //   这里读的是 swapchain 自述的 BufferDesc.Format —— 它不依赖任何 hook 时机，
+            //   是本进程内能拿到的、与 HDR 相关的最早一手信息。
+            // ★ 它只是"能力级"信号（后缓冲是 16F 还是 8-bit），不是"状态级"；
+            //   所以 ngx 侧的优先级是：color space（hook）> 本项 > 输入纹理格式。
+            // ★ 必须在 ENABLE_NGX 守卫内：OFF 构型没有 NgxBackend.cpp，否则 LNK2019。
+            ngx::set_swapchain_format(desc.BufferDesc.Format);
+#endif
         }
     }
     clone_and_patch_vtable(hook_instance, hook_method_count, patches);
@@ -15091,6 +15255,16 @@ void initialize()
         for (const std::string &warning : g_config.logging.pending_warnings)
             LOG_WARN(blog::cat::config, warning);
         g_config.logging.pending_warnings.clear();
+        // 后端选择状态行（SDS §3.13.2 第 2 条）：在 logger 起来 + 告警回放之后，
+        // 按已生效的 ffx12::backend() **恰输出一条**，两种模式都可取证。
+        // 走 blog::cat::config 并在日志器初始化之后，故不依赖 NGX 编译开关或 ensure_init。
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+        LOG_INFO(blog::cat::config, ffx12::backend() == ffx12::BackendKind::Ngx
+                                        ? "ngx_core backend=ngx"
+                                        : "ngx_core backend=native");
+#else
+        LOG_INFO(blog::cat::config, "ngx_core backend=native");
+#endif
     }
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)

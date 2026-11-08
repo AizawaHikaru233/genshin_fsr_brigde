@@ -72,6 +72,11 @@ option(DX11FSRBRIDGE_BUILD_TESTS "Build the SDK-free unit tests (il2cpp callsite
 option(DX11FSRBRIDGE_DIAGNOSTICS
     "Compile diagnostics/probes (PerfProbe, Fsr2InputDump, *Probe*, Trace*, Dump*) - keep OFF for release" OFF)
 
+# ---- D3D11 NGX（DLSS 超分）后端开关（2026-11-07，T-1）----
+# NGX 头被 gitignore（`.gitignore:158`，许可与 GPL 冲突、禁止提交）⇒ **无头检出必须仍能构建**
+# （REQ-08）：头缺失时自动降级为 OFF，只打一行 STATUS，不 FATAL。
+option(DX11FSRBRIDGE_ENABLE_NGX "Build the D3D11 NGX (DLSS) backend" ON)
+
 set(DX11FSRBRIDGE_DIAGNOSTICS_ON ${DX11FSRBRIDGE_DIAGNOSTICS})
 if(NOT DX11FSRBRIDGE_DIAGNOSTICS_ON AND CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(DX11FSRBRIDGE_DIAGNOSTICS_ON ON)
@@ -137,6 +142,22 @@ endif()
 # `#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)` 块整体不参与编译）。
 if(DX11FSRBRIDGE_DIAGNOSTICS_ON)
     target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_ENABLE_DIAGNOSTICS=1)
+endif()
+
+# NGX 后端接线（SDS §5.1）。★ 三行缺一不可：只写 include 目录与宏、不写 target_sources
+# ⇒ `NgxBackend.cpp` 永不进编译单元 ⇒ ngx 的 13 个符号未定义 ⇒ **LNK2019**（本 target 无 GLOB）。
+if(DX11FSRBRIDGE_ENABLE_NGX)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx/nvsdk_ngx_defs.h")
+        target_sources(Dx11FsrBridge PRIVATE NgxBackend.cpp)
+        target_include_directories(Dx11FsrBridge PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx")
+        target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_ENABLE_NGX=1)
+        message(STATUS "Dx11FsrBridge: NGX 后端参与编译（DX11FSRBRIDGE_ENABLE_NGX=1）")
+    else()
+        message(STATUS "NGX headers not found; building without the NGX backend "
+                       "(run tools/Fetch-NgxHeaders.ps1 to enable)")
+        set(DX11FSRBRIDGE_ENABLE_NGX OFF)
+    endif()
 endif()
 
 # 旧方案已彻底移除：Fsr2TranslationLayer（旧翻译层）与 Dx11On12Swapchain（On12 引导）
