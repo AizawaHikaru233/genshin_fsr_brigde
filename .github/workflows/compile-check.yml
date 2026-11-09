@@ -16,11 +16,14 @@ name: Compile Check (NGX on / off)
 #   不应改为静默跳过（否则又回到「从未编译过」的状态）。
 
 on:
-  # 2026-11-09（审核 C-5）：pull_request 不加 branches 过滤 = 任何目标分支的 PR 都触发；
-  # push 需覆盖实际开发分支 feat/ngx-backend（原来只有 main ⇒ 推送即无 CI）。
+  # 2026-11-10（用户要求）：取消 push 触发 —— 原配置在 main 与 feat/** 上每次提交都跑
+  # 两套 NGX 构型（各需克隆 OptiScaler 源码树 + 拉取 NGX 头文件），代价与收益不成比例。
+  # 合并后不复跑：PR 上的那一次编译已覆盖同一份内容，发布包由手动 workflow 构建。
+  # 文档类改动不触发（改不动编译结果），避免纯文档提交白跑一次 CI。
   pull_request:
-  push:
-    branches: [main, 'feat/**']
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
   workflow_dispatch:
 
 permissions:
