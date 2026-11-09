@@ -4352,6 +4352,47 @@ void load_config()
     g_config.ffx12_fail_closed =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FailClosed", 0, config_path.c_str()) != 0;
 #endif
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+    // 2026-11-09（PR #12 审查次要项 10）：`NgxPassthrough=1` 与 `Ffx12FailClosed=1` 的
+    // **代码级互斥**。AGENTS.md §二.7 要求评估「两个『关闭/接管』语义的开关同时开启
+    // 是否互相吞掉」—— 这一对恰好是其中最坏的一种：
+    //   ① NgxPassthrough=1 ⇒ ngx::dispatch 在第 0 步就 return false（不超分）；
+    //   ② 该 false 传回 ffx12::dispatch ⇒ 走到 draw 钩子的派发失败分支；
+    //   ③ Ffx12FailClosed=1 ⇒ 该分支 return true = **吞掉这次 draw 且不产出任何图**。
+    //   ⇒ 不超分 + 不回退 + draw 被吞 = **每帧黑屏**（不崩不冻，最难排查的一类）。
+    //
+    // 处理方向：**强制关掉 Ffx12FailClosed**，而不是关 passthrough。
+    //   理由：passthrough 是用户显式要的观测手段（SDS 判据 14 依赖它），关掉它等于
+    //   让用户「设了没反应」；而 fail_closed 是**故障注入式诊断**（源码注释即「禁止
+    //   回退原生（测试/故障显式暴露）」），它的正确语义本就是「暴露失败」，
+    //   不是「制造黑屏」。两者冲突时保留用户的观测意图、放弃故障注入，方向更安全。
+    //
+    // ★ 位置硬约束：必须在**两个键都读完**之后（NgxPassthrough 在键 9、Ffx12FailClosed
+    //   在本块上方）且在任何消费者之前（唯一消费者是 draw 钩子的派发失败分支）。
+    // ★ 为什么用 pending_warnings 而不是 LOG_WARN：load_config() 跑在 blog::init() 之前，
+    //   此时直接写日志会被丢弃（见本文件 §logging 的说明与 pending_warnings 的回放点）。
+    //
+    // ★ 为什么用 ngx::passthrough() 而不是就地重读 ini，也不用局部变量 ngx_pt：
+    //   · 不重读 ini：一次 GetPrivateProfileIntW 有文件解析开销，且会与键 9 形成
+    //     **两个解析点**——两处若哪天改了一处默认值就会静默不一致。
+    //   · 不用 ngx_pt：它虽然在同一函数作用域内可见（:4196，`#endif` 不关闭 C++ 作用域），
+    //     但 ngx::passthrough() 返回的正是 4198 行 set_passthrough 存进去的那个值，
+    //     也就是**下游消费者读到的同一个值** ⇒ 本互斥的判据与消费者同源，
+    //     不会出现「互斥按 ini 判、消费者按全局判」的两套口径。
+    //
+    // ⚠️ 适用范围（如实记录）：`Ffx12FailClosed` 的**读取点**本身在
+    //   `#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)` 内 ⇒ 发布构建里
+    //   g_config.ffx12_fail_closed 恒为 false，本互斥在发布构建中**永不触发**。
+    //   也就是说这对组合只在诊断构建里能凑出来 —— 但它恰恰是诊断构建最容易踩的组合
+    //   （排查黑屏时同时开「直通」与「失败关闭」来定位到底哪一段吞了图），必须挡住。
+    if (ngx::passthrough() && g_config.ffx12_fail_closed)
+    {
+        g_config.ffx12_fail_closed = false;
+        g_config.logging.pending_warnings.emplace_back(
+            "config_mutex key=Ffx12FailClosed forced=0 reason=NgxPassthrough=1 "
+            "why=passthrough_plus_failclosed_black_screen");
+    }
+#endif
     // -----------------------------------------------------------------------
     // 日志配置。新方案：显式等级 + 分类过滤（[Log] 段），不做内容推断。
     // `[Log] level` 是**唯一权威**（缺省 info）。
