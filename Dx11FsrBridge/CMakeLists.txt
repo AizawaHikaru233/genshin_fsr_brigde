@@ -231,6 +231,9 @@ target_link_libraries(Dx11FsrBridge PRIVATE
     d3d12
     d3dcompiler
     dxgi
+    # T-10：DisplayConfigGetDeviceInfo / QueryDisplayConfig（Windows 显示配置 API）
+    # 用于探测显示器真实 HDR 状态。这三个函数在 user32.lib。
+    user32
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/detours/detours.lib"
 )
 

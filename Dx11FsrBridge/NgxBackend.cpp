@@ -280,6 +280,18 @@ std::atomic<unsigned>     g_swapchain_hdr_state { 0 };   // SetColorSpace1 探�
 //   它不依赖 SetColorSpace1 是否被调用过，所以对「游戏从不调 SetColorSpace1」是净收益。
 //   同样跨线程（install_swapchain_hooks 写、dispatch 读）⇒ 同款 atomic。
 std::atomic<unsigned>     g_swapchain_format { 0 };          // 0 = 未知（DXGI_FORMAT_UNKNOWN）
+
+// T-10：Windows 显示配置 API 探测结果（0=未探测 1=SDR 2=HDR）。
+// ★ 独立于 g_swapchain_hdr_state：那是游戏主动声明的意图，这是系统级真实状态，两者互为校验。
+std::atomic<unsigned>     g_displayconfig_hdr_state { 0 };
+
+// ★ T-11：①②③ 三级探测的**预计算结果**（0=未定 1=SDR 2=HDR）。
+//   设计原则：探测源都是**事件驱动**的（hook / ensure_init），不是每帧变化的，
+//   所以不该在每帧路径上重复读+重复判断。写入方在状态变化后立即调
+//   refresh_hdr_probe_cache() 刷新本缓存，每帧只做一次 atomic load。
+//   ★ 只有缓存为 0（三级都没探测到）时，才回落到 ④ 的「按输入纹理格式猜」。
+std::atomic<unsigned>     g_hdr_probe_cache { 0 };
+
 // ★ m4：g_hdr_mode **故意保持普通 int**：它只由 load_config() 在 blog::init() 之前写入，
 //   之后运行期只读，cfg 无热重载（AGENTS §8.5）⇒ 不存在跨线程写，加 atomic 是纯开销。
 //   g_hdr 同理（且它已退化为「本次决策的回写镜像」，见 resolve_is_hdr 的注释）。
@@ -326,6 +338,72 @@ void log_ngx_error(const wchar_t *fmt, ...);     // 恒以 blog::Level::Error �
 // ---- flags / 配置位 转字符串：**返回 std::string**（配合 %hs 打印，见 §3.10.1）----
 std::string flags_to_string(unsigned int flags);
 std::string warn_to_string(unsigned int bits);
+
+// T-10：用 Windows 显示配置 API 探测显示器真实 HDR 状态。
+// 返回 0=探测失败/未知，1=SDR，2=HDR（任一活动显示器开着 advanced color 即判 HDR）。
+// ★ 只在 ensure_init 调用一次（QueryDisplayConfig 有枚举开销，不能每帧调）。
+// ★ 失败不置 g_release_all：探测失败只是少一个信息源，不是致命错误。
+static unsigned probe_displayconfig_hdr()
+{
+    UINT32 path_count = 0, mode_count = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) != ERROR_SUCCESS)
+        return 0;
+    if (path_count == 0)
+        return 0;
+
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count > 0 ? mode_count : 1);
+
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(),
+                           &mode_count, modes.data(), nullptr) != ERROR_SUCCESS)
+        return 0;
+
+    bool any_hdr = false;
+    bool any_ok  = false;
+    for (UINT32 i = 0; i < path_count; ++i)
+    {
+        DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO info {};
+        info.header.type      = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+        info.header.size      = sizeof(info);
+        info.header.adapterId = paths[i].targetInfo.adapterId;
+        info.header.id        = paths[i].targetInfo.id;
+
+        if (DisplayConfigGetDeviceInfo(&info.header) != ERROR_SUCCESS)
+            continue;
+
+        any_ok = true;
+        if (info.advancedColorEnabled)
+            any_hdr = true;
+    }
+
+    if (!any_ok) return 0;
+    return any_hdr ? 2u : 1u;
+}
+
+// T-11：重算 ①②③ 三级的合并结果并写入 g_hdr_probe_cache。
+// 由四个写入点调用（set_swapchain_hdr / set_swapchain_format /
+// ensure_init 的 DisplayConfig 探测 / set_hdr_mode）。
+// ★ 优先级与 resolve_is_hdr 一致：① > ② > ③；都为 0 时缓存置 0（交给 ④ 兜底）。
+static void refresh_hdr_probe_cache()
+{
+    const unsigned sw = g_swapchain_hdr_state.load(std::memory_order_relaxed);
+    if (sw != 0) { g_hdr_probe_cache.store(sw, std::memory_order_relaxed); return; }
+
+    const unsigned dc = g_displayconfig_hdr_state.load(std::memory_order_relaxed);
+    if (dc != 0) { g_hdr_probe_cache.store(dc, std::memory_order_relaxed); return; }
+
+    const unsigned fmt_raw = g_swapchain_format.load(std::memory_order_relaxed);
+    if (fmt_raw != 0)
+    {
+        const DXGI_FORMAT fmt = static_cast<DXGI_FORMAT>(fmt_raw);
+        const bool hdr = (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                          fmt == DXGI_FORMAT_R16G16B16A16_TYPELESS);
+        g_hdr_probe_cache.store(hdr ? 2u : 1u, std::memory_order_relaxed);
+        return;
+    }
+
+    g_hdr_probe_cache.store(0u, std::memory_order_relaxed);   // 三级都未定 ⇒ ④ 兜底
+}
 
 // ---- T-8：IsHDR 决策（定义在 §3.8.2 开头的 build_create_flags 之前）----
 // ★ 必须在这里前置声明：§3.10.2 的配置快照第 3 行（log_config_snapshot，定义在 §3.9A.1 之后、
@@ -807,6 +885,9 @@ static bool ensure_init(ID3D11Device *dev)
     {
         // ★ 目录表必须先解析：第 4 行要打真实的条目数，而 §3.4.2 要求快照在 LoadLibrary **之前**。
         resolve_feature_dirs();
+        // T-10：探测显示器真实 HDR 状态（只探一次；QueryDisplayConfig 有枚举开销）
+        g_displayconfig_hdr_state.store(probe_displayconfig_hdr(), std::memory_order_relaxed);
+        refresh_hdr_probe_cache();   // ★ T-11：② 级探测落地后立刻刷新预计算缓存
         log_config_snapshot();
     }
 
@@ -967,6 +1048,11 @@ inline void set_tex(NVSDK_NGX_Parameter *p, const char *name, ID3D11Texture2D *t
 //     与"IsHDR 取什么值"不是一回事。强制模式只改变**决策**，不该让取证字段变成假的 sw_known=0
 //     ——否则 NgxHdr=1/0 的会话里就再也看不到 swapchain 探测结果，恰好是本轮要的证据。
 //   · 为什么**只 load 一次**：两处各自 load 会重新引入撕裂（见下），这正是本条要消除的。
+// ★★ T-11：①②③ 三级改为**读预计算缓存** g_hdr_probe_cache（事件驱动，写入方见
+//   refresh_hdr_probe_cache 的注释）。本函数不再在每帧路径上重复「三次 load + 三层分支」。
+//   · 热路径（src == nullptr，即 flags_input_bits 的每帧调用）：**只有 1 次 atomic load**。
+//   · 冷路径（src != nullptr，仅日志/建 feature 时）：额外读两次 atomic 只为标注**来源**，
+//     这不影响决策、也不在每帧路径上 —— 可观测性保留在冷路径，热路径零额外成本。
 static bool resolve_is_hdr(DXGI_FORMAT color_fmt, const char **src, unsigned *sw_state_out)
 {
     // ★ MINOR-1：探测状态是**一个** atomic<unsigned> 里的三态（0=未知 1=SDR 2=HDR），
@@ -979,33 +1065,33 @@ static bool resolve_is_hdr(DXGI_FORMAT color_fmt, const char **src, unsigned *sw
     if (g_hdr_mode == 1) { if (src) *src = "forced-on";  g_hdr = true;  return true;  }
     if (g_hdr_mode == 2) { if (src) *src = "forced-off"; g_hdr = false; return false; }
 
-    // ---- auto：① SetColorSpace1 hook 读到的真实 color space（最准）----
-    if (sw_state != 0)                    // 已知（探测到过）：1 = SDR，2 = HDR
+    // ---- auto：①②③ 的预计算结果（T-11：事件驱动，不在每帧重算）----
+    // ① SetColorSpace1 hook（最准）> ② Windows 显示配置 API（T-10）> ③ swapchain buffer 格式（M4-b）。
+    // 三者的合并与优先级由 refresh_hdr_probe_cache() 在**写入点**完成；此处只读一个 atomic。
+    // ★ 为什么 ③ 的判据是「只有 16F 浮点后缓冲才倾向 HDR」：DXGI **没有** GetColorSpace
+    //   （已 grep Windows SDK 10.0.26100.0/shared/dxgi1_4.h：IDXGISwapChain3 只有
+    //   CheckColorSpaceSupport(:121) / SetColorSpace1(:127)），BufferDesc.Format 只是**能力级**信号；
+    //   且本机存在 10-bit SDR 会话 ⇒ 10-bit 一律按 SDR（M3 裁决口径，见上文）。
+    const unsigned cached = g_hdr_probe_cache.load(std::memory_order_relaxed);
+    if (cached != 0)
     {
-        const bool sw_hdr = (sw_state == 2);
-        if (src) *src = "swapchain";
-        g_hdr = sw_hdr;
-        return sw_hdr;
+        const bool hdr = (cached == 2);
+        if (src)
+        {
+            // 取证：说明是哪一级贡献的（仍然要能区分，便于实机排查）。
+            // ★ 这两次 load **只在冷路径**（src != nullptr）发生；每帧的 flags_input_bits
+            //   传的是 nullptr ⇒ 热路径上只有上面那一次 cached 的 load。
+            const unsigned sw = g_swapchain_hdr_state.load(std::memory_order_relaxed);
+            if (sw != 0)                     *src = "swapchain";
+            else if (g_displayconfig_hdr_state.load(std::memory_order_relaxed) != 0)
+                                             *src = "displayconfig";
+            else                             *src = "swapchain_format";
+        }
+        g_hdr = hdr;
+        return hdr;
     }
 
-    // ---- auto：② swapchain buffer 格式（主动探测，M4-b 路径 A）----
-    // DXGI **没有** GetColorSpace（已 grep Windows SDK 10.0.26100.0/shared/dxgi1_4.h：
-    //   IDXGISwapChain3 只有 CheckColorSpaceSupport(:121) / SetColorSpace1(:127)），
-    // 所以无法主动读回"当前" color space；退而求其次读 BufferDesc.Format 这一**能力级**信号。
-    // 它不依赖 hook 时机（install_swapchain_hooks 自己就能读），因此覆盖"游戏从不调 SetColorSpace1"。
-    // 判据与 M3 的裁决口径一致：只有 16F 浮点后缓冲才倾向 HDR；10-bit 一律按 SDR（本机有 10-bit SDR）。
-    const unsigned sw_fmt_raw = g_swapchain_format.load(std::memory_order_relaxed);
-    if (sw_fmt_raw != 0)
-    {
-        const DXGI_FORMAT sw_fmt = static_cast<DXGI_FORMAT>(sw_fmt_raw);
-        const bool fmt_hdr = (sw_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ||
-                              sw_fmt == DXGI_FORMAT_R16G16B16A16_TYPELESS);
-        if (src) *src = "swapchain_format";
-        g_hdr = fmt_hdr;
-        return fmt_hdr;
-    }
-
-    // ---- auto：③ 输入纹理格式（最后兜底；见上文的 M3 裁决）----
+    // ---- auto：④ 输入纹理格式（最后兜底；见上文的 M3 裁决）----
     if (src) *src = (color_fmt == DXGI_FORMAT_UNKNOWN) ? "unknown" : "format";
     const bool fmt_is_hdr = (color_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT);
     g_hdr = fmt_is_hdr;   // M2：回写镜像，让旧字段（及旧日志判据）与实际决策一致
@@ -1036,6 +1122,9 @@ static unsigned flags_input_bits(DXGI_FORMAT color_fmt)
 {
     unsigned bits = 0;
     // ★ 不取探测状态快照：本函数只算位图，不打日志（见上方注释）。第 3 参用默认值。
+    // ★★ T-11：这是**每帧**路径（dispatch 第 5 步）。resolve_is_hdr 现在只做
+    //   「1 次 g_hdr_probe_cache 的 atomic load」—— ①②③ 三级的读+判断已搬到写入点
+    //   （refresh_hdr_probe_cache），不再每帧重复；src == nullptr ⇒ 不做来源取证 load。
     if (resolve_is_hdr(color_fmt, nullptr))          bits |= kFlagsInputIsHdr;
     if (ffx12::depth_inverted())                     bits |= kFlagsInputDepthInvert;
     if (ffx12::motion_vectors_jittered())            bits |= kFlagsInputMvJittered;
@@ -1942,6 +2031,9 @@ void set_hdr_mode(int mode)
         g_hdr_mode = mode;
     else
         g_hdr_mode = 0;
+    // ★ T-11：本函数改的是强制模式、**不改变缓存内容**；这里刷新是为了让
+    //   「NgxHdr=auto 切换进来」时缓存一定与当前三级探测一致（幂等，无副作用）。
+    refresh_hdr_probe_cache();
 }
 
 void set_swapchain_hdr(bool hdr)
@@ -1954,6 +2046,7 @@ void set_swapchain_hdr(bool hdr)
     //   ⇒ HDR 会话被短暂判成 SDR。打包成一个 atomic 后，读方一次 load 只能看到
     //   某一个完整的旧三态或新三态，**不存在中间态**。
     g_swapchain_hdr_state.store(hdr ? 2u : 1u, std::memory_order_relaxed);
+    refresh_hdr_probe_cache();   // ★ T-11：探测变了，立刻刷新预计算缓存
 }
 
 // T-8 M4-b（路径 A）：swapchain 后缓冲格式。由 install_swapchain_hooks() 在第一次
@@ -1965,6 +2058,7 @@ void set_swapchain_hdr(bool hdr)
 void set_swapchain_format(DXGI_FORMAT f)
 {
     g_swapchain_format.store(static_cast<unsigned>(f), std::memory_order_relaxed);
+    refresh_hdr_probe_cache();   // ★ T-11：探测变了，立刻刷新预计算缓存
 }
 
 void set_render_preset(int v)
