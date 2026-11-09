@@ -1,0 +1,250 @@
+name: Compile Check (NGX on / off)
+
+# 说明：
+#   2026-11-09（PR #12 审查 B 项）：本 workflow 解决「新增的 NgxBackend.cpp 与桥侧
+#   ~200 行 #if 分支从未被任何自动化编译过」的问题。
+#
+#   两个构型都要过：
+#     - NGX OFF：不拉取 NVIDIA 专有头文件，验证 CMake 自动降级路径与「无 LNK2019」。
+#     - NGX ON ：用 tools/Fetch-NgxHeaders.ps1 拉取头文件，验证真编译。
+#                 只拉 2 个（NgxBackend.cpp:57-58 真正 include 的那两个），
+#                 且固定 commit a291cc7 + 逐文件 SHA-256 —— 不跟 main 分支，
+#                 否则上游一改头文件 CI 就必红（时间炸弹）。
+#
+#   ⚠️ 头文件不入库（NVIDIA 专有许可），故 ON 构型依赖联网获取。
+#   若 NVIDIA 仓库不可达，ON 构型会失败 —— 这是**有意的失败关闭**，
+#   不应改为静默跳过（否则又回到「从未编译过」的状态）。
+
+on:
+  # 2026-11-09（审核 C-5）：pull_request 不加 branches 过滤 = 任何目标分支的 PR 都触发；
+  # push 需覆盖实际开发分支 feat/ngx-backend（原来只有 main ⇒ 推送即无 CI）。
+  pull_request:
+  push:
+    branches: [main, 'feat/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ── 构型 1：NGX OFF（不依赖任何外部专有头文件）──────────────────────────
+  build-ngx-off:
+    name: NGX OFF
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Fetch OptiScaler source tree (FidelityFX SDK headers)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = Join-Path $env:GITHUB_WORKSPACE 'OptiScaler-src'
+          git clone --depth 1 https://github.com/optiscaler/OptiScaler.git $dest
+          git -C $dest submodule update --init --depth 1 -- external/FidelityFX-SDK-v2
+          $kit = Join-Path $dest 'external\FidelityFX-SDK-v2\Kits\FidelityFX'
+          if (-not (Test-Path (Join-Path $kit 'api\include\ffx_api.h'))) {
+            throw "FidelityFX SDK headers missing under $kit"
+          }
+          Write-Host "FidelityFX SDK headers ready: $kit"
+
+      - name: Import MSVC environment (vcvars64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+              throw "vswhere.exe not found at $vswhere"
+          }
+          $vsPath = & $vswhere -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
+          if (-not $vsPath) { throw 'Visual Studio with C++ tools not found' }
+          Write-Host "VS: $vsPath"
+
+          $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+          if (-not (Test-Path -LiteralPath $vcvars -PathType Leaf)) {
+              throw "vcvars64.bat not found at $vcvars"
+          }
+
+          # 必须用 cmd /c 跑 bat 再 set 导出：直接 . $vcvars 在 pwsh 里不生效。
+          $snapshot = & cmd.exe /c "`"$vcvars`" >nul 2>&1 && set"
+
+          # ⚠️ 关键（审核 C-1 修复）：GitHub Actions 的每个 run: 都在**独立进程**里执行，
+          # 在本 step 内 Set-Item Env: 只改本进程，**下一个 step 完全看不到**（实测：
+          # 导入 step 里 nmake 可解析，下一 step 里 INCLUDE 为空、nmake 不在 PATH）。
+          # 因此必须写进 $GITHUB_ENV —— runner 会在后续每个 step 启动前重新注入。
+          $lines = [System.Collections.Generic.List[string]]::new()
+          foreach ($line in $snapshot) {
+              if ($line -match '^([A-Za-z_][A-Za-z0-9_.()]*)=(.*)$') {
+                  $name = $matches[1]
+                  $value = $matches[2]
+                  # 多行值无法用 NAME=VALUE 表示；vcvars 实际不会产生，出现则跳过。
+                  if ($value.Contains("`n") -or $value.Contains("`r")) { continue }
+                  $lines.Add("$name=$value")
+              }
+          }
+          if ($lines.Count -eq 0) { throw 'vcvars64.bat produced no environment variables' }
+          # UTF-8 **无 BOM**：带 BOM 会让 runner 把首个变量名读成 \uFEFFPATH，PATH 静默丢失。
+          [IO.File]::AppendAllText($env:GITHUB_ENV, (($lines -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
+          Write-Host "Exported $($lines.Count) environment variables to GITHUB_ENV"
+
+          # 同时应用到本进程，好让下面的自检反映**真实**状态（而不是靠猜 GITHUB_ENV 写对了）。
+          foreach ($entry in $lines) {
+              $i = $entry.IndexOf('=')
+              if ($i -gt 0) {
+                  try { Set-Item -Path "Env:$($entry.Substring(0, $i))" -Value $entry.Substring($i + 1) } catch { }
+              }
+          }
+
+          # 验证关键工具已就位（失败关闭）：本 step 装不好，后续 step 也不会好。
+          foreach ($tool in @('cl.exe', 'nmake.exe', 'link.exe')) {
+              $cmd = Get-Command $tool -ErrorAction SilentlyContinue
+              if (-not $cmd) { throw "$tool not found on PATH after vcvars import" }
+              Write-Host "  $tool -> $($cmd.Source)"
+          }
+          if (-not $env:INCLUDE) { throw 'INCLUDE is not set after vcvars import' }
+          if (-not $env:LIB)     { throw 'LIB is not set after vcvars import' }
+
+      - name: Configure (NGX OFF)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kit = Join-Path $env:GITHUB_WORKSPACE 'OptiScaler-src\external\FidelityFX-SDK-v2\Kits\FidelityFX'
+          cmake -S Dx11FsrBridge -B build-off -G "NMake Makefiles" `
+              -DCMAKE_BUILD_TYPE=Release `
+              -DDX11FSRBRIDGE_ENABLE_NGX=OFF `
+              -DFFX_SDK_KIT_ROOT="$kit"
+
+      - name: Build (NGX OFF)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --build build-off
+          $dll = 'build-off\Dx11FsrBridge.dll'
+          if (-not (Test-Path $dll)) { throw "expected $dll" }
+          $size = (Get-Item $dll).Length
+          Write-Host "DLL: $size bytes"
+          # 2026-11-09（审核 C-6）：阈值由 100000 收紧。实测 NGX OFF = 598528 B；
+          # 500000 仍留约 16% 余量，但能抓住「DllMain 落进匿名命名空间」那类
+          # 静默缩水（AGENTS.md §三 #1 记录 575488→76800 B）。
+          if ($size -lt 500000) { throw "DLL suspiciously small ($size bytes)" }
+
+  # ── 构型 2：NGX ON（2 个专有头文件，固定 commit + SHA-256）─────────────
+  build-ngx-on:
+    name: NGX ON
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Fetch OptiScaler source tree (FidelityFX SDK headers)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = Join-Path $env:GITHUB_WORKSPACE 'OptiScaler-src'
+          git clone --depth 1 https://github.com/optiscaler/OptiScaler.git $dest
+          git -C $dest submodule update --init --depth 1 -- external/FidelityFX-SDK-v2
+          $kit = Join-Path $dest 'external\FidelityFX-SDK-v2\Kits\FidelityFX'
+          if (-not (Test-Path (Join-Path $kit 'api\include\ffx_api.h'))) {
+            throw "FidelityFX SDK headers missing under $kit"
+          }
+          Write-Host "FidelityFX SDK headers ready: $kit"
+
+      - name: Fetch NGX headers (SHA-256 pinned)
+        shell: pwsh
+        run: ./tools/Fetch-NgxHeaders.ps1
+
+      - name: Import MSVC environment (vcvars64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+              throw "vswhere.exe not found at $vswhere"
+          }
+          $vsPath = & $vswhere -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
+          if (-not $vsPath) { throw 'Visual Studio with C++ tools not found' }
+          Write-Host "VS: $vsPath"
+
+          $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+          if (-not (Test-Path -LiteralPath $vcvars -PathType Leaf)) {
+              throw "vcvars64.bat not found at $vcvars"
+          }
+
+          # 必须用 cmd /c 跑 bat 再 set 导出：直接 . $vcvars 在 pwsh 里不生效。
+          $snapshot = & cmd.exe /c "`"$vcvars`" >nul 2>&1 && set"
+
+          # ⚠️ 关键（审核 C-1 修复）：GitHub Actions 的每个 run: 都在**独立进程**里执行，
+          # 在本 step 内 Set-Item Env: 只改本进程，**下一个 step 完全看不到**（实测：
+          # 导入 step 里 nmake 可解析，下一 step 里 INCLUDE 为空、nmake 不在 PATH）。
+          # 因此必须写进 $GITHUB_ENV —— runner 会在后续每个 step 启动前重新注入。
+          $lines = [System.Collections.Generic.List[string]]::new()
+          foreach ($line in $snapshot) {
+              if ($line -match '^([A-Za-z_][A-Za-z0-9_.()]*)=(.*)$') {
+                  $name = $matches[1]
+                  $value = $matches[2]
+                  # 多行值无法用 NAME=VALUE 表示；vcvars 实际不会产生，出现则跳过。
+                  if ($value.Contains("`n") -or $value.Contains("`r")) { continue }
+                  $lines.Add("$name=$value")
+              }
+          }
+          if ($lines.Count -eq 0) { throw 'vcvars64.bat produced no environment variables' }
+          # UTF-8 **无 BOM**：带 BOM 会让 runner 把首个变量名读成 \uFEFFPATH，PATH 静默丢失。
+          [IO.File]::AppendAllText($env:GITHUB_ENV, (($lines -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
+          Write-Host "Exported $($lines.Count) environment variables to GITHUB_ENV"
+
+          # 同时应用到本进程，好让下面的自检反映**真实**状态（而不是靠猜 GITHUB_ENV 写对了）。
+          foreach ($entry in $lines) {
+              $i = $entry.IndexOf('=')
+              if ($i -gt 0) {
+                  try { Set-Item -Path "Env:$($entry.Substring(0, $i))" -Value $entry.Substring($i + 1) } catch { }
+              }
+          }
+
+          # 验证关键工具已就位（失败关闭）：本 step 装不好，后续 step 也不会好。
+          foreach ($tool in @('cl.exe', 'nmake.exe', 'link.exe')) {
+              $cmd = Get-Command $tool -ErrorAction SilentlyContinue
+              if (-not $cmd) { throw "$tool not found on PATH after vcvars import" }
+              Write-Host "  $tool -> $($cmd.Source)"
+          }
+          if (-not $env:INCLUDE) { throw 'INCLUDE is not set after vcvars import' }
+          if (-not $env:LIB)     { throw 'LIB is not set after vcvars import' }
+
+      - name: Configure (NGX ON)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kit = Join-Path $env:GITHUB_WORKSPACE 'OptiScaler-src\external\FidelityFX-SDK-v2\Kits\FidelityFX'
+          cmake -S Dx11FsrBridge -B build-on -G "NMake Makefiles" `
+              -DCMAKE_BUILD_TYPE=Release `
+              -DDX11FSRBRIDGE_ENABLE_NGX=ON `
+              -DFFX_SDK_KIT_ROOT="$kit"
+
+      - name: Build (NGX ON)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --build build-on
+          $dll = 'build-on\Dx11FsrBridge.dll'
+          if (-not (Test-Path $dll)) { throw "expected $dll" }
+          $size = (Get-Item $dll).Length
+          Write-Host "DLL: $size bytes"
+          # 2026-11-09（审核 C-6）：实测 NGX ON = 640512 B（NMake Release），
+          # 550000 留约 14% 余量；NGX ON 比 OFF 多出 NgxBackend 一整块，故下界更高。
+          if ($size -lt 550000) { throw "DLL suspiciously small ($size bytes)" }
+
+      - name: Verify NGX symbols present
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = 'build-on\Dx11FsrBridge.dll'
+          # 宽字符串必须按 UTF-16 查（AGENTS.md §四.A）
+          $bytes = [IO.File]::ReadAllBytes((Resolve-Path $dll).Path)
+          $uni = [Text.Encoding]::Unicode.GetString($bytes)
+          foreach ($needle in @('NgxRenderPreset', 'NgxHdr', 'ngx_hdr_decision')) {
+            if (-not $uni.Contains($needle)) { throw "NGX config string '$needle' missing from $dll" }
+          }
+          Write-Host 'NGX config strings present in binary'
