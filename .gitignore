@@ -120,6 +120,11 @@ DEV-CHANGELOG.local.md
 
 # 交接/计划/报告类文档（不进入仓库——本地保留）
 docs/
+# 例外：本 PR 的变更日志必须入库，否则审查者看不到区域/原因/目标/结果与证据等级。
+#   先把 docs/ 目录本身放回来，再排除其下全部内容，最后单独放行该文件。
+!docs/
+docs/*
+!docs/CHANGELOG_NgxBackend.md
 交接文档*.md
 AI智能体任务计划*.md
 **/NEXT-TEST-CHECKLIST*.md
