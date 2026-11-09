@@ -1081,6 +1081,16 @@ static bool ensure_init(ID3D11Device *dev)
         g_init_retry_after_us = 0;   // 窗口过期：允许重试一次
     }
 
+    // ---- 首初始化计时（2026-11-09，PR #12 审查次要项 8）----
+    // 为什么在这里：本函数在 draw 钩子内首次被调到（dispatch 第 3 步），
+    //   第 2 步的 LoadLibraryW 与第 9 步的 Sleep(500) 都发生在**渲染线程**上
+    //   ⇒ 首次进游戏会出现一次可见卡顿。本计时就是为了把这个卡顿变成**数字**，
+    //   而不是靠"应该会卡一下"的推断（AGENTS.md §一.6 / §二.5）。
+    // ★ 起点取在退避窗口之后：窗口内的早退不做任何工作，计它会把"没初始化"算成"初始化很慢"。
+    // ★ 本计时**只在首次初始化路径上**（g_inited 短路 + 5 秒退避窗口之外），
+    //   不是每帧探针 ⇒ 不触犯 §二.5 的热路径红线。
+    const std::uint64_t init_t0 = qpc_us();
+
     // ---- 第 0 步：配置快照（只打一次，由 g_logged_config 保证）----
     if (!g_logged_config.exchange(true, std::memory_order_relaxed))
     {
@@ -1208,6 +1218,18 @@ static bool ensure_init(ID3D11Device *dev)
     g_device    = dev;   // ComPtr::operator= 即 AddRef；只在首次成功时走到这里（g_inited 短路）
     log_ngx_error(L"ngx_core init ok=1 available=1 rc=0x%X",
                   static_cast<unsigned>(NVSDK_NGX_Result_Success));
+    // 2026-11-09（PR #12 审查次要项 8）：首次初始化的**实测**耗时（含 LoadLibraryW
+    // 与第 9 步的 Sleep(500)）。这一行是**固定一次**的（不是条件触发）——
+    // 判据是 first_init_us 的**值**，不是这行出不出现；名字里的 slow 指
+    // 「它量的是那次卡顿」，不指「只有卡顿才打」。
+    // ★ 为什么走 log_ngx_error（Error 级）而不是 Info：NgxLogLevel 默认 = 1（error），
+    //   用 Info 的话默认配置下**这条永远看不到** —— 而它的全部价值就是被看到。
+    //   与相邻的 init ok=1 行同级别，两行一起出现便于对账。
+    // ★ 为什么方案选 C（接受现状 + 计时）而不是 A/B：见变更日志的评估。
+    // ★ 失败路径不走到这里（fail_init 早退），但那些路径**也到不了**第 9 步的 Sleep(500)，
+    //   所以漏掉的只是"初始化失败时的耗时"，不影响本行要量的那个卡顿。
+    log_ngx_error(L"ngx_core init_slow first_init_us=%.1f",
+                  static_cast<double>(qpc_us() - init_t0));
     return true;
 }
 
@@ -2046,6 +2068,60 @@ static bool ensure_motion_src_srv(const ffx12::FrameInput &in, NgxInstance &inst
     }
     return inst.motion_src_srv != nullptr;
 }
+
+// ============================================================================
+// 2026-11-09（PR #12 审查次要项 9）：为什么两个 CS **用完置空**而不是「还原原值」
+// ============================================================================
+// 审查意见：用完置空（null）而非还原游戏原本绑定的 SRV，多组件共存（桥 + OptiScaler +
+//   ReShade）时可能互相干扰。
+// 结论：**保留置空**，理由与量化依据如下（不是"看起来更省事"）。
+//
+// ① 还原需要多少个 Get*（本文件实测点数，非估计）：
+//    本文件两个 CS 各绑定 4 类槽位 —— CS shader / SRV0 / CB0 / UAV0..N。
+//    ⇒ 还原必须成对调用 4 个 Get*：CSGetShader、CSGetShaderResources(0,1)、
+//       CSGetConstantBuffers(0,1)、CSGetUnorderedAccessViews(0,N)。
+//    两个 CS 每帧各跑一次 ⇒ **每帧 8 次 Get* + 8 次 Release**（每个 Get 返回的接口都
+//    AddRef 一次，必须逐个 Release，漏一个就是永久泄漏，见 AGENTS.md §三 #12）。
+//    而当前实现的解绑侧是 **8 次 Set***，一次 Get 都没有。
+//    ⇒ 还原方案的代价是「+8 Get* +8 Release / 帧」，不是任务书设想的 2-3 个 Get*。
+//
+// ② 为什么不能改读桥自己的影子状态（g_state.cs_srvs / cs_uavs / cs_shader / cs_cbs）：
+//    那四个影子数组只由 hooked_cs_set_* 维护，而 **CS 系列钩子在 Release 构建里根本不装**
+//    （Dx11FsrBridge.cpp 的 patches 表：k_idx_cs_set_* 整组在
+//    #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME) 内）。生产构建读到的会是**从不更新**的
+//    旧值 ⇒ 还原成任意别的资源，比置空更危险。故唯一可行路径就是上面那 8 个 Get*。
+//
+// ③ 为什么 8 个 Get* 在本项目算"代价明显"而不是"可以接受"：
+//    · CSGetUnorderedAccessViews / CSGetShaderResources 在 D3D11 立即上下文上是
+//      **回读型**调用：运行时为了让返回值准确，必须把延迟提交的状态落定。它们位于
+//      ngx::dispatch 的第 8/9 步 —— 该函数由 ffx12::dispatch 在**每个 FSR2 派发点**上调用
+//      （实机约每帧一次，与 NgxBackend 的 g_ngx_frame_count 同频），属于
+//      AGENTS.md §二.5 点名的"每帧/每 draw 路径"。
+//    · 附带 8 次 AddRef/Release 的原子引用计数操作，同样是每帧固定开销。
+//    ★ 诚实标注：本条的 ③ 是 **E0（读 API 语义与代码结构推断）**，
+//      **没有**做过「关/开还原」的帧数 A/B 实测（AGENTS.md §二.5 明确要求先验证探针
+//      本身无扰动再谈收益，本轮不具备该条件）。因此本决策的依据是 ①（可数的事实：
+//      8 Get* + 8 Release vs 0）与 ②（Release 构建没有影子状态可用），不是性能实测。
+//
+// ④ 置空方向为什么是**安全侧**：绑定 null 是「什么都不绑」，游戏在下一次自己的 CS 派发前
+//    会重新绑定它需要的全部槽位（D3D11 立即上下文没有状态继承）。而"还原成猜的资源"
+//    一旦猜错，就是**把别人的纹理绑进游戏的 CS**，形态是静默画面错误而非缺图。
+//
+// ④-b **还原在 API 层面就是不完整的**（这条是决定性的，已核 Windows SDK）：
+//    `CSGetUnorderedAccessViews` 的签名是
+//      void CSGetUnorderedAccessViews(UINT StartSlot, UINT NumUAVs,
+//                                     ID3D11UnorderedAccessView **ppUnorderedAccessViews);
+//    ——**没有 pUAVInitialCounts 输出参数**（d3d11.h:8523-8529，10.0.26100.0）。
+//    而绑定侧 `CSSetUnorderedAccessViews(..., const UINT *pUAVInitialCounts)` 是有的。
+//    ⇒ 一旦走「保存/还原」，游戏原本设的 UAV 初始计数会被**静默丢弃**（还原时只能传 nullptr
+//    或 -1 语义），而这正是 append/consume 型 UAV 的语义来源。
+//    也就是说：**"还原原值"做不到真的还原原值**，只能还原一半 —— 比置空更难解释的形态。
+//
+// ⑤ 已知风险（如实记录，未验证）：多组件共存时，若 OptiScaler / ReShade 依赖
+//    "桥退出后 CS 槽位仍是它们绑的那一份"，本实现会把它们看到的槽位清成 null。
+//    当前无证据表明存在这种依赖（三组件共存场景下未做过对照实测）；
+//    若现场出现"开桥后 ReShade 的某个 CS 后处理失效"，本条是**首要排查点**。
+// ============================================================================
 
 // §3.6.1 深度提取 CS（1 SRV / 1 CB / 1 UAV）
 static void dispatch_depth_cs(ID3D11DeviceContext *ctx, NgxInstance &inst)
