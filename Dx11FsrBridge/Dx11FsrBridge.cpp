@@ -15,6 +15,9 @@
 #include "Il2CppCallSiteHook.h"
 #include "TransparentJitterHook.h"
 #include "Ffx12Backend.h"
+#include "NgxBackend.h"   // ngx::set_*（D13 九键）。只有 8 个 setter 有消费者；
+                          // 本头不含 NGX SDK 头，故 OFF 构型包含它也安全（REQ-08），
+                          // 但下面所有 ngx:: 调用点都被 DX11FSRBRIDGE_ENABLE_NGX 守卫。
 #include "Fsr2InputDump.h"
 #include "BridgeLogger.h"
 #include "PerfProbe.h"
@@ -4094,13 +4097,127 @@ void load_config()
     ffx12::set_async_upscale(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12AsyncUpscale", 1, config_path.c_str()) != 0);
     ffx12::set_hdr_input(g_config.ffx12_hdr_input);
+    // ---- D13 九键读取（SDS §3.13.1）：紧邻 Ffx12Hdr 的读取点 ----
+    // 此处 blog::init() 尚未执行 ⇒ 9 个 setter 只存值、一行日志都不打；
+    // 唯一需要输出的是非法值告警，它先进 pending_warnings，由 initialize() 回放。
+    //
+    // ⚠️ Ffx12Backend 只接受**精确小写**的 native / ngx：不 tolower、不 trim。
+    //    缺键（lpDefault=L"native"）与显式 native ⇒ native 且不告警；
+    //    显式空值 / NGX / Native / 拼错 ⇒ native + backend_invalid 告警。
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+    // ---- 键 1：Ffx12Backend（唯一走 ffx12 命名空间的键——不存在 ngx::set_backend）----
+    wchar_t backend_buf[64] {};
+    GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Backend", L"native",
+                             backend_buf, static_cast<DWORD>(std::size(backend_buf)),
+                             config_path.c_str());
+    const std::wstring backend_value(backend_buf);
+    const bool ngx_mode = (backend_value == L"ngx");
+    const bool native_mode = (backend_value == L"native");
+    if (!ngx_mode && !native_mode)
+        g_config.logging.pending_warnings.emplace_back(
+            "ngx_core backend=native config_warn bits=backend_invalid");
+    ffx12::set_backend(ngx_mode ? ffx12::BackendKind::Ngx : ffx12::BackendKind::Native);
+
+    // ---- 键 2：NgxApplicationId（uint64；0 → 1337，warn 位由 set_ 内部记）----
+    wchar_t appid_buf[32] {};
+    GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxApplicationId", L"1337",
+                             appid_buf, static_cast<DWORD>(std::size(appid_buf)),
+                             config_path.c_str());
+    const unsigned long long appid =
+        static_cast<unsigned long long>(_wcstoui64(appid_buf, nullptr, 10));
+    ngx::set_application_id(appid);
+
+    // ---- 键 3：NgxFeatureDirs（分号分隔；空 = 自动探测）----
+    wchar_t dirs_buf[2048] {};
+    GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxFeatureDirs", L"",
+                             dirs_buf, static_cast<DWORD>(std::size(dirs_buf)),
+                             config_path.c_str());
+    std::vector<std::wstring> ngx_dirs;   // 空 vector = 让 ensure_init 走自动探测
+    if (dirs_buf[0] != L'\0')
+    {
+        const std::wstring all(dirs_buf);
+        std::size_t pos = 0;
+        while (pos <= all.size())
+        {
+            const std::size_t sep = all.find(L';', pos);
+            const std::size_t end = (sep == std::wstring::npos) ? all.size() : sep;
+            if (end > pos) ngx_dirs.emplace_back(all, pos, end - pos);
+            if (sep == std::wstring::npos) break;
+            pos = sep + 1;
+        }
+    }
+    ngx::set_feature_dirs(ngx_dirs);
+
+    // ---- 键 4：NgxHdr（T-8 三态：auto / 1 / 0；默认 auto）----
+    // auto = 自动探测（**三级**：① swapchain color space > ② swapchain 缓冲格式 > ③ 输入纹理格式）；
+    // 1 = 强制 HDR；0 = 强制 SDR。旧配置写 1/0 仍然有效。
+    {
+        wchar_t hdr_buf[32] {};
+        GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxHdr", L"auto",
+                                 hdr_buf, static_cast<DWORD>(std::size(hdr_buf)),
+                                 config_path.c_str());
+        std::wstring hdr_s(hdr_buf);
+        // trim 两侧空白
+        const auto b = hdr_s.find_first_not_of(L" \t");
+        const auto e = hdr_s.find_last_not_of(L" \t");
+        hdr_s = (b == std::wstring::npos) ? std::wstring() : hdr_s.substr(b, e - b + 1);
+        for (auto &ch : hdr_s) ch = static_cast<wchar_t>(towlower(ch));
+        int hdr_mode = 0;   // auto
+        if (hdr_s == L"1" || hdr_s == L"true" || hdr_s == L"on")       hdr_mode = 1;
+        else if (hdr_s == L"0" || hdr_s == L"false" || hdr_s == L"off") hdr_mode = 2;
+        // 其它（含 "auto"、空、无法识别）一律 auto
+        ngx::set_hdr_mode(hdr_mode);
+    }
+
+    // ---- 键 5：NgxRenderPreset（P-11：默认 0 = 不设 preset，跟随 NGX 自身规则）----
+    // 0 = 六个 preset 参数一个都不设，由 NGX 按性能档自行决定（与 OptiScaler 的
+    // RenderPresetForAll=0 同义）。合法值 5..15 可显式指定档位。
+    const int ngx_preset =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxRenderPreset", 0, config_path.c_str());
+    ngx::set_render_preset(ngx_preset);
+
+    // ---- 键 6：NgxSetFrameTimeDelta（默认 1）----
+    const int ngx_dt =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxSetFrameTimeDelta", 1, config_path.c_str());
+    ngx::set_frame_time_delta(ngx_dt != 0);
+
+    // ---- 键 7：NgxUseReactiveMask（默认 0）----
+    const int ngx_react =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxUseReactiveMask", 0, config_path.c_str());
+    ngx::set_use_reactive_mask(ngx_react != 0);
+
+    // ---- 键 8：NgxLogLevel（默认 1；0=全关 1=error 2=info 3=debug）----
+    const int ngx_lv =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxLogLevel", 1, config_path.c_str());
+    ngx::set_log_level(ngx_lv);
+
+    // ---- 键 9：NgxPassthrough（默认 0）----
+    const int ngx_pt =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxPassthrough", 0, config_path.c_str());
+    ngx::set_passthrough(ngx_pt != 0);
+#else
+    // ---- REQ-08：NGX 未编译进本产物 ----
+    // 九个键里只有 Ffx12Backend 有消费者（后端选择器归 ffx12），其余 8 个 NGX 键在 OFF
+    // 构型下没有任何消费者，故不读。缺键 / 显式 native ⇒ 静默 native（不告警）；
+    // 任何其它取值（精确 ngx、非法值）⇒ 强制 Native + 一条固定告警。
+    {
+        wchar_t backend_buf[64] {};
+        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Backend", L"native",
+                                 backend_buf, static_cast<DWORD>(std::size(backend_buf)),
+                                 config_path.c_str());
+        if (std::wstring(backend_buf) != L"native")
+            g_config.logging.pending_warnings.emplace_back(
+                "ngx_core backend=native config_warn bits=ngx_not_compiled");
+        ffx12::set_backend(ffx12::BackendKind::Native);
+    }
+#endif
     ffx12::set_auto_exposure(g_config.ffx12_auto_exposure);
     ffx12::set_non_linear(g_config.ffx12_non_linear);
     ffx12::set_velocity_factor(g_config.ffx12_velocity_factor);
     // 【正式功能】P1 单实例接管（默认开）——段必须是 `[Dx11FsrBridge]`。
     // 它读在诊断守卫之外：这是**功能键**（消费者改变行为），发布构建必须保留。
     g_config.ffx12_single_instance =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12SingleInstance", 0, config_path.c_str()) != 0;
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12SingleInstance", 1, config_path.c_str()) != 0;
     g_config.ffx12_single_instance_pick = std::clamp<std::uint32_t>(
         static_cast<std::uint32_t>(GetPrivateProfileIntW(
             L"Dx11FsrBridge", L"Ffx12SingleInstancePick", 0, config_path.c_str())),
@@ -4234,6 +4351,47 @@ void load_config()
     // 审查文档也把它记为 fail-closed 诊断 ⇒ 归 B 组，发布构建不再读取。
     g_config.ffx12_fail_closed =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FailClosed", 0, config_path.c_str()) != 0;
+#endif
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+    // 2026-11-09（PR #12 审查次要项 10）：`NgxPassthrough=1` 与 `Ffx12FailClosed=1` 的
+    // **代码级互斥**。AGENTS.md §二.7 要求评估「两个『关闭/接管』语义的开关同时开启
+    // 是否互相吞掉」—— 这一对恰好是其中最坏的一种：
+    //   ① NgxPassthrough=1 ⇒ ngx::dispatch 在第 0 步就 return false（不超分）；
+    //   ② 该 false 传回 ffx12::dispatch ⇒ 走到 draw 钩子的派发失败分支；
+    //   ③ Ffx12FailClosed=1 ⇒ 该分支 return true = **吞掉这次 draw 且不产出任何图**。
+    //   ⇒ 不超分 + 不回退 + draw 被吞 = **每帧黑屏**（不崩不冻，最难排查的一类）。
+    //
+    // 处理方向：**强制关掉 Ffx12FailClosed**，而不是关 passthrough。
+    //   理由：passthrough 是用户显式要的观测手段（SDS 判据 14 依赖它），关掉它等于
+    //   让用户「设了没反应」；而 fail_closed 是**故障注入式诊断**（源码注释即「禁止
+    //   回退原生（测试/故障显式暴露）」），它的正确语义本就是「暴露失败」，
+    //   不是「制造黑屏」。两者冲突时保留用户的观测意图、放弃故障注入，方向更安全。
+    //
+    // ★ 位置硬约束：必须在**两个键都读完**之后（NgxPassthrough 在键 9、Ffx12FailClosed
+    //   在本块上方）且在任何消费者之前（唯一消费者是 draw 钩子的派发失败分支）。
+    // ★ 为什么用 pending_warnings 而不是 LOG_WARN：load_config() 跑在 blog::init() 之前，
+    //   此时直接写日志会被丢弃（见本文件 §logging 的说明与 pending_warnings 的回放点）。
+    //
+    // ★ 为什么用 ngx::passthrough() 而不是就地重读 ini，也不用局部变量 ngx_pt：
+    //   · 不重读 ini：一次 GetPrivateProfileIntW 有文件解析开销，且会与键 9 形成
+    //     **两个解析点**——两处若哪天改了一处默认值就会静默不一致。
+    //   · 不用 ngx_pt：它虽然在同一函数作用域内可见（:4196，`#endif` 不关闭 C++ 作用域），
+    //     但 ngx::passthrough() 返回的正是 4198 行 set_passthrough 存进去的那个值，
+    //     也就是**下游消费者读到的同一个值** ⇒ 本互斥的判据与消费者同源，
+    //     不会出现「互斥按 ini 判、消费者按全局判」的两套口径。
+    //
+    // ⚠️ 适用范围（如实记录）：`Ffx12FailClosed` 的**读取点**本身在
+    //   `#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)` 内 ⇒ 发布构建里
+    //   g_config.ffx12_fail_closed 恒为 false，本互斥在发布构建中**永不触发**。
+    //   也就是说这对组合只在诊断构建里能凑出来 —— 但它恰恰是诊断构建最容易踩的组合
+    //   （排查黑屏时同时开「直通」与「失败关闭」来定位到底哪一段吞了图），必须挡住。
+    if (ngx::passthrough() && g_config.ffx12_fail_closed)
+    {
+        g_config.ffx12_fail_closed = false;
+        g_config.logging.pending_warnings.emplace_back(
+            "config_mutex key=Ffx12FailClosed forced=0 reason=NgxPassthrough=1 "
+            "why=passthrough_plus_failclosed_black_screen");
+    }
 #endif
     // -----------------------------------------------------------------------
     // 日志配置。新方案：显式等级 + 分类过滤（[Log] 段），不做内容推断。
@@ -7218,6 +7376,47 @@ HRESULT STDMETHODCALLTYPE hooked_resize_buffers(
     {
         update_swapchain_backbuffer_resources(swapchain);
         apply_hdr_swapchain_force(swapchain);
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+        // T-FIX-11 MINOR-1 + T-FIX-25 M-1：ResizeBuffers 成功后重读后缓冲格式，交给 ngx 侧。
+        //   动机：ResizeBuffers 可能改变后缓冲格式（SDR↔HDR、分辨率切换等场景下游戏会
+        //   重建 8-bit/10-bit 交换链）。不重读 ⇒ is_hdr10_color_space 读到的仍是安装钩子
+        //   那一刻的旧格式，G10 判据会一直用错值（且是静默的：无日志、无报错）。
+        //   ★ 可达性（T-FIX-25 修的正是这一点）：本块只有 hooked_resize_buffers 被 attach
+        //     才会执行。attach 判据是 swapchain_control_hook_needed()（见 install_swapchain_hooks
+        //     的 patches 段），该谓词现已包含 Ngx 后端。T-FIX-25 之前它只有 dlssg 与
+        //     HdrSwapchainForce 两项，后者在发布构型恒假 ⇒ 默认发布构型下本块不执行。
+        //     ⇒ 判断本块是否生效请看 swapchain_control_hook_needed()，不要只看这段注释。
+        //   ★ 为何 GetDesc 在这里安全：ResizeBuffers 成功后交换链已处于可用状态，
+        //     GetDesc 只读描述结构、不涉及 GPU 同步；本函数由应用调用 ResizeBuffers
+        //     触发，不在 Present 每帧路径上。注意：部分应用会以未变化的参数重复调用
+        //     ResizeBuffers，那种情形只在 dlssg_dxgi_workaround_active() 为真时被上方
+        //     分支短路；ngx 且未启用 dlssg 时不会短路，本块会随每次调用执行
+        //     （一次 GetDesc + 一次 atomic 存储 + 一条 LOG_DEBUG，量级可忽略）。
+        //     先例取发布构型也成立的那个：hooked_present 里 GetDesc 是无守卫调用
+        //     （搜「const bool desc_available = SUCCEEDED(swapchain->GetDesc(&desc));」），
+        //     发布/诊断构型都执行 ⇒「Present 之后立刻 GetDesc」本就是既有做法。
+        //     （不要拿 apply_hdr_swapchain_force 的 QueryInterface 当先例：它与
+        //      update_swapchain_backbuffer_resources 都受诊断开关门控 ——
+        //      hdr_swapchain_force_active 在发布构型恒返回 false ⇒ 根本不执行。）
+        //   ★ 失败处理：GetDesc 失败 ⇒ 保持旧值不动。切勿写 UNKNOWN(0) ——
+        //     写 0 不是「把未知当探测」：refresh_hdr_probe_cache 对 fmt_raw==0 是
+        //     显式跳过（判断条件是 if (fmt_raw != 0)），不会产出 1/2 的假信号。
+        //     真实风险是清掉已知值：原本有效的 24/29 被清成未知 ⇒ ①②③ 三级都拿不到值
+        //     ⇒ 掉到 ④ 输入纹理格式兜底 ⇒ 翻转 HDR 决策（比「没更新」更糟）。
+        //   ★ 必须留在 ENABLE_NGX 守卫内：OFF 构型没有 NgxBackend.cpp（否则 LNK2019）。
+        if (swapchain != nullptr)
+        {
+            DXGI_SWAP_CHAIN_DESC resized {};
+            if (SUCCEEDED(swapchain->GetDesc(&resized)))
+            {
+                ngx::set_swapchain_format(resized.BufferDesc.Format);
+                LOG_DEBUG(blog::cat::hdr, "ngx_swapchain_format_refresh source=ResizeBuffers format=" +
+                    describe_dxgi_format(resized.BufferDesc.Format) +
+                    " size=" + std::to_string(resized.BufferDesc.Width) + "x" +
+                    std::to_string(resized.BufferDesc.Height));
+            }
+        }
+#endif
     }
     return result;
 }
@@ -7270,8 +7469,82 @@ bool hdr_swapchain_force_active()
 
 bool is_hdr10_color_space(DXGI_COLOR_SPACE_TYPE color_space)
 {
-    return color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
-        color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020;
+    // PQ（G2084）本身即 HDR 传输函数，无条件成立。
+    if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+        color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020)
+        return true;
+
+    // G10（scRGB）需要额外条件：**假定**必须配合 FP16 后缓冲，才按 HDR 处理。
+    //   ★ 2026-11-09（PR #12 审查 A-3）：不能无条件把 G10 判成 HDR。
+    //     DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709（值 1）**正是 Windows 在
+    //     「自动管理颜色」(ACM) 开启但显示器为 SDR 时对 SDR 交换链使用的标准值**
+    //     ⇒ 无条件判 HDR 会把 SDR 内容喂成 IsHDR=1，违反本仓库既有裁决
+    //     「宁可判 SDR 也不误报 HDR」（package.ini 的 NgxHdr 段 / NgxBackend.cpp 的
+    //     resolve_is_hdr 上方「M3 修复」段，搜「回退层保守化」；
+    //     **按内容定位，不写绝对行号** —— 行号随改动漂移，写了必然过期）。
+    //
+    //   ★★ T-FIX-11 MAJOR-1：「SDR 不会是 FP16」是**假设**，不是定理，不得当确定前提用。
+    //      本仓库自己就有反例（就地引用）：
+    //        · NgxBackend.cpp 的 srv_typed_format（搜「SDR 半浮点」）明文写这三种是
+    //          「本机/目标平台真会出现的 **SDR** 半浮点与广色域格式」，其中
+    //            case DXGI_FORMAT_R16G16B16A16_UNORM:   // 11
+    //            case DXGI_FORMAT_R16G16B16A16_SNORM:   // 13
+    //          ⇒ **SDR 会话可以是 16-bit 半浮点**，故「SDR 不会是 FP16」为假。
+    //        · 真正撑住本判据的是**取值范围**，不是位深：真 scRGB HDR 需要用 >1.0
+    //          表示超出 SDR 白点的亮度，只有 FLOAT(10) 有这个扩展范围；UNORM(11) 钳在
+    //          [0,1]、SNORM(13) 钳在 [-1,1]，装不下超白点 ⇒ 它们即便 16-bit 也只能是 SDR。
+    //          判据因此**刻意**只收 FLOAT(10) / TYPELESS(9)（可被当作 FLOAT 建视图），
+    //          不收 UNORM(11)/SNORM(13)。
+    //        · 证据等级：**E0**（读本仓库源码 + Windows SDK 头 dxgiformat.h:22-26/:37）。
+    //          未做过「UNORM/SNORM 后缓冲 + G10 色空间」的实机组合实测 ⇒ 本判据是
+    //          **未经 E2 证实的假设**，不是已验证结论。
+    //        · 因此本判据只提供**充分性**（命中即判 HDR），不提供必要性（未命中不排除 HDR）。
+    //
+    //   ★★ T-FIX-11 MAJOR-2：**对本项目唯一目标程序，本分支实质不可达**。
+    //      实机日志（2026-11-09 实机运行；SDR/HDR 各两份独立会话，逐字一致）：
+    //        HDR 会话：ngx_hdr_decision is_hdr=1 src=swapchain mode=0 sw_known=1
+    //                  sw_hdr=1 sw_fmt=24 color_fmt=23 depth_inv=1 flags=0xB
+    //        SDR 会话：ngx_hdr_decision is_hdr=0 src=swapchain_format mode=0 sw_known=0
+    //                  sw_hdr=0 sw_fmt=29 color_fmt=27 depth_inv=1 flags=0xA
+    //      出处（归档日志，可直接逐字 grep 复核）：
+    //        HDR = build-t6verify/t8-run1.log:460、build-t6verify/perf-latest.log:460
+    //        SDR = build-t6verify/t8-sdr.log:457 与 :553、
+    //              build-t6verify/perf-sdr.log:463 与 :552
+    //      ★ 与 VERIFY_T8 的关系（勿再误判为「照 schema 补全」）：
+    //        docs/agent/evidence/VERIFY_T8_NGXHDR_AUTODETECT.md 的帧率表只摘了 9 个字段
+    //        中的 5 个（is_hdr / src / sw_fmt / color_fmt / flags），未列
+    //        mode / sw_known / sw_hdr / depth_inv。那是**摘录省略**，不是字段不存在；
+    //        以原始日志为准，两处**不矛盾**。本注释是逐字引用，未按 schema 补全。
+    //      sw_fmt=24 = DXGI_FORMAT_R10G10B10A2_UNORM（dxgiformat.h:37），
+    //      sw_fmt=29 = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB（dxgiformat.h:42）；
+    //      而本分支要求 R16G16B16A16_FLOAT(10) / TYPELESS(9)（dxgiformat.h:22-23）。
+    //      ⇒ 目标游戏后缓冲只有 8-bit(29) 与 10-bit(24) 两种形态，**均非 FP16**
+    //        ⇒ 本分支恒为 false，是**死分支**。
+    //      ⇒ 净效果 = **撤销 C 项（G10 支持），G10 一律判 SDR**；
+    //        而不是「scRGB 已可判 HDR」。维护者不得据此认为该通路已可用。
+    //      ⇒ 旁证（E2 日志 + E0 代码推理）：同一日志里 sw_hdr=1 与 sw_fmt=24 并存
+    //        ⇒ 命中者只可能是上方 PQ(G2084) 分支（G10 分支在非 FP16 格式下恒 false；
+    //        唯一例外是 SetColorSpace1 那一刻后缓冲恰为 16F，而全部实机日志中
+    //        从未出现过 10/9）。即目标游戏的 HDR 走 PQ，不走 G10。
+    //      ⇒ 只有「16F 后缓冲 + G10 色空间」的程序才会走到 true（目标游戏不在其列）。
+    //      ⇒ 逃生舱：NgxHdr=1 强制 HDR（见 package.ini 的 NgxHdr 说明）。
+    //
+    //   ⇒ 判据 = G10 色空间 **且** 后缓冲格式为 R16G16B16A16_FLOAT(_TYPELESS)。
+    //   ★ 只有 FULL 变体的 G10 存在（dxgicommon.h:30 / :54），没有 STUDIO_G10 —— 实测编译报 C2065。
+    if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 ||
+        color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P2020)
+    {
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+        const DXGI_FORMAT fmt = ngx::swapchain_format();
+        return fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+               fmt == DXGI_FORMAT_R16G16B16A16_TYPELESS;
+#else
+        // NGX 关闭时无法读取后缓冲格式 ⇒ 保守判 SDR（不误报）。
+        return false;
+#endif
+    }
+
+    return false;
 }
 
 HRESULT STDMETHODCALLTYPE hooked_check_color_space_support(
@@ -7309,7 +7582,17 @@ HRESULT STDMETHODCALLTYPE hooked_set_color_space1(
     DXGI_COLOR_SPACE_TYPE color_space)
 {
     void *const caller = _ReturnAddress();
-    const bool spoof = hdr_swapchain_spoof_active() && is_hdr10_color_space(color_space);
+    // T-FIX-11 MINOR-2：原实现在本调用点对 is_hdr10_color_space(color_space) **求值两次**
+    //   （① spoof 判据、② ngx::set_swapchain_hdr 的实参）。该函数内部读
+    //   ngx::swapchain_format()（atomic），两次求值之间可能被写方翻转
+    //   ⇒「放行/拦截的判定」与「告诉 NGX 的状态」可能不是同一个结论。
+    //   改为**一次求值、两处复用**：spoof 与 NGX 侧看到同一结果。
+    const bool hdr10 = is_hdr10_color_space(color_space);
+    const bool spoof = hdr_swapchain_spoof_active() && hdr10;
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+    // T-8：把 swapchain 的 HDR 状态告诉 NGX（本游戏 HDR 由注册表在启动时决定，不运行时切换）
+    ngx::set_swapchain_hdr(hdr10);
+#endif
     const DXGI_COLOR_SPACE_TYPE physical_color_space = spoof
         ? DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
         : color_space;
@@ -7348,32 +7631,35 @@ HRESULT STDMETHODCALLTYPE hooked_set_hdr_metadata(
             ? g_original_set_hdr_metadata(swapchain, type, size, metadata)
             : DXGI_ERROR_INVALID_CALL);
 
-    std::ostringstream message;
-    message << "dxgi_hdr_metadata swapchain=" << hex64(reinterpret_cast<std::uintptr_t>(swapchain))
-        << " caller=" << module_path_from_address(caller)
-        << " type=" << static_cast<unsigned>(type) << "/" << hdr_metadata_type_name(type)
-        << " size=" << size
-        << " physical_hr=" << hex64(static_cast<std::uint32_t>(physical_hr))
-        << " spoof=" << (spoof ? 1 : 0);
-    if (type == DXGI_HDR_METADATA_TYPE_HDR10 && metadata != nullptr && size >= sizeof(DXGI_HDR_METADATA_HDR10))
-    {
-        const auto &hdr10 = *static_cast<const DXGI_HDR_METADATA_HDR10 *>(metadata);
-        message << " red=" << hdr10.RedPrimary[0] << "," << hdr10.RedPrimary[1]
-            << " green=" << hdr10.GreenPrimary[0] << "," << hdr10.GreenPrimary[1]
-            << " blue=" << hdr10.BluePrimary[0] << "," << hdr10.BluePrimary[1]
-            << " white=" << hdr10.WhitePoint[0] << "," << hdr10.WhitePoint[1]
-            << " max_mastering=" << hdr10.MaxMasteringLuminance
-            << " min_mastering=" << hdr10.MinMasteringLuminance
-            << " max_cll=" << hdr10.MaxContentLightLevel
-            << " max_fall=" << hdr10.MaxFrameAverageLightLevel;
-    }
 #if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
     const bool should_log = true;
 #else
     const bool should_log = spoof;
 #endif
+    // 发布构建下 should_log 恒为假：拼串整体下沉进 if，避免每帧白做格式化与模块扫描
     if (should_log)
+    {
+        std::ostringstream message;
+        message << "dxgi_hdr_metadata swapchain=" << hex64(reinterpret_cast<std::uintptr_t>(swapchain))
+            << " caller=" << module_path_from_address(caller)
+            << " type=" << static_cast<unsigned>(type) << "/" << hdr_metadata_type_name(type)
+            << " size=" << size
+            << " physical_hr=" << hex64(static_cast<std::uint32_t>(physical_hr))
+            << " spoof=" << (spoof ? 1 : 0);
+        if (type == DXGI_HDR_METADATA_TYPE_HDR10 && metadata != nullptr && size >= sizeof(DXGI_HDR_METADATA_HDR10))
+        {
+            const auto &hdr10 = *static_cast<const DXGI_HDR_METADATA_HDR10 *>(metadata);
+            message << " red=" << hdr10.RedPrimary[0] << "," << hdr10.RedPrimary[1]
+                << " green=" << hdr10.GreenPrimary[0] << "," << hdr10.GreenPrimary[1]
+                << " blue=" << hdr10.BluePrimary[0] << "," << hdr10.BluePrimary[1]
+                << " white=" << hdr10.WhitePoint[0] << "," << hdr10.WhitePoint[1]
+                << " max_mastering=" << hdr10.MaxMasteringLuminance
+                << " min_mastering=" << hdr10.MinMasteringLuminance
+                << " max_cll=" << hdr10.MaxContentLightLevel
+                << " max_fall=" << hdr10.MaxFrameAverageLightLevel;
+        }
         LOG_INFO(blog::cat::hdr, message.str());
+    }
     return spoof ? S_OK : physical_hr;
 }
 
@@ -13006,8 +13292,16 @@ bool try_fsr2_translation_draw(
     // 判据都不成立 ⇒ 原有语义（切断原生 FSR2）逐字保留。
     if (g_config.ffx12 && il2cpp_callsite::active())
     {
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+        // ★ T-6 第一道 fail-open gate（SDS §3.3.3 / D9）：NGX 全局放手时放行累积 draw，
+        //   否则原生 FSR2 的输入缺失 ⇒ 画面冻在最后一帧（2026-09-28 实机冻屏回归的机理）。
+        //   should_release_all() 只读一个 std::atomic<bool>，不碰容器、不取锁。
+        if (release_untagged_accumulate || ngx::should_release_all())
+            return false;
+#else
         if (release_untagged_accumulate)
             return false;
+#endif
         return true;
     }
 
@@ -13289,6 +13583,18 @@ bool fsr2_family_should_skip_draw(ID3D11DeviceContext *context)
 {
     if (!g_config.fsr2_family_skip)
         return false;
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+    // ★ T-6 第二道 fail-open gate（SDS §3.3.3 / D9，**主要放手点**）：
+    //   NGX 全局放手时关闭「跳过原生 FSR2 3-draw 预处理 pass」的许可。
+    //   本门在 draw 钩子里**每 draw** 调用一次，且物理上取不到 ffx12::g_mutex
+    //   （它在 Ffx12Backend.cpp 的匿名命名空间内、Ffx12Backend.h 里查不到），
+    //   故只能读 ngx::should_release_all() —— 它只读一个 std::atomic<bool>，
+    //   不碰容器、不取任何锁。语义必须是「全局」：任一实例失败都要关掉全局 family skip，
+    //   否则正常实例继续被 skip 而失败实例不出图 ⇒ 冻屏。
+    //   ⚠️ 必须早于下方 cached_ps 热点块（那块每次 draw 都要 PSGetShader）。
+    if (ngx::should_release_all())
+        return false;
+#endif
     // P1 单实例接管：**当前**确有多个活跃实例时**禁止**跳过预处理 pass。
     // 该跳过的前提是"每次累积 pass 都被桥成功替换"，而 P1 只替换**一个**实例的累积
     // pass —— 放行给原生的那一路仍需要自己的预处理 pass（其输出被族内的原生累积 pass
@@ -14294,11 +14600,39 @@ bool swapchain_present_hook_needed()
 
 bool swapchain_control_hook_needed()
 {
-    return dlssg_dxgi_workaround_active() || hdr_swapchain_force_active();
+    // ★ 修复 M-1（R-14B 复审）：把 Ngx 后端并入本谓词 —— 这是修既有刷新块的
+    //   **可达性**，不是新功能。原实现把「ResizeBuffers 成功后重读后缓冲格式」
+    //   （hooked_resize_buffers 内、ngx::set_swapchain_format 那一段）当成缺口已修，
+    //   但本谓词当时只有 dlssg 与 HdrSwapchainForce 两项，而 HdrSwapchainForce 在
+    //   发布构型恒假（见 hdr_swapchain_force_active）⇒ 在「NGX 后端 + 默认发布 ini
+    //   + 未启用 dlssg 帧生成」构型下 resize_buffers 槽不会被 patch，那段刷新块
+    //   不执行（静默：无日志、无报错）。
+    // ★ 为什么 NGX 需要它：ngx 的 G10 判据（is_hdr10_color_space）依赖后缓冲格式
+    //   的实时性。游戏在 SDR↔HDR / 全屏 / 分辨率切换时会重建交换链并可能改变
+    //   BufferDesc.Format；只在 install_swapchain_hooks 里读一次，ngx 侧就会一直
+    //   用安装时刻的旧格式。
+    // 注：ffx12::backend() 与 BackendKind 在 Ffx12Backend.h 中无条件声明，
+    //     Ffx12Backend.cpp 无条件进 target_sources ⇒ OFF 构型也安全，不需要 #if 守卫
+    //     （与下方 swapchain_color_hook_needed 同构）。
+    // ★ 副作用（改这里前必读）：本谓词 = should_hook_general_swapchain_controls，
+    //   除 resize_buffers 外还会 patch set/get_fullscreen_state 与 resize_target
+    //   三个槽（见 install_swapchain_hooks）。三者在 Ngx 构型且 dlssg 未启用时均为
+    //   纯透传；只有 dlssg_dxgi_workaround_active() 为真时才短路，而那种情形
+    //   本谓词本来就返回真、钩子本来就装 —— 即三个槽的行为与本次改动前一致。
+    return dlssg_dxgi_workaround_active() || hdr_swapchain_force_active() ||
+        ffx12::backend() == ffx12::BackendKind::Ngx;
 }
 
 bool swapchain_color_hook_needed()
 {
+    // T-8：ngx 后端需要读 swapchain 的 color space 来判定 IsHDR 标志。
+    // 发布构建下 k_color_diagnostics_enabled / spoof / force 三者恒假，
+    // 若不在此加条件，set_color_space1 hook 永不安装 ⇒ ngx 的 auto 探测退化为
+    // 仅按输入纹理格式推导（不可靠：本机存在 10-bit SDR 会话）。
+    // 注：ffx12::backend() 与 BackendKind 在 Ffx12Backend.h 中无条件声明，
+    //     Ffx12Backend.cpp 无条件进 target_sources ⇒ OFF 构型也安全，不需要 #if 守卫。
+    if (ffx12::backend() == ffx12::BackendKind::Ngx)
+        return true;
     return k_color_diagnostics_enabled || hdr_swapchain_spoof_active() || hdr_swapchain_force_active();
 }
 
@@ -14423,6 +14757,20 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
                 " format=" + describe_dxgi_format(desc.BufferDesc.Format) +
                 " size=" + std::to_string(desc.BufferDesc.Width) + "x" + std::to_string(desc.BufferDesc.Height) +
                 " swapchain4=" + std::to_string(supports_hdr_metadata ? 1 : 0));
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+            // T-8 M4-b（路径 A）：把后缓冲格式主动交给 NGX 侧，作为 HDR 判定的第二来源。
+            // 为什么需要"主动"：DXGI **没有** GetColorSpace（IDXGISwapChain3 只有
+            //   CheckColorSpaceSupport / SetColorSpace1，已 grep Windows SDK
+            //   10.0.26100.0/shared/dxgi1_4.h:121/127 确认），读不回"当前" color space。
+            //   因此若游戏从不调用 SetColorSpace1，hooked_set_color_space1 永远不会跑，
+            //   ngx 的 auto 探测就只能退到"输入纹理格式"这一最不可靠的来源。
+            //   这里读的是 swapchain 自述的 BufferDesc.Format —— 它不依赖任何 hook 时机，
+            //   是本进程内能拿到的、与 HDR 相关的最早一手信息。
+            // ★ 它只是"能力级"信号（后缓冲是 16F 还是 8-bit），不是"状态级"；
+            //   所以 ngx 侧的优先级是：color space（hook）> 本项 > 输入纹理格式。
+            // ★ 必须在 ENABLE_NGX 守卫内：OFF 构型没有 NgxBackend.cpp，否则 LNK2019。
+            ngx::set_swapchain_format(desc.BufferDesc.Format);
+#endif
         }
     }
     clone_and_patch_vtable(hook_instance, hook_method_count, patches);
@@ -15091,6 +15439,16 @@ void initialize()
         for (const std::string &warning : g_config.logging.pending_warnings)
             LOG_WARN(blog::cat::config, warning);
         g_config.logging.pending_warnings.clear();
+        // 后端选择状态行（SDS §3.13.2 第 2 条）：在 logger 起来 + 告警回放之后，
+        // 按已生效的 ffx12::backend() **恰输出一条**，两种模式都可取证。
+        // 走 blog::cat::config 并在日志器初始化之后，故不依赖 NGX 编译开关或 ensure_init。
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+        LOG_INFO(blog::cat::config, ffx12::backend() == ffx12::BackendKind::Ngx
+                                        ? "ngx_core backend=ngx"
+                                        : "ngx_core backend=native");
+#else
+        LOG_INFO(blog::cat::config, "ngx_core backend=native");
+#endif
     }
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)

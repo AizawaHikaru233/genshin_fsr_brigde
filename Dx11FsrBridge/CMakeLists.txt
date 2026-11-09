@@ -72,6 +72,11 @@ option(DX11FSRBRIDGE_BUILD_TESTS "Build the SDK-free unit tests (il2cpp callsite
 option(DX11FSRBRIDGE_DIAGNOSTICS
     "Compile diagnostics/probes (PerfProbe, Fsr2InputDump, *Probe*, Trace*, Dump*) - keep OFF for release" OFF)
 
+# ---- D3D11 NGX（DLSS 超分）后端开关（2026-11-07，T-1）----
+# NGX 头被 gitignore（`.gitignore:158`，许可与 GPL 冲突、禁止提交）⇒ **无头检出必须仍能构建**
+# （REQ-08）：头缺失时自动降级为 OFF，只打一行 STATUS，不 FATAL。
+option(DX11FSRBRIDGE_ENABLE_NGX "Build the D3D11 NGX (DLSS) backend" ON)
+
 set(DX11FSRBRIDGE_DIAGNOSTICS_ON ${DX11FSRBRIDGE_DIAGNOSTICS})
 if(NOT DX11FSRBRIDGE_DIAGNOSTICS_ON AND CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(DX11FSRBRIDGE_DIAGNOSTICS_ON ON)
@@ -137,6 +142,22 @@ endif()
 # `#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)` 块整体不参与编译）。
 if(DX11FSRBRIDGE_DIAGNOSTICS_ON)
     target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_ENABLE_DIAGNOSTICS=1)
+endif()
+
+# NGX 后端接线（SDS §5.1）。★ 三行缺一不可：只写 include 目录与宏、不写 target_sources
+# ⇒ `NgxBackend.cpp` 永不进编译单元 ⇒ ngx 的 13 个符号未定义 ⇒ **LNK2019**（本 target 无 GLOB）。
+if(DX11FSRBRIDGE_ENABLE_NGX)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx/nvsdk_ngx_defs.h")
+        target_sources(Dx11FsrBridge PRIVATE NgxBackend.cpp)
+        target_include_directories(Dx11FsrBridge PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx")
+        target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_ENABLE_NGX=1)
+        message(STATUS "Dx11FsrBridge: NGX 后端参与编译（DX11FSRBRIDGE_ENABLE_NGX=1）")
+    else()
+        message(STATUS "NGX headers not found; building without the NGX backend "
+                       "(run tools/Fetch-NgxHeaders.ps1 to enable)")
+        set(DX11FSRBRIDGE_ENABLE_NGX OFF)
+    endif()
 endif()
 
 # 旧方案已彻底移除：Fsr2TranslationLayer（旧翻译层）与 Dx11On12Swapchain（On12 引导）
@@ -210,6 +231,9 @@ target_link_libraries(Dx11FsrBridge PRIVATE
     d3d12
     d3dcompiler
     dxgi
+    # T-10：DisplayConfigGetDeviceInfo / QueryDisplayConfig（Windows 显示配置 API）
+    # 用于探测显示器真实 HDR 状态。这三个函数在 user32.lib。
+    user32
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/detours/detours.lib"
 )
 
@@ -357,6 +381,13 @@ if(DX11FSRBRIDGE_BUILD_BACKEND_TEST)
     #    已加 fail-open 的 try/catch（见 Ffx12Backend.cpp）。
     #
     #    保持本开关默认 OFF，避免让"已知失败的测试"混进 CI 绿灯。
+    # 2026-11-09（PR #12 审查次要项 6）：**本 test 只覆盖 native 路径**。
+    #   不定义 DX11FSRBRIDGE_ENABLE_NGX ⇒ Ffx12Backend.cpp 里的 ngx:: 分支
+    #   （#if defined(DX11FSRBRIDGE_ENABLE_NGX) 内）不参与编译 ⇒ 测试不覆盖 NGX 路径。
+    #   理由：本 test 在隔离 harness 下已知运行崩溃（见上方 message），扩展其覆盖面
+    #   没有价值；NGX 路径的编译覆盖由 .github/workflows/compile-check.yml 的
+    #   build-ngx-on job 覆盖；但该 job 已配置、从未在 GitHub 上运行过，
+    #   因此编译覆盖目前是 NOT VERIFIED。
     add_executable(Ffx12BackendTest
         Ffx12BackendTest.cpp
         Ffx12Backend.cpp

@@ -22,10 +22,27 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # 已知的桥加载路线（新增路线时在此登记）
-$routes = @(
-    @{ Name = 'Starward'; Dir = 'D:\miHoYo Games\Starward\原神解帧FSR插件包\payload\Bridge' },
-    @{ Name = 'FufuLauncher'; Dir = 'D:\Program Files\FufuLauncher\Plugins\FSR-Bridge-Plugin\payload\Bridge' }
-)
+#
+# 2026-11-10（实机路线已迁移，旧表整体失效）：启动器日志 `FSR-Bridge-Plugin.log` 里的
+#   `bridge_path` 与 `bridge_load_success module=0x7FF984140000` 证明本机真正加载的是
+#   FufuLauncher 的**用户级**安装目录（%LOCALAPPDATA%\Programs\...），不是全机安装的
+#   D:\Program Files\...。本机实测原两条路线 Test-Path 均为 False ⇒ 旧脚本一条都铺不到
+#   （循环里全部「跳过」然后 exit 0，见文件末尾的兜底）。
+#   故新增 FufuLauncherUser 一条；旧的 Starward / FufuLauncher **保留**——别的机器上它们
+#   可能仍然有效，删掉会让那些机器部署不到。Legacy=$true 只影响「跳过」时的提示文案。
+#   FufuLauncherUser 用 %LOCALAPPDATA% 环境变量拼接（用户级安装目录随用户而异），
+#   不写死任何本机绝对路径。该变量为空时自动跳过这条路线（不报错）。
+$routes = @()
+
+    # 用户级安装目录由 %LOCALAPPDATA% 拼接；变量为空（非 Windows 或被清空）时跳过本条，不抛错。
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $routes += @{ Name = 'FufuLauncherUser'; Dir = (Join-Path $env:LOCALAPPDATA 'Programs\FufuLauncher\Plugins\FSR-Bridge-Plugin\payload\Bridge'); Legacy = $false }
+    }
+
+    $routes += @(
+        @{ Name = 'Starward';         Dir = 'D:\miHoYo Games\Starward\原神解帧FSR插件包\payload\Bridge'; Legacy = $true },
+        @{ Name = 'FufuLauncher';     Dir = 'D:\Program Files\FufuLauncher\Plugins\FSR-Bridge-Plugin\payload\Bridge'; Legacy = $true }
+    )
 
 # 必须显式写入的功能键 —— **与 `Dx11FsrBridge\Dx11FsrBridge.package.ini` 的
 # [Dx11FsrBridge] 段逐键一致**（改模板时同步改这里）。
@@ -38,11 +55,16 @@ $routes = @(
 #    已从发布版整块剔除：本清单与发布模板都不再包含它们；需要诊断请用开发构建。
 #    Diagnostic keys are excluded from the release build - do not add them back here.
 #
-# ⚠️ 两个**故意不写**的例外：
+# ⚠️ 三个**故意不写**的例外：
 #    · Ffx12AsyncUpscale —— 由安装器 / 芙芙启动器按显卡自动写入（RDNA2→0、其他→1），
 #      本脚本写死 1 会与它的按显卡判定打架；
 #    · Ffx12DllPath     —— 路径键：留空即"随包 payload\AMD 的 SDK"，本脚本不覆盖
-#      用户自定义路径。
+#      用户自定义路径；
+#    · Ffx12Backend     —— **部署脚本不得静默把用户切回 native 后端**。ngx 是 opt-in 后端：
+#      本脚本每次部署都跑，若在这里写死 native，每次部署都会把用户已选的 ngx 清掉，
+#      而 ngx 失效是**静默**的（回落到 native 只是性能/画质变化，不会崩、不会报错）。
+#      缺键时代码内建缺省就是 native（Dx11FsrBridge.cpp:4110 lpDefault=L"native"），
+#      所以不写这个键也天然安全，用户手改的 ngx 也就保得住。
 $configValues = [ordered]@{
     # ---- 1. 核心功能 / Core features ----
     'Enabled'                   = '1'
@@ -92,6 +114,18 @@ $configValues = [ordered]@{
     'Fsr2Il2CppHook'            = '1'   # 代码内建缺省是 0 ⇒ 删行会让桥接失效
     'Ffx12ReuseSameGeneration'  = '0'   # 开启会产生残像
     'Ffx12FeatureFallback'      = '1'
+    # ---- 7. NGX(DLSS) 后端 / NGX backend（opt-in，默认全程 native）----
+    # 默认值逐键与 Dx11FsrBridge.package.ini 的 [Dx11FsrBridge] 段、以及代码内建缺省一致
+    # （Dx11FsrBridge.cpp:4107-4195）。改这里必须三处同步改。
+    # ⚠️ Ffx12Backend **故意不在本表里**：见文件顶部"三个故意不写的例外"。
+    'NgxApplicationId'          = '1337'
+    'NgxFeatureDirs'            = ''    # 空 = 自动探测含 nvngx_dlss.dll 的目录
+    'NgxHdr'                    = 'auto' # 三态：auto（默认）/ 1 强制 HDR / 0 强制 SDR
+    'NgxRenderPreset'           = '0'   # 0 = 六个 preset 参数都不设（跟随 NGX 自身规则）；5..15 可显式指定
+    'NgxSetFrameTimeDelta'      = '1'
+    'NgxUseReactiveMask'        = '0'
+    'NgxLogLevel'               = '1'   # 0=全关 1=error（默认，取证行已可见）2=info 3=debug
+    'NgxPassthrough'            = '0'
     # ---- 日志（[Log] 段）/ Logging ----
     # 必须在这里写：Add-LogSection 只在**没有** [Log] 段时才补整段，
     # 而已部署的 ini 都已有 [Log] 段 → 段内的新键永远不会被补上（实测 queue_capacity 缺失）。
@@ -189,13 +223,25 @@ function Add-LogSection {
     return $true
 }
 
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+# 2026-11-10（与仓库规范对齐）：规范 §8.5 要求备份名 `Xxx.dll.bak-YYYYMMDD-HHMM`（时分
+#   HHMM 两位、不带秒），原格式带秒。改前已 grep 全仓库确认**没有任何代码解析这个 stamp**：
+#   它只用于拼备份文件名，而 -Rollback 与 Toggle-BridgeDll.ps1 都用 'Dx11FsrBridge.dll.bak-*'
+#   通配枚举、不解析时间串 ⇒ 改短不影响任何调用方，历史带秒的备份仍能被通配匹配到。
+$stamp = Get-Date -Format 'yyyyMMdd-HHmm'
 $summary = New-Object System.Collections.ArrayList
+# 2026-11-10（核心改进）：统计**真正成功**的路线数。原脚本在一条都铺不到时只打印一串
+#   「跳过」然后正常 exit 0 —— 使用者看到一堆「跳过」很容易误以为已部署。现在 0 条即
+#   失败退出（见文件末尾），让「看起来跑完了其实什么都没做」不可能静默通过。
+$modeLabel = if ($Rollback) { '回滚' } else { '部署' }
+$appliedCount = 0
 
 foreach ($route in $routes) {
     $dir = $route.Dir
     if (-not (Test-Path -LiteralPath $dir)) {
-        [void]$summary.Add("[$($route.Name)] 跳过：目录不存在 $dir")
+        # 2026-11-10：历史路线（Legacy）在本机已不存在属预期，文案要与「新路线也找不到」
+        #   区分开，否则真实的登记错误会被淹没在一片正常的「跳过」里。
+        $why = if ($route.Legacy) { '路线已不存在则跳过（历史路线，本机可能已迁移）' } else { '**跳过：登记路线不存在**' }
+        [void]$summary.Add("[$($route.Name)] $($why)：$dir")
         continue
     }
     $dll = Join-Path $dir 'Dx11FsrBridge.dll'
@@ -211,7 +257,10 @@ foreach ($route in $routes) {
                Sort-Object LastWriteTime -Descending | Select-Object -First 1
         if ($null -eq $bak) { [void]$summary.Add("[$($route.Name)] 无备份可回滚"); continue }
         Copy-Item -LiteralPath $bak.FullName -Destination $dll -Force
-        [void]$summary.Add("[$($route.Name)] 已回滚到 $($bak.Name)")
+        $rbSize = (Get-Item $dll).Length
+        $rbSha = (Get-FileHash $dll -Algorithm SHA256).Hash.Substring(0, 16)
+        [void]$summary.Add(("[{0}] 已回滚到 {1}  ->  {2}  {3} B  sha256={4}" -f $route.Name, $bak.Name, $dll, $rbSize, $rbSha))
+        $appliedCount++
         continue
     }
 
@@ -228,7 +277,9 @@ foreach ($route in $routes) {
     Copy-Item -LiteralPath $dll -Destination (Join-Path $dir "Dx11FsrBridge.dll.bak-$stamp") -Force -ErrorAction SilentlyContinue
     Copy-Item -LiteralPath $BuildDll -Destination $dll -Force
     $after = (Get-Item $dll).Length
-    $sha = (Get-FileHash $dll -Algorithm SHA256).Hash.Substring(0, 8)
+    # 2026-11-10：摘要取 SHA256 前 16 位（原为 8 位）。8 位只有 32 bit，多份构建撞车概率不可忽略，
+    #   16 位足以人工比对又不至于把 summary 撑爆。
+    $sha = (Get-FileHash $dll -Algorithm SHA256).Hash.Substring(0, 16)
 
     $cfgNote = 'config 未改'
     if (-not $SkipConfig -and (Test-Path -LiteralPath $ini)) {
@@ -246,12 +297,37 @@ foreach ($route in $routes) {
         }
     }
 
-    [void]$summary.Add(("[{0}] DLL {1} -> {2} B  sha={3}  {4}" -f $route.Name, $before, $after, $sha, $cfgNote))
+    # 2026-11-10：成功行必须能一眼核对"到底写了哪个文件"——打印完整 DLL 路径 + 大小 +
+    #   SHA256 前 16 位（原先是 8 位，且不含路径，只能靠路线名反推）。多路线时同名 DLL
+    #   分散在不同目录，路径是唯一能区分它们的字段。
+    [void]$summary.Add(("[{0}] 已写入 {1}  {2} B  sha256={3}  (原 {4} B)  {5}" -f $route.Name, $dll, $after, $sha, $before, $cfgNote))
+    $appliedCount++
 }
 
 Write-Host ""
-Write-Host "部署结果 / Deploy summary:" -ForegroundColor Cyan
+Write-Host "$($modeLabel)结果 / Deploy summary:" -ForegroundColor Cyan
 foreach ($line in $summary) { Write-Host "  $line" }
+Write-Host "  合计：$appliedCount / $($routes.Count) 条路线已$($modeLabel)" -ForegroundColor Cyan
+
+# 2026-11-10（本改动的核心目的）：0 条成功必须以非 0 退出码失败。
+#   原来的行为是一条都没铺时也只打印一串「跳过」然后正常退出，使用者极易误判成
+#   「跑完了、已部署」——实测本机两条旧路线都不存在时正是这种静默空转。
+#   现在：0 条 → Write-Error（醒目）+ exit 1。注意这里**不能**用 throw：$ErrorActionPreference
+#   已是 Stop，throw 会在打印前把控制权交给调用方，退出码不可控；显式 exit 1 才确定。
+#   同时提示"至少有一条"是真实条件（不是永远成立），故只陈述当前判定，不承诺将来。
+if ($appliedCount -eq 0) {
+    Write-Host ""
+    Write-Host "已登记路线（逐条 Test-Path 复核）:" -ForegroundColor Yellow
+    foreach ($route in $routes) {
+        $state = if (Test-Path -LiteralPath $route.Dir) { '存在' } else { '不存在' }
+        Write-Host ("    [{0}] {1}  ({2})" -f $route.Name, $route.Dir, $state) -ForegroundColor Yellow
+    }
+    Write-Host "  这不是成功：一条都没写。请先确认实机加载路线，再把正确目录登记进路线表。" -ForegroundColor Red
+    # -ErrorAction Continue 必须显式给出：$ErrorActionPreference 已是 Stop，否则 Write-Error
+    #   会立刻抛终止错误、跳过下一行的 exit 1，退出码就落到调用方/宿主手里，不再是本脚本决定。
+    Write-Error ("[$modeLabel] 没有任何路线成功：0 / {0} 条。所有登记路线的目录都不存在，或 DLL 全部被占用。" -f $routes.Count) -ErrorAction Continue
+    exit 1
+}
 
 if (-not $Rollback) {
     Write-Host ""
