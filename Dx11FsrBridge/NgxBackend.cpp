@@ -2061,6 +2061,14 @@ void set_swapchain_format(DXGI_FORMAT f)
     refresh_hdr_probe_cache();   // ★ T-11：探测变了，立刻刷新预计算缓存
 }
 
+// T-FIX-2：读回后缓冲格式，供 Dx11FsrBridge 的 is_hdr10_color_space 判断
+// 「G10 色空间 + FP16 后缓冲」这一组合。单独 G10 不足以判 HDR
+// （ACM + SDR 显示器也用 G10），详见 Dx11FsrBridge.cpp 该函数的注释。
+DXGI_FORMAT swapchain_format()
+{
+    return static_cast<DXGI_FORMAT>(g_swapchain_format.load(std::memory_order_relaxed));
+}
+
 void set_render_preset(int v)
 {
     // §3.13：不在 (0 或 5..15) → 回退 0 并记位。0 的语义是"六个 preset 参数一个都不设"，

@@ -17,11 +17,16 @@ void set_application_id(unsigned long long id);             // NgxApplicationId�
 void set_feature_dirs(const std::vector<std::wstring> &d);  // NgxFeatureDirs；空 = 自动探测
 void set_hdr(bool on);                                      // NgxHdr，默认 true（旧接口；T-8 起由 set_hdr_mode 取代，保留不删）
 // T-8：HDR 三态。mode: 0=auto（默认，自动探测）1=强制HDR 2=强制SDR。
-// auto 时按**三级**顺序探测（与 NgxBackend.cpp 的 resolve_is_hdr 一一对应）：
+// auto 时按**四级**顺序探测（与 NgxBackend.cpp 的 resolve_is_hdr 一一对应）：
 //   ① swapchain color space（set_swapchain_hdr，由 SetColorSpace1 hook 调用）——最准；
-//   ② swapchain buffer 格式（set_swapchain_format，由 install_swapchain_hooks 主动读）——
+//   ② Windows 显示配置 API（probe_displayconfig_hdr，ensure_init 时探一次）——
+//      系统级真实 HDR 状态，不依赖游戏是否调 SetColorSpace1；
+//   ③ swapchain buffer 格式（set_swapchain_format，由 install_swapchain_hooks 主动读）——
 //      覆盖"游戏从不调 SetColorSpace1"的场合；
-//   ③ 输入纹理格式（resolve_is_hdr 的 color_fmt 参数）——最后兜底。
+//   ④ 输入纹理格式（resolve_is_hdr 的 color_fmt 参数）——最后兜底。
+// ★ 缓存策略：①②③ 都是事件驱动的（hook / ensure_init 写入），所以在**写入点**
+//   预计算进 g_hdr_probe_cache，每帧只读一次；只有 ④ 依赖每帧的 color_fmt。
+//   2026-11-09（PR #12 审查 E 项）：原注释写「三级」，实现已是四级，此处同步。
 void set_hdr_mode(int mode);                 // NgxHdr = auto / 1 / 0
 void set_swapchain_hdr(bool hdr);            // 由 Dx11FsrBridge 的 SetColorSpace1 hook 调用
 // T-8 M4-b：swapchain 后缓冲格式（DXGI_SWAP_CHAIN_DESC::BufferDesc.Format）。
@@ -31,6 +36,10 @@ void set_swapchain_hdr(bool hdr);            // 由 Dx11FsrBridge 的 SetColorSp
 //   只能靠 install_swapchain_hooks() 主动读 BufferDesc.Format 作为第二来源。
 //   DXGI_FORMAT_UNKNOWN(0) 表示"未知/不参与判定"。
 void set_swapchain_format(DXGI_FORMAT f);    // 由 install_swapchain_hooks() 主动调用
+
+// T-FIX-2：供 Dx11FsrBridge 的 is_hdr10_color_space 判断「G10 + FP16」组合。
+// 返回 0 = 未知（DXGI_FORMAT_UNKNOWN），否则是当前 swapchain 后缓冲格式。
+DXGI_FORMAT swapchain_format();
 void set_render_preset(int v);                              // NgxRenderPreset，默认 0（跟随 NGX）
 void set_frame_time_delta(bool on);                         // NgxSetFrameTimeDelta，默认 true
 void set_use_reactive_mask(bool on);                        // NgxUseReactiveMask，默认 false

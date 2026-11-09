@@ -7428,8 +7428,82 @@ bool hdr_swapchain_force_active()
 
 bool is_hdr10_color_space(DXGI_COLOR_SPACE_TYPE color_space)
 {
-    return color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
-        color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020;
+    // PQ（G2084）本身即 HDR 传输函数，无条件成立。
+    if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+        color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020)
+        return true;
+
+    // G10（scRGB）需要额外条件：**假定**必须配合 FP16 后缓冲，才按 HDR 处理。
+    //   ★ 2026-11-09（PR #12 审查 A-3）：不能无条件把 G10 判成 HDR。
+    //     DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709（值 1）**正是 Windows 在
+    //     「自动管理颜色」(ACM) 开启但显示器为 SDR 时对 SDR 交换链使用的标准值**
+    //     ⇒ 无条件判 HDR 会把 SDR 内容喂成 IsHDR=1，违反本仓库既有裁决
+    //     「宁可判 SDR 也不误报 HDR」（package.ini 的 NgxHdr 段 / NgxBackend.cpp 的
+    //     resolve_is_hdr 上方「M3 修复」段，搜「回退层保守化」；
+    //     **按内容定位，不写绝对行号** —— 行号随改动漂移，写了必然过期）。
+    //
+    //   ★★ T-FIX-11 MAJOR-1：「SDR 不会是 FP16」是**假设**，不是定理，不得当确定前提用。
+    //      本仓库自己就有反例（就地引用）：
+    //        · NgxBackend.cpp 的 srv_typed_format（搜「SDR 半浮点」）明文写这三种是
+    //          「本机/目标平台真会出现的 **SDR** 半浮点与广色域格式」，其中
+    //            case DXGI_FORMAT_R16G16B16A16_UNORM:   // 11
+    //            case DXGI_FORMAT_R16G16B16A16_SNORM:   // 13
+    //          ⇒ **SDR 会话可以是 16-bit 半浮点**，故「SDR 不会是 FP16」为假。
+    //        · 真正撑住本判据的是**取值范围**，不是位深：真 scRGB HDR 需要用 >1.0
+    //          表示超出 SDR 白点的亮度，只有 FLOAT(10) 有这个扩展范围；UNORM(11) 钳在
+    //          [0,1]、SNORM(13) 钳在 [-1,1]，装不下超白点 ⇒ 它们即便 16-bit 也只能是 SDR。
+    //          判据因此**刻意**只收 FLOAT(10) / TYPELESS(9)（可被当作 FLOAT 建视图），
+    //          不收 UNORM(11)/SNORM(13)。
+    //        · 证据等级：**E0**（读本仓库源码 + Windows SDK 头 dxgiformat.h:22-26/:37）。
+    //          未做过「UNORM/SNORM 后缓冲 + G10 色空间」的实机组合实测 ⇒ 本判据是
+    //          **未经 E2 证实的假设**，不是已验证结论。
+    //        · 因此本判据只提供**充分性**（命中即判 HDR），不提供必要性（未命中不排除 HDR）。
+    //
+    //   ★★ T-FIX-11 MAJOR-2：**对本项目唯一目标程序，本分支实质不可达**。
+    //      实机日志（2026-11-09 实机运行；SDR/HDR 各两份独立会话，逐字一致）：
+    //        HDR 会话：ngx_hdr_decision is_hdr=1 src=swapchain mode=0 sw_known=1
+    //                  sw_hdr=1 sw_fmt=24 color_fmt=23 depth_inv=1 flags=0xB
+    //        SDR 会话：ngx_hdr_decision is_hdr=0 src=swapchain_format mode=0 sw_known=0
+    //                  sw_hdr=0 sw_fmt=29 color_fmt=27 depth_inv=1 flags=0xA
+    //      出处（归档日志，可直接逐字 grep 复核）：
+    //        HDR = build-t6verify/t8-run1.log:460、build-t6verify/perf-latest.log:460
+    //        SDR = build-t6verify/t8-sdr.log:457 与 :553、
+    //              build-t6verify/perf-sdr.log:463 与 :552
+    //      ★ 与 VERIFY_T8 的关系（勿再误判为「照 schema 补全」）：
+    //        docs/agent/evidence/VERIFY_T8_NGXHDR_AUTODETECT.md 的帧率表只摘了 9 个字段
+    //        中的 5 个（is_hdr / src / sw_fmt / color_fmt / flags），未列
+    //        mode / sw_known / sw_hdr / depth_inv。那是**摘录省略**，不是字段不存在；
+    //        以原始日志为准，两处**不矛盾**。本注释是逐字引用，未按 schema 补全。
+    //      sw_fmt=24 = DXGI_FORMAT_R10G10B10A2_UNORM（dxgiformat.h:37），
+    //      sw_fmt=29 = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB（dxgiformat.h:42）；
+    //      而本分支要求 R16G16B16A16_FLOAT(10) / TYPELESS(9)（dxgiformat.h:22-23）。
+    //      ⇒ 目标游戏后缓冲只有 8-bit(29) 与 10-bit(24) 两种形态，**均非 FP16**
+    //        ⇒ 本分支恒为 false，是**死分支**。
+    //      ⇒ 净效果 = **撤销 C 项（G10 支持），G10 一律判 SDR**；
+    //        而不是「scRGB 已可判 HDR」。维护者不得据此认为该通路已可用。
+    //      ⇒ 旁证（E2 日志 + E0 代码推理）：同一日志里 sw_hdr=1 与 sw_fmt=24 并存
+    //        ⇒ 命中者只可能是上方 PQ(G2084) 分支（G10 分支在非 FP16 格式下恒 false；
+    //        唯一例外是 SetColorSpace1 那一刻后缓冲恰为 16F，而全部实机日志中
+    //        从未出现过 10/9）。即目标游戏的 HDR 走 PQ，不走 G10。
+    //      ⇒ 只有「16F 后缓冲 + G10 色空间」的程序才会走到 true（目标游戏不在其列）。
+    //      ⇒ 逃生舱：NgxHdr=1 强制 HDR（见 package.ini 的 NgxHdr 说明）。
+    //
+    //   ⇒ 判据 = G10 色空间 **且** 后缓冲格式为 R16G16B16A16_FLOAT(_TYPELESS)。
+    //   ★ 只有 FULL 变体的 G10 存在（dxgicommon.h:30 / :54），没有 STUDIO_G10 —— 实测编译报 C2065。
+    if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 ||
+        color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P2020)
+    {
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+        const DXGI_FORMAT fmt = ngx::swapchain_format();
+        return fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+               fmt == DXGI_FORMAT_R16G16B16A16_TYPELESS;
+#else
+        // NGX 关闭时无法读取后缓冲格式 ⇒ 保守判 SDR（不误报）。
+        return false;
+#endif
+    }
+
+    return false;
 }
 
 HRESULT STDMETHODCALLTYPE hooked_check_color_space_support(
