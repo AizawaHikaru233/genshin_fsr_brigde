@@ -57,7 +57,11 @@
 #include "third_party/ngx/nvsdk_ngx_defs.h"
 #include "third_party/ngx/nvsdk_ngx_params.h"
 
-// ---- ⑤ 系统库（T-2 增；不改 CMakeLists.txt，它已冻结）----
+// ---- ⑤ 系统库（T-2 增）----
+// 2026-11-09（PR #12 审查）：原注释写「不改 CMakeLists.txt，它已冻结」，但本 PR
+//   确实改了 CMakeLists.txt（加 NGX 开关、加 user32）。保留 #pragma comment 而非
+//   改链接行的理由**不是**「CMakeLists 不能动」，而是：这三行只在
+//   DX11FSRBRIDGE_ENABLE_NGX 打开时生效，不需要污染 CMake 的全局链接列表。
 // 三行等价于在链接行加同名 .lib，实测可用，且不改变任何既有 target 配置：
 //   advapi32 → RegGetValueW（§4.2 第 1 行）；ole32 + shell32 → SHGetKnownFolderPath（§3.4.4）
 #pragma comment(lib, "advapi32.lib")
@@ -316,6 +320,13 @@ std::atomic<unsigned> g_ngx_log_count { 0 };   // §3.11.3 的 200 条硬限流
 //   ⇒ 加 atomic 等于为一个不存在的竞争付一次全内存序，且破坏本文件的形态纪律。
 std::uint64_t g_ngx_frame_count = 0;
 
+// 2026-11-09（PR #12 审查次要项 1 复核）：passthrough 逐帧行的**诊断档位**计数闸门输入。
+// 与 g_ngx_frame_count 同一形态纪律（普通 std::uint64_t，只在 ngx::dispatch 内自增）。
+// ★ 不复用 g_ngx_frame_count：那一份的语义是「第几帧」，被 ngx_in/ngx_out/eval 三条线
+//   共用；passthrough 时那三条线**全部不可达**（第 0 步就 return），复用它等于让它
+//   在 passthrough 会话里只为本行服务 —— 名字与实际用途不符，下一个人一定会读错。
+std::uint64_t g_ngx_passthrough_count = 0;
+
 // ---- NGX ini 非法值位图（此处不能打日志，所以先记位）----
 // backend_invalid 由 Dx11FsrBridge.cpp 的 load_config 缓存到 pending_warnings，
 // 因为 Native 回退时不会进入 ngx::ensure_init()。
@@ -329,11 +340,104 @@ unsigned g_config_warn = 0;
 // §3.9A.1 内部辅助函数（全部在本匿名命名空间内）
 // ============================================================================
 
-// ---- 日志：两套形态并存是**有意**的，不要合并 ----
+// ---- 日志：多套形态并存是**有意**的，不要合并 ----
 // log_ngx_core：带级别参数，用于生命周期事件与配置快照（§3.10.1 的 ngx_core 层）
 // log_ngx_error：等价于 log_ngx_core(Level::Error, …)，仅用于"失败且要置 g_release_all"的路径
-void log_ngx_core(blog::Level lv, const wchar_t *fmt, ...);
-void log_ngx_error(const wchar_t *fmt, ...);     // 恒以 blog::Level::Error 输出
+//
+// ★ 2026-11-09（PR #12 审查 D-1 / D-2）：**上面两个函数都不做任何计数闸门**，
+//   这才是「等价」二字的实际含义。上一版只给 log_ngx_error 加了计数闸门，
+//   于是注释与实现互相矛盾（违反 AGENTS.md §二.2），且闸门本身是错的（见下方 D-1 注）。
+//   频次控制的责任在**调用方**，按错误性质二选一：
+//     · 致命错误（置 g_release_all / 设备丢失 / 一次性事件）⇒ log_ngx_error 或
+//       log_ngx_core(Level::Error, …)，**不加闸门**。它们承载的是「NGX 已全局放手」的
+//       唯一解释，吞掉任何一条都会让现场无法复盘。
+//     · 高频重复的**非致命**错误（建池 / 建视图 / 采样失败）⇒ log_ngx_error_throttled
+//       （按调用点独立限频），或 BridgeLogger.h:152/171 的 LOG_THROTTLE / LOG_THROTTLE_COUNT。
+//   ★ 改这里任何一个函数的行为，都必须同步改本段注释（§二.2：注释不得与代码矛盾）。
+void log_ngx_core(blog::Level lv, const wchar_t *fmt, ...);   // 无计数闸门（频次控制归调用方）
+void log_ngx_error(const wchar_t *fmt, ...);                  // 恒以 Level::Error 输出，无计数闸门
+
+// 2026-11-09（PR #12 审查 D-1/D-2 新增）：**按调用点独立限频**的 Error 日志。
+//   ★ 存在理由（缺陷原状）：上一版把计数闸门加在 log_ngx_error **内部**，所有调用点共用
+//     一个 static 计数器 ⇒ 前 32 条之后的**任何新种类**错误都被静默吞掉，直到计数恰好落在
+//     1024 的倍数；而其中若干条是置 g_release_all 的致命失败。当时的注释还声称
+//     「首次出现的错误必然落在前 32 条里」—— 那句话是错的：计数器不区分调用点。
+//     结论：闸门不能按"函数"共享，必须按"调用点"独立。
+//
+// ★★ 2026-11-09（R-5 MAJOR 修复 + R-9 MINOR-1 收口）：槽位改为**编译期模板参数**，不再对
+//   tag 字符串做运行期哈希。上一版的槽位是在**运行期**对 tag 字符串做 FNV-1a 哈希取模算出的，
+//   而 static_assert 只比较手工列出的 kUsedSlots[] —— 两者之间没有任何强制关联。于是"新增
+//   tag 撞槽会被编译器拦下"是**假的**：新调用点只要不把 tag 加进 kUsedSlots，编译器不会报错，
+//   撞槽被静默接受；而撞槽 = 两个调用点共享同一个计数器，后出现的那个 tag 的**首现会被吞掉**。
+//   当时发现不了的原因：哈希值无法从 tag 名一眼看出（撞槽只能靠事后核对发现），而那条断言
+//   核对的是常量表、不是实际传入的 tag。
+//   ⇒ R-5 先把槽位改成模板参数，但断言只做到"传进来的值在常量表里"，仍留一条残余路径：
+//     **另起一个取同值的常量、不登记进表**照样编译通过（slot_is_registered(3) 会因为 3 已被
+//     ColorSrvFail 占用而返回 true），两个调用点于是静默共用 count<3>，新调用点的首现被吞。
+//     R-9 用 g++ 与 MSVC 双编译器复现了这条路径（新调用点首现打印次数 = 0）。
+//   ⇒ R-9 MINOR-1 的收口：**enum 与常量表由同一份 LOG_SLOT_LIST 展开**（见下方命名空间）。
+//     ★ 能保证的只有「**经 LOG_SLOT_LIST 新增**的枚举子与表项同时产生、逐项对应」——
+//       那正是本文件规定的唯一写法，不是语言层面堵死的性质：
+//       枚举定义处**仍可手工追加**枚举子（T-FIX-18 已用 g++ 16.2.0 实测：追加
+//       `NewCallSite = 14` 后 slots_all_distinct() 照样通过、两个枚举子共用 count<14>）。
+//       所以「不加显式转换就写不出第二处槽号」**不成立**，绕过点有两个：
+//       ① 直接在 enum 花括号里追加枚举子（不受 static_assert 约束）；
+//       ② 显式转换 static_cast<Slot>(n) / Slot(n) / (Slot)n / Slot{n}。
+//       但显式转换仍可绕过：static_cast<Slot>(n) 只是其中一种写法，Slot(n) / (Slot)n / Slot{n}
+//       同样可行（g++ 16.2.0 实测，见下方模板定义处的「残余」说明）。
+//     每个枚举子是一个**独立的模板特化**，各自持有自己的 static 计数器（物理隔离）
+//     ⇒ 运行期不存在哈希，也就不存在哈希冲突。
+//   ★ 调用点写法：log_ngx_error_throttled<log_throttle_slot::Slot::PoolTexFail>(fmt, ...)，
+//     **没有** tag 实参；模板参数是 enum，裸整数（如 <3>）不再能隐式转换进去。
+//   ★ 前 8 条全打（启动/首帧可见，槽的首现必在其中），之后每 1024 条一条。
+//   适用：高频重复的**非致命**错误（pool 创建失败、sample 失败等）。
+//   ★ 致命错误（置 g_release_all 的）**必须**用 log_ngx_error，不要用本函数。
+
+namespace log_throttle_slot
+{
+// ★★ 唯一的真值源：新增/删除/改名调用点只改这一处，enum 与常量表都由它展开。
+//   格式：X(枚举子名, 槽号)。槽号是**手写常量**、只用来标识身份，不是任何哈希的结果。
+#define LOG_SLOT_LIST(X) \
+    X(PoolTexFail,       14) \
+    X(ColorSrvFail,       3) \
+    X(UavFail,           20) \
+    X(CbFail,             5) \
+    X(SampleStagingFail, 26) \
+    X(SampleMapFail,     15)
+
+// ① 调用点可以传的**全部**槽位（模板参数的类型就是它）。
+#define LOG_SLOT_ENUM_ITEM(name, value) name = value,
+enum class Slot : unsigned { LOG_SLOT_LIST(LOG_SLOT_ENUM_ITEM) };
+#undef LOG_SLOT_ENUM_ITEM
+
+// ② 常量表：由同一份列表展开 ⇒ 与 ① 逐项对应，"加了枚举子却忘了登记"不再是一个可表达的状态。
+#define LOG_SLOT_TABLE_ITEM(name, value) Slot::name,
+constexpr Slot kUsedSlots[] = { LOG_SLOT_LIST(LOG_SLOT_TABLE_ITEM) };
+#undef LOG_SLOT_TABLE_ITEM
+#undef LOG_SLOT_LIST
+
+constexpr unsigned kSlots = 32;   // 槽号上限；LOG_SLOT_LIST 里的槽号必须 < kSlots
+constexpr unsigned kUsedSlotCount = sizeof(kUsedSlots) / sizeof(kUsedSlots[0]);
+
+// 表内两两互异。★ X-macro 只保证 enum 与表**逐项对应**，它管不住两个枚举子被显式赋成
+//   **同一个槽号** —— 那等于两个调用点共用同一个计数器、后出现者的首现被吞，必须编译期拦下。
+//   6 个元素 ⇒ 15 次比较，编译期零成本。
+constexpr bool slots_all_distinct()
+{
+    for (unsigned i = 0; i < kUsedSlotCount; ++i)
+        for (unsigned j = i + 1; j < kUsedSlotCount; ++j)
+            if (kUsedSlots[i] == kUsedSlots[j])
+                return false;
+    return true;
+}
+
+static_assert(slots_all_distinct(),
+              "log_ngx_error_throttled：LOG_SLOT_LIST 里两个条目取了同一个槽号 ⇒ 两个调用点会共用"
+              "同一个计数器，后出现者的首现会被吞掉。请换一个未占用的槽号。");
+} // namespace log_throttle_slot
+
+template <log_throttle_slot::Slot S>
+void log_ngx_error_throttled(const wchar_t *fmt, ...);
 
 // ---- flags / 配置位 转字符串：**返回 std::string**（配合 %hs 打印，见 §3.10.1）----
 std::string flags_to_string(unsigned int flags);
@@ -387,10 +491,18 @@ static unsigned probe_displayconfig_hdr()
 static void refresh_hdr_probe_cache()
 {
     const unsigned sw = g_swapchain_hdr_state.load(std::memory_order_relaxed);
-    if (sw != 0) { g_hdr_probe_cache.store(sw, std::memory_order_relaxed); return; }
+    if (sw != 0)
+    {
+        g_hdr_probe_cache.store(sw, std::memory_order_relaxed);
+        return;
+    }
 
     const unsigned dc = g_displayconfig_hdr_state.load(std::memory_order_relaxed);
-    if (dc != 0) { g_hdr_probe_cache.store(dc, std::memory_order_relaxed); return; }
+    if (dc != 0)
+    {
+        g_hdr_probe_cache.store(dc, std::memory_order_relaxed);
+        return;
+    }
 
     const unsigned fmt_raw = g_swapchain_format.load(std::memory_order_relaxed);
     if (fmt_raw != 0)
@@ -472,10 +584,99 @@ void log_ngx_error(const wchar_t *fmt, ...)
 {
     if (g_log_level <= 0)
         return;
+    // ★★ 2026-11-09（PR #12 审查 D-1 / D-2）：**本函数不做任何计数闸门**。
+    //   缺陷原状（已删除）：这里曾有一个 static std::atomic_uint64_t，**所有**调用点共用，
+    //   前 32 条全打、之后每 1024 条一条。它有两个后果：
+    //     ① 计数器不区分调用点、不区分错误种类 ⇒ 第 33 条之后**任何新种类**错误都被吞掉
+    //        （例如第 40 条才第一次出现的 set_mismatch），直到计数恰好落在 1024 的倍数。
+    //        旧注释「首次出现的错误必然落在前 32 条里」正是这个错误的来源，已证伪并删除。
+    //     ② 本函数承载若干**置 g_release_all 的致命失败**（fail_init / set_mismatch /
+    //        release_all / dev_removed），它们是「NGX 已全局放手」的唯一解释 —— 吞掉任何
+    //        一条都会让现场无法复盘。
+    //   ⇒ 频次控制移到**调用方**（AGENTS.md §五.6 的要求仍然成立，只是责任点不同）：
+    //     非致命的重复性错误请改用 log_ngx_error_throttled（按槽独立限频，见该模板的注释）。
+    //   ★ 本函数与 log_ngx_core 因此在闸门语义上**重新等价**（两者都只做等级闸门）。
     va_list args;
     va_start(args, fmt);
     vlog_ngx(blog::Level::Error, fmt, args);
     va_end(args);
+}
+
+// 2026-11-09（PR #12 审查 D-1/D-2）：按调用点独立限频的 Error 日志（实现说明见声明处）。
+//
+// ★★ 槽位（2026-11-09 R-5 MAJOR 修复 + R-9 MINOR-1 收口）：模板参数是 log_throttle_slot::Slot，
+//   **不接受裸整数**。上一版是在运行期对 tag 字符串做 FNV-1a 哈希取模来算槽，带来三个后果：
+//     ① static_assert 是**假的**：它只比较常量表，与调用点实际传入的字符串毫无关联
+//        ⇒ 新增调用点忘了登记就不会被编译器发现。
+//     ② 撞槽**吞首现**：计数器是按槽共享的，某个 tag 打满前 8 条后，撞进同一槽的新 tag
+//        首现时 n 已 >8 且通常不是 1024 的倍数 ⇒ 首现被静默丢弃（旧注释声称"首现必在
+//        前 8 条里"，只在"该槽从未被别的 tag 用过"时成立，而槽是共享的，前提不成立）。
+//     ③ 阈值 32→8 把"首现被吞"所需的前置次数从 32 降到 8，放大 ②。
+//   ⇒ R-5 先改成模板参数 Slot，但断言只检查"Slot 的值在常量表里"，于是留下残余路径：
+//     另起一个**取同值**的常量、不登记进表，断言照样通过（R-9 用 g++ 与 MSVC 双编译器实测，
+//     新调用点首现打印次数 = 0）。这是 R-5 那个 MAJOR 的残余路径。
+//   ⇒ 现在把风险从"看不出的静默撞车"收敛为"必须显式越权"，依据如下（**不是**结构上不可能）：
+//     · enum 与常量表由**同一份 LOG_SLOT_LIST** 展开 ⇒ **经该列表新增**的枚举子与表项逐项对应；
+//     · 表内两两互异由 slots_all_distinct() 在编译期守 ⇒ **表内**两个条目不会取到同一槽号。
+//       ★ 该断言只看 kUsedSlots[]，**看不到 enum 定义处手工追加的枚举子**（g++ 16.2.0 实测：
+//         追加 `NewCallSite = 14` 后断言仍通过，count<14> 被两个枚举子共用 ⇒ 首现被吞）；
+//         故「两个枚举子不可能取到同一槽号」**不成立**，改为"表内条目互异"。
+//     · 模板参数的类型就是那个 enum ⇒ 传裸整数（如 <3>）不再能隐式转换进来。
+//     ⇒ 每个枚举子是一个**独立的模板特化**，各自持有自己的 static 计数器（物理隔离），
+//       运行期零哈希、零冲突，② 与 ③ 的存在前提被消除。
+//   ★ 残余（诚实标注，不是"已完全堵死"）：以下三种写法仍会让两个调用点共享计数器 ——
+//     ① 把**同一个枚举子**用在两个调用点；
+//     ② 显式写 static_cast<log_throttle_slot::Slot>(n)（或 Slot(n) / (Slot)n / Slot{n}）指定槽号；
+//     ③ 在 enum 定义处**手工追加**一个取同值的枚举子（绕过 LOG_SLOT_LIST ⇒ static_assert 看不到）。
+//     三者都是 diff 里一眼可见的显式越权，而不是旧方案那种"看不出撞车"的静默接受。
+
+// ★★ 槽位是模板参数，每个枚举子是**独立的模板特化** ⇒ 下面那个 static 计数器是
+//   **每个特化各自一份**（C++ 标准：函数模板的静态局部变量属于该特化，不是全模板共享）。
+//   这就是"物理隔离"的全部依据：枚举子不同 ⇒ 特化不同 ⇒ 计数器不同 ⇒ 不存在互相挤占，
+//   也就不存在"撞槽吞首现"。反过来说，同一调用点每次必然传同一个枚举子，
+//   所以它自己的计数是连续的、语义明确的。
+template <log_throttle_slot::Slot S>
+void log_ngx_error_throttled(const wchar_t *fmt, ...)
+{
+    // ① 越界：槽号 >= kSlots 说明 LOG_SLOT_LIST 里写了超范围的槽号（扩表时忘了改上限）。
+    constexpr unsigned Slot = static_cast<unsigned>(S);
+    static_assert(Slot < log_throttle_slot::kSlots,
+                  "log_ngx_error_throttled：槽号越界（必须 < log_throttle_slot::kSlots）。"
+                  "请检查 LOG_SLOT_LIST 里的槽号。");
+    // ② 不再需要"是否登记"断言：S 的类型就是 log_throttle_slot::Slot，而**经 LOG_SLOT_LIST**
+    //    写出来的枚举子与常量表由**同一份列表**展开 ⇒ "传进来的值不在表里"这个状态不会出现。
+    //    ★ 但"枚举子一定来自 LOG_SLOT_LIST"**不成立**：enum 定义处可手工追加（见上方 ③）。
+    //    ★ 但显式转换（static_cast<Slot>(n) / Slot(n) / (Slot)n / Slot{n}）可构造出任意数值
+    //      （含根本不是枚举子的 7），该状态仍可表达。这是**已知残余**，见上方「残余」段；
+    //      不靠断言拦，靠 code review 拦。
+
+    if (g_log_level <= 0)
+        return;
+
+    // 本特化独有的计数器（每个枚举子一份，物理隔离）。
+    static std::atomic_uint64_t count { 0 };
+    const std::uint64_t n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    // 前 8 条全打（启动/首帧可见 ⇒ 本槽的**首现必然打出**），之后每 1024 条一条。
+    //   ★ 「首现必打」的前提（T-FIX-18 补齐，此前只写在下面第三颗 ★ 里）：
+    //     ① 本槽的计数从 0 起（count 是该特化的静态局部变量，n 由 1 开始）；
+    //     ② 该槽只被一个调用点使用 —— 撞槽（见上方"残余"）会让共享槽的第二个调用点
+    //        首现时 n 已 >8 且通常不是 1024 的倍数 ⇒ 被吞；
+    //     ③ 日志链路的其它闸门放行：vlog_ngx 本身只做 g_log_level 档位闸门，
+    //        但 blog::write 还有一层 enabled()，可用 [Log] 分类覆盖把 upscale 关掉
+    //        （BridgeLogger.cpp:394-403）。那种配置下"首现必打"也不成立。
+    // ★ 上界是「本槽重复错误打多少条」的预算，不是「哪些错误能打」的白名单 —— 这正是
+    //   旧实现弄错的地方：它把预算做成了全局的，于是新种类错误被当成"第 33 条重复"吞掉。
+    // ★ 计数器是**槽级**的（每个枚举子一份），所以 n 的语义严格说是「本槽第几次」，不是
+    //   「本调用点第几次」；两者只在"一个槽只被一个调用点使用"时重合，而那是本文件的常态。
+    //   由此"首现必打"成立。
+    if (n > 8 && (n % 1024) != 0)
+        return;
+
+    va_list args;
+    va_start(args, fmt);
+    vlog_ngx(blog::Level::Error, fmt, args);
+    va_end(args);   // ★ va_list 只消费一次（AGENTS.md §16.1-3）
 }
 
 // §3.9A.1：输入是 9 个 bit 的 OR 结果；输出形如 IsHDR|MVLowRes|DepthInverted（无位时为 None）。
@@ -1062,8 +1263,20 @@ static bool resolve_is_hdr(DXGI_FORMAT color_fmt, const char **src, unsigned *sw
     const unsigned sw_state = g_swapchain_hdr_state.load(std::memory_order_relaxed);
     if (sw_state_out) *sw_state_out = sw_state;   // ★ MINOR-1：**决策与日志共用的唯一一次 load**
 
-    if (g_hdr_mode == 1) { if (src) *src = "forced-on";  g_hdr = true;  return true;  }
-    if (g_hdr_mode == 2) { if (src) *src = "forced-off"; g_hdr = false; return false; }
+    if (g_hdr_mode == 1)
+    {
+        if (src)
+            *src = "forced-on";
+        g_hdr = true;
+        return true;
+    }
+    if (g_hdr_mode == 2)
+    {
+        if (src)
+            *src = "forced-off";
+        g_hdr = false;
+        return false;
+    }
 
     // ---- auto：①②③ 的预计算结果（T-11：事件驱动，不在每帧重算）----
     // ① SetColorSpace1 hook（最准）> ② Windows 显示配置 API（T-10）> ③ swapchain buffer 格式（M4-b）。
@@ -1144,7 +1357,12 @@ struct CreateFlagsEval
     const char  *hdr_src = "?";      // resolve_is_hdr 给出的决策来源
     unsigned     sw_state = 0;       // ★ MINOR-1：决策所依据的那一次 swapchain 三态
                                      //   load（0=未知 1=SDR 2=HDR），供日志派生 sw_known/sw_hdr。
-                                     //   与 is_hdr **同源同一次 load** ⇒ 日志不可能自相矛盾。
+                                     //   与 is_hdr 同源于 resolve_is_hdr 入口的那一次 load
+                                     //   ⇒ **同一次求值内**日志的两个字段不会互相矛盾。
+                                     //   ★ 不是"永远"：强制模式（NgxHdr=1/0）下 is_hdr 由
+                                     //     g_hdr_mode 决定、与 sw_state 无关，此时
+                                     //     is_hdr=1 + sw_hdr=0 是**正常**形态（见 resolve_is_hdr
+                                     //     的 MINOR-1 注释），不是撕裂。
 };
 
 // 3.8.2：九 bit 只设四个。绝不设 DoSharpening（SR_DEPRECATED_SHARPENING 在 MSVC 下
@@ -1161,7 +1379,9 @@ static CreateFlagsEval build_create_flags(DXGI_FORMAT color_fmt)
     if (ev.is_hdr)                              ev.flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
                                                 ev.flags |= NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;      // 1<<1，恒设
     if (ffx12::motion_vectors_jittered())       ev.flags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;   // 1<<2，默认不设
-    if (ffx12::depth_inverted())                ev.flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted; // 1<<3，T-9：按 Ffx12DepthInverted 配置
+    // T-9：按 Ffx12DepthInverted 配置（1<<3）
+    if (ffx12::depth_inverted())
+        ev.flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     // ---- 同一组输入的位图（M4-a）----
     if (ev.is_hdr)                              ev.bits |= kFlagsInputIsHdr;
     if (ffx12::depth_inverted())                ev.bits |= kFlagsInputDepthInvert;
@@ -1302,7 +1522,8 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
 
     log_ngx_core(blog::Level::Error, L"ngx_core create_feature ok=%d preset=%d rc=0x%X",
                  rr == NVSDK_NGX_Result_Success ? 1 : 0, g_render_preset, rr);
-    if (rr != NVSDK_NGX_Result_Success) {
+    if (rr != NVSDK_NGX_Result_Success)
+    {
         inst.feature = nullptr;
         inst.feature_create_failed = true;
         // 偏离 3：SDS 3.8.1 的代码块漏了下面这一行，但 4.2 第 10 行与 3.9.7 明文要求
@@ -1330,7 +1551,12 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     //   ⇒ SDR 会话打出 hdr_flag=1 而 create_flags 含 IsHDR，等于用日志给错误决策背书。
     //   现在：hdr_flag 直接取 flags 的 IsHDR 位（= build_create_flags 实际写进 NGX 的那一位），
     //   src_ngx_hdr 取同一次 resolve_is_hdr 的决策（与 M1 的 ngx_hdr_decision 行严格一致）。
-    //   ⇒ 这两行以后**不可能**再互相矛盾。
+    //   ⇒ 二者同源于**本函数里 build_create_flags(inst.color_fmt) 的那一次调用**：
+    //     hdr_flag 是 flag_eval.flags 的 IsHDR 位，src_ngx_hdr 是同一个 flag_eval.is_hdr，
+    //     而 ev.flags 的 IsHDR 位在 build_create_flags 内就是由 ev.is_hdr 置的。
+    //   ★ 这保证的是「**本函数的单次求值内**二者一致」，不是「永远不会矛盾」：
+    //     若将来把这两处拆成两次 build_create_flags 调用、或在 build_create_flags 里改用
+    //     别的输入置 IsHDR 位而不同步 is_hdr，二者就会分叉。改动上述任一处时须一并复核本行。
     // ★ 字段名一个都不删：§7.1-8 的 grep 判据依赖 hdr_flag= / src_ngx_hdr= / ffx12_hdr=。
     log_ngx_core(blog::Level::Error,
         L"ngx_core create_flags=0x%X bits=%hs autoexposure=0 "
@@ -1371,8 +1597,13 @@ static bool make_pool_texture(ID3D11Device *dev, const PoolDesc &d,
     const HRESULT hr = dev->CreateTexture2D(&td, nullptr, out.GetAddressOf());
     if (FAILED(hr))
     {
-        log_ngx_error(L"ngx_inst pool tex fail inst=%d name=%hs w=%u h=%u fmt=%d hr=0x%08X",
-                      inst_id, d.name, w, h, static_cast<int>(d.fmt), static_cast<unsigned>(hr));
+        // 非致命重复性错误（每帧重试建池）⇒ 按槽独立限频，见 log_ngx_error_throttled 的注释。
+        // ★ 为什么不是致命：create_pool 失败只让本帧放弃，不置 g_release_all（S-81 的锁存由
+        //   调用方按尺寸/格式变化决定），因此高频重复是可能的、也必须限频。
+        log_ngx_error_throttled<log_throttle_slot::Slot::PoolTexFail>(
+            L"ngx_inst pool tex fail inst=%d name=%hs w=%u h=%u fmt=%d hr=0x%08X",
+            inst_id, d.name, w, h, static_cast<int>(d.fmt),
+            static_cast<unsigned>(hr));
         return false;
     }
     return true;
@@ -1409,7 +1640,8 @@ static void release_pool_resources(NgxInstance &inst)
     inst.depth_src_srv.Reset(); inst.motion_src_srv.Reset();
     inst.depth_src_last = nullptr;  inst.motion_src_last = nullptr;
 
-    // ★★ 必须同步复位 cb 的缓存判据（SDS §3.12.3 规则 2 明文要求「cb + 3 UAV + 3 SRV」——SDS 早期把 SRV 数误记为 4，实际只有 color_srv + depth_src_srv + motion_src_srv 这 3 个，
+    // ★★ 必须同步复位 cb 的缓存判据（SDS §3.12.3 规则 2 明文要求「cb + 3 UAV + 3 SRV」——
+    //   SDS 早期把 SRV 数误记为 4，实际只有 color_srv + depth_src_srv + motion_src_srv 这 3 个，
     //   而 cb 的缓存判据是 cb 状态的一部分）。否则陷阱 1 / 1b 会在两条路径上复活：
     //     ① 实例重建路径（make/destroy 之间）；
     //     ② 已建池实例上的 create_pool 重入路径（T-5 §3.7 第 5 步）。
@@ -1515,7 +1747,13 @@ static bool create_pool(ID3D11Device *dev, NgxInstance &inst,
     sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     sd.Texture2D.MipLevels = 1;
     HRESULT hr = dev->CreateShaderResourceView(inst.color.Get(), &sd, inst.color_srv.GetAddressOf());
-    if (FAILED(hr)) { log_ngx_error(L"ngx_inst color_srv fail hr=0x%08X", static_cast<unsigned>(hr)); return fail(); }
+    // 非致命重复性错误（每次建池都可能重犯）⇒ 按槽独立限频。
+    if (FAILED(hr))
+    {
+        log_ngx_error_throttled<log_throttle_slot::Slot::ColorSrvFail>(
+            L"ngx_inst color_srv fail hr=0x%08X", static_cast<unsigned>(hr));
+        return fail();
+    }
 
     // 三个 UAV：TYPELESS 资源必须显式给 typed 格式（D3D11 规定）
     // ★★ 同上：std::addressof，不要 &inst.X（否则三个 UAV 源纹理被置空 ⇒ E_INVALIDARG）
@@ -1533,7 +1771,13 @@ static bool create_pool(ID3D11Device *dev, NgxInstance &inst,
         ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
         ud.Texture2D.MipSlice = 0;
         hr = dev->CreateUnorderedAccessView(uav_tex[k]->Get(), &ud, uav_out[k]->GetAddressOf());
-        if (FAILED(hr)) { log_ngx_error(L"ngx_inst uav fail k=%d hr=0x%08X", k, static_cast<unsigned>(hr)); return fail(); }
+        if (FAILED(hr))
+        {
+            // 非致命重复性错误 ⇒ 按槽独立限频。
+            log_ngx_error_throttled<log_throttle_slot::Slot::UavFail>(
+                L"ngx_inst uav fail k=%d hr=0x%08X", k, static_cast<unsigned>(hr));
+            return fail();
+        }
     }
 
     // 16 B 常量缓冲（§3.6.5：b0 由 upload_cb 填）
@@ -1543,7 +1787,13 @@ static bool create_pool(ID3D11Device *dev, NgxInstance &inst,
     bd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
     bd.CPUAccessFlags = 0;
     hr = dev->CreateBuffer(&bd, nullptr, inst.cb.GetAddressOf());
-    if (FAILED(hr)) { log_ngx_error(L"ngx_inst cb fail hr=0x%08X", static_cast<unsigned>(hr)); return fail(); }
+    // 非致命重复性错误 ⇒ 按槽独立限频。
+    if (FAILED(hr))
+    {
+        log_ngx_error_throttled<log_throttle_slot::Slot::CbFail>(
+            L"ngx_inst cb fail hr=0x%08X", static_cast<unsigned>(hr));
+        return fail();
+    }
 
     return true;
 }
@@ -1555,7 +1805,8 @@ static bool create_pool(ID3D11Device *dev, NgxInstance &inst,
 static void destroy_instance()
 {
     // ★ feature 是裸 handle，ComPtr 管不到，必须手工释放
-    if (g_inst.feature) {
+    if (g_inst.feature)
+    {
         if (g_release) g_release(g_inst.feature);
         g_inst.feature = nullptr;
     }
@@ -1586,7 +1837,8 @@ static bool create_instance(std::uint64_t key, ID3D11Device *dev,
     g_inst.first      = true;
     g_inst.eval_fail_streak = 0;
 
-    if (!create_pool(dev, g_inst, rw, rh, dw, dh, key)) {
+    if (!create_pool(dev, g_inst, rw, rh, dw, dh, key))
+    {
         destroy_instance();     // ★ 自己回滚：半成品资源不能留
         return false;
     }
@@ -1603,7 +1855,8 @@ static bool ensure_instance(std::uint64_t key, ID3D11Device *dev,
 {
     // 同 key 且已建好：直接复用。
     // ★ key == 0 是合法值（§4.4 B-7），**不能**用 key != 0 判断「已建」。
-    if (g_inst.key_valid && g_inst.key == key) {
+    if (g_inst.key_valid && g_inst.key == key)
+    {
         g_inst.last_used_tick = GetTickCount64();
         return true;
     }
@@ -1611,7 +1864,8 @@ static bool ensure_instance(std::uint64_t key, ID3D11Device *dev,
     // ---- 切换：先释放，再重建 ----
     const std::uint64_t t0 = qpc_us();
     destroy_instance();                  // ReleaseFeature + ComPtr 自动放纹理/UAV/SRV/cb
-    if (!create_instance(key, dev, rw, rh, dw, dh, color_fmt, output_fmt)) {
+    if (!create_instance(key, dev, rw, rh, dw, dh, color_fmt, output_fmt))
+    {
         return false;                    // 建池失败：本帧放弃（create_instance 已回滚）
     }
     const std::uint64_t dt = qpc_us() - t0;
@@ -1634,20 +1888,30 @@ static bool ensure_shaders()
                                       "main", "cs_5_0", 0, 0, &code, &err);
         // ★ 判 hr 且判 code 非空：失败时 code == nullptr，
         //   紧接着的 code->GetBufferPointer() 是【空指针解引用 ⇒ 崩溃】。
-        if (FAILED(hr) || !code) {
+        if (FAILED(hr) || !code)
+        {
             log_ngx_error(L"ngx_core compile fail stage=depth hr=0x%08X", static_cast<unsigned>(hr));
-            if (err) { OutputDebugStringA(static_cast<const char *>(err->GetBufferPointer())); err->Release(); }
+            if (err)
+            {
+                OutputDebugStringA(static_cast<const char *>(err->GetBufferPointer()));
+                err->Release();
+            }
             if (code) code->Release();
             g_shader_compile_failed = true;
             return false;
         }
-        if (err) { err->Release(); err = nullptr; }
+        if (err)
+        {
+            err->Release();
+            err = nullptr;
+        }
 
         const HRESULT hr2 = g_device->CreateComputeShader(
             code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_depth_cs);
         code->Release();
         code = nullptr;
-        if (FAILED(hr2)) {
+        if (FAILED(hr2))
+        {
             log_ngx_error(L"ngx_core create_cs fail stage=depth hr=0x%08X", static_cast<unsigned>(hr2));
             g_shader_object_failed = true;
             return false;
@@ -1665,12 +1929,20 @@ static bool ensure_shaders()
         if (FAILED(hr) || !code)
         {
             log_ngx_error(L"ngx_core compile fail stage=motion hr=0x%08X", static_cast<unsigned>(hr));
-            if (err) { OutputDebugStringA(static_cast<const char *>(err->GetBufferPointer())); err->Release(); }
+            if (err)
+            {
+                OutputDebugStringA(static_cast<const char *>(err->GetBufferPointer()));
+                err->Release();
+            }
             if (code) code->Release();
             g_shader_compile_failed = true;
             return false;
         }
-        if (err) { err->Release(); err = nullptr; }
+        if (err)
+        {
+            err->Release();
+            err = nullptr;
+        }
 
         const HRESULT hr2 = g_device->CreateComputeShader(
             code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_motion_cs);
@@ -1865,7 +2137,10 @@ static bool sample_1x1_zero(ID3D11DeviceContext *ctx, ID3D11Texture2D *src,
     st.MiscFlags        = 0;
     if (FAILED(g_device->CreateTexture2D(&st, nullptr, staging.GetAddressOf())) || !staging)
     {
-        log_ngx_error(L"ngx_out sample staging fail fmt=%d", static_cast<int>(sd.Format));
+        // 非致命重复性错误（诊断路径每 600 帧抽检一次，同一失败会反复出现）⇒ 按槽独立限频。
+        // ★ 调用方必须能区分「采样失败」与「全黑」，所以这行**不能**改成不打（见本函数头注释）。
+        log_ngx_error_throttled<log_throttle_slot::Slot::SampleStagingFail>(
+            L"ngx_out sample staging fail fmt=%d", static_cast<int>(sd.Format));
         return false;
     }
 
@@ -1877,7 +2152,9 @@ static bool sample_1x1_zero(ID3D11DeviceContext *ctx, ID3D11Texture2D *src,
     D3D11_MAPPED_SUBRESOURCE ms {};
     if (FAILED(ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &ms)) || ms.pData == nullptr)
     {
-        log_ngx_error(L"ngx_out sample map fail x=%u y=%u", x, y);
+        // 非致命重复性错误 ⇒ 按槽独立限频。
+        log_ngx_error_throttled<log_throttle_slot::Slot::SampleMapFail>(
+            L"ngx_out sample map fail x=%u y=%u", x, y);
         return false;
     }
     const std::uint8_t *px = static_cast<const std::uint8_t *>(ms.pData);
@@ -1886,7 +2163,11 @@ static bool sample_1x1_zero(ID3D11DeviceContext *ctx, ID3D11Texture2D *src,
     bool zero = true;
     for (std::size_t i = 0; i < n; ++i)
     {
-        if (px[i] != 0) { zero = false; break; }
+        if (px[i] != 0)
+        {
+            zero = false;
+            break;
+        }
     }
     is_zero = zero;
     ctx->Unmap(staging.Get(), 0);
@@ -2143,7 +2424,26 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     // （ensure_init 不在 passthrough 路径上）。
     if (g_passthrough)
     {
-        log_ngx_core(blog::Level::Error, L"ngx_core passthrough=1 backend=ngx");
+        // 2026-11-09（PR #12 审查次要项 1 复核）：**按档位分流**，兼顾两条互相拉扯的要求。
+        //
+        // 原报告意见：「passthrough 每帧写一条 Level::Error；log_ngx_core 只有级别闸门，
+        //   没有计数闸门，诊断模式下会刷屏」。
+        // 当时的判断是不加闸门，理由是 SDS 判据 14 要求这一行与 ngx_in **同帧对应**。
+        // 复核后改为两者共存 —— 判据 14 是**验收时**的需求，不是常态：
+        //   · g_log_level <= 2（error / info，即**验收与常规档位**）：**不限频**。
+        //     判据 14 的取证（grep -c 计数、与 ngx_in 同帧对应）在这一档成立。
+        //   · g_log_level == 3（debug，**诊断档位**）：前 8 条全打 + 之后每 256 条一条。
+        //     ★ 为什么保留"前 8 条全打"而不是纯 %256：纯 %256 会让**全新一次运行的首条
+        //       永不出现**（count=1 时 1%256≠0），而那正是判据 14 的 grep 对象
+        //       ⇒ 在 debug 档跑验收会得到假阴性。前 8 条全打 + 计数从 1 起 ⇒
+        //       「本次运行的首条」（n=1）一定在 <=8 内，不被本闸门吞掉；
+        //       （注意这只管本闸门；blog::write 的 enabled() 仍可能按分类覆盖丢行。）
+        //       阈值口径与本文件既有的 log_gate_fail8_every256（<=8 或 %256==0）一致。
+        //   · g_log_level <= 0（全关）：log_ngx_core 自己第一行就 return，本处不必再判。
+        // 成本：一次自增 + 一次比较，均在**已经要打日志**的分支内，无格式化、无字符串拼接。
+        const std::uint64_t pt_count = ++g_ngx_passthrough_count;
+        if (g_log_level < 3 || pt_count <= 8u || (pt_count % 256u) == 0u)
+            log_ngx_core(blog::Level::Error, L"ngx_core passthrough=1 backend=ngx");
         return false;
     }
 
@@ -2431,6 +2731,18 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
             //    再出现 ngx_core eval 成功行 / ngx_out 行」（计划 §9.1-12）。在一条**没有**
             //    置位的路径上打 release_all，会让该判据误判成"已经放手却还在出图"。
             //    故本行用 ngx_core 的独立事件名 dev_removed，不进 release_all 的计数。
+            // ★ 已知偏离（R-5 审核 MINOR-A / R-9 MINOR-3）：本行**不置 g_release_all**、且
+            //   **可重复**（设备再次丢失时会再打），按"非致命 + 可重复 ⇒ 应改限频"的判据本该用
+            //   log_ngx_error_throttled。此处**有意保留** log_ngx_error 不闸门，理由如下 ——
+            //   ★ 旧注释写的"其频次已由外层限频"**不成立**，已删除：本分支没有任何计数或时间
+            //     闸门；上面那条 eval 行的 log_gate_fail8_every256 只闸 eval 行，**不含本行**。
+            //     实际约束只有一条：shutdown_all() 之后的下一次 ensure_init 若 Init_Ext 失败，
+            //     fail_init() 会置 g_release_all，之后本路径不再进入；若重建成功，设备再丢就再打。
+            //   ★ 旧注释写的"shutdown_all 会重建设备"也不准：shutdown_all() 只清
+            //     g_device / g_params / g_inited（"清设备与参数"段），**不重建**；重建发生在
+            //     下一次 dispatch 的 ensure_init（第 3 步）。
+            //   ⇒ 保留不闸门的真实理由：设备反复丢失的**次数**本身就是要看的证据，闸门会把这个
+            //     次数抹成"每 1024 次一条"。
             log_ngx_error(L"ngx_core dev_removed shutdown drr=0x%08X inst=0x%llX",
                           static_cast<unsigned>(drr),
                           static_cast<unsigned long long>(instance_key));
@@ -2490,6 +2802,11 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
         const bool br_ok = sample_1x1_zero(ctx, inst.output.Get(), inst.dw - 1u, inst.dh - 1u, br_zero);
         if (tl_ok && br_ok && tl_zero && br_zero)
         {
+            // ★ 已知偏离（R-5 审核 MINOR-A）：本行同样**不置 g_release_all**、且**可重复**
+            //   （场景本身持续全黑时每 600 帧都会命中），按判据本该改 log_ngx_error_throttled。
+            //   此处**有意保留** log_ngx_error 不闸门：外层已有 600 帧（约 10 秒）的天然限频，
+            //   且这条是"CopyResource 可能无声失败"的唯一线索，排障时需要看到它是否
+            //   与画面异常同步出现 —— 再叠一层计数闸门只会让因果对齐变难。
             log_ngx_error(L"ngx_out copy fail suspect inst=0x%llX out=%ux%u fmt=%d frame=%llu",
                           static_cast<unsigned long long>(instance_key),
                           inst.dw, inst.dh, static_cast<int>(odesc.Format),
