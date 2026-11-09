@@ -4217,7 +4217,7 @@ void load_config()
     // 【正式功能】P1 单实例接管（默认开）——段必须是 `[Dx11FsrBridge]`。
     // 它读在诊断守卫之外：这是**功能键**（消费者改变行为），发布构建必须保留。
     g_config.ffx12_single_instance =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12SingleInstance", 0, config_path.c_str()) != 0;
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12SingleInstance", 1, config_path.c_str()) != 0;
     g_config.ffx12_single_instance_pick = std::clamp<std::uint32_t>(
         static_cast<std::uint32_t>(GetPrivateProfileIntW(
             L"Dx11FsrBridge", L"Ffx12SingleInstancePick", 0, config_path.c_str())),
