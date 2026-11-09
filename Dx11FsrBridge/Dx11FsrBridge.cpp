@@ -7335,6 +7335,47 @@ HRESULT STDMETHODCALLTYPE hooked_resize_buffers(
     {
         update_swapchain_backbuffer_resources(swapchain);
         apply_hdr_swapchain_force(swapchain);
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+        // T-FIX-11 MINOR-1 + T-FIX-25 M-1：ResizeBuffers 成功后重读后缓冲格式，交给 ngx 侧。
+        //   动机：ResizeBuffers 可能改变后缓冲格式（SDR↔HDR、分辨率切换等场景下游戏会
+        //   重建 8-bit/10-bit 交换链）。不重读 ⇒ is_hdr10_color_space 读到的仍是安装钩子
+        //   那一刻的旧格式，G10 判据会一直用错值（且是静默的：无日志、无报错）。
+        //   ★ 可达性（T-FIX-25 修的正是这一点）：本块只有 hooked_resize_buffers 被 attach
+        //     才会执行。attach 判据是 swapchain_control_hook_needed()（见 install_swapchain_hooks
+        //     的 patches 段），该谓词现已包含 Ngx 后端。T-FIX-25 之前它只有 dlssg 与
+        //     HdrSwapchainForce 两项，后者在发布构型恒假 ⇒ 默认发布构型下本块不执行。
+        //     ⇒ 判断本块是否生效请看 swapchain_control_hook_needed()，不要只看这段注释。
+        //   ★ 为何 GetDesc 在这里安全：ResizeBuffers 成功后交换链已处于可用状态，
+        //     GetDesc 只读描述结构、不涉及 GPU 同步；本函数由应用调用 ResizeBuffers
+        //     触发，不在 Present 每帧路径上。注意：部分应用会以未变化的参数重复调用
+        //     ResizeBuffers，那种情形只在 dlssg_dxgi_workaround_active() 为真时被上方
+        //     分支短路；ngx 且未启用 dlssg 时不会短路，本块会随每次调用执行
+        //     （一次 GetDesc + 一次 atomic 存储 + 一条 LOG_DEBUG，量级可忽略）。
+        //     先例取发布构型也成立的那个：hooked_present 里 GetDesc 是无守卫调用
+        //     （搜「const bool desc_available = SUCCEEDED(swapchain->GetDesc(&desc));」），
+        //     发布/诊断构型都执行 ⇒「Present 之后立刻 GetDesc」本就是既有做法。
+        //     （不要拿 apply_hdr_swapchain_force 的 QueryInterface 当先例：它与
+        //      update_swapchain_backbuffer_resources 都受诊断开关门控 ——
+        //      hdr_swapchain_force_active 在发布构型恒返回 false ⇒ 根本不执行。）
+        //   ★ 失败处理：GetDesc 失败 ⇒ 保持旧值不动。切勿写 UNKNOWN(0) ——
+        //     写 0 不是「把未知当探测」：refresh_hdr_probe_cache 对 fmt_raw==0 是
+        //     显式跳过（判断条件是 if (fmt_raw != 0)），不会产出 1/2 的假信号。
+        //     真实风险是清掉已知值：原本有效的 24/29 被清成未知 ⇒ ①②③ 三级都拿不到值
+        //     ⇒ 掉到 ④ 输入纹理格式兜底 ⇒ 翻转 HDR 决策（比「没更新」更糟）。
+        //   ★ 必须留在 ENABLE_NGX 守卫内：OFF 构型没有 NgxBackend.cpp（否则 LNK2019）。
+        if (swapchain != nullptr)
+        {
+            DXGI_SWAP_CHAIN_DESC resized {};
+            if (SUCCEEDED(swapchain->GetDesc(&resized)))
+            {
+                ngx::set_swapchain_format(resized.BufferDesc.Format);
+                LOG_DEBUG(blog::cat::hdr, "ngx_swapchain_format_refresh source=ResizeBuffers format=" +
+                    describe_dxgi_format(resized.BufferDesc.Format) +
+                    " size=" + std::to_string(resized.BufferDesc.Width) + "x" +
+                    std::to_string(resized.BufferDesc.Height));
+            }
+        }
+#endif
     }
     return result;
 }
@@ -7426,10 +7467,16 @@ HRESULT STDMETHODCALLTYPE hooked_set_color_space1(
     DXGI_COLOR_SPACE_TYPE color_space)
 {
     void *const caller = _ReturnAddress();
-    const bool spoof = hdr_swapchain_spoof_active() && is_hdr10_color_space(color_space);
+    // T-FIX-11 MINOR-2：原实现在本调用点对 is_hdr10_color_space(color_space) **求值两次**
+    //   （① spoof 判据、② ngx::set_swapchain_hdr 的实参）。该函数内部读
+    //   ngx::swapchain_format()（atomic），两次求值之间可能被写方翻转
+    //   ⇒「放行/拦截的判定」与「告诉 NGX 的状态」可能不是同一个结论。
+    //   改为**一次求值、两处复用**：spoof 与 NGX 侧看到同一结果。
+    const bool hdr10 = is_hdr10_color_space(color_space);
+    const bool spoof = hdr_swapchain_spoof_active() && hdr10;
 #if defined(DX11FSRBRIDGE_ENABLE_NGX)
     // T-8：把 swapchain 的 HDR 状态告诉 NGX（本游戏 HDR 由注册表在启动时决定，不运行时切换）
-    ngx::set_swapchain_hdr(is_hdr10_color_space(color_space));
+    ngx::set_swapchain_hdr(hdr10);
 #endif
     const DXGI_COLOR_SPACE_TYPE physical_color_space = spoof
         ? DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
@@ -14438,7 +14485,27 @@ bool swapchain_present_hook_needed()
 
 bool swapchain_control_hook_needed()
 {
-    return dlssg_dxgi_workaround_active() || hdr_swapchain_force_active();
+    // ★ 修复 M-1（R-14B 复审）：把 Ngx 后端并入本谓词 —— 这是修既有刷新块的
+    //   **可达性**，不是新功能。原实现把「ResizeBuffers 成功后重读后缓冲格式」
+    //   （hooked_resize_buffers 内、ngx::set_swapchain_format 那一段）当成缺口已修，
+    //   但本谓词当时只有 dlssg 与 HdrSwapchainForce 两项，而 HdrSwapchainForce 在
+    //   发布构型恒假（见 hdr_swapchain_force_active）⇒ 在「NGX 后端 + 默认发布 ini
+    //   + 未启用 dlssg 帧生成」构型下 resize_buffers 槽不会被 patch，那段刷新块
+    //   不执行（静默：无日志、无报错）。
+    // ★ 为什么 NGX 需要它：ngx 的 G10 判据（is_hdr10_color_space）依赖后缓冲格式
+    //   的实时性。游戏在 SDR↔HDR / 全屏 / 分辨率切换时会重建交换链并可能改变
+    //   BufferDesc.Format；只在 install_swapchain_hooks 里读一次，ngx 侧就会一直
+    //   用安装时刻的旧格式。
+    // 注：ffx12::backend() 与 BackendKind 在 Ffx12Backend.h 中无条件声明，
+    //     Ffx12Backend.cpp 无条件进 target_sources ⇒ OFF 构型也安全，不需要 #if 守卫
+    //     （与下方 swapchain_color_hook_needed 同构）。
+    // ★ 副作用（改这里前必读）：本谓词 = should_hook_general_swapchain_controls，
+    //   除 resize_buffers 外还会 patch set/get_fullscreen_state 与 resize_target
+    //   三个槽（见 install_swapchain_hooks）。三者在 Ngx 构型且 dlssg 未启用时均为
+    //   纯透传；只有 dlssg_dxgi_workaround_active() 为真时才短路，而那种情形
+    //   本谓词本来就返回真、钩子本来就装 —— 即三个槽的行为与本次改动前一致。
+    return dlssg_dxgi_workaround_active() || hdr_swapchain_force_active() ||
+        ffx12::backend() == ffx12::BackendKind::Ngx;
 }
 
 bool swapchain_color_hook_needed()
