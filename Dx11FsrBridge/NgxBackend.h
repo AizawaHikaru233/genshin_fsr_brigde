@@ -31,7 +31,7 @@ void set_swapchain_hdr(bool hdr);            // 由 Dx11FsrBridge 的 SetColorSp
 //   只能靠 install_swapchain_hooks() 主动读 BufferDesc.Format 作为第二来源。
 //   DXGI_FORMAT_UNKNOWN(0) 表示"未知/不参与判定"。
 void set_swapchain_format(DXGI_FORMAT f);    // 由 install_swapchain_hooks() 主动调用
-void set_render_preset(int v);                              // NgxRenderPreset，默认 12
+void set_render_preset(int v);                              // NgxRenderPreset，默认 0（跟随 NGX）
 void set_frame_time_delta(bool on);                         // NgxSetFrameTimeDelta，默认 true
 void set_use_reactive_mask(bool on);                        // NgxUseReactiveMask，默认 false
 void set_log_level(int lv);                                 // NgxLogLevel 0..3，默认 1

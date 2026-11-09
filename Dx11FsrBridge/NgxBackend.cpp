@@ -296,7 +296,7 @@ std::atomic<unsigned>     g_hdr_probe_cache { 0 };
 //   之后运行期只读，cfg 无热重载（AGENTS §8.5）⇒ 不存在跨线程写，加 atomic 是纯开销。
 //   g_hdr 同理（且它已退化为「本次决策的回写镜像」，见 resolve_is_hdr 的注释）。
 int                       g_hdr_mode      = 0;         // 0=auto 1=force-on 2=force-off
-int                       g_render_preset = 12;
+int                       g_render_preset = 0;          // P-11：默认 0 = 不设 preset，跟随 NGX 自身规则
 bool                      g_dt_enabled    = true;
 bool                      g_use_reactive  = false;
 int                       g_log_level     = 1;
@@ -321,7 +321,7 @@ std::uint64_t g_ngx_frame_count = 0;
 // 因为 Native 回退时不会进入 ngx::ensure_init()。
 enum NgxConfigWarn : unsigned {
     kWarnAppIdZero      = 1u << 0,   // NgxApplicationId=0 → 强制 1337
-    kWarnPresetInvalid  = 1u << 1,   // NgxRenderPreset 越界 → 回退 12
+    kWarnPresetInvalid  = 1u << 1,   // NgxRenderPreset 越界 → 回退 0
 };
 unsigned g_config_warn = 0;
 
@@ -2063,14 +2063,15 @@ void set_swapchain_format(DXGI_FORMAT f)
 
 void set_render_preset(int v)
 {
-    // §3.13：不在 (0 或 5..15) → 回退 12 并记位。0 的语义是"六个 preset 参数一个都不设"，
+    // §3.13：不在 (0 或 5..15) → 回退 0 并记位。0 的语义是"六个 preset 参数一个都不设"，
     // 不是"默认预设"（§3.8.3 / T-3 ③）。
+    // ★ P-11：非法值的回退目标从 12 改为 0 —— 与默认值一致，都是"跟随 NGX"。
     if (v == 0 || (v >= 5 && v <= 15))
     {
         g_render_preset = v;
         return;
     }
-    g_render_preset = 12;
+    g_render_preset = 0;
     g_config_warn |= kWarnPresetInvalid;
 }
 

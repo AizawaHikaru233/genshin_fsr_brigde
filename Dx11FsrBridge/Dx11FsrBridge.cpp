@@ -4169,9 +4169,11 @@ void load_config()
         ngx::set_hdr_mode(hdr_mode);
     }
 
-    // ---- 键 5：NgxRenderPreset（默认 12 = L）----
+    // ---- 键 5：NgxRenderPreset（P-11：默认 0 = 不设 preset，跟随 NGX 自身规则）----
+    // 0 = 六个 preset 参数一个都不设，由 NGX 按性能档自行决定（与 OptiScaler 的
+    // RenderPresetForAll=0 同义）。合法值 5..15 可显式指定档位。
     const int ngx_preset =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxRenderPreset", 12, config_path.c_str());
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxRenderPreset", 0, config_path.c_str());
     ngx::set_render_preset(ngx_preset);
 
     // ---- 键 6：NgxSetFrameTimeDelta（默认 1）----
