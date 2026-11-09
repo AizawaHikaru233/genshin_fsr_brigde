@@ -381,6 +381,13 @@ if(DX11FSRBRIDGE_BUILD_BACKEND_TEST)
     #    已加 fail-open 的 try/catch（见 Ffx12Backend.cpp）。
     #
     #    保持本开关默认 OFF，避免让"已知失败的测试"混进 CI 绿灯。
+    # 2026-11-09（PR #12 审查次要项 6）：**本 test 只覆盖 native 路径**。
+    #   不定义 DX11FSRBRIDGE_ENABLE_NGX ⇒ Ffx12Backend.cpp 里的 ngx:: 分支
+    #   （#if defined(DX11FSRBRIDGE_ENABLE_NGX) 内）不参与编译 ⇒ 测试不覆盖 NGX 路径。
+    #   理由：本 test 在隔离 harness 下已知运行崩溃（见上方 message），扩展其覆盖面
+    #   没有价值；NGX 路径的编译覆盖由 .github/workflows/compile-check.yml 的
+    #   build-ngx-on job 覆盖；但该 job 已配置、从未在 GitHub 上运行过，
+    #   因此编译覆盖目前是 NOT VERIFIED。
     add_executable(Ffx12BackendTest
         Ffx12BackendTest.cpp
         Ffx12Backend.cpp
