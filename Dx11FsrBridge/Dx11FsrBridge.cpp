@@ -4225,6 +4225,13 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxUseReactiveMask", 0, config_path.c_str());
     ngx::set_use_reactive_mask(ngx_react != 0);
 
+    // ---- NgxDepthScale：深度提取 CS 的乘数（默认 1.0 = 上游不缩放）----
+    // 游戏逆深度约 [0, ~0.03]，NGX 期望 [0,1]；32 倍可让前后景可分。
+    // 这是量纲问题，不涉及方向，与 jitter/MV 的符号问题无关。
+    const int ngx_depth = GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxDepthScale", 1,
+                                                config_path.c_str());
+    ngx::set_depth_scale(static_cast<float>(ngx_depth > 0 ? ngx_depth : 1));
+
     // ---- 键 8：NgxLogLevel（默认 1；0=全关 1=error 2=info 3=debug）----
     const int ngx_lv =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxLogLevel", 1, config_path.c_str());

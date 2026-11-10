@@ -43,6 +43,10 @@ DXGI_FORMAT swapchain_format();
 void set_render_preset(int v);                              // NgxRenderPreset，默认 0（跟随 NGX）
 void set_frame_time_delta(bool on);                         // NgxSetFrameTimeDelta，默认 true
 void set_use_reactive_mask(bool on);                        // NgxUseReactiveMask，默认 false
+// NgxDepthScale：深度提取 CS 的乘数，默认 1.0（= 上游不缩放）。
+// 游戏逆深度值域约 [0, ~0.03]，而 NGX 期望 [0,1]；设为 32 可让前后景可分。
+// 这是量纲缩放，不改变方向，与 jitter/MV 的符号问题无关。
+void set_depth_scale(float scale);
 void set_log_level(int lv);                                 // NgxLogLevel 0..3，默认 1
 void set_passthrough(bool on);                              // NgxPassthrough，默认 false
 // NgxCrossKeyReuse，默认 true（ini 里 1）。语义：instance_key 变了，但建池/建 feature 真正

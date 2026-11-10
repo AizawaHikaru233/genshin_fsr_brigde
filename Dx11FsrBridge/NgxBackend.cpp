@@ -319,6 +319,22 @@ bool                      g_use_reactive  = false;
 int                       g_log_level     = 1;
 bool                      g_passthrough   = false;
 
+// ---- NgxDepthScale（默认 1.0 = 上游行为）----
+//
+// `g_depth_extract_hlsl` 的算式是 `out_depth = in_depth.x * g_depth_scale`，
+// 上游在 `upload_cb(ctx, inst, 1.0f, 1.0f)` 里恒传 1.0，即**不缩放**。
+//
+// 为什么这可能不对：游戏用的是逆深度，实际值域约 `[0, ~0.03]`，而 NGX/DLSS
+// 期望深度覆盖 `[0, 1]`。不缩放时前后景在数值上几乎不可分，DLSS 的
+// disocclusion 判据会失效 —— 表现是运动残影与时域不收敛（线条抖动）。
+//
+// 同一仓库的 FFX 后端对这件事早有结论（Ffx12Backend.cpp 的 g_depth_scale 注释：
+// "不归一化则深度感知/低分辨率 MV 上采样失真 → 视角移动残影"），只是 NGX 路径
+// 没有沿用。这是**量纲**问题而非方向问题，所以不存在"翻错符号"的风险。
+//
+// 默认 1.0 保持上游行为不变；设为 32（≈1/0.03）做 A/B。
+float                     g_depth_scale   = 1.0f;
+
 // ---- NgxCrossKeyReuse（默认 true）----
 // ★ 为什么是 std::atomic<bool> 而 g_passthrough 是普通 bool：
 //   两者形态不同，是**按访问面**选的，不是风格不一致。g_passthrough 只在 ffx12::dispatch()
@@ -2833,6 +2849,14 @@ void set_use_reactive_mask(bool on)
     g_use_reactive = on;
 }
 
+// 深度提取 CS 的乘数（默认 1.0 = 上游不缩放）。语义见 g_depth_scale 的注释。
+void set_depth_scale(float scale)
+{
+    if (!(scale > 0.0f) || scale > 256.0f)
+        return;   // 越界忽略，保留上一个有效值（不静默改成 1.0，否则用户看不出没生效）
+    g_depth_scale = scale;
+}
+
 void set_log_level(int lv)
 {
     if (lv < 0 || lv > 3)
@@ -3102,7 +3126,7 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     // ---- 第 8 步：深度提取 CS（§3.6.1）----
     if (!ensure_depth_src_srv(in, inst))
         return false;
-    upload_cb(ctx, inst, 1.0f, 1.0f);      // ★ depth_scale / flip 恒 1.0（§3.6.5），两段 CS 共用一个 cb
+    upload_cb(ctx, inst, g_depth_scale, 1.0f);   // ★ depth_scale 由 NgxDepthScale 控制（默认 1.0 = 上游行为），flip 恒 1.0
     dispatch_depth_cs(ctx, inst);
 
     // ---- 第 9 步：motion 解码 CS（§3.6.2）----
