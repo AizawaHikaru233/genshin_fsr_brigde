@@ -144,6 +144,39 @@
 ---
 
 ## 已解决
+### K 模型拖影：`IsHDR` 被错误置位（2026-11-10）
+
+**解决提交**：`fix(ngx): default NgxHdr to 0 so IsHDR is not set`
+
+**结论**：`NgxHdr` 默认 `auto`，本机解析成 HDR，于是 `Create.Flags` 带上 `IsHDR`：
+
+```
+ngx_core hdr_flag=1 src=ngx_hdr(1)
+ngx_core create_flags=0xB bits=IsHDR|MVLowRes|DepthInverted
+```
+
+桥交给 NGX 的是 **PQ 码值**，不是线性光。置 `IsHDR` 让 DLSS 按 HDR 管线解释这些
+码值，色调映射与运动补偿的判断随之偏离画面实际内容 ⇒ 走动时大面积拖影。
+
+改为 `NgxHdr=0` 后：
+
+```
+ngx_core create_flags=0xA bits=MVLowRes|DepthInverted
+```
+
+**实机确认 K 模型拖影消失，与 FFX 输入路径持平。**
+
+值得注意的是 `NgxBackend.cpp` 的 ini 注释本就写明「G10 always resolves to SDR ...
+to force HDR on a non-FP16 back buffer, use NgxHdr=1」，即作者意图是默认 SDR。
+`auto` 的实际解析路径与注释相反，改为 `0` 使二者一致。
+
+**排查中被证伪的路径**（均已实机验证，供后来者避免重复）：
+`NgxJitterSign=1`、`NgxDepthScale=32`、`Ffx12JitterDelay=1`（会让画面变模糊）、
+`quality_from_ratio` 改 DLAA、`AlphaUpscaling=1`。共同点是都在改「数值」，
+而真因是一个「语义位」。
+
+**未解决**：M / L 模型的细线条抖动（量级接近 FFX 路径）。
+
 
 ### 发布管线不启用 NGX 构型（2026-11-10）
 
