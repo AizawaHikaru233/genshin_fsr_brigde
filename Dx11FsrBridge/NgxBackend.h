@@ -46,6 +46,16 @@ void set_use_reactive_mask(bool on);                        // NgxUseReactiveMas
 void set_log_level(int lv);                                 // NgxLogLevel 0..3，默认 1
 void set_passthrough(bool on);                              // NgxPassthrough，默认 false
 
+// 2026-11-10（B154）：NGX 实现来源（NgxProvider 键），默认 auto。
+//   auto     = 先真 NGX（注册表 FullPath → _nvngx.dll），失败再找外部实现（默认）；
+//   nvidia   = 只走真 NGX（与 v1 逐条相同：失败即确定性失败，不重试、不换来源）；
+//   external = 只走外部实现：先 LoadLibraryW("_nvngx.dll")（OptiScaler 的 LoadLibrary
+//              钩子会返回它自己），再枚举已加载模块，找导出 NVSDK_NGX_D3D11_Init_Ext 的那个。
+// ★ 外部实现只在"注册表不存在 / 装载失败"这条路上改变结果：真 NGX 一旦拿到，行为不变。
+// ★ auto 的 external 失败是**可重试**的（12 × 5 s 窗口），用尽才按 provider_missing 收尾 ——
+//   外部实现何时加载不由本 DLL 决定。
+void set_provider_mode(int mode);                           // NgxProvider（0=auto 1=nvidia 2=external）
+
 // ---- 查询 ----
 bool active();          // 已成功初始化且 available==1
 bool available();       // 最近一次探测结果

@@ -4097,8 +4097,8 @@ void load_config()
     ffx12::set_async_upscale(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12AsyncUpscale", 1, config_path.c_str()) != 0);
     ffx12::set_hdr_input(g_config.ffx12_hdr_input);
-    // ---- D13 九键读取（SDS §3.13.1）：紧邻 Ffx12Hdr 的读取点 ----
-    // 此处 blog::init() 尚未执行 ⇒ 9 个 setter 只存值、一行日志都不打；
+    // ---- D13 十键读取（SDS §3.13.1）：紧邻 Ffx12Hdr 的读取点 ----
+    // 此处 blog::init() 尚未执行 ⇒ 10 个 setter 只存值、一行日志都不打；
     // 唯一需要输出的是非法值告警，它先进 pending_warnings，由 initialize() 回放。
     //
     // ⚠️ Ffx12Backend 只接受**精确小写**的 native / ngx：不 tolower、不 trim。
@@ -4195,9 +4195,29 @@ void load_config()
     const int ngx_pt =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxPassthrough", 0, config_path.c_str());
     ngx::set_passthrough(ngx_pt != 0);
+
+    // ---- 键 10：NgxProvider（2026-11-10 增，B154；默认 auto）----
+    // 只接受**精确小写**的 auto / nvidia / external：与 Ffx12Backend 同风格（不 tolower、不 trim）。
+    // 其它取值（显式空值 / 拼错 / ngx / NVIDIA）⇒ auto + provider_invalid 告警（位由 setter 记），
+    // 因为"拼错"与"故意用默认"在日志里必须能区分开。
+    {
+        wchar_t provider_buf[32] {};
+        GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxProvider", L"auto",
+                                 provider_buf, static_cast<DWORD>(std::size(provider_buf)),
+                                 config_path.c_str());
+        const std::wstring provider_value(provider_buf);
+        int provider_mode = -1;   // -1 = 非法（交给 set_provider_mode 记位并回 auto）
+        if (provider_value == L"auto")
+            provider_mode = 0;
+        else if (provider_value == L"nvidia")
+            provider_mode = 1;
+        else if (provider_value == L"external")
+            provider_mode = 2;
+        ngx::set_provider_mode(provider_mode);
+    }
 #else
     // ---- REQ-08：NGX 未编译进本产物 ----
-    // 九个键里只有 Ffx12Backend 有消费者（后端选择器归 ffx12），其余 8 个 NGX 键在 OFF
+    // 十个键里只有 Ffx12Backend 有消费者（后端选择器归 ffx12），其余 9 个 NGX 键在 OFF
     // 构型下没有任何消费者，故不读。缺键 / 显式 native ⇒ 静默 native（不告警）；
     // 任何其它取值（精确 ngx、非法值）⇒ 强制 Native + 一条固定告警。
     {

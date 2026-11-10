@@ -45,6 +45,7 @@
 #include <dxgi.h>         // IDXGIAdapter / IDXGIDevice（GetFeatureRequirements 反查）
 #include <d3dcompiler.h>  // D3DCompile（两个自写 CS）
 #include <shlobj.h>       // ★ T-2 增（§3.4.4）：SHGetKnownFolderPath / FOLDERID_LocalAppData
+#include <tlhelp32.h>     // ★ B154 增：CreateToolhelp32Snapshot / Module32FirstW（枚举已加载的 provider）
 #include <wrl/client.h>   // Microsoft::WRL::ComPtr
 
 // ---- ③ 本项目 ----
@@ -229,6 +230,17 @@ NVSDK_NGX_Parameter *g_params = nullptr;          // 全局一份，**不调 Res
 std::atomic<bool>   g_logged_config { false };    // 配置快照只打一次（§3.10.2 第 0 步）
 std::uint64_t       g_init_retry_after_us = 0;   // ★ 失败退避窗口（§3.4.1 / MAJ-13）；0 = 未失败过
 
+// ---- provider 来源（2026-11-10 增，B154：NgxProvider 键）----
+// 为什么单独一个状态位而不是直接看 ini：ensure_init 里要按它决定"试几条路"，
+// 而 ini 解析在 Dx11FsrBridge.cpp（另一个 TU）⇒ 只能由 set_provider_mode() 送进来。
+// ★ 三态值写死在这里（不靠 ini 字符串比较）：常量即契约，setter 与 ensure_init 共用。
+enum NgxProviderMode : int {
+    kProviderAuto     = 0,   // 默认：先 nvidia，失败再 external
+    kProviderNvidia   = 1,   // 只走真 NGX（注册表），失败即确定性失败（= v1 行为）
+    kProviderExternal = 2,   // 只走外部实现（OptiScaler 之类）
+};
+int g_provider_mode = kProviderAuto;
+
 // ---- 入口（10 个函数指针，§3.4.3 / §3.4.6）----
 PFN_NGX_Init_Ext                 g_init_ext   = nullptr;
 PFN_NGX_GetCapabilityParameters  g_get_caps   = nullptr;
@@ -333,6 +345,11 @@ std::uint64_t g_ngx_passthrough_count = 0;
 enum NgxConfigWarn : unsigned {
     kWarnAppIdZero      = 1u << 0,   // NgxApplicationId=0 → 强制 1337
     kWarnPresetInvalid  = 1u << 1,   // NgxRenderPreset 越界 → 回退 0
+    // 2026-11-10（B154）：NgxProvider 不是 auto/nvidia/external ⇒ 回退 auto。
+    // ★ 与 NgxHdr 的处理不同：Hdr 的越界静默归 auto 就够（auto 本来就是它的默认语义），
+    //   而 provider 拼错（ngx / NVIDIA / 外部 / 空值）会让人以为"已经切到外部实现"，
+    //   所以必须留下一条位名，随配置快照一起打出来。
+    kWarnProviderInvalid = 1u << 2,  // NgxProvider 非法值 → 回退 auto
 };
 unsigned g_config_warn = 0;
 
@@ -719,15 +736,17 @@ std::string flags_to_string(unsigned int flags)
     return out;
 }
 
-// §3.13 末：配置位 → 位名。**只有两位**（appid_zero / preset_invalid）。
+// §3.13 末：配置位 → 位名。**三位**（appid_zero / preset_invalid / provider_invalid；
+// 第三位是 2026-11-10 的 B154 加的：NgxProvider 非法值）。
 // backend_invalid 不在此位图（它走 pending_warnings，因为 Native 回退后 ensure_init 不可达）。
 // bits == 0 返回空串（调用方只在 g_config_warn != 0 时调，见 §3.13.2 第 2 条）。
 std::string warn_to_string(unsigned int bits)
 {
     struct BitName { unsigned int bit; const char *name; };
     const BitName names[] = {
-        { kWarnAppIdZero,     "appid_zero" },
-        { kWarnPresetInvalid, "preset_invalid" },
+        { kWarnAppIdZero,      "appid_zero" },
+        { kWarnPresetInvalid,  "preset_invalid" },
+        { kWarnProviderInvalid, "provider_invalid" },
     };
     if (bits == 0)
         return std::string {};
@@ -752,6 +771,18 @@ std::string warn_to_string(unsigned int bits)
         out += tail;
     }
     return out;
+}
+
+// 2026-11-10（B154）：provider 模式的**窄串**名字（给 %hs 用）。
+// ★ 与上面的位名表分开：这里枚举的是"配置要什么"，不是告警。
+const char *provider_mode_name(int mode)
+{
+    switch (mode)
+    {
+    case kProviderNvidia:   return "nvidia";
+    case kProviderExternal: return "external";
+    default:                return "auto";
+    }
 }
 
 // ============================================================================
@@ -1041,10 +1072,230 @@ static void log_config_snapshot()
     log_ngx_error(L"ngx_core dt_flag=%d reactive=%d",
                   g_dt_enabled ? 1 : 0, g_use_reactive ? 1 : 0);
 
+    // 2026-11-10（B154）：provider 来源（NgxProvider）。与成功时的 "provider resolved=" 分开命名：
+    //   这一行说"配置要什么"，那一行说"实际用了谁" —— 两行一起才能区分"配置没生效"与"来源没找到"。
+    log_ngx_error(L"ngx_core provider_mode=%hs", provider_mode_name(g_provider_mode));
+
     // §3.13 末：非法值位图（只在非零时打；warn_to_string 返回窄串 ⇒ %hs）。
     if (g_config_warn != 0)
         log_ngx_error(L"ngx_core config_warn bits=%hs", warn_to_string(g_config_warn).c_str());
 }
+
+// ============================================================================
+// §3.4.3A provider 解析（2026-11-10 增，B154）
+// 为什么要有这一层：v1 把"谁是 NGX 实现"写死成"注册表 FullPath 指向的那个 _nvngx.dll"。
+//   可注册表只是 NVIDIA 驱动的一条**发现路径**，不是 NGX 的唯一来源 —— OptiScaler 就导出
+//   同一套 NVSDK_NGX_D3D11_* 入口（v0.9.4-final 共 53 个 NVSDK_NGX_* 导出，D3D11 十项齐全）。
+//   于是非 N 卡机器上"注册表不存在"被当成确定性失败（fail_init 置不可逆的 g_release_all），
+//   ngx 后端整个会话报废 —— 这是把**观测源**和**动作**绑死（AGENTS.md §五.1）。
+// 本层只做一件事：给定"来源"，把 10 个入口绑定好；绑定之后的流程一字未变。
+// ============================================================================
+
+// ---- 10 个入口的统一绑定（原第 3 步，抽出来给两条来源复用）----
+// 返回 true = 10 个都在。失败时把**十个指针全部清回 nullptr**：
+//   同一进程里可能先后试过多个候选模块，留下"半套指针"会让后续出现"部分可用"
+//   这种不存在的状态（create_feature 会直接用 g_create / g_eval ⇒ 半套必然是指针空判）。
+static bool bind_entries_from(HMODULE module, std::string *missing)
+{
+    // ★ 名字一律用 §3.4.3 表里核实过的导出名；**不从 nvsdk_ngx.h 抄**（头文件与真实 DLL 有 4 处差异）。
+    g_init_ext = reinterpret_cast<PFN_NGX_Init_Ext>(
+        GetProcAddress(module, "NVSDK_NGX_D3D11_Init_Ext"));
+    g_get_caps = reinterpret_cast<PFN_NGX_GetCapabilityParameters>(
+        GetProcAddress(module, "NVSDK_NGX_D3D11_GetCapabilityParameters"));
+    g_create = reinterpret_cast<PFN_NGX_CreateFeature>(
+        GetProcAddress(module, "NVSDK_NGX_D3D11_CreateFeature"));
+    g_release = reinterpret_cast<PFN_NGX_ReleaseFeature>(
+        GetProcAddress(module, "NVSDK_NGX_D3D11_ReleaseFeature"));
+    g_eval = reinterpret_cast<PFN_NGX_EvaluateFeature>(
+        GetProcAddress(module, "NVSDK_NGX_D3D11_EvaluateFeature"));
+    g_shutdown = reinterpret_cast<PFN_NGX_Shutdown1>(
+        GetProcAddress(module, "NVSDK_NGX_D3D11_Shutdown1"));
+    g_alloc = reinterpret_cast<PFN_NGX_AllocateParameters>(
+        GetProcAddress(module, "NVSDK_NGX_D3D11_AllocateParameters"));
+    g_destroy = reinterpret_cast<PFN_NGX_DestroyParameters>(
+        GetProcAddress(module, "NVSDK_NGX_D3D11_DestroyParameters"));
+    g_scratch = reinterpret_cast<PFN_NGX_GetScratchBufferSize>(
+        GetProcAddress(module, "NVSDK_NGX_D3D11_GetScratchBufferSize"));
+    g_req = reinterpret_cast<PFN_NGX_GetFeatureRequirements>(
+        GetProcAddress(module, "NVSDK_NGX_D3D11_GetFeatureRequirements"));
+
+    // §4.2 第 3 行：**打印所有 null 的名字**，不是只报第一个 —— 少一个入口和少五个
+    // 在某台机器上是完全不同的诊断结论。
+    std::string miss;
+    auto note = [&miss](bool present, const char *name)
+    {
+        if (present)
+            return;
+        if (!miss.empty())
+            miss += ",";
+        miss += name;
+    };
+    note(g_init_ext != nullptr, "NVSDK_NGX_D3D11_Init_Ext");
+    note(g_get_caps != nullptr, "NVSDK_NGX_D3D11_GetCapabilityParameters");
+    note(g_create   != nullptr, "NVSDK_NGX_D3D11_CreateFeature");
+    note(g_release  != nullptr, "NVSDK_NGX_D3D11_ReleaseFeature");
+    note(g_eval     != nullptr, "NVSDK_NGX_D3D11_EvaluateFeature");
+    note(g_shutdown != nullptr, "NVSDK_NGX_D3D11_Shutdown1");
+    note(g_alloc    != nullptr, "NVSDK_NGX_D3D11_AllocateParameters");
+    note(g_destroy  != nullptr, "NVSDK_NGX_D3D11_DestroyParameters");
+    note(g_scratch  != nullptr, "NVSDK_NGX_D3D11_GetScratchBufferSize");
+    note(g_req      != nullptr, "NVSDK_NGX_D3D11_GetFeatureRequirements");
+    if (!miss.empty())
+    {
+        // 清回全套 nullptr（见函数头注释）；顺序与上面一致，方便对照
+        g_init_ext = nullptr;
+        g_get_caps = nullptr;
+        g_create   = nullptr;
+        g_release  = nullptr;
+        g_eval     = nullptr;
+        g_shutdown = nullptr;
+        g_alloc    = nullptr;
+        g_destroy  = nullptr;
+        g_scratch  = nullptr;
+        g_req      = nullptr;
+        log_ngx_error(L"ngx_core missing_entry names=%hs", miss.c_str());
+        if (missing != nullptr)
+            *missing = miss;
+        return false;
+    }
+    if (missing != nullptr)
+        missing->clear();
+    return true;
+}
+
+// ---- 命中的 provider（只用于日志与"要不要付 E1 的 500 ms"）----
+struct ProviderHit
+{
+    HMODULE module = nullptr;
+    const wchar_t *kind = L"unknown";   // nvidia_registry / nvngx_load / loaded_module
+    std::wstring path;                  // 诊断用（可为空）
+    bool nvidia = false;                // true = 真 NGX ⇒ 第 9 步要 Sleep(500)（E1）
+};
+
+// 注册表这条路的三个失败档位（v1 的三条 reason 原样对应）
+enum class ProviderStage { ok, no_registry, load_failed, missing_entry };
+
+const wchar_t *provider_stage_reason(ProviderStage stage)
+{
+    switch (stage)
+    {
+    case ProviderStage::no_registry:   return L"no_registry";
+    case ProviderStage::load_failed:   return L"load_failed";
+    case ProviderStage::missing_entry: return L"missing_entry";
+    default:                           return L"unknown";
+    }
+}
+
+// ---- 来源①：真 NGX（v1 的第 1-3 步原样搬进来）----
+// ⚠️ 无系统目录兜底：v0 的 %WINDIR%\System32\_nvngx.dll 是错的，真运行时在 DriverStore。
+// ★ 句柄不存：v1 不调 Shutdown1、也从不 FreeLibrary（模块与进程同寿，§6-13）。
+static ProviderStage try_nvidia_registry(ProviderHit *hit, unsigned *rc)
+{
+    *rc = 0;
+
+    wchar_t full_path[1024] {};
+    DWORD cb = sizeof(full_path);
+    const LSTATUS reg = RegGetValueW(HKEY_LOCAL_MACHINE,
+                                     L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore",
+                                     L"FullPath", RRF_RT_REG_SZ, nullptr,
+                                     full_path, &cb);
+    if (reg != ERROR_SUCCESS || full_path[0] == L'\0')
+    {
+        *rc = static_cast<unsigned>(reg);
+        return ProviderStage::no_registry;
+    }
+
+    const std::wstring nvngx_path = std::wstring(full_path) + L"\\_nvngx.dll";
+    const HMODULE module = LoadLibraryW(nvngx_path.c_str());
+    if (module == nullptr)
+    {
+        *rc = static_cast<unsigned>(GetLastError());
+        return ProviderStage::load_failed;
+    }
+
+    if (!bind_entries_from(module, nullptr))
+        return ProviderStage::missing_entry;
+
+    hit->module = module;
+    hit->kind   = L"nvidia_registry";
+    hit->path   = nvngx_path;
+    hit->nvidia = true;
+    return ProviderStage::ok;
+}
+
+// ---- 来源②-a：枚举已加载模块，找导出 NVSDK_NGX_D3D11_Init_Ext 的那个 ----
+// ★ 为什么不用"按文件名找 _nvngx.dll"：OptiScaler 劫持 LoadLibraryW 后返回的是**它自己**
+//   的 HMODULE，进程里并不存在名为 _nvngx.dll 的模块；文件名判据在"谁冒充 NGX"这件事上
+//   完全不可靠。导出面才是事实（AGENTS.md §五.1：观测源要落在源头）。
+// ★ CreateToolhelp32Snapshot 只在 ensure_init 首次（或退避后重试）调用，不在每帧路径上
+//   ⇒ 不触犯 §二.5 热路径红线。
+static bool scan_loaded_modules(ProviderHit *hit, unsigned *scanned)
+{
+    if (scanned != nullptr)
+        *scanned = 0;
+
+    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+                                                  GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE)
+        return false;
+
+    bool found = false;
+    unsigned count = 0;
+    MODULEENTRY32W me {};
+    me.dwSize = sizeof(me);
+    for (BOOL ok = Module32FirstW(snap, &me); ok != FALSE; ok = Module32NextW(snap, &me))
+    {
+        ++count;
+        if (me.hModule == nullptr)
+            continue;
+        // 先做一次最便宜的存在性检查，避免对上百个模块各做 10 次 GetProcAddress
+        if (GetProcAddress(me.hModule, "NVSDK_NGX_D3D11_Init_Ext") == nullptr)
+            continue;
+        if (!bind_entries_from(me.hModule, nullptr))
+            continue;   // 只导出了部分入口 ⇒ 不是完整 provider，继续找
+        hit->module = me.hModule;
+        hit->kind   = L"loaded_module";
+        hit->path   = me.szExePath;
+        found = true;
+        break;
+    }
+    CloseHandle(snap);
+    if (scanned != nullptr)
+        *scanned = count;
+    return found;
+}
+
+// ---- 来源②-b：external 的全部两条路（先裸名装载，再枚举）----
+// ★ OptiScaler 的 kernel32 LoadLibraryW 钩子（LibraryLoad_Hooks.cpp:66-75）命中
+//   nvngxNamesW（nvngx.dll / nvngx / _nvngx.dll / _nvngx）时返回它自己 ⇒ 这里拿到的
+//   就是 OptiScaler 的 HMODULE。没有 OptiScaler 时它按常规装载失败（126），无害。
+// ★ 成功也**不** FreeLibrary：劫持路径返回的句柄不是正常 LoadLibrary 语义下的新增引用，
+//   对它 FreeLibrary 会打乱对方的引用计数（§6-13 的"不卸载"惯例同理）。
+static bool try_external(ProviderHit *hit, std::wstring *detail)
+{
+    const HMODULE module = LoadLibraryW(L"_nvngx.dll");
+    const unsigned load_err = (module == nullptr) ? static_cast<unsigned>(GetLastError()) : 0u;
+    if (module != nullptr && bind_entries_from(module, nullptr))
+    {
+        hit->module = module;
+        hit->kind   = L"nvngx_load";
+        hit->path   = L"_nvngx.dll";
+        return true;
+    }
+
+    unsigned count = 0;
+    if (scan_loaded_modules(hit, &count))
+        return true;
+
+    if (detail != nullptr)
+    {
+        wchar_t buf[96] {};
+        swprintf_s(buf, L"nvngx_load=0x%X modules=%u", load_err, count);
+        *detail = buf;
+    }
+    return false;
+}
+
 
 // ============================================================================
 // §3.4.2 每条失败路径的统一收尾
@@ -1052,12 +1303,41 @@ static void log_config_snapshot()
 //   ② 置 g_release_all —— §4.2 矩阵里 ensure_init 的 8 条失败（第 1-8 行）全是**确定性**的
 //      （注册表/装载/入口/目录/目录创建/Init_Ext/取参数/可用性），重试不会好，让原生接手（§4.3）
 //   ③ 置 5 秒退避窗口（§3.4.1）——**不设 g_inited**
+// ★ 2026-11-10（B154）：只有 external provider 走**软失败** soft_fail_init()（不置 g_release_all、
+//   可重试 12 次）；其余失败路径的语义不变 —— 「provider 尚未就绪」（软）≠「provider 根本不存在」（硬）。
 // ============================================================================
 static bool fail_init(const wchar_t *reason, unsigned rc)
 {
     log_ngx_error(L"ngx_core init ok=0 available=0 rc=0x%X reason=%s", rc, reason);
     g_release_all.store(true, std::memory_order_relaxed);
     g_init_retry_after_us = qpc_us() + 5000000ull;   // 5000 ms，写死，不做 ini 键（§3.4.1）
+    return false;
+}
+
+// ============================================================================
+// §3.4.2A 软失败（2026-11-10 增，B154）
+//   外部 provider（OptiScaler）何时被加载**不由桥决定**：桥可能先于它初始化，
+//   也可能这一帧它还没装钩子。一次判死（fail_init 置不可逆的 g_release_all）会把
+//   "先初始化"变成永久失效 —— 那是把加载顺序当成能力判定。
+//   所以 external 走这里的**可重试**收尾：只做 5 秒退避、不置 g_release_all，最多
+//   kSoftInitRetries 次；用尽后才按确定性失败收尾（reason=provider_missing）。
+// ★ 计数器是普通 unsigned（与 g_init_retry_after_us 同形态纪律：只在
+//   ffx12::dispatch() 持 g_mutex 的调用栈内访问）；shutdown_all **不清**它 ——
+//   清掉会让换设备时把窗口计数重置，等于允许无限重试。
+// ============================================================================
+constexpr unsigned kSoftInitRetries = 12;   // 12 × 5 s ≈ 60 s 窗口
+unsigned g_init_soft_attempts = 0;
+
+static bool soft_fail_init(const std::wstring &detail)
+{
+    ++g_init_soft_attempts;
+    const bool exhausted = (g_init_soft_attempts >= kSoftInitRetries);
+    // retry 字段写进行内：读日志的人不必自己算"还剩几次"（AGENTS.md §五.6 日志口径自洽）
+    log_ngx_error(L"ngx_core init soft_fail attempt=%u/%u reason=provider_missing detail=%s retry=%d",
+                  g_init_soft_attempts, kSoftInitRetries, detail.c_str(), exhausted ? 0 : 1);
+    if (exhausted)
+        return fail_init(L"provider_missing", 0);
+    g_init_retry_after_us = qpc_us() + 5000000ull;
     return false;
 }
 
@@ -1102,76 +1382,57 @@ static bool ensure_init(ID3D11Device *dev)
         log_config_snapshot();
     }
 
-    // ---- 第 1 步：注册表 HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore → FullPath ----
-    // ⚠️ 无系统目录兜底：v0 的 %WINDIR%\System32\_nvngx.dll 是错的，真运行时在 DriverStore。
-    wchar_t full_path[1024] {};
-    {
-        DWORD cb = sizeof(full_path);
-        const LSTATUS reg = RegGetValueW(HKEY_LOCAL_MACHINE,
-                                         L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore",
-                                         L"FullPath", RRF_RT_REG_SZ, nullptr,
-                                         full_path, &cb);
-        if (reg != ERROR_SUCCESS || full_path[0] == L'\0')
-            return fail_init(L"no_registry", static_cast<unsigned>(reg));
-    }
+    // ---- 第 1..3 步：解析 provider 并绑定 10 个入口（2026-11-10 起有两条来源，B154）----
+    // 来源由 NgxProvider 决定（g_provider_mode）：nvidia / external / auto（默认：先 nvidia 再 external）。
+    // ★ 绑定之后的第 4..10 步与 v1 **逐字相同** —— 本改动只换「谁是 NGX 实现」，不换流程。
+    ProviderHit hit;
+    bool provided = false;
+    std::wstring fallback_detail;   // auto/external 失败时的诊断（只出现在 soft_fail 行里）
 
-    // ---- 第 2 步：LoadLibraryW(FullPath + L"\\_nvngx.dll") ----
-    // ★ 句柄不存：v1 不调 Shutdown1、也从不 FreeLibrary（模块与进程同寿，§6-13）。
-    const std::wstring nvngx_path = std::wstring(full_path) + L"\\_nvngx.dll";
-    HMODULE module = LoadLibraryW(nvngx_path.c_str());
-    if (module == nullptr)
-        return fail_init(L"load_failed", static_cast<unsigned>(GetLastError()));
-
-    // ---- 第 3 步：GetProcAddress × 10（清单见 §3.4.3）----
-    // ★ 名字一律用 §3.4.3 表里核实过的导出名；**不从 nvsdk_ngx.h 抄**（头文件与真实 DLL 有 4 处差异）。
-    g_init_ext = reinterpret_cast<PFN_NGX_Init_Ext>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_Init_Ext"));
-    g_get_caps = reinterpret_cast<PFN_NGX_GetCapabilityParameters>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_GetCapabilityParameters"));
-    g_create = reinterpret_cast<PFN_NGX_CreateFeature>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_CreateFeature"));
-    g_release = reinterpret_cast<PFN_NGX_ReleaseFeature>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_ReleaseFeature"));
-    g_eval = reinterpret_cast<PFN_NGX_EvaluateFeature>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_EvaluateFeature"));
-    g_shutdown = reinterpret_cast<PFN_NGX_Shutdown1>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_Shutdown1"));
-    g_alloc = reinterpret_cast<PFN_NGX_AllocateParameters>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_AllocateParameters"));
-    g_destroy = reinterpret_cast<PFN_NGX_DestroyParameters>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_DestroyParameters"));
-    g_scratch = reinterpret_cast<PFN_NGX_GetScratchBufferSize>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_GetScratchBufferSize"));
-    g_req = reinterpret_cast<PFN_NGX_GetFeatureRequirements>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_GetFeatureRequirements"));
+    if (g_provider_mode != kProviderExternal)
     {
-        // §4.2 第 3 行：**打印所有 null 的名字**，不是只报第一个 —— 少一个入口和少五个
-        // 在某台机器上是完全不同的诊断结论。
-        std::string missing;
-        auto note = [&missing](bool present, const char *name)
+        unsigned nvidia_rc = 0;
+        const ProviderStage stage = try_nvidia_registry(&hit, &nvidia_rc);
+        if (stage == ProviderStage::ok)
         {
-            if (present)
-                return;
-            if (!missing.empty())
-                missing += ",";
-            missing += name;
-        };
-        note(g_init_ext != nullptr, "NVSDK_NGX_D3D11_Init_Ext");
-        note(g_get_caps != nullptr, "NVSDK_NGX_D3D11_GetCapabilityParameters");
-        note(g_create   != nullptr, "NVSDK_NGX_D3D11_CreateFeature");
-        note(g_release  != nullptr, "NVSDK_NGX_D3D11_ReleaseFeature");
-        note(g_eval     != nullptr, "NVSDK_NGX_D3D11_EvaluateFeature");
-        note(g_shutdown != nullptr, "NVSDK_NGX_D3D11_Shutdown1");
-        note(g_alloc    != nullptr, "NVSDK_NGX_D3D11_AllocateParameters");
-        note(g_destroy  != nullptr, "NVSDK_NGX_D3D11_DestroyParameters");
-        note(g_scratch  != nullptr, "NVSDK_NGX_D3D11_GetScratchBufferSize");
-        note(g_req      != nullptr, "NVSDK_NGX_D3D11_GetFeatureRequirements");
-        if (!missing.empty())
+            provided = true;
+        }
+        else if (g_provider_mode == kProviderNvidia)
         {
-            log_ngx_error(L"ngx_core missing_entry names=%hs", missing.c_str());
-            return fail_init(L"missing_entry", 0);
+            // 显式 nvidia：与 v1 逐条相同（三条 reason + rc 原样），不重试、不换来源
+            return fail_init(provider_stage_reason(stage), nvidia_rc);
+        }
+        else
+        {
+            wchar_t buf[64] {};
+            swprintf_s(buf, L"%s(0x%X)", provider_stage_reason(stage), nvidia_rc);
+            fallback_detail = buf;
         }
     }
+
+    if (!provided)
+    {
+        std::wstring ext_detail;
+        if (try_external(&hit, &ext_detail))
+        {
+            provided = true;
+        }
+        else
+        {
+            if (ext_detail.empty())
+                ext_detail = L"unknown";
+            if (!fallback_detail.empty())
+                fallback_detail += L" external=";
+            fallback_detail += ext_detail;
+            // ★ 不置 g_release_all：OptiScaler 可能还没加载完（§3.4.2A）
+            return soft_fail_init(fallback_detail);
+        }
+    }
+
+    // ---- 第 3 步收尾：来源取证（Error 级 ⇒ 默认 NgxLogLevel=1 就可见）----
+    // 为什么要单独一行：`Ffx12Backend=ngx` 只说明"用户要 ngx"，这一行才说明"实际用的是谁"。
+    log_ngx_error(L"ngx_core provider resolved=%s module=%s",
+                  hit.kind, hit.path.empty() ? L"(unknown)" : hit.path.c_str());
 
     // ---- 第 4 步：组装 NVSDK_NGX_FeatureCommonInfo（§3.4.5）----
     NVSDK_NGX_FeatureCommonInfo fc {};
@@ -1210,7 +1471,12 @@ static bool ensure_init(ID3D11Device *dev)
         return fail_init(L"unavailable", static_cast<unsigned>(avail_rc));
 
     // ---- 第 9 步：Sleep(500)（E1：Sleep(500) 后 CreateFeature 才有效；只在首次初始化付一次）----
-    Sleep(500);
+    // ★ 2026-11-10（B154）：只在**真 NGX**（nvidia provider）上付这 500 ms。E1 说的是
+    //   NVIDIA 运行时在校验/落盘之后才让 CreateFeature 有效；外部 provider（OptiScaler）
+    //   没有这个延迟，在 draw 钩子内白等 500 ms 只换来一次可见卡顿。
+    const int sleep_ms = hit.nvidia ? 500 : 0;
+    if (sleep_ms > 0)
+        Sleep(500);
 
     // ---- 第 10 步：成功 ----
     g_inited    = true;
@@ -1228,8 +1494,10 @@ static bool ensure_init(ID3D11Device *dev)
     // ★ 为什么方案选 C（接受现状 + 计时）而不是 A/B：见变更日志的评估。
     // ★ 失败路径不走到这里（fail_init 早退），但那些路径**也到不了**第 9 步的 Sleep(500)，
     //   所以漏掉的只是"初始化失败时的耗时"，不影响本行要量的那个卡顿。
-    log_ngx_error(L"ngx_core init_slow first_init_us=%.1f",
-                  static_cast<double>(qpc_us() - init_t0));
+    // ★ 2026-11-10（B154）：追加 sleep_ms 字段 —— 外部 provider 跳过 500 ms 后，
+    //   两个构型的 first_init_us 不再可直接对比；写明这一段睡了多少才谈得上对比。
+    log_ngx_error(L"ngx_core init_slow first_init_us=%.1f sleep_ms=%d",
+                  static_cast<double>(qpc_us() - init_t0), sleep_ms);
     return true;
 }
 
@@ -2460,6 +2728,21 @@ void set_log_level(int lv)
 void set_passthrough(bool on)
 {
     g_passthrough = on;
+}
+
+// 2026-11-10（B154）：NgxProvider 三态。越界（含 load_config 送来的 -1）静默回 auto，
+// 但**记位** —— provider 拼错（ngx / NVIDIA / 外部 / 空值）会让人以为"已经切到外部实现"，
+// 与 NgxHdr 越界（不记位）刻意不同：Hdr 的 auto 本来就是它的默认语义，provider 的不是。
+void set_provider_mode(int mode)
+{
+    if (mode == kProviderNvidia || mode == kProviderExternal)
+    {
+        g_provider_mode = mode;
+        return;
+    }
+    g_provider_mode = kProviderAuto;
+    if (mode != kProviderAuto)
+        g_config_warn |= kWarnProviderInvalid;
 }
 
 // ============================================================================

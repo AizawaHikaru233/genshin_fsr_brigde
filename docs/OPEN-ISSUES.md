@@ -32,31 +32,35 @@
 
 ---
 
-## 2. 非 NVIDIA 平台借用外部 NGX 实现（未实现，方案已评估）
+## 2. 非 NVIDIA 平台借用外部 NGX 实现（机制已落地，画质契约与实机未验证）
 
 **现状**
 
-- `ensure_init` 第一步读注册表 `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore` 的 `FullPath`；非 N 卡上该键不存在 ⇒ 记为确定性失败，进入 5 秒退避，本轮会话不再尝试，整体回落 FFX。
+- `NgxProvider` 决定 NGX 实现从哪里来（默认 `auto`）：
+  - `nvidia`：注册表 `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore` 的 `FullPath` → `_nvngx.dll`，失败即确定性失败（与改动前逐条相同）；
+  - `external`：先 `LoadLibraryW(L"_nvngx.dll")`（OptiScaler 的 LoadLibrary 钩子会返回它自己），再枚举已加载模块，找导出 `NVSDK_NGX_D3D11_Init_Ext` 的那个；
+  - `auto`：先 `nvidia`，失败再 `external`。
+- 外部实现失败是**可重试**的（5 s 退避 × 12 次 ≈ 60 s），用尽才记 `reason=provider_missing` 并回落 native；不再一次判死整轮会话。
+- 取证行：`ngx_core provider_mode=…`（配置要什么）与 `ngx_core provider resolved=… module=…`（实际用了谁；kind ∈ `nvidia_registry` / `nvngx_load` / `loaded_module`）。
 
-**可行性**
+**影响 / 仍未验证**
 
-- OptiScaler 拦截对 `nvngx` 的 `LoadLibraryW` 并把自身模块返回给调用方，且导出了 D3D11 全套 `NVSDK_NGX_D3D11_*` 入口；其 `Init_Ext` 在 DLSS 能力不可用时也会返回成功，`CreateFeature` 默认给出 FSR 2.2.1 的 D3D11 实现（静态链接 FFX，不需要额外 DLL、不需要 N 卡）。
-- 方案 A：无注册表时直接 `LoadLibraryW(L"_nvngx.dll")`，依赖对方的 kernel32 钩子（约 3~5 行）。
-- 方案 B（推荐）：枚举已加载模块，逐个 `GetProcAddress("NVSDK_NGX_D3D11_Init_Ext")`，命中即用（不依赖钩子与文件名，约 40~60 行）。
-
-**推进需要**
-
-- 改掉 `fail_init` 的「确定性失败」语义（当前一次失败即整会话放弃）；
-- 增加显式开关（如 `NgxProvider=auto|nvidia|external`），避免默认行为在 N 卡上被改掉。
+- 只针对「A 卡 + OptiScaler（v0.9.4-final）」这一种组合设计，**没有实机跑过**；`auto` 在纯 N 卡机器上的行为应当与改动前一致，但也只是代码级推断。
+- 外部实现是 OptiScaler 自己的 FSR 2.2.1（D3D11 静态 FFX），与真 DLSS 不是同一个实现 ⇒ 画面结论不能照搬 DLSS 的。
 
 **必须先验的画质契约**
 
-- 桥恒设 `MVLowRes`，且 `MV_Scale_X/Y` 只是透传；而对方的 FSR2 D3D11 实现不读该组参数（按 UV 单位处理运动矢量）⇒ 若游戏给的是像素单位会出现全屏拖影。
+- 桥恒设 `MVLowRes`，`MV_Scale_X/Y` 只是透传；而对方的 FSR2 D3D11 实现不读该组参数（按 UV 单位处理运动矢量）⇒ 若游戏给的是像素单位会出现全屏拖影。
 - `IsHDR` 直接决定对方的 FSR2 是否走 HDR 分支，误判即过曝或发灰。
+
+**推进需要**
+
+- 本机（AMD RX 9070 XT + OptiScaler）实跑：`Ffx12Backend=ngx` + `NgxProvider=auto`，确认日志 `init ok=1` 与 `provider resolved=…`；
+- 画面：先在 SDR 会话看是否拖影（验 `MV_Scale` 契约），再切 HDR 会话看亮度（验 `IsHDR`）；测试期把 OptiScaler 的 `SkipFirstFrames` / `Dx11DelayedInit` / `Hudfix` 显式钉死。
 
 **相关代码**
 
-- `Dx11FsrBridge/NgxBackend.cpp`（注册表探测、导出解析、`build_create_flags`、每帧参数设置）
+- `Dx11FsrBridge/NgxBackend.cpp`（`try_nvidia_registry` / `try_external` / `scan_loaded_modules` / `bind_entries_from` / `soft_fail_init` / `build_create_flags`）
 
 ---
 

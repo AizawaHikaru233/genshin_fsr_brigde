@@ -126,6 +126,7 @@ $configValues = [ordered]@{
     'NgxUseReactiveMask'        = '0'
     'NgxLogLevel'               = '1'   # 0=全关 1=error（默认，取证行已可见）2=info 3=debug
     'NgxPassthrough'            = '0'
+    'NgxProvider'               = 'auto' # NGX 实现来源：auto（默认）/ nvidia / external（非 N 卡经 OptiScaler）
     # ---- 日志（[Log] 段）/ Logging ----
     # 必须在这里写：Add-LogSection 只在**没有** [Log] 段时才补整段，
     # 而已部署的 ini 都已有 [Log] 段 → 段内的新键永远不会被补上（实测 queue_capacity 缺失）。
