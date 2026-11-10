@@ -286,7 +286,7 @@ ReShade 的着色器 / 纹理 / Preset / 截图路径均使用**相对路径**�
 
 ## 构建
 
-需要 Visual Studio（含 C++ 桌面开发组件）、Windows SDK 和 CMake 3.20 或更新版本（Ninja 生成器）。发布配置需要仓库内的 `Dx11FsrBridge\third_party` 目录，其中包含 FFX12 ffx-api 头文件和 Microsoft Detours 构建依赖。
+需要 Visual Studio（含 C++ 桌面开发组件）、Windows SDK 和 CMake 3.20 或更新版本（Ninja 生成器）。发布配置需要仓库内的 `Dx11FsrBridge\third_party` 目录，其中包含 FFX12 ffx-api 头文件、Microsoft Detours 构建依赖与 NVIDIA NGX 头文件。
 
 还要 Rust 工具链（`cargo`）来编图形安装器：先跑一次 `Installer\app\build-app.ps1` 生成 `Installer\app\GenshinFSRBridgeInstaller.exe`，打包脚本会直接取它；没有这个 exe 时会报错提示。
 
@@ -329,9 +329,10 @@ Bridge 和反虚化组件默认会保留错误日志（接入 OptiScaler/ReShade
 ## 第三方组件
 
 - FFX12 ffx-api 头文件与 Microsoft Detours 仅作为构建依赖，保留各自原始许可证与声明。
+- NVIDIA NGX（DLSS）头文件同样仅作为构建依赖（编译可选的 DLSS 后端），来源、固定版本与 SHA-256 见 `Dx11FsrBridge/third_party/ngx/NOTICE.md`。它按 NVIDIA RTX SDKs License 授权，**不由 GPL-3.0-or-later 覆盖**；许可原文随该目录与发布包内 `payload/Bridge/NVIDIA-NGX-SDK-LICENSE.txt` 一并提供。
 - OptiScaler 是独立项目：<https://github.com/optiscaler/OptiScaler>。
 - 本地分发包需要自行补齐相应组件，并遵守各组件授权要求。
-- 本项目不包含 NVIDIA DLSS 与 AMD FSR SDK 运行时二进制。
+- 本项目不包含 NVIDIA DLSS 与 AMD FSR SDK 运行时二进制（`_nvngx.dll` 由显卡驱动提供，`nvngx_dlss.dll` 由安装器在用户机器上获取）。
 
 ## 许可证
 

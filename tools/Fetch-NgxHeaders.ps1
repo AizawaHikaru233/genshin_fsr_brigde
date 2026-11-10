@@ -1,51 +1,68 @@
-<#
+﻿<#
 .SYNOPSIS
-    拉取 NVIDIA NGX（DLSS）头文件到 Dx11FsrBridge/third_party/ngx/。
+    校验 / 同步 Dx11FsrBridge/third_party/ngx/ 下的 NVIDIA NGX（DLSS）头文件。
 
 .DESCRIPTION
-    这些头文件是 NVIDIA 专有许可（LicenseRef-NvidiaProprietary），与仓库的
-    GPL-3.0-or-later 不兼容，因此**不入库**（已 gitignore）。
+    这些头文件**已随仓库分发**（许可与来源见 third_party/ngx/NOTICE.md），本脚本是
+    它们唯一的**版本与完整性事实源**：固定 commit + 逐文件 SHA-256。
 
-    ── 只拉 2 个文件 ──────────────────────────────────────────────────────
-    Dx11FsrBridge/NgxBackend.cpp:57-58 只 include 这两个头：
+    ── 三种模式 ──────────────────────────────────────────────────────────
+    默认      从固定 commit 下载并校验后落盘（纠正被改动或缺失的头文件）
+    -Verify   只校验**磁盘上已有的文件**，不联网、不写盘（CI 用它当编译前的闸门）
+    -Update   下载并打印新哈希，不落盘、不与期望值比对（升级 SDK 时用）
+
+    ── 为什么固定 commit，不跟分支 ────────────────────────────────────────
+    分支会移动：上游一更新头文件，SHA-256 校验就会失败关闭 ⇒ CI 的 NGX 构型必红，
+    直到有人手动改表。固定 commit 后同一个 URL 永远返回同样的字节。
+
+    本脚本锁的是 commit a291cc7（"DLSS 310.7.0 SDK"），对应 NGX API 1.5.0
+    （nvsdk_ngx_defs.h: NVSDK_NGX_VERSION_API_MACRO = 0x0000015）。
+
+    ── 只同步 2 个文件 ───────────────────────────────────────────────────
+    Dx11FsrBridge/NgxBackend.cpp 只 include 这两个头：
         nvsdk_ngx_defs.h    —— 类型、NVSDK_NGX_Parameter_* 字符串键、结果码
         nvsdk_ngx_params.h  —— NVSDK_NGX_Parameter 纯虚接口
 
-    nvsdk_ngx.h 故意不拉：它用 extern "C" 且无 dllexport 声明入口，include 后
+    nvsdk_ngx.h 不拉：它用 extern "C" 且无 dllexport 声明入口，include 后
     会去找 __imp_NVSDK_NGX_D3D11_* ⇒ 直接链接失败；所有入口走 GetProcAddress。
     nvsdk_ngx_helpers*.h 三个文件全仓库无人 include（已 grep 确认），故也不拉。
 
-    ── 固定 commit，不跟分支 ─────────────────────────────────────────────
-    2026-11-09（时间炸弹修复）：原实现默认 -Ref main，即**分支名**。分支会
-    移动：上游一更新头文件，下面的哈希校验就会失败关闭 ⇒ CI 的 NGX ON job 必红，
-    直到有人手动改表。改为固定 commit 后，同一个 URL 永远返回同样的字节。
+    许可证原文随头一起入库（NVIDIA-SDK-LICENSE.txt），本脚本不管它（它不是代码依赖，
+    但升级 commit 后要人工确认上游许可文本是否变化）。
 
-    本脚本锁的是 commit a291cc7（提交信息 "DLSS 310.7.0 SDK"），对应 NGX API
-    1.5.0（nvsdk_ngx_defs.h: NVSDK_NGX_VERSION_API_MACRO = 0x0000015）。
-
-    ── 怎么更新到更新的 SDK ─────────────────────────────────────────────
+    ── 怎么升级到更新的 SDK ──────────────────────────────────────────────
       1. 在 NVIDIA/DLSS 找到目标 commit 的完整 40 位 SHA，改下面的 $Commit；
       2. 跑 pwsh -File tools/Fetch-NgxHeaders.ps1 -Update
          （只打印新哈希，不落盘、不与期望值比对）；
       3. 人工核对打印出来的哈希确实是预期的那批，再更新 $expected 表；
-      4. 正常跑一次，确认两个文件都 ok。
+      4. 正常跑一次，确认两个文件都 ok；同时刷新 NOTICE.md 里的表与 commit。
     改 $Commit 必须同时改 $expected，否则下一次运行必然失败关闭（这是有意的）。
+
+.PARAMETER Verify
+    只校验磁盘上已入库的头文件与 $expected 一致；不联网、不写盘。
+    任一文件缺失、大小异常或哈希不符即 throw（失败关闭）。
 
 .PARAMETER Update
     重新计算并打印当前下载内容的 SHA-256 表，供人工核对后更新本脚本。
     此模式仍校验文件大小下限，但不与期望值比对，也不落盘。
 
 .EXAMPLE
+    pwsh -File tools/Fetch-NgxHeaders.ps1 -Verify
     pwsh -File tools/Fetch-NgxHeaders.ps1
     pwsh -File tools/Fetch-NgxHeaders.ps1 -Update
 #>
 [CmdletBinding()]
 param(
+    [switch]$Verify,
     [switch]$Update
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+if ($Verify -and $Update) {
+    throw '-Verify 与 -Update 不能同时使用（一个读本地、一个读上游）。'
+}
 
 # 固定到 DLSS 310.7.0 SDK 的 commit。
 # ★ 不用分支名（main）：上游一更新头文件，哈希校验就会失败关闭 ⇒ CI 必红。
@@ -64,12 +81,63 @@ $expected = @{
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $destDir  = Join-Path $repoRoot 'Dx11FsrBridge/third_party/ngx'
 
+function Get-Sha256([string]$path) {
+    return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+# ── 模式 1：-Verify（只读本地）─────────────────────────────────────────────
+if ($Verify) {
+    Write-Host "Verifying vendored NGX headers"
+    Write-Host "  commit: $Commit"
+    Write-Host "  dir   : $destDir"
+
+    $bad = 0
+    foreach ($name in ($expected.Keys | Sort-Object)) {
+        $path = Join-Path $destDir $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            Write-Host "  MISSING $name"
+            $bad++
+            continue
+        }
+        $size = (Get-Item -LiteralPath $path).Length
+        if ($size -lt 256) {
+            Write-Host "  BAD     $name ($size bytes, looks like an error page)"
+            $bad++
+            continue
+        }
+        $hash = Get-Sha256 $path
+        if ($hash -ne $expected[$name]) {
+            Write-Host "  CHANGED $name"
+            Write-Host "            expected: $($expected[$name])"
+            Write-Host "            actual  : $hash"
+            $bad++
+            continue
+        }
+        Write-Host "  ok      $name ($size bytes, sha256 verified)"
+    }
+
+    if ($bad -gt 0) {
+        throw @"
+$bad NGX header file(s) do not match the pinned SHA-256 table.
+
+These headers are vendored verbatim and must not be edited by hand: any local
+change makes the build non-reproducible and is exactly what this check exists to
+catch. Restore them with:  pwsh -File tools/Fetch-NgxHeaders.ps1
+"@
+    }
+
+    Write-Host ""
+    Write-Host "Both vendored headers match the pinned commit."
+    return
+}
+
+# ── 模式 2 / 3：下载（默认落盘，-Update 只打印）───────────────────────────
 Write-Host "Fetching NGX headers"
 Write-Host "  commit: $Commit"
 Write-Host "  dest  : $destDir"
-if ($Update) { Write-Host "  mode  : UPDATE (prints new hashes, does not verify)" }
+if ($Update) { Write-Host "  mode  : UPDATE (prints new hashes, does not verify or install)" }
 
-if (-not (Test-Path -LiteralPath $destDir)) {
+if (-not $Update -and -not (Test-Path -LiteralPath $destDir)) {
     New-Item -ItemType Directory -Path $destDir -Force | Out-Null
 }
 
@@ -93,7 +161,7 @@ try {
             throw "$name came back as $size bytes, which looks like an error page rather than a header"
         }
 
-        $hash = (Get-FileHash -LiteralPath $tmpOut -Algorithm SHA256).Hash.ToLowerInvariant()
+        $hash = Get-Sha256 $tmpOut
         $newHashes[$name] = $hash
 
         if (-not $Update) {
@@ -120,7 +188,7 @@ mismatch means either this table was written for a different commit (fix it with
             Write-Host ("    '{0}' = '{1}'" -f $name, $newHashes[$name])
         }
         Write-Host ""
-        Write-Host "Not installing in -Update mode."
+        Write-Host "Not installing in -Update mode. Also refresh NOTICE.md (commit + hash table)."
         return
     }
 

@@ -72,9 +72,10 @@ option(DX11FSRBRIDGE_BUILD_TESTS "Build the SDK-free unit tests (il2cpp callsite
 option(DX11FSRBRIDGE_DIAGNOSTICS
     "Compile diagnostics/probes (PerfProbe, Fsr2InputDump, *Probe*, Trace*, Dump*) - keep OFF for release" OFF)
 
-# ---- D3D11 NGX（DLSS 超分）后端开关（2026-11-07，T-1）----
-# NGX 头被 gitignore（`.gitignore:158`，许可与 GPL 冲突、禁止提交）⇒ **无头检出必须仍能构建**
-# （REQ-08）：头缺失时自动降级为 OFF，只打一行 STATUS，不 FATAL。
+# ---- D3D11 NGX（DLSS 超分）后端开关 ----
+# NGX 头已随仓库分发（`third_party/ngx/`，许可与来源见该目录 `NOTICE.md`）⇒ 全新检出默认
+# 就能编出 NGX 构型，与发布包一致。仍保留「头缺失 ⇒ 自动降级为 OFF，只打一行 STATUS、
+# 不 FATAL」这条兜底：显式删掉头文件或裁剪仓库时，其余部分必须仍能构建。
 option(DX11FSRBRIDGE_ENABLE_NGX "Build the D3D11 NGX (DLSS) backend" ON)
 
 set(DX11FSRBRIDGE_DIAGNOSTICS_ON ${DX11FSRBRIDGE_DIAGNOSTICS})
@@ -154,8 +155,9 @@ if(DX11FSRBRIDGE_ENABLE_NGX)
         target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_ENABLE_NGX=1)
         message(STATUS "Dx11FsrBridge: NGX 后端参与编译（DX11FSRBRIDGE_ENABLE_NGX=1）")
     else()
-        message(STATUS "NGX headers not found; building without the NGX backend "
-                       "(run tools/Fetch-NgxHeaders.ps1 to enable)")
+        message(STATUS "NGX headers not found (Dx11FsrBridge/third_party/ngx/nvsdk_ngx_defs.h); "
+                       "building without the NGX backend. Restore them with "
+                       "tools/Fetch-NgxHeaders.ps1 if this checkout is incomplete.")
         set(DX11FSRBRIDGE_ENABLE_NGX OFF)
     endif()
 endif()

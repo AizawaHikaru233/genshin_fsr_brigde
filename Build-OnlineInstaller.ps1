@@ -469,6 +469,14 @@ function Prepare-FpsStage {
     }
     Copy-Item -LiteralPath $bridgeDll -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.dll') -Force
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.ini') -Force
+    # Bridge 的编译期依赖里有一份专有许可：NVIDIA NGX SDK 头（third_party\ngx\）。
+    # 许可要求随分发对象一并提供许可文本（NVIDIA RTX SDKs License §2.c），故放进模块目录；
+    # 与 TextureLoader\licenses\ 同一惯例 —— 外部许可不上移到包根 license\。
+    $ngxLicense = Join-Path $root 'Dx11FsrBridge\third_party\ngx\NVIDIA-SDK-LICENSE.txt'
+    if (-not (Test-Path -LiteralPath $ngxLicense -PathType Leaf)) {
+        throw "缺少 NVIDIA NGX SDK 许可文本: $ngxLicense（third_party\ngx 目录不完整，先跑 tools\Fetch-NgxHeaders.ps1）"
+    }
+    Copy-Item -LiteralPath $ngxLicense -Destination (Join-Path $stagePayloadBridge 'NVIDIA-NGX-SDK-LICENSE.txt') -Force
     Copy-Item -LiteralPath $antiDll -Destination (Join-Path $stagePayloadAnti 'AntiPlayerMosaic.dll') -Force
     # TextureLoader（纹理/Mod 加载器）：DLL + ini + DirectStorage 运行时 + 空 Mods 目录。
     # 许可文件收进模块目录内 licenses/ 子文件夹（自身 GPL-3.0 许可/溯源 +
@@ -602,6 +610,7 @@ function Build-FpsPackage {
         ) + $installerFiles + @(
             'license\OptiScaler-LICENSE.txt', 'license\FPSUnlocker-LICENSE.txt', 'license\ReShade-LICENSE.txt',
             'payload\Bridge\Dx11FsrBridge.dll', 'payload\Bridge\Dx11FsrBridge.ini',
+            'payload\Bridge\NVIDIA-NGX-SDK-LICENSE.txt',
             'payload\AntiPlayerMosaic\AntiPlayerMosaic.dll',
             'payload\TextureLoader\TextureLoader.dll', 'payload\TextureLoader\TextureLoader.ini',
             'payload\TextureLoader\dstorage.dll', 'payload\TextureLoader\dstoragecore.dll',
@@ -769,6 +778,7 @@ try {
         'FSR-Bridge-Plugin.dll', 'config.ini', 'Feedback.txt', 'Package-Version.txt',
         'license\OptiScaler-LICENSE.txt', 'license\FPSUnlocker-LICENSE.txt', 'license\ReShade-LICENSE.txt',
         'payload\Bridge\Dx11FsrBridge.dll', 'payload\Bridge\Dx11FsrBridge.ini',
+        'payload\Bridge\NVIDIA-NGX-SDK-LICENSE.txt',
         'payload\OptiScaler\OptiScaler.dll', 'payload\OptiScaler\amd_fidelityfx_dx12.dll',
         'payload\OptiScaler\amd_fidelityfx_upscaler_dx12.dll', 'payload\OptiScaler\libxell.dll',
         'payload\OptiScaler\libxess.dll', 'payload\OptiScaler\libxess_dx11.dll',

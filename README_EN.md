@@ -292,7 +292,7 @@ ReShade directory, must use a dynamically generated absolute path when installed
 
 ## Build
 
-Visual Studio with the Desktop development with C++ workload, the Windows SDK, and CMake 3.20 or newer (Ninja generator) are required. The release configuration requires the repository's `Dx11FsrBridge\third_party` directory, which contains the FFX12 ffx-api headers and the Microsoft Detours build dependency.
+Visual Studio with the Desktop development with C++ workload, the Windows SDK, and CMake 3.20 or newer (Ninja generator) are required. The release configuration requires the repository's `Dx11FsrBridge\third_party` directory, which contains the FFX12 ffx-api headers, the Microsoft Detours build dependency, and the NVIDIA NGX headers.
 
 A Rust toolchain (`cargo`) is also required to build the graphical installer: run `Installer\app\build-app.ps1` once to produce `Installer\app\GenshinFSRBridgeInstaller.exe`; the packaging script takes that file directly and fails with a hint when it is missing.
 
@@ -335,9 +335,10 @@ When further diagnostics are needed, temporarily change `LogLevel` under `Log` i
 ## Third-Party Components
 
 - FFX12 ffx-api headers and Microsoft Detours are build dependencies only; their original licenses and notices are retained.
+- The NVIDIA NGX (DLSS) headers are likewise a build dependency only (for the optional DLSS backend); their source, pinned version, and SHA-256 are documented in `Dx11FsrBridge/third_party/ngx/NOTICE.md`. They are licensed under the NVIDIA RTX SDKs License and are **not covered by GPL-3.0-or-later**; the license text ships with that directory and inside the package at `payload/Bridge/NVIDIA-NGX-SDK-LICENSE.txt`.
 - OptiScaler is an independent project: <https://github.com/optiscaler/OptiScaler>.
 - Local distributions must complete the required components on their own and comply with each component's licensing terms.
-- This project does not include NVIDIA DLSS or AMD FSR SDK runtime binaries.
+- This project does not include NVIDIA DLSS or AMD FSR SDK runtime binaries (`_nvngx.dll` comes from the GPU driver; `nvngx_dlss.dll` is fetched on the user's machine by the installer).
 
 ## License
 

@@ -3,3 +3,9 @@
 # 识别不到 section 结构 → 静默不写 config.ini（无任何报错）。
 # 这里显式固定为 CRLF，避免编辑器/工具链把它转成 LF。
 *.lua text eol=crlf
+
+# NVIDIA NGX 头与许可原文必须与上游逐字节一致：tools/Fetch-NgxHeaders.ps1 -Verify 按固定
+# commit 的 SHA-256 校验它们。core.autocrlf 或编辑器一旦改写行尾，哈希就不再等于上游，
+# CI 会以「头文件被改过」失败（而文件其实没人动）。故禁止任何行尾/编码转换。
+Dx11FsrBridge/third_party/ngx/*.h -text
+Dx11FsrBridge/third_party/ngx/NVIDIA-SDK-LICENSE.txt -text

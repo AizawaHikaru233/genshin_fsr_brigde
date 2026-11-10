@@ -160,8 +160,3 @@ Installer/app/src-tauri/target/
 Installer/app/src-tauri/gen/
 Installer/app/*.exe
 Installer/tools/shots/
-
-# NVIDIA NGX SDK headers are proprietary (LicenseRef-NvidiaProprietary, incompatible
-# with this repo's GPL-3.0-or-later). They are never vendored; fetch on demand with
-# tools/Fetch-NgxHeaders.ps1. Same rule as the upstream-side bridge tree.
-Dx11FsrBridge/third_party/ngx/*.h

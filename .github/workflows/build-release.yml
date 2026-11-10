@@ -20,6 +20,12 @@ name: Build GitHub Release Package
 #   故必须先克隆 OptiScaler 源码树并初始化 FidelityFX-SDK-v2 子模块，
 #   否则 CMake 会以 "FidelityFX ffx-api headers were not found" 直接失败。
 #   该克隆与子模块初始化由下方 "Fetch OptiScaler source tree" step 完成。
+#
+#   NVIDIA NGX（DLSS）后端：头文件随仓库分发（Dx11FsrBridge/third_party/ngx/，许可与
+#   来源见该目录 NOTICE.md），故 CMake 的 DX11FSRBRIDGE_ENABLE_NGX 默认 ON 会真正生效，
+#   发布包里的 Bridge 不再是 NGX OFF 构型。
+#   ⚠️ 这是有意的：此前发布包静默降级为 NGX OFF，用户设 Ffx12Backend=ngx 只会回落 native，
+#   且 CI 不报警。故下方新增正向断言 —— 包里找不到 NGX 字符串就让构建失败。
 
 on:
   workflow_dispatch:
@@ -75,6 +81,42 @@ jobs:
       - name: Build GitHub release package
         shell: pwsh
         run: ./Build-OnlineInstaller.ps1 -Configuration Release -GithubOnly
+
+      # 正向断言：发布包必须真的带 NGX 后端。
+      # 判据取**已生成的发布包**（dist\github-release\*.7z）里的 Bridge DLL —— 构建目录里有 NGX
+      # 字符串不代表它被拷进了包；打包用的中间 stage 目录在 Build-FpsPackage 结束时已删除。
+      # 缺任一字符串即说明本次构建降级成了 NGX OFF（例如入库头文件被删、CMake 判据被改），
+      # 此时用户在 ini 里写 Ffx12Backend=ngx 会静默回落 native，只有日志里一行
+      # "ngx_core init ok=0"。宁可在打包阶段失败。
+      - name: Verify NGX backend is present in the packaged bridge
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Get-ChildItem -LiteralPath 'dist\github-release' -Filter 'GenshinFSRBridge_v*.7z' |
+              Sort-Object LastWriteTime | Select-Object -Last 1
+          if ($null -eq $archive) { throw 'no dist\github-release\GenshinFSRBridge_v*.7z produced' }
+          # 与 Build-OnlineInstaller.ps1 相同的 7-Zip 解析顺序（tools\7zip 不随仓库分发）
+          $sevenZip = @('tools\7zip\7z.exe', 'C:\Program Files\7-Zip\7z.exe', 'C:\Program Files (x86)\7-Zip\7z.exe') |
+              Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $sevenZip) { $sevenZip = (Get-Command '7z.exe' -ErrorAction Stop).Source }
+          $out = Join-Path $env:RUNNER_TEMP 'ngx-verify'
+          Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue
+          # 只取出这一个成员（给出包内相对路径即可，7z 会保留目录结构）
+          & $sevenZip x $archive.FullName 'payload\Bridge\Dx11FsrBridge.dll' "-o$out" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z extraction failed ($LASTEXITCODE): $($archive.Name)" }
+          $dll = Join-Path $out 'payload\Bridge\Dx11FsrBridge.dll'
+          if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) {
+              throw "missing payload\Bridge\Dx11FsrBridge.dll inside $($archive.Name)"
+          }
+          $bytes = [IO.File]::ReadAllBytes($dll)
+          # 宽字符串必须按 UTF-16 查（AGENTS.md §四.A）
+          $uni = [Text.Encoding]::Unicode.GetString($bytes)
+          foreach ($needle in @('Ffx12Backend', 'NgxRenderPreset', 'NgxHdr', 'ngx_hdr_decision')) {
+              if (-not $uni.Contains($needle)) {
+                  throw "NGX string '$needle' missing from the packaged bridge - this build downgraded to NGX OFF"
+              }
+          }
+          Write-Host "NGX backend present in $($archive.Name) (bridge $($bytes.Length) bytes)"
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v4

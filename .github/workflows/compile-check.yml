@@ -5,15 +5,13 @@ name: Compile Check (NGX on / off)
 #   ~200 行 #if 分支从未被任何自动化编译过」的问题。
 #
 #   两个构型都要过：
-#     - NGX OFF：不拉取 NVIDIA 专有头文件，验证 CMake 自动降级路径与「无 LNK2019」。
-#     - NGX ON ：用 tools/Fetch-NgxHeaders.ps1 拉取头文件，验证真编译。
-#                 只拉 2 个（NgxBackend.cpp:57-58 真正 include 的那两个），
-#                 且固定 commit a291cc7 + 逐文件 SHA-256 —— 不跟 main 分支，
-#                 否则上游一改头文件 CI 就必红（时间炸弹）。
+#     - NGX OFF：显式 -DDX11FSRBRIDGE_ENABLE_NGX=OFF，验证「关掉后端仍能构建」与无 LNK2019。
+#     - NGX ON ：默认构型（与发布包同一条路径），验证真编译且产物里确实有 NGX 字符串。
 #
-#   ⚠️ 头文件不入库（NVIDIA 专有许可），故 ON 构型依赖联网获取。
-#   若 NVIDIA 仓库不可达，ON 构型会失败 —— 这是**有意的失败关闭**，
-#   不应改为静默跳过（否则又回到「从未编译过」的状态）。
+#   2026-11-10：NVIDIA NGX 头已随仓库分发（Dx11FsrBridge/third_party/ngx/，许可与来源见
+#   该目录 NOTICE.md）⇒ ON 构型不再联网取头。改为先跑 Fetch-NgxHeaders.ps1 -Verify：
+#   按固定 commit a291cc7 的 SHA-256 校验入库的两个头（不跟分支，避免上游一改就红）；
+#   任何人手改入库头文件都会在这里失败，而不是悄悄编出一个与发布包不同的 DLL。
 
 on:
   # 2026-11-10（用户要求）：取消 push 触发 —— 原配置在 main 与 feat/** 上每次提交都跑
@@ -133,7 +131,7 @@ jobs:
           # 静默缩水（AGENTS.md §三 #1 记录 575488→76800 B）。
           if ($size -lt 500000) { throw "DLL suspiciously small ($size bytes)" }
 
-  # ── 构型 2：NGX ON（2 个专有头文件，固定 commit + SHA-256）─────────────
+  # ── 构型 2：NGX ON（头已入库，先按固定 commit 的 SHA-256 校验再编）────────
   build-ngx-on:
     name: NGX ON
     runs-on: windows-latest
@@ -154,9 +152,9 @@ jobs:
           }
           Write-Host "FidelityFX SDK headers ready: $kit"
 
-      - name: Fetch NGX headers (SHA-256 pinned)
+      - name: Verify vendored NGX headers (pinned commit + SHA-256)
         shell: pwsh
-        run: ./tools/Fetch-NgxHeaders.ps1
+        run: ./tools/Fetch-NgxHeaders.ps1 -Verify
 
       - name: Import MSVC environment (vcvars64)
         shell: pwsh
