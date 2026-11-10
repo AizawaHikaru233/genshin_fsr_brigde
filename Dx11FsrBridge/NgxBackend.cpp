@@ -1761,6 +1761,27 @@ static CreateFlagsEval build_create_flags(DXGI_FORMAT color_fmt)
 //   修法：**接近 1:1（<= 1.05）直接判 DLAA**，而不是落到最近的档位。
 //   判据用「是否落在 DLAA 区间」而非「最接近哪个档位」—— 档位标签错配的
 //   代价（重投影比例错、画面全局拖影）远大于档位不精确。
+//
+//   ⚠️ 放大不只 1.3 倍：OptiScaler 还会**再改一次**。
+//   `OptiScaler/OptiScaler/upscalers/dlss/DLSSFeature.cpp:255-259` 把
+//   `UltraQuality` 改写成 `MaxQuality`（标称 1.50x）：
+//
+//     UINT perfQ = ...;
+//     if (Get(PerfQualityValue, &perfQ) == Success &&
+//         perfQ == NVSDK_NGX_PerfQuality_Value_UltraQuality)
+//         Set(PerfQualityValue, NVSDK_NGX_PerfQuality_Value_MaxQuality);
+//
+//   ⇒ 实际放大 = 1.50 / 1.001565 = **1.4977 倍**（不是 1.298）。
+//   **只改写 UltraQuality，DLAA 不在名单里** ⇒ 返回 DLAA 后值原样抵达 DLSS。
+//
+//   误差随运动线性增长，与已知症状一一对应：
+//     真实 2.1px  ⇒ DLSS 以为 3.15px（误差 1.05px）
+//     真实 10px   ⇒ DLSS 以为 14.98px（误差 4.98px）
+//   ⇒ 走动/转视角时误差大 ⇒ **拖影**（J/K 明显，长度与速度成正比）；
+//     静止时误差为 0，但亚像素抖动仍在 ⇒ **线条抖动**。
+//
+//   枚举实值（nvsdk_ngx_defs.h:251-260）：MaxPerf=0, Balanced=1, MaxQuality=2,
+//   UltraPerformance=3, UltraQuality=4, **DLAA=5**。日志里的 `pq=5` 即 DLAA。
 static NVSDK_NGX_PerfQuality_Value quality_from_ratio(std::uint32_t render_w, std::uint32_t display_w)
 {
     if (render_w == 0) return NVSDK_NGX_PerfQuality_Value_MaxPerf;   // 防御除零
