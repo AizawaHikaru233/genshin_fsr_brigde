@@ -15,7 +15,7 @@
 #include "Il2CppCallSiteHook.h"
 #include "TransparentJitterHook.h"
 #include "Ffx12Backend.h"
-#include "NgxBackend.h"   // ngx::set_*（D13 九键）。只有 8 个 setter 有消费者；
+#include "NgxBackend.h"   // ngx::set_*（D13 九键 + NgxCrossKeyReuse = 十个键）。十个 setter 都有消费者；
                           // 本头不含 NGX SDK 头，故 OFF 构型包含它也安全（REQ-08），
                           // 但下面所有 ngx:: 调用点都被 DX11FSRBRIDGE_ENABLE_NGX 守卫。
 #include "Fsr2InputDump.h"
@@ -4097,8 +4097,8 @@ void load_config()
     ffx12::set_async_upscale(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12AsyncUpscale", 1, config_path.c_str()) != 0);
     ffx12::set_hdr_input(g_config.ffx12_hdr_input);
-    // ---- D13 十键读取（SDS §3.13.1）：紧邻 Ffx12Hdr 的读取点 ----
-    // 此处 blog::init() 尚未执行 ⇒ 10 个 setter 只存值、一行日志都不打；
+    // ---- D13 十键读取（SDS §3.13.1）+ 键 11 NgxCrossKeyReuse：紧邻 Ffx12Hdr 的读取点 ----
+    // 此处 blog::init() 尚未执行 ⇒ 11 个 setter 只存值、一行日志都不打；
     // 唯一需要输出的是非法值告警，它先进 pending_warnings，由 initialize() 回放。
     //
     // ⚠️ Ffx12Backend 只接受**精确小写**的 native / ngx：不 tolower、不 trim。
@@ -4215,6 +4215,14 @@ void load_config()
             provider_mode = 2;
         ngx::set_provider_mode(provider_mode);
     }
+    // ---- 键 11：NgxCrossKeyReuse（默认 1）----
+    // 1 = instance_key 变化但尺寸/格式全等时复用现有资源池与 feature（消除进出角色界面
+    //     ~500ms 卡顿 + 短暂黑屏：根因是 destroy_instance() 的 g_release(feature)，实测 502ms）；
+    // 0 = 每次 key 变化都销毁重建，与引入本键之前**逐字节同一条路径**。
+    // ★ 语义是 int -> bool 折叠（!= 0），与上面 8 个二分开关一致：非 0 即开。
+    const int ngx_ckr =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxCrossKeyReuse", 1, config_path.c_str());
+    ngx::set_cross_key_reuse(ngx_ckr != 0);
 #else
     // ---- REQ-08：NGX 未编译进本产物 ----
     // 十个键里只有 Ffx12Backend 有消费者（后端选择器归 ffx12），其余 9 个 NGX 键在 OFF

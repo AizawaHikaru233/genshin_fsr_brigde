@@ -116,7 +116,7 @@ $configValues = [ordered]@{
     'Ffx12FeatureFallback'      = '1'
     # ---- 7. NGX(DLSS) 后端 / NGX backend（opt-in，默认全程 native）----
     # 默认值逐键与 Dx11FsrBridge.package.ini 的 [Dx11FsrBridge] 段、以及代码内建缺省一致
-    # （Dx11FsrBridge.cpp:4107-4195）。改这里必须三处同步改。
+    # （Dx11FsrBridge.cpp:4199-4206）。改这里必须四处同步改（load_config + 本脚本 + package.ini + 变更日志）。
     # ⚠️ Ffx12Backend **故意不在本表里**：见文件顶部"三个故意不写的例外"。
     'NgxApplicationId'          = '1337'
     'NgxFeatureDirs'            = ''    # 空 = 自动探测含 nvngx_dlss.dll 的目录
@@ -127,6 +127,7 @@ $configValues = [ordered]@{
     'NgxLogLevel'               = '1'   # 0=全关 1=error（默认，取证行已可见）2=info 3=debug
     'NgxPassthrough'            = '0'
     'NgxProvider'               = 'auto' # NGX 实现来源：auto（默认）/ nvidia / external（非 N 卡经 OptiScaler）
+    'NgxCrossKeyReuse'          = '1'   # 1 = key 变化但尺寸/格式全等时复用实例（消除角色界面切换 ~500ms 卡顿）；0 = 每次切换都销毁重建
     # ---- 日志（[Log] 段）/ Logging ----
     # 必须在这里写：Add-LogSection 只在**没有** [Log] 段时才补整段，
     # 而已部署的 ini 都已有 [Log] 段 → 段内的新键永远不会被补上（实测 queue_capacity 缺失）。

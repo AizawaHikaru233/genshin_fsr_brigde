@@ -267,7 +267,8 @@ NgxInstance g_inst;   // v8（S-90）：全局唯一实例，不再是 unordered
 // ★ v8 补（MAJOR-1）：上一次的 instance_key，**仅用于 ngx_inst switch from=… 日志**。
 std::uint64_t g_prev_key = 0;
 
-// ---- 配置（9 个 ini 键的落地变量，与 §3.13 的 8 个 setter + ffx12::set_backend 一一对应）----
+// ---- 配置（9 个 NGX ini 键 + NgxCrossKeyReuse 的落地变量，与 §3.13 的 8 个 setter
+//      + ngx::set_cross_key_reuse + ffx12::set_backend 一一对应）----
 // 注意：Ffx12Backend 那个键**不在这里** —— 它归 ffx12::set_backend()，见 §3.13.1。
 unsigned long long        g_app_id        = 1337;
 std::vector<std::wstring> g_feature_dirs;              // NgxFeatureDirs 的**原始输入**（空 = 自动探测）
@@ -317,6 +318,18 @@ bool                      g_dt_enabled    = true;
 bool                      g_use_reactive  = false;
 int                       g_log_level     = 1;
 bool                      g_passthrough   = false;
+
+// ---- NgxCrossKeyReuse（默认 true）----
+// ★ 为什么是 std::atomic<bool> 而 g_passthrough 是普通 bool：
+//   两者形态不同，是**按访问面**选的，不是风格不一致。g_passthrough 只在 ffx12::dispatch()
+//   持 g_mutex 的调用栈内被读写（§3.3.4.2 形态纪律），加 atomic 是纯开销；
+//   而本键的**写**发生在 Dx11FsrBridge.cpp 的 load_config()（初始化线程），
+//   **读**发生在 ensure_instance()（渲染线程，被 draw 钩子调用）。二者之间没有 g_mutex
+//   同步（load_config 早于任何 draw）。实际上 load_config 早于首个 draw、读端不会真正并发，
+//   但那是**时序巧合**而不是同步保证 —— 一旦将来出现配置热重载或初始化被推迟，普通 bool
+//   的跨线程读写就是数据竞争（C++ 层面 UB）。一个只在 key 切换时读一次的值，
+//   relaxed 语义的 atomic 开销可忽略，故取 atomic。
+std::atomic<bool>         g_cross_key_reuse { true };
 
 // ---- 诊断计数 ----
 std::atomic<unsigned> g_ngx_log_count { 0 };   // §3.11.3 的 200 条硬限流
@@ -420,7 +433,9 @@ namespace log_throttle_slot
     X(UavFail,           20) \
     X(CbFail,             5) \
     X(SampleStagingFail, 26) \
-    X(SampleMapFail,     15)
+    X(SampleMapFail,     15) \
+    X(InstReuse,         17) \
+    X(InstReuseSkip,     18)
 
 // ① 调用点可以传的**全部**槽位（模板参数的类型就是它）。
 #define LOG_SLOT_ENUM_ITEM(name, value) name = value,
@@ -1867,6 +1882,30 @@ static void log_ngx_inst_switch(std::uint64_t from, std::uint64_t to, std::uint6
                  static_cast<int>(rebuild_us));
 }
 
+// 跨 key 复用（NgxCrossKeyReuse）：key 变了但尺寸/格式全等时复用现有实例，
+//   不销毁、不重建 feature。标签固定为 "ngx_inst reuse"，与上面的 "ngx_inst switch"
+//   在 grep 时严格可区分（两者分别 grep -c 统计次数）。rebuild_us 恒为 0 是刻意保留的：
+//   与 switch 行的字段集合一致，便于并排比对，同时明示「本次没有花时间重建」。
+//
+// ★★ 为什么走 log_ngx_error_throttled（槽 InstReuse）而不是 log_ngx_error：
+//   本行**每次 key 变化**打一条。角色界面来回切一次就 2 条，一次会话几十上百条，
+//   用 Error 级无限频会把日志刷满（这正是引入限频前的实机现象）。
+//   本文件对「高频重复的非致命事件」的既定惯例就是**按槽独立限频**（见 LOG_SLOT_LIST
+//   上方的长篇说明与 make_pool_texture 的调用点），本条与之同族：非致命、可能高频、
+//   且需要**首现可见**（首现正是取证要的那一条）。限频模板的前 8 条全打 ⇒ 首现必在
+//   前 8 条里，取证不受影响。
+// ★ 为什么**不**改成「只在 NgxLogLevel>=2 时打」：那会让默认档位（1=error）下**一条都看不到**，
+//   而本键的验收证据正是靠这条行（grep -c 'ngx_inst reuse'）取得的。把取证行藏到非默认
+//   档位后面，等于要求取证时必须先改 ini —— 与 §3.10.3「取证行按 error 打、默认 1 就能看到」
+//   的既定纪律直接冲突。限频既保住默认档位下的可见性，又把量压到可接受。
+static void log_ngx_inst_reuse(std::uint64_t from, std::uint64_t to)
+{
+    log_ngx_error_throttled<log_throttle_slot::Slot::InstReuse>(
+        L"ngx_inst reuse from=0x%llX to=0x%llX rebuild_us=0",
+        static_cast<unsigned long long>(from),
+        static_cast<unsigned long long>(to));
+}
+
 // 五张纹理的 desc 差异全部用这张表表达，不要每个字段手抄一遍
 struct PoolDesc { DXGI_FORMAT fmt; UINT bind; const char *name; };
 
@@ -2149,6 +2188,67 @@ static bool ensure_instance(std::uint64_t key, ID3D11Device *dev,
     {
         g_inst.last_used_tick = GetTickCount64();
         return true;
+    }
+
+    // ★★ 跨 key 复用（配置键 NgxCrossKeyReuse，默认开）：key 变了，但建池/建 feature 真正
+    //    依赖的「尺寸 + 格式」全等 ⇒ 现有池与 feature 描述的仍是同一个东西，销毁再建纯属浪费。
+    //    实机 E2 证据：6 次 ngx_inst switch 的 sw_fmt/color_fmt/depth_inv/flags 完全相同，
+    //    却每次都花 ~502ms 在 destroy_instance() 的 g_release(feature) 上；
+    //    无 feature 可释放的那次只用 520us。E1 日志：switch 1 次 / reuse 13 次 / rebuild_us=0。
+    //    ★ 只放行「尺寸与格式全等」：任一项不同都落到下面的 destroy + create，行为不变。
+    //    ★ 必须把 key 写回 g_inst.key：否则上面那条同 key 分支永远不命中，
+    //      每帧都会重新进本分支（虽然不崩，但会每帧刷一条日志）。
+    //
+    // ★★ 配置门控：cross_key_reuse() 关掉时，本 if 的第一个子表达式即假 ⇒ 整条分支不可达，
+    //    控制流**直接落到下面的 destroy_instance() + create_instance()**，与引入本键之前的
+    //    路径逐字节一致（唯一的差别是本条 if 求值了一次 atomic relaxed load）。
+    //    这是刻意把门控放在**条件最前面**而不是包一层 if：包一层会多一层缩进、
+    //    且将来改判定逻辑时更容易只改到其中一层。
+    if (cross_key_reuse() &&
+        g_inst.key_valid &&
+        g_inst.rw == rw && g_inst.rh == rh && g_inst.dw == dw && g_inst.dh == dh &&
+        g_inst.color_fmt == color_fmt && g_inst.output_fmt == output_fmt)
+    {
+        // ★★ 安全校验（宁可慢也不出错）：尺寸/格式全等**只说明 key 背后的语义等价**，
+        //    并不证明现有资源仍然可用。以下两类东西可能在别处被释放/半成品化：
+        //      · feature 句柄（裸 handle，不归 ComPtr 管）；
+        //      · 池内 5 张纹理（ComPtr，理论上 key_valid 为真时非空，但 key_valid 只是一个
+        //        bool，任何一处漏置位都会让它与真实状态脱钩）。
+        //    复用一份半成品资源去 EvaluateFeature，后果是**画面错误或驱动崩溃**，
+        //    且远比起一次重建难排查 ⇒ 任一不满足就**放弃复用**，落到 destroy + create。
+        //    ★ 注意这不是"静默降级"：下面的 warn 行会说明是哪一项不满足，
+        //      而且这条路径与 cross_key_reuse=0 时的路径**完全相同**（都会重建），
+        //      所以最坏情况就是退回到引入本键之前的性能，不会更差，也不会每帧重复降级。
+        const bool feature_ok = (g_inst.feature != nullptr);
+        const bool pool_ok    = (g_inst.color && g_inst.depth && g_inst.motion &&
+                                 g_inst.reactive && g_inst.output);
+        if (!feature_ok || !pool_ok)
+        {
+            // 用限频槽打：这条在"资源真出问题"时会**每次 key 变化都命中**，与 reuse 行同族，
+            //   必须限频；同样保证首现可见（前 8 条全打）。
+            // ★ 必须用**独立槽** InstReuseSkip：与上面的 InstReuse 共用槽号会让两个调用点
+            //   共享同一个计数器 ⇒ 后出现者的首现被吞（见 LOG_SLOT_LIST 上方"残余 ①"）。
+            log_ngx_error_throttled<log_throttle_slot::Slot::InstReuseSkip>(
+                L"ngx_inst reuse skip reason=resources_invalid feature=%d pool=%d "
+                L"from=0x%llX to=0x%llX",
+                feature_ok ? 1 : 0, pool_ok ? 1 : 0,
+                static_cast<unsigned long long>(g_inst.key),
+                static_cast<unsigned long long>(key));
+        }
+        else
+        {
+            log_ngx_inst_reuse(g_inst.key, key);
+            g_inst.key            = key;
+            // ★ 2026-11-10（独立审核 MINOR-1）：复用**必须**补一次 Reset。
+            //   改动前 key 变化走 destroy+create，create_instance 置 first=true ⇒ 下一帧 Reset=1
+            //   ⇒ NGX 时域历史归零。复用路径不重建 feature，若不置 first，就会让新 key
+            //   继承旧 key 的历史（两个不同视图的时域累积互相污染）。
+            //   成本可忽略：只多一次 Reset 标志，不重建 feature。
+            g_inst.first          = true;
+            g_inst.last_used_tick = GetTickCount64();
+            g_prev_key            = key;
+            return true;
+        }
     }
 
     // ---- 切换：先释放，再重建 ----
@@ -2745,6 +2845,12 @@ void set_provider_mode(int mode)
         g_config_warn |= kWarnProviderInvalid;
 }
 
+// NgxCrossKeyReuse（默认 true）。只存值，非法值不在此处纠正（int -> bool 已在读取点折叠）。
+void set_cross_key_reuse(bool on)
+{
+    g_cross_key_reuse.store(on, std::memory_order_relaxed);
+}
+
 // ============================================================================
 // 查询
 // ============================================================================
@@ -2762,6 +2868,12 @@ bool available()
 bool passthrough()
 {
     return g_passthrough;
+}
+
+// 返回下游消费者（ensure_instance）读到的**同一个值**，避免"门控按 ini 判、消费者按全局判"的两套口径。
+bool cross_key_reuse()
+{
+    return g_cross_key_reuse.load(std::memory_order_relaxed);
 }
 
 // ============================================================================
