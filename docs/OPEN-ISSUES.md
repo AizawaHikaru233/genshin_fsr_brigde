@@ -144,39 +144,42 @@
 ---
 
 
-## 7. 帧生成缺少 HUDless 缓冲，UI 元素参与插帧
+## 7. 帧生成拿不到 HUDless 缓冲（已放弃，非本项目可解）
 
-**现状**
+**结论：放弃。** 这条路线经反编译核实后判定**无法通过改造桥解决**，不再投入。
 
-OptiScaler 的 DLSSG 帧生成已启用（`FGOutput = DLSSG`、`HUDFix = true`、DX11 Hudfix 资源跟踪已装上），
-但日志里 `Hudfix_Dx12::ResetCounters _hudlessList: 0` **恒为 0** —— 说明整个会话没有检测到任何 HUDless 缓冲。
+**现状与已查清的事实**
 
-桥目前不 hook 任何 UI 绘制（`Draw` / `DrawIndexed`），也没有 UI 与场景分离的通道，
-因此无法向帧生成提供一个「无 HUD」的干净画面。
+- 日志里 `Hudfix_Dx12::ResetCounters _hudlessList: 0` 恒为 0，整个会话没有检测到 HUDless 缓冲。
+- OptiScaler 的 Hudfix 是**纯 hook 式**的：`Hudfix_Dx12::CheckForHudless` 自己遍历游戏资源，
+  按尺寸/格式匹配后缓冲，再 `Create a copy of resource` 复制一份作为 HUDless 候选，
+  最后由 `HudCopy_Dx12` 的全屏 compute shader 用亮度差算出 UI 遮罩（`uiMask = smoothstep(threshold, threshold*2, delta)`）。
+  **它不依赖游戏主动提供任何标记。**
+- 唯一的「游戏主动提供」通道是资源私有数据标记 `Opti.Hudless`（`Hudfix_Dx11::PublishGameHudless`），
+  但目标游戏**没有这个机制**，该通道不可用。
+- 真正的阻塞点：本作是 D3D11 游戏，OptiScaler 走 `Dx11wDx12` 互操作，Hudfix 实际跑的是 **Dx12 路径**，
+  而 Dx12 侧看不到 D3D11 的纹理 ⇒ `_hudlessList` 永远为 0。
+  DLL 里虽有完整的 `Hudfix_Dx11` 实现（`CheckForHudless` / `CreateCaptureResource` / `PublishCaptureToFg`），
+  但日志中调用次数为 **0**，从未被启用。
 
-**影响**
+**为什么判定「桥救不了」**
 
-帧生成在**带 UI 的合成画面**上做光流插帧，而不是在干净的场景画面上插帧。
-可能出现 UI 元素（血条、技能图标、伤害数字）在插帧里抖动、拖影或被错误插值。
+即便桥替 OptiScaler 完成「找 + 复制」两步，仍有两点绕不过去：
 
-**推进需要**
+1. `HudCopy` 的全屏 compute shader 省不掉 —— 帧生成必须有 UI 遮罩才能把 UI 与场景分开插帧。
+   4K 下每帧读 2 张全屏纹理、写 1 张（约 300 MB/帧显存带宽），这是 HUDless 路线的固有成本。
+2. 桥没有「无 UI 画面」可用 —— 游戏不存在独立的 UI 渲染通道，UI 与场景在同一 pass 混绘，
+   桥无法在 UI 绘制前截到干净的后缓冲。
 
-1. 先确认这个游戏是否存在独立的 UI 渲染通道（UI 是否在单独的 pass / 单独的 render target 里绘制）。
-   若是，桥可在 UI 绘制**之前**捕获后缓冲作为 HUDless 候选；若 UI 与场景在同一 pass 混绘，则无解。
-2. 若可捕获，需要按帧生成的约定把 HUDless 纹理与 UI 纹理一起标记给它（OptiScaler 侧已有对应键：
-   `DisableHudless` / `HudlessValidNow` / `OnlyAcceptFirstHudless` / `HUDFixUITexture` / `HUDFixUIUnblend`）。
-3. 先做只读观测：hook 一次 UI 绘制并记录「本帧是否有独立 UI pass」，不改行为。
+**若将来要重启这条线，先确认的前提**
+
+- 上游 OptiScaler 是否让 `Hudfix_Dx11` 在 `Dx11wDx12` 互操作下可用（当前不会启用）。
+- 目标游戏是否出现独立的 UI 渲染通道（当前没有）。
 
 **相关代码**
 
-- `Dx11FsrBridge/Dx11FsrBridge.cpp`（Present / 交换链钩子；目前无 UI 绘制钩子）
-- OptiScaler 侧：`OptiScaler.ini` 的 `[FrameGen]` 与 HUD 相关键；日志前缀 `Hudfix_`
-
-**未验证**
-
-- 未确认该游戏是否有独立 UI 通道
-- 未确认提供 HUDless 后能否改善画面（可能与当前的 HDR 发灰问题无关，也可能相关）
-- 未评估性能与显存开销
+- OptiScaler 侧：`Hudfix_Dx12` / `Hudfix_Dx11` / `HudCopy_Dx12`；日志前缀 `Hudfix_`。
+- 本仓库：`Dx11FsrBridge/Dx11FsrBridge.cpp`（Present / 交换链钩子；无 UI 绘制钩子）。
 
 ## 已解决
 
