@@ -56,6 +56,10 @@ void set_sdk_dll_path(const wchar_t *path);
 void set_depth_inverted(bool inverted);
 void set_decode_motion(bool decode);
 void set_motion_flip(float flip); // XeSS/DLSS 定向——motion 方向翻转（±1）
+// NGX 路径的 jitter 符号翻转（2026-11-10）。FFX 与 NGX 对 Jitter.Offset 的方向
+// 约定相反，上游让两者共用同一个值 ⇒ NGX 收到的是反向抖动。本 setter 只影响
+// `ngx::dispatch` 的入参，**不动 native/FFX 路径**。
+void set_ngx_jitter_sign(bool flip);
 void set_depth_scale(float scale); // XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
 // 运动矢量是否已经包含投影 jitter。仅在已包含时启用 SDK 的 jitter cancellation。
 void set_motion_vectors_jittered(bool jittered);

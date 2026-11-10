@@ -324,6 +324,21 @@ struct Config
     //   其他上采样模型对半像素偏置较宽容，故长期未被发现 —— 但偏置是**普遍存在**的。
     // 0=+norm*width-0.5, 1=+norm*width(符号反→整体抖), 2=raw, 3=-norm*width+0.5(默认), 4=-norm*width, 5=零
     std::uint32_t ffx12_jitter_mode = 3;
+    // NGX 路径的 jitter 符号（**独立于 Ffx12JitterMode**，2026-11-10）。
+    //
+    // 为什么必须独立：FFX 与 NGX 对 `Jitter.Offset` 的约定**方向相反**。
+    //   FSR2/FFX 语义：samplePos = pixelPos + jitterOffset
+    //   NGX 语义     ：prevUV = uv - mv*scale，jitter 用于补偿本帧采样位置
+    // 上游实现两者共用 `Ffx12JitterMode`（默认 3 = `-norm*W+0.5`），
+    // 于是 NGX 收到的是与 FFX 完全相同的数值 —— 方向对 NGX 是反的。
+    //
+    // 实测依据（dlss-input 分支，同一台机器、同样 MV 符号 +1）：
+    //   jitter=mode3(`-n*W+0.5`) + mv=+1  => K 拖影、M/L 抖动
+    //   jitter=mode0(`+n*W-0.5`) + mv=+1  => K 锯齿/鬼影消失、M/L 稳定、画面与 FFX 输入持平
+    // 两者**互为相反数**，只差符号。
+    //
+    // 取值：0=沿用 Ffx12JitterMode（上游行为，默认）；1=对 NGX 取反（+n*W-0.5）
+    std::uint32_t ngx_jitter_sign = 0;
     bool ffx12_depth_inverted = true; // 游戏深度逆方向（0=far）；FSR2 默认 0=near
     bool ffx12_decode_motion = true;  // 游戏 motion 为 R10G10B10A2 平方编码 → 解码 R16G16_FLOAT
     bool ffx12_hdr_input = true;      // 游戏 10-bit HDR 管线
@@ -4022,6 +4037,10 @@ void load_config()
 #endif
     g_config.ffx12_jitter_mode = static_cast<std::uint32_t>(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12JitterMode", 3, config_path.c_str()));
+    // NGX 路径的 jitter 符号（0=沿用 FFX 值，默认；1=取反）。
+    // 语义与依据见 Config::ngx_jitter_sign 的注释。
+    g_config.ngx_jitter_sign = static_cast<std::uint32_t>(
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxJitterSign", 0, config_path.c_str())) != 0 ? 1u : 0u;
     g_config.ffx12_depth_inverted =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DepthInverted", 1, config_path.c_str()) != 0;
     g_config.ffx12_decode_motion =
@@ -4098,6 +4117,9 @@ void load_config()
     ffx12::set_depth_inverted(g_config.ffx12_depth_inverted);
     ffx12::set_decode_motion(g_config.ffx12_decode_motion);
     ffx12::set_motion_vectors_jittered(g_config.fsr2_motion_vectors_jittered);
+    // NGX 路径 jitter 符号（默认 false = 沿用上游的"FFX/NGX 共用同一值"）。
+    // 语义与实测依据见 Config::ngx_jitter_sign 的注释。
+    ffx12::set_ngx_jitter_sign(g_config.ngx_jitter_sign != 0);
     g_config.ffx12_gpu_interop =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12GpuInterop", 1, config_path.c_str()) != 0;
     ffx12::set_gpu_interop(g_config.ffx12_gpu_interop);

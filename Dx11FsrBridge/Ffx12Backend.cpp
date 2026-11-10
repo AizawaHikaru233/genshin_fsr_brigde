@@ -367,6 +367,9 @@ bool g_depth_inverted = true;   // 游戏深度逆方向（0=far）—— 2026-0
 bool g_decode_motion = true;    // 游戏 motion 为 R10G10B10A2 平方编码
 std::uint32_t g_create_flags = 0; // 实际创建 flags（日志按真值输出，勿硬编码）
 float g_motion_flip = 1.0f;     // XeSS/DLSS 定向——motion 方向翻转（默认 +1 = FSR 方向）
+// NGX 路径的 jitter 符号翻转开关（2026-11-10）。默认 false = 沿用上游行为
+// （FFX/NGX 共用同一值）。理由与实测依据见 set_ngx_jitter_sign 的注释。
+bool g_ngx_jitter_sign_flip = false;
 float g_depth_scale = 1.0f;     // XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
 // b0 常数缓冲（g_motion_cb）与其"已上传值"缓存已搬进 InstanceRes（P2：按实例隔离）。
 bool g_motion_vectors_jittered = false; // 游戏配置：motion 是否已包含投影 jitter
@@ -2945,7 +2948,22 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
 
         // ★ 这里只有这一行。初始化在 ngx::dispatch 内部完成（懒初始化）。
         //   不得在此调 ngx::init —— 公开 init() 已在计划第十稿取消。
-        const bool ok = ngx::dispatch(input, game_context, instance_key);
+        //
+        // ⚠️ jitter 符号（2026-11-10，`NgxJitterSign` 控制，默认沿用上游行为）：
+        //   上游让 FFX 与 NGX **共用** `Ffx12JitterMode` 算出的同一个值。但两个
+        //   SDK 对 `Jitter.Offset` 的方向约定相反（FFX: samplePos = pixel + jitter；
+        //   NGX: 用 jitter 补偿 prevUV 采样位置），共用等于让 NGX 收反向抖动。
+        //
+        //   实测（同机、MV 符号同为 +1）：mode3(`-n*W+0.5`) 出 K 拖影 + M/L 抖动；
+        //   mode0(`+n*W-0.5`) 则锯齿/鬼影消失、M/L 稳定、画面与 FFX 输入持平。
+        //   两者互为相反数 ⇒ 这里按开关翻转，**只影响 NGX，不动 native 路径**。
+        ffx12::FrameInput ngx_in = input;
+        if (g_ngx_jitter_sign_flip)
+        {
+            ngx_in.jitter_x = -input.jitter_x;
+            ngx_in.jitter_y = -input.jitter_y;
+        }
+        const bool ok = ngx::dispatch(ngx_in, game_context, instance_key);
 
         // 统计口径：不是与 native 完全同口径，而是「计数一致、rc 只记最终值」。
         // native 路径在下方两行写这两个全局；ngx 模式下那两行不可达，故本分支自己写一次。
@@ -3248,6 +3266,13 @@ const char *create_flags_hex()
 void set_motion_flip(float flip) // XeSS/DLSS 定向——motion 方向翻转（±1）
 {
     g_motion_flip = flip;
+}
+
+// NGX 路径的 jitter 符号翻转。只改 `ngx::dispatch` 的入参副本，
+// native/FFX 路径收到的 input 完全不受影响。
+void set_ngx_jitter_sign(bool flip)
+{
+    g_ngx_jitter_sign_flip = flip;
 }
 
 void set_depth_scale(float scale) // XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
