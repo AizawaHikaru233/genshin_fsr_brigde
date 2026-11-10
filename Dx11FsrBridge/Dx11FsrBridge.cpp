@@ -15357,13 +15357,11 @@ static void resolve_backend_auto(std::uint32_t vendor, std::uint32_t device_id, 
         return;
     g_backend_auto_resolved = true;
     const bool want_ngx = gpu_pick::supports_dlss(vendor, device_id, desc);
-    char vendor_hex[16] {};
-    std::snprintf(vendor_hex, sizeof(vendor_hex), "0x%04X", vendor);
-    std::string gpu = narrow(desc.c_str());
-    if (gpu.empty())
-        gpu = "unknown";
+    // 厂商/型号文字直接复用 record_adapter_info 上面刚写入的 g_route_*（焦点框用的是同一份），
+    // 不再自己 snprintf + narrow 一遍：同一事实两套口径迟早会漂（AGENTS.md §五.2）。
+    // 摘要里也不再重复打印 GPU 型号 —— 焦点框的 "  GPU : <型号> (vendor=0x…)" 已经打过。
     g_backend_auto_note = std::string("auto=") + (want_ngx ? "ngx" : "native") +
-        " vendor=" + vendor_hex + " gpu=\"" + gpu + "\"";
+        " vendor=" + g_route_vendor_label;
 #if defined(DX11FSRBRIDGE_ENABLE_NGX)
     ffx12::set_backend(want_ngx ? ffx12::BackendKind::Ngx : ffx12::BackendKind::Native);
     LOG_INFO(blog::cat::config, std::string(ffx12::backend() == ffx12::BackendKind::Ngx
