@@ -330,6 +330,17 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     target_include_directories(TransparentJitterHookTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME TransparentJitterHookTest COMMAND TransparentJitterHookTest)
 
+    # Ffx12Backend=auto 的型号判据（GpuBackendPick.h，纯 header，零依赖）：
+    # RTX -> ngx；GTX / MX / 非 NVIDIA -> native；名字认不出关键字时按 device id 兜底
+    # （只认 Ampere / Ada / Blackwell，Turing 与 GTX 16 同段故不兜底）。
+    # 不需要游戏、不需要 GPU、不链接任何库。
+    add_executable(GpuBackendPickTest
+        GpuBackendPickTest.cpp
+    )
+    fsrbridge_configure_test(GpuBackendPickTest)
+    target_include_directories(GpuBackendPickTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME GpuBackendPickTest COMMAND GpuBackendPickTest)
+
     # ---- 以下两个 test target 是**诊断专用**，随诊断开关一起排除 ----
     #
     # ⚠️ 必须一起排除，否则发布构建会挂：`PerfProbeTest` 要测 `perf_probe::read_*` /

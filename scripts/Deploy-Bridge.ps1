@@ -60,11 +60,11 @@ $routes = @()
 #      本脚本写死 1 会与它的按显卡判定打架；
 #    · Ffx12DllPath     —— 路径键：留空即"随包 payload\AMD 的 SDK"，本脚本不覆盖
 #      用户自定义路径；
-#    · Ffx12Backend     —— **部署脚本不得静默把用户切回 native 后端**。ngx 是 opt-in 后端：
-#      本脚本每次部署都跑，若在这里写死 native，每次部署都会把用户已选的 ngx 清掉，
-#      而 ngx 失效是**静默**的（回落到 native 只是性能/画质变化，不会崩、不会报错）。
-#      缺键时代码内建缺省就是 native（Dx11FsrBridge.cpp:4110 lpDefault=L"native"），
-#      所以不写这个键也天然安全，用户手改的 ngx 也就保得住。
+#    · Ffx12Backend     —— **部署脚本不得静默改写用户已选的后端**（auto / native / ngx 三种都算）。
+#      本脚本每次部署都跑，若在这里写死任何一个值，都会把用户手改的选择清掉，
+#      而后端写错是**静默**的（回落到 native 只是性能/画质变化，不会崩、不会报错）。
+#      缺键时走代码内建缺省——与发布模板同为 auto（load_config 的 lpDefault=L"auto"），
+#      所以不写这个键也天然安全，用户手改的值也就保得住。
 $configValues = [ordered]@{
     # ---- 1. 核心功能 / Core features ----
     'Enabled'                   = '1'
@@ -114,9 +114,9 @@ $configValues = [ordered]@{
     'Fsr2Il2CppHook'            = '1'   # 代码内建缺省是 0 ⇒ 删行会让桥接失效
     'Ffx12ReuseSameGeneration'  = '0'   # 开启会产生残像
     'Ffx12FeatureFallback'      = '1'
-    # ---- 7. NGX(DLSS) 后端 / NGX backend（opt-in，默认全程 native）----
+    # ---- 7. NGX(DLSS) 后端 / NGX backend（后端由 Ffx12Backend=auto 按显卡型号选）----
     # 默认值逐键与 Dx11FsrBridge.package.ini 的 [Dx11FsrBridge] 段、以及代码内建缺省一致
-    # （Dx11FsrBridge.cpp:4199-4206）。改这里必须四处同步改（load_config + 本脚本 + package.ini + 变更日志）。
+    # （load_config 的 NGX 键解析段）。改这里必须四处同步改（load_config + 本脚本 + package.ini + 提交信息）。
     # ⚠️ Ffx12Backend **故意不在本表里**：见文件顶部"三个故意不写的例外"。
     'NgxApplicationId'          = '1337'
     'NgxFeatureDirs'            = ''    # 空 = 自动探测含 nvngx_dlss.dll 的目录
