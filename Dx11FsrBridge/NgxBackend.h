@@ -45,6 +45,13 @@ void set_frame_time_delta(bool on);                         // NgxSetFrameTimeDe
 void set_use_reactive_mask(bool on);                        // NgxUseReactiveMask，默认 false
 void set_log_level(int lv);                                 // NgxLogLevel 0..3，默认 1
 void set_passthrough(bool on);                              // NgxPassthrough，默认 false
+// NgxCrossKeyReuse，默认 true（ini 里 1）。语义：instance_key 变了，但建池/建 feature 真正
+//   依赖的「render/display 尺寸 + color/output 格式」全等时，**复用**现有资源池与 feature，
+//   不销毁重建。false（ini 里 0）⇒ 每次 key 变化都走原来的 destroy + create，与引入该键之前
+//   逐字节同一条路径。
+// ★ 为什么需要它：destroy_instance() 里的 g_release(feature) 实测 ~502ms（E2），
+//   而进出角色界面这类 key 切换的尺寸/格式并不变，销毁重建纯属浪费 ⇒ ~500ms 卡顿 + 短暂黑屏。
+void set_cross_key_reuse(bool on);
 
 // 2026-11-10（B154）：NGX 实现来源（NgxProvider 键），默认 auto。
 //   auto     = 先真 NGX（注册表 FullPath → _nvngx.dll），失败再找外部实现（默认）；
@@ -60,6 +67,8 @@ void set_provider_mode(int mode);                           // NgxProvider（0=a
 bool active();          // 已成功初始化且 available==1
 bool available();       // 最近一次探测结果
 bool passthrough();
+// 当前是否允许跨 key 复用（返回下游消费者读到的**同一个值**，见 NgxCrossKeyReuse）。
+bool cross_key_reuse();
 
 // ---- 每帧（唯一入口；初始化在内部懒完成）----
 // 返回 true  = NGX 已完成超分并把结果写入 in.output_target（调用方应 return true）。
