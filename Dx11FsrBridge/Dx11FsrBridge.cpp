@@ -354,7 +354,10 @@ struct Config
     bool ffx12_reuse_same_generation = true;
     bool ffx12_output_mark = false;     // 输出标记（诊断：验证画面来源是否 ffx12）
     float ffx12_fov_scale = 1.0f;       // FOV 缩放（AA 重投影验证：1.0=45°）
-    bool ffx12_jitter_delay = true;   // 2026-08-25 FSR4 实测：游戏双缓冲预录滞后一帧 → 用上一帧 jitter（jdelay=1）
+    // 2026-11-10 实机复测推翻 2026-08-25 的结论：本版本游戏**不再**滞后一帧。
+// 设 1（用上一帧）会让整个画面变模糊，且不解决 K 拖影；设 0 才与 FFX 持平。
+// 三处（结构体 / load_config fallback / package.ini）统一为 0。
+bool ffx12_jitter_delay = false;
     bool ffx12_force_reset = false;   // 诊断：每帧强制 FSR2 reset（与正常对比：相同=历史零贡献/单帧重建）
     // 原生 D3D11 纯 GPU 传输（自建 D3D12 + NT 共享句柄 + D3D11.4 fence）。
     // 默认开：GpuInteropProbe 已在本机字节级验证；不劫持游戏设备为 On12（进场前冻结根因）。
@@ -4192,7 +4195,7 @@ void load_config()
     // 1 = 强制 HDR；0 = 强制 SDR。旧配置写 1/0 仍然有效。
     {
         wchar_t hdr_buf[32] {};
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxHdr", L"auto",
+        GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxHdr", L"0",
                                  hdr_buf, static_cast<DWORD>(std::size(hdr_buf)),
                                  config_path.c_str());
         std::wstring hdr_s(hdr_buf);
