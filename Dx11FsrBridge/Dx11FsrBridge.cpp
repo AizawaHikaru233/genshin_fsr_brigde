@@ -4152,12 +4152,20 @@ void load_config()
     }
     ngx::set_feature_dirs(ngx_dirs);
 
-    // ---- 键 4：NgxHdr（T-8 三态：auto / 1 / 0；默认 auto）----
-    // auto = 自动探测（**三级**：① swapchain color space > ② swapchain 缓冲格式 > ③ 输入纹理格式）；
-    // 1 = 强制 HDR；0 = 强制 SDR。旧配置写 1/0 仍然有效。
+    // ---- 键 4：NgxHdr（T-8 三态：auto / 1 / 0；默认 0 = 强制 SDR）----
+    // 为什么默认从 auto 改成 0（实机 E2 证据，同机同场景对比）：
+    //   NgxHdr=auto ⇒ 解析成 HDR（create_flags=0xB，含 IsHDR）⇒ 角色走动/转视角时拖影明显；
+    //   NgxHdr=0    ⇒ create_flags=0xA（无 IsHDR）⇒ 拖影大幅改善。
+    // 机制：桥交给 NGX 的是 **PQ 码值**，不是线性光。置 IsHDR 会让 DLSS 按 HDR 管线解释这些
+    //   码值，色调映射与运动补偿的判断偏离画面实际内容 ⇒ 走动/转视角时大面积拖影。
+    // ⚠️ 该结论只在**绕过 OptiScaler** 时才能测出 —— OptiScaler 会把 IsHDR 强制改回 1。
+    // auto 三态仍然可用（只是不再是默认）：
+    //   auto = 自动探测（① swapchain color space > ② swapchain 缓冲格式 > ③ 输入纹理格式）；
+    //   1 = 强制 HDR；0 = 强制 SDR。旧配置写 1/0 仍然有效。
+    //   需要复现原行为（HDR 会话解析成 HDR）时，显式写 auto。
     {
         wchar_t hdr_buf[32] {};
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxHdr", L"auto",
+        GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxHdr", L"0",
                                  hdr_buf, static_cast<DWORD>(std::size(hdr_buf)),
                                  config_path.c_str());
         std::wstring hdr_s(hdr_buf);
