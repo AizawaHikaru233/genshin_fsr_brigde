@@ -3129,6 +3129,74 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     upload_cb(ctx, inst, g_depth_scale, 1.0f);   // ★ depth_scale 由 NgxDepthScale 控制（默认 1.0 = 上游行为），flip 恒 1.0
     dispatch_depth_cs(ctx, inst);
 
+    // ---- 深度值域探针（诊断，NgxLogLevel>=3 时才跑；§二.5 低频）----
+    //
+    // 为什么需要：`NgxDepthScale` 是否该 >1，取决于**这个游戏这一版**的逆深度
+    // 实际值域。仓库里对它有两条互相矛盾的记录：
+    //   · Ffx12Backend 的 g_depth_scale 注释说「不归一化 → 视角移动残影」；
+    //   · Dx11FsrBridge.cpp 的 xess_or_dlss 分支却写着「depth 归一化实测无效」。
+    // 两者都是注释、都没给数字。所以这里直接量：把 depth 纹理读回，
+    // 采样 256 个点算 min/max/mean，用实测值域代替任何一方的说法。
+    //
+    // 采样率：只在 NgxLogLevel>=3 且 count<=45 时执行（见下方门控），
+    // 且每帧只读一次 staging。默认 NgxLogLevel=1 时整块不执行。
+    if (g_log_level >= 3 && frame_count <= 45 && (frame_count % 15) == 0 && inst.depth)
+    {
+        D3D11_TEXTURE2D_DESC dd {};
+        inst.depth->GetDesc(&dd);
+        D3D11_TEXTURE2D_DESC sd = dd;
+        sd.Usage          = D3D11_USAGE_STAGING;
+        sd.BindFlags      = 0;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        sd.MiscFlags      = 0;
+        ID3D11Texture2D *staging = nullptr;
+        ID3D11Device *dev = nullptr;
+        ctx->GetDevice(&dev);
+        if (dev != nullptr)
+        {
+            if (SUCCEEDED(dev->CreateTexture2D(&sd, nullptr, &staging)) && staging != nullptr)
+            {
+                ctx->CopyResource(staging, inst.depth.Get());
+                ctx->Flush();
+                D3D11_MAPPED_SUBRESOURCE m {};
+                if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m)) && m.pData != nullptr)
+                {
+                    float mn = 1e30f, mx = -1e30f, sum = 0.0f;
+                    int n = 0;
+                    const auto *row = static_cast<const float *>(m.pData);
+                    const UINT pitch_f = m.RowPitch / sizeof(float);
+                    for (UINT gy = 1; gy <= 16; ++gy)
+                    {
+                        for (UINT gx = 1; gx <= 16; ++gx)
+                        {
+                            const UINT px = dd.Width  * gx / 17u;
+                            const UINT py = dd.Height * gy / 17u;
+                            const float v = row[static_cast<std::size_t>(py) * pitch_f + px];
+                            if (!(v == v))
+                                continue;                     // 跳过 NaN
+                            if (v < mn) mn = v;
+                            if (v > mx) mx = v;
+                            sum += v;
+                            ++n;
+                        }
+                    }
+                    if (n > 0)
+                    {
+                        log_ngx_core(blog::Level::Info,
+                                     L"ngx_depth_probe n=%d min=%.6f max=%.6f mean=%.6f scale=%.2f"
+                                     L" | range tells whether NgxDepthScale>1 is needed",
+                                     n, static_cast<double>(mn), static_cast<double>(mx),
+                                     static_cast<double>(sum / static_cast<float>(n)),
+                                     static_cast<double>(g_depth_scale));
+                    }
+                    ctx->Unmap(staging, 0);
+                }
+                staging->Release();
+            }
+            dev->Release();
+        }
+    }
+
     // ---- 第 9 步：motion 解码 CS（§3.6.2）----
     if (!ensure_motion_src_srv(in, inst))
         return false;
