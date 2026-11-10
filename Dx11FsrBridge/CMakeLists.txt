@@ -129,6 +129,7 @@ add_library(Dx11FsrBridge SHARED
     Il2CppCallSiteHook.cpp
     TransparentJitterHook.cpp
     Ffx12Backend.cpp
+    NgxParamMap.cpp
 )
 
 # ⚠️ `Fsr2InputDump.cpp`（抓帧诊断）**只在诊断构建里**进源列表：
@@ -284,28 +285,49 @@ option(DX11FSRBRIDGE_BUILD_BACKEND_TEST
     "Build Ffx12BackendTest (KNOWN ISSUE: crashes in ffxCreateContext under the isolated test harness)"
     OFF)
 
-if(DX11FSRBRIDGE_BUILD_TESTS OR DX11FSRBRIDGE_BUILD_BACKEND_TEST)
-    # 共用设置函数：把主 target 用到的宏与警告级别统一施加到测试 target
-    function(fsrbridge_configure_test target)
-        target_compile_features(${target} PRIVATE cxx_std_20)
-        if(MSVC)
-            target_compile_options(${target} PRIVATE /utf-8 /W3)
-        endif()
-        target_compile_definitions(${target} PRIVATE
-            WIN32_LEAN_AND_MEAN
-            NOMINMAX
-            UNICODE
-            _UNICODE
-        )
-        # ⚠️ 测试 target 必须与主 target **用同一个诊断开关**：
-        # 否则要么诊断 test 在没有诊断实现的构建里编译失败（PerfProbeTest /
-        # Fsr2InputDumpTest），要么 `Il2CppCallSiteHookTest` /
-        # `TransparentJitterHookTest` 与 DLL 走不同的 `PerfProbe.h` 分支。
-        if(DX11FSRBRIDGE_DIAGNOSTICS_ON)
-            target_compile_definitions(${target} PRIVATE DX11FSRBRIDGE_ENABLE_DIAGNOSTICS=1)
-        endif()
-    endfunction()
-endif()
+# 共用设置函数：把主 target 用到的宏与警告级别统一施加到测试 target
+#
+# ★ 2026-11-10（A 阶段）：本函数原先包在
+#   `if(DX11FSRBRIDGE_BUILD_TESTS OR DX11FSRBRIDGE_BUILD_BACKEND_TEST)` 块内，
+#   现移到块外。原因：`NgxParamMapTest` 是**零依赖**的纯映射层单测，必须在
+#   **默认构建**（两个开关都 OFF）下就能编译 —— 若函数仍在块内，那个 target
+#   在默认配置下根本不存在。测试 target 不进 DLL 源列表 ⇒ 对产物零影响。
+function(fsrbridge_configure_test target)
+    target_compile_features(${target} PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /utf-8 /W3)
+    endif()
+    target_compile_definitions(${target} PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        UNICODE
+        _UNICODE
+    )
+    # ⚠️ 测试 target 必须与主 target **用同一个诊断开关**：
+    # 否则要么诊断 test 在没有诊断实现的构建里编译失败（PerfProbeTest /
+    # Fsr2InputDumpTest），要么 `Il2CppCallSiteHookTest` /
+    # `TransparentJitterHookTest` 与 DLL 走不同的 `PerfProbe.h` 分支。
+    if(DX11FSRBRIDGE_DIAGNOSTICS_ON)
+        target_compile_definitions(${target} PRIVATE DX11FSRBRIDGE_ENABLE_DIAGNOSTICS=1)
+    endif()
+endfunction()
+
+# ---- NGX 参数映射纯函数层单测（2026-11-10，A 阶段）----
+#
+# `NgxParamMap.h/.cpp` 是**零 D3D / 零 NGX / 零全局**的纯计算层 ⇒ 本 target
+# **不需要任何开关**：不需要 FFX SDK 头、不需要 NGX 头（`DX11FSRBRIDGE_ENABLE_NGX=OFF`
+# 照样构建）、不需要 GPU、不需要游戏、不链 Detours。
+# 它把重构前**只能实机验证**的五处公式（CreateFlags / jitter 六模式 / MV scale /
+# reset / reactive 尺寸守卫）用**位模式**钉住：测试里的 oracle 是重构前原代码
+# **另抄一份**，断言用 `std::bit_cast` 比位（不是 epsilon）。
+add_executable(NgxParamMapTest
+    NgxParamMapTest.cpp
+    NgxParamMap.cpp
+)
+fsrbridge_configure_test(NgxParamMapTest)
+target_include_directories(NgxParamMapTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+enable_testing()
+add_test(NAME NgxParamMapTest COMMAND NgxParamMapTest)
 
 if(DX11FSRBRIDGE_BUILD_TESTS)
     # il2cpp callsite hook：观察/跳过/还原模式 + per-instance 隔离 + 相机 hook。

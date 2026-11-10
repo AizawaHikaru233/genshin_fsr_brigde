@@ -18,6 +18,10 @@
 #include "NgxBackend.h"   // ngx::set_*（D13 九键 + NgxCrossKeyReuse = 十个键）。十个 setter 都有消费者；
                           // 本头不含 NGX SDK 头，故 OFF 构型包含它也安全（REQ-08），
                           // 但下面所有 ngx:: 调用点都被 DX11FSRBRIDGE_ENABLE_NGX 守卫。
+// A 阶段（2026-11-10）：NGX 参数映射的**纯计算层**（零 D3D / 零 NGX / 零全局）。
+// 本 TU 只把"已算好的归一化 jitter / 配置值"喂进去，公式在 NgxParamMap.cpp。
+// ★ 无条件 include：本头只依赖 <cstdint>，OFF 构型同样安全（同上面 NgxBackend.h 的口径）。
+#include "NgxParamMap.h"
 #include "Fsr2InputDump.h"
 #include "BridgeLogger.h"
 #include "PerfProbe.h"
@@ -12597,32 +12601,34 @@ bool try_fsr2_translation_draw(
                         bound_cb->Release();
                     }
                 }
-                const float use_jx = g_config.ffx12_jitter_delay ? st->prev_jx : jit_src_x;
-                const float use_jy = g_config.ffx12_jitter_delay ? st->prev_jy : jit_src_y;
-                switch (g_config.ffx12_jitter_mode)
+                // ---- A 阶段（2026-11-10）：模式换算搬进纯函数 NgxParamMap.cpp ----
+                // ★ 逐位等价：六种模式的公式与重构前 switch **逐字相同**（含 mode 2 的
+                //   "原样"语义、mode 5 的恒 0、以及 default 兜住一切非法值）。
+                //   对照 oracle（重构前 switch 另抄一份）在 NgxParamMapTest.cpp 第 [2][3][4] 节。
+                // ★ 传进去的 norm 是 jit_src_x（= 旧代码 use_jx 的来源），delay 由纯函数内部选；
+                //   旧代码的 use_jx/use_jy 三元表达式因此整条搬进了 map_jitter。
+                // ★ 单次读取模式：旧代码 switch 只读一次 g_config.ffx12_jitter_mode，
+                //   本段也必须只读一次；分两次读（填 ji.mode 一次 + !=2 判据一次）会在
+                //   配置热重载场景下出现“填模式”与“是否回写”读到不同值的窗口。
+                const std::uint32_t jit_mode = g_config.ffx12_jitter_mode;
+                ngx_param_map::JitterInput ji {};
+                ji.norm_x = jit_src_x;
+                ji.norm_y = jit_src_y;
+                ji.render_w = sdk_in.render_w;
+                ji.render_h = sdk_in.render_h;
+                ji.mode = jit_mode;
+                ji.delay_one_frame = g_config.ffx12_jitter_delay;
+                ji.prev_norm_x = st->prev_jx;
+                ji.prev_norm_y = st->prev_jy;
+                const ngx_param_map::JitterOutput jit_out = ngx_param_map::map_jitter(ji);
+                // ★★ mode 2 必须**不回写**：旧代码 case 2 是 `break;`，sdk_in.jitter_x/y
+                //   保留 switch **之前**的赋值（:12437 = call_params.jitter_x/y）。
+                //   纯函数在 mode 2 返回的是 jit_src_x，与 call_params 在 cb0 回退路径上
+                //   可能不同 ⇒ 这里显式跳过赋值，才与重构前逐位一致。
+                if (jit_mode != 2)
                 {
-                    case 1: // +norm×render（无 −0.5）
-                        sdk_in.jitter_x = use_jx * static_cast<float>(sdk_in.render_w);
-                        sdk_in.jitter_y = use_jy * static_cast<float>(sdk_in.render_h);
-                        break;
-                    case 2: // 原样归一化（≈0，等效关 jitter）
-                        break;
-                    case 3: // −norm×render + 0.5（模式 0 的 X/Y 翻转，翻译层 Fsr2JitterMode=3 风格）
-                        sdk_in.jitter_x = -(use_jx * static_cast<float>(sdk_in.render_w)) + 0.5f;
-                        sdk_in.jitter_y = -(use_jy * static_cast<float>(sdk_in.render_h)) + 0.5f;
-                        break;
-                    case 4: // −norm×render（游戏反汇编约定：采样 = pixel − jitter；默认）
-                        sdk_in.jitter_x = -(use_jx * static_cast<float>(sdk_in.render_w));
-                        sdk_in.jitter_y = -(use_jy * static_cast<float>(sdk_in.render_h));
-                        break;
-                    case 5: // 零 jitter（诊断）
-                        sdk_in.jitter_x = 0.0f;
-                        sdk_in.jitter_y = 0.0f;
-                        break;
-                    default: // 0: +norm×render − 0.5（旧默认，A/B 保留）
-                        sdk_in.jitter_x = use_jx * static_cast<float>(sdk_in.render_w) - 0.5f;
-                        sdk_in.jitter_y = use_jy * static_cast<float>(sdk_in.render_h) - 0.5f;
-                        break;
+                    sdk_in.jitter_x = jit_out.px;
+                    sdk_in.jitter_y = jit_out.py;
                 }
                 st->prev_jx = jit_src_x;
                 st->prev_jy = jit_src_y;
@@ -12672,12 +12678,19 @@ bool try_fsr2_translation_draw(
                 // motion scale：FSR2 约定 = ±render 尺寸，符号 = 游戏原生运动方向约定。
                 // 2026-08-25 依据游戏 accumulate 反汇编（history_uv = UV − mv_g, mv_g=正向）：
                 // FSR2 需要反向运动 → 本桥 −sign 解码已反向 → scale 必须 +renderSize（Fsr2MotionVectorScaleMode=1）。
-                const float mv_sign = g_config.fsr2_positive_motion_vector_scale ? 1.0f : -1.0f;
-                // motionScale：FSR2/DLSS/XeSS 均按 render 尺寸（输入分辨率像素；display 尺寸已试无变化）。
-                sdk_in.motion_scale_x = mv_sign * static_cast<float>(sdk_in.render_w) *
-                                        g_config.ffx12_motion_scale;
-                sdk_in.motion_scale_y = mv_sign * static_cast<float>(sdk_in.render_h) *
-                                        g_config.ffx12_motion_scale;
+                // ---- A 阶段（2026-11-10）：MV scale 搬进纯函数 NgxParamMap.cpp ----
+                // ★ 逐位等价：mv_sign 与 (sign*W)*scale 的左结合顺序**逐字保留**。
+                //   对照 oracle（重构前两行另抄一份）在 NgxParamMapTest.cpp 第 [6] 节。
+                // ★ motionScale 口径不变：FSR2/DLSS/XeSS 均按 render 尺寸
+                //   （输入分辨率像素；display 尺寸已试无变化）。
+                ngx_param_map::MvScaleInput mi {};
+                mi.positive_scale = g_config.fsr2_positive_motion_vector_scale;
+                mi.motion_scale = g_config.ffx12_motion_scale;
+                mi.render_w = sdk_in.render_w;
+                mi.render_h = sdk_in.render_h;
+                const ngx_param_map::MvScaleOutput mv_out = ngx_param_map::map_mv_scale(mi);
+                sdk_in.motion_scale_x = mv_out.x;
+                sdk_in.motion_scale_y = mv_out.y;
                 // 相机参数：先用 OptiScaler 路径已验证值（原生值待 PRE cb0 探测）。
                 // FovScale 配置：AA 重投影依赖 FOV，缩放可快速验证 FOV 是否为 AA 失效元凶。
                 sdk_in.camera_near = g_config.ffx12_camera_near;
