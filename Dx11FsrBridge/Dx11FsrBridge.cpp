@@ -7530,9 +7530,11 @@ bool is_hdr10_color_space(DXGI_COLOR_SPACE_TYPE color_space)
     //      ⇒ 逃生舱：NgxHdr=1 强制 HDR（见 package.ini 的 NgxHdr 说明）。
     //
     //   ⇒ 判据 = G10 色空间 **且** 后缓冲格式为 R16G16B16A16_FLOAT(_TYPELESS)。
-    //   ★ 只有 FULL 变体的 G10 存在（dxgicommon.h:30 / :54），没有 STUDIO_G10 —— 实测编译报 C2065。
-    if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 ||
-        color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P2020)
+    //   ★ G10 在 dxgicommon.h 的 DXGI_COLOR_SPACE_TYPE 里只有一个成员：
+    //     DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 = 1（即 scRGB，线性、P709 基色）。
+    //     没有 STUDIO_G10，**也没有 G10_NONE_P2020 这个成员** —— 臆造它会让 MSVC 报
+    //     C2065（2026-11-10 修复：合并后的 main 因此在 NGX ON 构型下编译失败）。
+    if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709)
     {
 #if defined(DX11FSRBRIDGE_ENABLE_NGX)
         const DXGI_FORMAT fmt = ngx::swapchain_format();
