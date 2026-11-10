@@ -143,6 +143,41 @@
 
 ---
 
+
+## 7. 帧生成缺少 HUDless 缓冲，UI 元素参与插帧
+
+**现状**
+
+OptiScaler 的 DLSSG 帧生成已启用（`FGOutput = DLSSG`、`HUDFix = true`、DX11 Hudfix 资源跟踪已装上），
+但日志里 `Hudfix_Dx12::ResetCounters _hudlessList: 0` **恒为 0** —— 说明整个会话没有检测到任何 HUDless 缓冲。
+
+桥目前不 hook 任何 UI 绘制（`Draw` / `DrawIndexed`），也没有 UI 与场景分离的通道，
+因此无法向帧生成提供一个「无 HUD」的干净画面。
+
+**影响**
+
+帧生成在**带 UI 的合成画面**上做光流插帧，而不是在干净的场景画面上插帧。
+可能出现 UI 元素（血条、技能图标、伤害数字）在插帧里抖动、拖影或被错误插值。
+
+**推进需要**
+
+1. 先确认这个游戏是否存在独立的 UI 渲染通道（UI 是否在单独的 pass / 单独的 render target 里绘制）。
+   若是，桥可在 UI 绘制**之前**捕获后缓冲作为 HUDless 候选；若 UI 与场景在同一 pass 混绘，则无解。
+2. 若可捕获，需要按帧生成的约定把 HUDless 纹理与 UI 纹理一起标记给它（OptiScaler 侧已有对应键：
+   `DisableHudless` / `HudlessValidNow` / `OnlyAcceptFirstHudless` / `HUDFixUITexture` / `HUDFixUIUnblend`）。
+3. 先做只读观测：hook 一次 UI 绘制并记录「本帧是否有独立 UI pass」，不改行为。
+
+**相关代码**
+
+- `Dx11FsrBridge/Dx11FsrBridge.cpp`（Present / 交换链钩子；目前无 UI 绘制钩子）
+- OptiScaler 侧：`OptiScaler.ini` 的 `[FrameGen]` 与 HUD 相关键；日志前缀 `Hudfix_`
+
+**未验证**
+
+- 未确认该游戏是否有独立 UI 通道
+- 未确认提供 HUDless 后能否改善画面（可能与当前的 HDR 发灰问题无关，也可能相关）
+- 未评估性能与显存开销
+
 ## 已解决
 
 ### 发布管线不启用 NGX 构型（2026-11-10）
