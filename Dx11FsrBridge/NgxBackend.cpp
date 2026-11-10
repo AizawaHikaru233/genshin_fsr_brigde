@@ -1748,17 +1748,31 @@ static CreateFlagsEval build_create_flags(DXGI_FORMAT color_fmt)
 }
 
 // 3.8.3 六档映射。一律返回枚举名，不写整数字面量（防 Ffx12CameraNear 式静默失效）。
-// 本机 3840/1920 = 2.0 => 落 MaxPerf。
+//
+// ⚠️ 2026-11-10：原实现把「接近 1:1」的比例量化到 UltraQuality，这是错的。
+//
+//   `PerfQualityValue` 不只是个标签 —— DLSS 会用它构造内部的**重投影比例**。
+//   本机 render=2556 / display=2560 => ratio = **1.001565**（几乎 1:1），
+//   而原实现的 `ratio > 1.0f && ratio <= 1.3f` 分支把它判成 UltraQuality
+//   （标称 1.30x）⇒ DLSS 按 1.30x 构造重投影 ⇒ 位移被放大
+//   `1.30 / 1.001565 = 1.298` 倍 ⇒ 运动 2.1px 被当作 2.73px，
+//   即「朝偏移 30% 的位置找历史」= J/K 拖影、M/L 线条抖动。
+//
+//   修法：**接近 1:1（<= 1.05）直接判 DLAA**，而不是落到最近的档位。
+//   判据用「是否落在 DLAA 区间」而非「最接近哪个档位」—— 档位标签错配的
+//   代价（重投影比例错、画面全局拖影）远大于档位不精确。
 static NVSDK_NGX_PerfQuality_Value quality_from_ratio(std::uint32_t render_w, std::uint32_t display_w)
 {
     if (render_w == 0) return NVSDK_NGX_PerfQuality_Value_MaxPerf;   // 防御除零
 
     const float ratio = static_cast<float>(display_w) / static_cast<float>(render_w);
+    // ★ 1:1 附近必须 DLAA（1.00x）。留 5% 余量覆盖奇数分辨率/非整数缩放。
+    if (ratio <= 1.05f) return NVSDK_NGX_PerfQuality_Value_DLAA;
     if (ratio > 2.0f && ratio <= 3.0f) return NVSDK_NGX_PerfQuality_Value_UltraPerformance;
     if (ratio > 1.7f && ratio <= 2.0f) return NVSDK_NGX_PerfQuality_Value_MaxPerf;      // <- 本机 2.0x
     if (ratio > 1.5f && ratio <= 1.7f) return NVSDK_NGX_PerfQuality_Value_Balanced;
     if (ratio > 1.3f && ratio <= 1.5f) return NVSDK_NGX_PerfQuality_Value_MaxQuality;
-    if (ratio > 1.0f && ratio <= 1.3f) return NVSDK_NGX_PerfQuality_Value_UltraQuality;
+    if (ratio > 1.05f && ratio <= 1.3f) return NVSDK_NGX_PerfQuality_Value_UltraQuality;
     return NVSDK_NGX_PerfQuality_Value_DLAA;
 }
 
