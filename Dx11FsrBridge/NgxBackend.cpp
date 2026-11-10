@@ -816,6 +816,21 @@ static bool log_gate_win8_every1024(std::uint64_t count)
     return count <= 8u || (count % 1024u) == 0u;
 }
 
+// 连续采样窗口（**诊断用**，2026-11-10）。
+//
+// 为什么需要：稳态 jitter 序列的**周期**与**是否推进**决定 DLSS 时域能否收敛，
+// 而 `log_gate_win8_every1024` 每 1024 帧才取一个点 —— 那样看不到相邻帧，
+// 「相位冻结」与「采样恰好撞上同一值」这两种情况无法区分（本项目已因此误判过一轮）。
+//
+// 为什么不会污染热路径：由 `NgxLogLevel>=3` 显式打开，且窗口只有前 48 帧。
+// 默认 `NgxLogLevel=1` 时本函数恒为 false，开销只有一个整数比较（§二.5）。
+static bool log_gate_cadence_window(std::uint64_t count)
+{
+    if (g_log_level < 3)
+        return false;
+    return count <= 48u;
+}
+
 // 每 1024 帧一次（ngx_core eval 成功行，§3.10.1）。
 static bool log_gate_every1024(std::uint64_t count)
 {
@@ -3109,7 +3124,7 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     // ---- ngx_in 行（§3.10.1 输入侧；info；闸门 count <= 8 || count % 1024 == 0）----
     // ★ fmt 的三个值取自**实际输入纹理的 GetDesc()**，不得凭空构造。
     // ★ 本行是**逐帧**行，绝不与一次性快照的 ngx_core 混用（§3.10.2 末尾的硬约束）。
-    if (log_gate_win8_every1024(frame_count))
+    if (log_gate_win8_every1024(frame_count) || log_gate_cadence_window(frame_count))
     {
         D3D11_TEXTURE2D_DESC ddesc {}, mdesc {};
         in.depth->GetDesc(&ddesc);
