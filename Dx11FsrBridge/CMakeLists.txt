@@ -44,7 +44,7 @@ option(DX11FSRBRIDGE_BUILD_FAMILY_TEST "Build the Fsr2FamilyTakeover state-machi
 #   - `Ffx12Test` / `Ffx12AccumTest` —— `#include "ffx_api.h"` / `"ffx_upscale.h"`，
 #     需 FFX SDK 头 staging（本文件的 FFX_API_STAGE_ROOT 流程），且运行需真实 SDK DLL
 #   - `Ffx12DescTest`               —— 纯 D3D12 计算着色器验证，运行需 GPU
-#   - `GpuRouteTest`                —— 已在文件内标注 OBSOLETE
+#   - 历史参考表（GPU id → 架构）已删除：其被测函数在生产代码中已不存在，见提交历史
 # 这些留待需要时按 FFX SDK staging 接入；先保证"能无外部依赖编译"的两个进 CI。
 option(DX11FSRBRIDGE_BUILD_TESTS "Build the SDK-free unit tests (il2cpp callsite, ffx12 backend)" OFF)
 
@@ -279,7 +279,7 @@ endif()
 #      残留的**失效实例指针**会污染下一次 `install()`（已修）。
 #   ⚠️ `Ffx12BackendTest` —— 可编译，但**运行仍崩溃**（见下），故单独开关。
 #   ❌ `Ffx12Test` / `Ffx12AccumTest` —— `#include "ffx_api.h"` 等，需 FFX SDK 头
-#      staging；`Ffx12DescTest` 另需 GPU；`GpuRouteTest` 已在文件内标注 OBSOLETE。
+#      staging；`Ffx12DescTest` 另需 GPU。
 option(DX11FSRBRIDGE_BUILD_TESTS "Build the runnable SDK-free unit tests (il2cpp callsite)" OFF)
 option(DX11FSRBRIDGE_BUILD_BACKEND_TEST
     "Build Ffx12BackendTest (KNOWN ISSUE: crashes in ffxCreateContext under the isolated test harness)"
@@ -351,6 +351,17 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     fsrbridge_configure_test(TransparentJitterHookTest)
     target_include_directories(TransparentJitterHookTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME TransparentJitterHookTest COMMAND TransparentJitterHookTest)
+
+    # Ffx12Backend=auto 的型号判据（GpuBackendPick.h，纯 header，零依赖）：
+    # RTX -> ngx；GTX / MX / 非 NVIDIA -> native；名字认不出关键字时按 device id 兜底
+    # （只认 Ampere / Ada / Blackwell，Turing 与 GTX 16 同段故不兜底）。
+    # 不需要游戏、不需要 GPU、不链接任何库。
+    add_executable(GpuBackendPickTest
+        GpuBackendPickTest.cpp
+    )
+    fsrbridge_configure_test(GpuBackendPickTest)
+    target_include_directories(GpuBackendPickTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME GpuBackendPickTest COMMAND GpuBackendPickTest)
 
     # ---- 以下两个 test target 是**诊断专用**，随诊断开关一起排除 ----
     #

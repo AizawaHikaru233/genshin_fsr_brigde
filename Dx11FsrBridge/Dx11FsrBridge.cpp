@@ -15,6 +15,7 @@
 #include "Il2CppCallSiteHook.h"
 #include "TransparentJitterHook.h"
 #include "Ffx12Backend.h"
+#include "GpuBackendPick.h" // Ffx12Backend=auto 的型号判据（纯 header，零依赖）
 #include "NgxBackend.h"   // ngx::set_*（D13 九键 + NgxCrossKeyReuse = 十个键）。十个 setter 都有消费者；
                           // 本头不含 NGX SDK 头，故 OFF 构型包含它也安全（REQ-08），
                           // 但下面所有 ngx:: 调用点都被 DX11FSRBRIDGE_ENABLE_NGX 守卫。
@@ -584,6 +585,14 @@ static bool g_route_applied = false; // 路由已应用（防止设备补检重�
 static std::string g_route_gpu_name;
 static std::string g_route_vendor_label;
 static std::string g_route_sdk_path;
+// Ffx12Backend=auto（按显卡型号自动落位后端）：
+//   requested —— ini 里写了 auto，等首个非零 vendor 的适配器信息才判；
+//   resolved  —— 已落位。后端是进程级单值，只判一次：后续再看到别的适配器不改后端
+//                （多适配器机器上设备可能不止一个）。
+//   note      —— 落位摘要（"auto=ngx vendor=0x10DE gpu=\"...\""），供状态行追加。
+static bool g_backend_auto_requested = false;
+static bool g_backend_auto_resolved = false;
+static std::string g_backend_auto_note;
 
 // OptiScaler 输出定向修复——XeSS/DLSS 的 jitter 需 ≤±0.5（像素/归一化），
 // FSR 输出保持原样（互不干扰）。运行时按 OptiScaler.ini 的 Dx11Upscaler/Dx12Upscaler 判定
@@ -636,7 +645,8 @@ static OptiOutput opti_output_current()
     return g_opti_output.load(std::memory_order_relaxed);
 }
 // 显卡信息记录（**已不做路由**；定义于 initialize 之前，设备创建 hook 先于定义处使用）
-static void record_adapter_info(std::uint32_t vendor, const std::wstring &desc);
+static void record_adapter_info(std::uint32_t vendor, std::uint32_t device_id, const std::wstring &desc);
+static void resolve_backend_auto(std::uint32_t vendor, std::uint32_t device_id, const std::wstring &desc);
 static void route_from_d3d11_device(ID3D11Device *d3d11_device);
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 std::mutex g_ps_trace_mutex;
@@ -4105,21 +4115,28 @@ void load_config()
     // 此处 blog::init() 尚未执行 ⇒ 11 个 setter 只存值、一行日志都不打；
     // 唯一需要输出的是非法值告警，它先进 pending_warnings，由 initialize() 回放。
     //
-    // ⚠️ Ffx12Backend 只接受**精确小写**的 native / ngx：不 tolower、不 trim。
-    //    缺键（lpDefault=L"native"）与显式 native ⇒ native 且不告警；
+    // ⚠️ Ffx12Backend 只接受**精确小写**的 auto / native / ngx：不 tolower、不 trim。
+    //    缺键（lpDefault=L"auto"，与发布模板一致，见 AGENTS.md §二.7）与显式 auto 等效：
+    //    先按 native 落位，等首个适配器信息到手再按型号判（resolve_backend_auto）；
+    //    显式 native ⇒ native 且不告警；
     //    显式空值 / NGX / Native / 拼错 ⇒ native + backend_invalid 告警。
 #if defined(DX11FSRBRIDGE_ENABLE_NGX)
     // ---- 键 1：Ffx12Backend（唯一走 ffx12 命名空间的键——不存在 ngx::set_backend）----
     wchar_t backend_buf[64] {};
-    GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Backend", L"native",
+    GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Backend", L"auto",
                              backend_buf, static_cast<DWORD>(std::size(backend_buf)),
                              config_path.c_str());
     const std::wstring backend_value(backend_buf);
     const bool ngx_mode = (backend_value == L"ngx");
     const bool native_mode = (backend_value == L"native");
-    if (!ngx_mode && !native_mode)
+    const bool auto_mode = (backend_value == L"auto");
+    if (!ngx_mode && !native_mode && !auto_mode)
         g_config.logging.pending_warnings.emplace_back(
             "ngx_core backend=native config_warn bits=backend_invalid");
+    // auto：此刻还没有适配器信息（设备还没创建），先按 native 落位；
+    // 真正的判定发生在 route_from_d3d11_device -> resolve_backend_auto（设备创建 hook 内，
+    // 早于 swapchain_hook_needed() 的求值）。
+    g_backend_auto_requested = auto_mode;
     ffx12::set_backend(ngx_mode ? ffx12::BackendKind::Ngx : ffx12::BackendKind::Native);
 
     // ---- 键 2：NgxApplicationId（uint64；0 → 1337，warn 位由 set_ 内部记）----
@@ -4238,14 +4255,19 @@ void load_config()
 #else
     // ---- REQ-08：NGX 未编译进本产物 ----
     // 十个键里只有 Ffx12Backend 有消费者（后端选择器归 ffx12），其余 9 个 NGX 键在 OFF
-    // 构型下没有任何消费者，故不读。缺键 / 显式 native ⇒ 静默 native（不告警）；
-    // 任何其它取值（精确 ngx、非法值）⇒ 强制 Native + 一条固定告警。
+    // 构型下没有任何消费者，故不读。缺键（lpDefault=L"auto"）/ 显式 auto ⇒ 交给
+    // resolve_backend_auto 按型号判；显式 native ⇒ 静默 native（不告警）；
+    // 精确 ngx 与非法值 ⇒ 强制 Native + 一条固定告警。
     {
         wchar_t backend_buf[64] {};
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Backend", L"native",
+        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Backend", L"auto",
                                  backend_buf, static_cast<DWORD>(std::size(backend_buf)),
                                  config_path.c_str());
-        if (std::wstring(backend_buf) != L"native")
+        // auto 在本构型下**合法**、不告警：型号判为 RTX 时才有必要提示"想走 ngx 但没编进来"，
+        // 而那时才拿得到适配器信息（由 resolve_backend_auto 打这一行）。
+        const std::wstring backend_value(backend_buf);
+        g_backend_auto_requested = (backend_value == L"auto");
+        if (backend_value != L"native" && !g_backend_auto_requested)
             g_config.logging.pending_warnings.emplace_back(
                 "ngx_core backend=native config_warn bits=ngx_not_compiled");
         ffx12::set_backend(ffx12::BackendKind::Native);
@@ -15322,7 +15344,7 @@ static bool contains_ci(const std::wstring &hay, const wchar_t *needle)
 // provider 的 ffxQueryDescGetVersions 按 GPU 能力返回最高支持版本，降级链 4→3→2 兜底；
 // RDNA2 等需要 4.0.2c 的用户自行替换 SDK 文件（见 ini 备注）。
 // 旧签名还带 device/source 两个参数，函数体里直接 (void) 丢弃——调用方以为在传路由依据。
-static void record_adapter_info(std::uint32_t vendor, const std::wstring &desc)
+static void record_adapter_info(std::uint32_t vendor, std::uint32_t device_id, const std::wstring &desc)
 {
     if (g_route_applied)
         return;
@@ -15334,6 +15356,47 @@ static void record_adapter_info(std::uint32_t vendor, const std::wstring &desc)
     g_route_gpu_name = narrow(desc.c_str());
     g_route_sdk_path = narrow(g_config.ffx12_dll_path.c_str());
     g_route_applied = true;
+    // Ffx12Backend=auto 的落位点：这里刚拿到 vendor / device id / 描述，且本函数由
+    // route_from_d3d11_device 在**设备创建 hook 内**调用，早于同一 hook 里
+    // swapchain_hook_needed() 的求值（Dx11FsrBridge.cpp:14931 早于 :14937）——
+    // 因此落位结果能被交换链钩子的谓词立刻看到。
+    resolve_backend_auto(vendor, device_id, desc);
+}
+
+// Ffx12Backend=auto：按显卡型号落位后端（用户口径：RTX -> ngx，非 RTX -> native）。
+//
+// 为什么判据只看型号、不看 NGX 运行时是否就绪：
+//   · 判据的唯一来源是适配器（这里），而 NGX 可用性要等设备创建后才能问（ensure_init）；
+//   · 预判为 ngx 但 NGX 初始化失败时，dispatch 逐帧 fail-open 交回游戏原生路径
+//     （Ffx12Backend.cpp:2956 -> Dx11FsrBridge.cpp:13254），最坏只是没超分，不会崩、不会黑屏；
+//   · 反过来（预判 native 但机器其实能跑 NGX）只会少一条画质更好的路径，也一样安全。
+//   ⇒ 判错的两个方向都可恢复，故不在配置期引入"探测 NGX 运行时"的重复逻辑
+//     （那会与 ngx::ensure_init 形成两套口径，见 AGENTS.md §五.1 判据单一来源）。
+static void resolve_backend_auto(std::uint32_t vendor, std::uint32_t device_id, const std::wstring &desc)
+{
+    if (!g_backend_auto_requested || g_backend_auto_resolved || vendor == 0)
+        return;
+    g_backend_auto_resolved = true;
+    const bool want_ngx = gpu_pick::supports_dlss(vendor, device_id, desc);
+    // 厂商/型号文字直接复用 record_adapter_info 上面刚写入的 g_route_*（焦点框用的是同一份），
+    // 不再自己 snprintf + narrow 一遍：同一事实两套口径迟早会漂（AGENTS.md §五.2）。
+    // 摘要里也不再重复打印 GPU 型号 —— 焦点框的 "  GPU : <型号> (vendor=0x…)" 已经打过。
+    g_backend_auto_note = std::string("auto=") + (want_ngx ? "ngx" : "native") +
+        " vendor=" + g_route_vendor_label;
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+    ffx12::set_backend(want_ngx ? ffx12::BackendKind::Ngx : ffx12::BackendKind::Native);
+    LOG_INFO(blog::cat::config, std::string(ffx12::backend() == ffx12::BackendKind::Ngx
+                                               ? "ngx_core backend=ngx "
+                                               : "ngx_core backend=native ") +
+        g_backend_auto_note);
+#else
+    // NGX 未编译进本产物：只有"型号判为 RTX"才值得告警（用户写了 auto，本意是让 RTX 走 ngx）。
+    if (want_ngx)
+        LOG_WARN(blog::cat::config,
+            "ngx_core backend=native config_warn bits=ngx_not_compiled " + g_backend_auto_note);
+    else
+        LOG_INFO(blog::cat::config, "ngx_core backend=native " + g_backend_auto_note);
+#endif
 }
 
 // D3D11 设备就绪后的可靠补检（IDXGIDevice::GetAdapter 不受 loader lock 影响）
@@ -15348,6 +15411,7 @@ static void route_from_d3d11_device(ID3D11Device *d3d11_device)
         return;
     IDXGIAdapter *adapter = nullptr;
     std::uint32_t vendor = 0;
+    std::uint32_t device_id = 0;
     std::wstring desc_text;
     if (SUCCEEDED(dxgi_device->GetAdapter(&adapter)) && adapter != nullptr)
     {
@@ -15355,13 +15419,14 @@ static void route_from_d3d11_device(ID3D11Device *d3d11_device)
         if (SUCCEEDED(adapter->GetDesc(&desc)))
         {
             vendor = desc.VendorId;
+            device_id = desc.DeviceId;
             desc_text = desc.Description;
         }
         adapter->Release();
     }
     dxgi_device->Release();
     if (vendor != 0)
-        record_adapter_info(vendor, desc_text);
+        record_adapter_info(vendor, device_id, desc_text);
 }
 
 // ---------------------------------------------------------------------------
@@ -15493,12 +15558,18 @@ void initialize()
         // 后端选择状态行（SDS §3.13.2 第 2 条）：在 logger 起来 + 告警回放之后，
         // 按已生效的 ffx12::backend() **恰输出一条**，两种模式都可取证。
         // 走 blog::cat::config 并在日志器初始化之后，故不依赖 NGX 编译开关或 ensure_init。
+        // Ffx12Backend=auto 在这一行必然还是 pending（设备尚未创建 ⇒ 适配器信息未到），
+        // 故追加 auto=pending；落位时 resolve_backend_auto() 会再打一条同格式行
+        // （ngx_core backend=… auto=… vendor=… gpu="…"）——两条成对出现，可直接当验收判据。
+        const std::string auto_suffix =
+            (g_backend_auto_requested && !g_backend_auto_resolved) ? " auto=pending" : "";
 #if defined(DX11FSRBRIDGE_ENABLE_NGX)
-        LOG_INFO(blog::cat::config, ffx12::backend() == ffx12::BackendKind::Ngx
-                                        ? "ngx_core backend=ngx"
-                                        : "ngx_core backend=native");
+        LOG_INFO(blog::cat::config, std::string(ffx12::backend() == ffx12::BackendKind::Ngx
+                                                   ? "ngx_core backend=ngx"
+                                                   : "ngx_core backend=native") +
+            auto_suffix);
 #else
-        LOG_INFO(blog::cat::config, "ngx_core backend=native");
+        LOG_INFO(blog::cat::config, "ngx_core backend=native" + auto_suffix);
 #endif
     }
 

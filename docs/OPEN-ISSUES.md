@@ -118,6 +118,31 @@
 
 ---
 
+## 6. `Ffx12Backend=auto` 只按型号判据，缺 DLSS 运行时不会自动回落
+
+**现状**
+
+- 2026-11-10 起 `Ffx12Backend` 缺省为 `auto`（代码 `lpDefault` 与发布模板一致）：`GpuBackendPick.h` 按 vendor / device id / 描述判 `RTX` ⇒ `ngx`，其余 ⇒ `native`。
+- 判据**只看型号**，不看 NGX 运行时是否真的可用（避免与 `ngx::ensure_init` 形成两套口径）。
+- 落位点在 `record_adapter_info`（设备创建 hook 内，早于 `swapchain_hook_needed()` 的求值），每个会话只落位一次。
+
+**影响**
+
+- RTX 机器但缺 `nvngx_dlss.dll`（发布包只在「勾选 OptiScaler 且检测到 RTX」时才下载该文件）⇒ auto 选中 ngx 后 `ensure_init` 失败，dispatch 逐帧返回 false 走 fail-open，表现为**没有超分**（回落到游戏原生路径），日志只有 `ngx_core init ok=0`。
+- 非 RTX + OptiScaler 的组合（借外部实现呈现 DLSS 接口那条路线）在**全新安装**下默认得到 native，必须显式写 `Ffx12Backend=ngx` 才会让 OptiScaler 接管；`Deploy-Bridge.ps1` 不写该键，所以既有安装保留用户原值。
+
+**推进需要**
+
+- RTX 实机：验 `auto` ⇒ `ngx` 的正向路径，以及缺 `nvngx_dlss.dll` 时的实际表现。
+- 若「缺运行时即无超分」不可接受，可在 NGX 确定性失败后把后端切回 native；注意别为此新增第二套可用性判据（`AGENTS.md` §五.1 判据单一来源）。
+- 可选的收紧：auto 除型号外再要求「特征目录里存在 `nvngx_dlss.dll`」或「注册表 NGXCore 存在」。
+
+**相关代码**
+
+- `Dx11FsrBridge/GpuBackendPick.h`、`Dx11FsrBridge/Dx11FsrBridge.cpp`（`resolve_backend_auto` / `record_adapter_info` / `load_config` 的 Ffx12Backend 段）、`Dx11FsrBridge/Ffx12Backend.cpp`（dispatch 的 ngx 分支）
+
+---
+
 ## 已解决
 
 ### 发布管线不启用 NGX 构型（2026-11-10）
