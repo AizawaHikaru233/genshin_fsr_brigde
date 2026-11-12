@@ -5,6 +5,7 @@
   <a href="Dx11FsrBridge/LICENSE"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue"></a>
   <img alt="Platform: Windows DX11" src="https://img.shields.io/badge/platform-Windows%20DX11-6f42c1?logo=windows&amp;logoColor=white">
   <img alt="FSR4 / FSR3 / FSR2" src="https://img.shields.io/badge/FSR-4%20%7C%203%20%7C%202-f97316">
+  <img alt="DLSS (NGX backend)" src="https://img.shields.io/badge/DLSS-NGX%20backend-76B900?logo=nvidia&amp;logoColor=white">
   <img alt="AMD FFX12 SDK" src="https://img.shields.io/badge/AMD-FFX12%20SDK-ED1C24?logo=amd&amp;logoColor=white">
   <img alt="Genshin 7.1+" src="https://img.shields.io/badge/Genshin-7.1%2B-0ea5e9">
 </p>
@@ -14,7 +15,7 @@
 </p>
 
 <div align="center">
-  <img src="assets/readme/hero-en.svg" alt="Genshin native FSR2 calls bridged by Dx11FsrBridge to the AMD FFX12 SDK, producing FSR4 / FSR3 / FSR2" width="100%">
+  <img src="assets/readme/hero-en.svg" alt="Genshin native FSR2 calls hooked by Dx11FsrBridge and split into two backends: AMD FFX12 SDK (FSR4/FSR3/FSR2) and NVIDIA NGX (DLSS)" width="100%">
 </div>
 
 A graphics plugin for the Genshin Impact Windows DX11 client. It independently hooks the game's native FSR2 calls and forwards them to the AMD FFX12 official SDK for upscaling: FSR4/FSR3/FSR2 are provided directly on supported GPUs without any external plugin such as OptiScaler. On NVIDIA GPUs it can also switch to the built-in NGX backend and output DLSS directly (also without OptiScaler); OptiScaler can additionally be connected to extend the upscaler types (XeSS, FSR4 INT8, etc.).
@@ -71,7 +72,7 @@ For the Chinese documentation, see [README.md](README.md).
     <td width="50%" align="center" valign="top">
       <a href="assets/readme/installer-home.jpg"><img src="assets/readme/installer-home.jpg" alt="Installer · Home" width="100%"></a>
       <br>
-      <sub><b>Installer · Home</b> · game directory, frame-rate cap, and installed content in one screen</sub>
+      <sub><b>Installer · Home</b> · game directory, frame-rate cap, super-resolution input (Auto / FFX / NVNGX), and installed content in one screen</sub>
     </td>
     <td width="50%" align="center" valign="top">
       <a href="assets/readme/installer-plugins.jpg"><img src="assets/readme/installer-plugins.jpg" alt="Installer · Plugins" width="100%"></a>
@@ -108,13 +109,15 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 
 ## Features
 
-The core path of the bridge is to intercept the game's native FSR2 calls and forward them to the FFX12 SDK:
+The bridge intercepts the game's native FSR2 calls once and then attaches two backends behind them — the AMD FFX12 SDK and NVIDIA NGX (DLSS):
 
 ```mermaid
 flowchart LR
     G["Genshin DX11 client<br/>native FSR2 calls"] --> B["Dx11FsrBridge.dll<br/>DX11 hook · FFX12 resource bridge"]
-    B --> S["AMD FFX12 SDK<br/>FSR4 / FSR3 / FSR2"]
+    B -->|"Ffx12Backend=native, or auto on a non-RTX GPU"| S["AMD FFX12 SDK<br/>FSR4 / FSR3 / FSR2"]
+    B -->|"Ffx12Backend=ngx, or auto on an RTX GPU"| N["NVIDIA NGX<br/>DLSS"]
     S --> P["Game frame<br/>upscaled output"]
+    N --> P
 ```
 
 | Module | Capability | Notes |
@@ -122,6 +125,7 @@ flowchart LR
 | 🎯 | **Native FSR forwarding** | Intercepts DX11 device and context activity to obtain the timing of Genshin Impact's FSR2 calls. |
 | 🧩 | **FFX12 resource bridge** | Prepares color, depth, motion-vector, jitter, and history resources for the FFX12 SDK and forwards the upscaling dispatch. |
 | ⚡ | **Automatic tier matching** | Auto-matches the FSR series by GPU capability (FSR4/FSR3/FSR2); upscaling works on supported GPUs without external plugins. |
+| 🟩 | **NGX backend (DLSS)** | On RTX 20 series and newer the same FSR2 call can be routed to NVIDIA NGX and output DLSS, also without OptiScaler; see "[DLSS on NVIDIA without OptiScaler](#dlss-on-nvidia-without-optiscaler-ngx-backend)" for the GPU test, prerequisites, and how to obtain the runtime. |
 | 🎚 | **Extended render scale** | Extends the in-game render-scale menu to `0.2–0.999`. |
 | 📝 | **Runtime logs** | Writes runtime logs to `Dx11FsrBridge.log` beside the DLL by default for load and hook diagnostics. |
 | 🖼 | **TextureLoader** (texture/Mod loader) | 3DMigoto-compatible `[TextureOverride]` Mod loading (DDS replacement + GDDS DirectStorage GPU decompression), loading from the package `Mods` directory by default. **Currently it supports pure texture mods only — model mods are not supported** (see "[TextureLoader Scope](#textureloader-scope)" below). **On NVIDIA GPUs this component is not recommended** (replaced texture mods will very likely fail to load; it is not completely unusable, and it can still be enabled manually) — see "[GPU Support and NVIDIA Caveats](#gpu-support-and-nvidia-caveats)" below. |
@@ -130,7 +134,7 @@ flowchart LR
 
 | Component | AMD | NVIDIA | Intel |
 | --- | --- | --- | --- |
-| FSR Bridge (FSR4/FSR3/FSR2) | ✅ | ✅ | ✅ (XeSS) |
+| FSR Bridge (FSR4/FSR3/FSR2) | ✅ | ✅ | ✅ |
 | FSR Bridge built-in DLSS (NGX backend) | ❌ N/A | ✅ RTX 20 series and newer (GTX 16 / MX unsupported) | ❌ N/A |
 | OptiScaler (DLSS/XeSS/FSR4 INT8) | ✅ | ✅ | ✅ |
 | Anti-Mosaic / Hide UID, ReShade + RenoDX | ✅ | ✅ | ✅ |

@@ -5,6 +5,7 @@
   <a href="Dx11FsrBridge/LICENSE"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue"></a>
   <img alt="Platform: Windows DX11" src="https://img.shields.io/badge/platform-Windows%20DX11-6f42c1?logo=windows&amp;logoColor=white">
   <img alt="FSR4 / FSR3 / FSR2" src="https://img.shields.io/badge/FSR-4%20%7C%203%20%7C%202-f97316">
+  <img alt="DLSS（NGX 后端）" src="https://img.shields.io/badge/DLSS-NGX%20backend-76B900?logo=nvidia&amp;logoColor=white">
   <img alt="AMD FFX12 SDK" src="https://img.shields.io/badge/AMD-FFX12%20SDK-ED1C24?logo=amd&amp;logoColor=white">
   <img alt="Genshin 7.1+" src="https://img.shields.io/badge/Genshin-7.1%2B-0ea5e9">
 </p>
@@ -14,7 +15,7 @@
 </p>
 
 <div align="center">
-  <img src="assets/readme/hero.svg" alt="原神原生 FSR2 调用经 Dx11FsrBridge 转接到 AMD FFX12 SDK，输出 FSR4 / FSR3 / FSR2" width="100%">
+  <img src="assets/readme/hero.svg" alt="原神原生 FSR2 调用经 Dx11FsrBridge 分叉到 AMD FFX12 SDK（FSR4/FSR3/FSR2）与 NVIDIA NGX（DLSS）两条后端" width="100%">
 </div>
 
 面向原神 Windows DX11 客户端的图形插件。它独立 hook 游戏原生 FSR2 调用，并转接到 AMD FFX12 官方 SDK 实现超分：在支持的显卡上直接提供 FSR4/FSR3/FSR2，不依赖 OptiScaler 等外部插件；NVIDIA 显卡上还可以切到内置 NGX 后端直接输出 DLSS（同样不需要 OptiScaler），接入 OptiScaler 后可以进一步扩展 XeSS/FSR4 INT8 等超分类型。
@@ -67,7 +68,7 @@
     <td width="50%" align="center" valign="top">
       <a href="assets/readme/installer-home.jpg"><img src="assets/readme/installer-home.jpg" alt="安装器 · 主页" width="100%"></a>
       <br>
-      <sub><b>安装器 · 主页</b> · 游戏目录、帧率上限、安装内容，一屏改完</sub>
+      <sub><b>安装器 · 主页</b> · 游戏目录、帧率上限、超分输入类型（Auto / FFX / NVNGX）、安装内容，一屏改完</sub>
     </td>
     <td width="50%" align="center" valign="top">
       <a href="assets/readme/installer-plugins.jpg"><img src="assets/readme/installer-plugins.jpg" alt="安装器 · 插件配置" width="100%"></a>
@@ -106,13 +107,15 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 
 ## 功能
 
-Bridge 的核心路径是拦截游戏原生 FSR2 调用并转接到 FFX12 SDK：
+Bridge 只拦截一次游戏原生 FSR2 调用，然后在它后面接上两条后端 —— AMD FFX12 SDK 与 NVIDIA NGX（DLSS）：
 
 ```mermaid
 flowchart LR
     G["原神 DX11 客户端<br/>原生 FSR2 调用"] --> B["Dx11FsrBridge.dll<br/>DX11 Hook · FFX12 资源转接"]
-    B --> S["AMD FFX12 SDK<br/>FSR4 / FSR3 / FSR2"]
+    B -->|"Ffx12Backend=native，或 auto 判为非 RTX"| S["AMD FFX12 SDK<br/>FSR4 / FSR3 / FSR2"]
+    B -->|"Ffx12Backend=ngx，或 auto 判为 RTX"| N["NVIDIA NGX<br/>DLSS"]
     S --> P["游戏画面<br/>超分输出"]
+    N --> P
 ```
 
 | 模块 | 能力 | 说明 |
@@ -120,6 +123,7 @@ flowchart LR
 | 🎯 | **原生 FSR 转接** | 通过 DX11 设备与上下文拦截获取原神的 FSR2 调用时机。 |
 | 🧩 | **FFX12 资源转接** | 为 FFX12 SDK 准备颜色、深度、运动向量、抖动和历史资源，并转接超分 dispatch。 |
 | ⚡ | **自动档位匹配** | 按显卡能力自动匹配 FSR 系列（FSR4/FSR3/FSR2），支持显卡上无需外部插件即可超分。 |
+| 🟩 | **NGX 后端（DLSS）** | RTX 20 系起可把同一个 FSR2 调用改走 NVIDIA NGX 输出 DLSS，同样不需要 OptiScaler；判据、前置条件与获取方式见下方「[N 卡不接 OptiScaler 也能开 DLSS](#n-卡不接-optiscaler-也能开-dlssngx-后端)」。 |
 | 🎚 | **渲染精度扩展** | 将游戏渲染精度菜单扩展为 `0.2–0.999`。 |
 | 📝 | **运行日志** | 运行时日志默认写入 DLL 同目录的 `Dx11FsrBridge.log`，用于排查加载与 Hook 状态。 |
 | 🖼 | **TextureLoader**（纹理/Mod 加载器） | 3DMigoto 兼容的 `[TextureOverride]` Mod 加载（DDS 替换 + GDDS DirectStorage GPU 解压），默认从插件包内 `Mods` 目录加载。**当前只支持纯纹理贴图类 Mod，不支持模型类 Mod**，见下方「[TextureLoader 支持范围](#textureloader-支持范围)」。**该组件在 N 卡上不推荐**（极大概率出现替换贴图 Mod 加载丢失，但不是完全不可用，仍可手动开启），见下方「[GPU 支持与 N 卡注意事项](#gpu-支持与-n-卡注意事项)」。 |
@@ -128,7 +132,7 @@ flowchart LR
 
 | 组件 | AMD | NVIDIA | Intel |
 | --- | --- | --- | --- |
-| FSR Bridge（FSR4/FSR3/FSR2） | ✅ | ✅ | ✅（XeSS） |
+| FSR Bridge（FSR4/FSR3/FSR2） | ✅ | ✅ | ✅ |
 | FSR Bridge 内置 DLSS（NGX 后端） | ❌ 不适用 | ✅ RTX 20 系及以上（GTX 16 / MX 不支持） | ❌ 不适用 |
 | OptiScaler（DLSS/XeSS/FSR4 INT8） | ✅ | ✅ | ✅ |
 | 反虚化 / 隐藏 UID、ReShade + RenoDX | ✅ | ✅ | ✅ |
