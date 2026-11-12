@@ -65,7 +65,7 @@ std::uint64_t takeover_leave_count();
 // 单测（Fsr2FamilyTakeoverTest）逐条钉住这两条 ⇒ 回归不可能再次悄悄发生。
 struct TokenOnlyClaimFacts
 {
-    bool single_instance_takeover = false;  // Ffx12SingleInstance=1（P1 生效）
+    bool single_instance_takeover = false;  // 单实例接管**生效**（Ffx12SingleInstance=1 或 NGX 后端强制）
     bool second_instance_present = false;   // 当前确有多个**活跃**实例（非粘性，见下）
     // ⚠️ 实机回归（2026-09-28）：`second_instance_present` 早先被实现为**粘性**（"本进程出现过
     // 第二个实例"）。状态槽只增不减、场景/视图切换也不回收 ⇒ 一次为真终生为真 ⇒ 单视图场景下

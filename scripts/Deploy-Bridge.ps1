@@ -55,7 +55,7 @@ $routes = @()
 #    已从发布版整块剔除：本清单与发布模板都不再包含它们；需要诊断请用开发构建。
 #    Diagnostic keys are excluded from the release build - do not add them back here.
 #
-# ⚠️ 三个**故意不写**的例外：
+# ⚠️ 四个**故意不写**的例外：
 #    · Ffx12AsyncUpscale —— 由安装器 / 芙芙启动器按显卡自动写入（RDNA2→0、其他→1），
 #      本脚本写死 1 会与它的按显卡判定打架；
 #    · Ffx12DllPath     —— 路径键：留空即"随包 payload\AMD 的 SDK"，本脚本不覆盖
@@ -65,6 +65,9 @@ $routes = @()
 #      而后端写错是**静默**的（回落到 native 只是性能/画质变化，不会崩、不会报错）。
 #      缺键时走代码内建缺省——与发布模板同为 auto（load_config 的 lpDefault=L"auto"），
 #      所以不写这个键也天然安全，用户手改的值也就保得住。
+#    · Ffx12SingleInstance —— 发布模板缺省 0=全部接管（FFX 后端多机位/分屏场景的正确值），
+#      NGX 后端在代码里无视该键、一律按 1 处理。本脚本每次部署都跑，写死任一个值都会盖掉
+#      用户的手改；缺键时走代码内建缺省（同为 0，load_config 的 lpDefault=0），故不写也安全。
 $configValues = [ordered]@{
     # ---- 1. 核心功能 / Core features ----
     'Enabled'                   = '1'

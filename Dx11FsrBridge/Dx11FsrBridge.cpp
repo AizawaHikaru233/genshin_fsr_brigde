@@ -283,14 +283,20 @@ struct Config
     bool ffx12 = false;
     std::wstring ffx12_dll_path;
     bool ffx12_fail_closed = false; // 禁止回退原生（测试/故障显式暴露）
-    // 【正式功能】P1 单实例接管（默认**开**）：多个 FSR2 上下文并存时只接管**一个**实例，
-    // 其余实例**放行游戏原生上采样**（返回 false，让游戏的累积 draw 照常执行；返回 true
-    // 会吞掉那一路的累积 pass ⇒ 画面冻住）。
-    // 为什么需要：FFX12 的 GPU 互操作共享层是**全局单份**（共享纹理/fence/单槽 pending/
-    // 尺寸池），只支持一条流水线；而现场实测有两个长期并存的 FSR2 上下文（各有一份
-    // ffxContext、历史各归各的）⇒ 两路交替复用同一份共享资源，交付帧混进另一视角的角色。
-    // P1 不隔离共享层（那是 P2），只消除"并存"：只要任一时刻只有一路走桥，就不会混帧。
-    bool ffx12_single_instance = true;
+    // 【正式功能】P1 单实例接管（默认**关** = 全量接管）：置 1 时多个 FSR2 上下文并存
+    // 只接管**一个**实例，其余实例**放行游戏原生上采样**（返回 false，让游戏的累积 draw
+    // 照常执行；返回 true 会吞掉那一路的累积 pass ⇒ 画面冻住）。
+    // 历史（为什么默认不开）：引入时（2026-09-28）FFX12 的 GPU 互操作共享层是**全局单份**
+    // （共享纹理/fence/单槽 pending/尺寸池），只支持一条流水线；现场实测有两个长期并存的
+    // FSR2 上下文（各有一份 ffxContext、历史各归各的）⇒ 两路交替复用同一份共享资源，交付帧
+    // 混进另一视角的角色，故先用 P1 消除"并存"。同日 f9e52b3 起该共享层改为**按实例独占**
+    // （纹理/UAV/SRV/尺寸池/context/挂起槽全部按 instance_key 隔离，只剩 fence 是全局），
+    // 68ed170（2026-10-02）遂把缺省改为 0 全量接管，实测左右 1:1 分屏两路各自 100% 接管
+    // （0 拒绝 / 0 吞掉 / 无覆盖层 / 无冻结）。2026-11-10 合并 NGX 后端时被改回 1（回归，
+    // 提交说明所谓"与发布 ini 对齐"不成立——改动前两处本来都是 0），2026-11-13 恢复 0。
+    // ⚠️ NGX 后端例外：它的 feature/资源池是真全局单实例 ⇒ 无视本键，一律按 1 处理
+    //   （见 single_instance_takeover_effective()）。
+    bool ffx12_single_instance = false;
     // 接管哪一个（默认 0 = 自动）：0 = render 面积大者优先、面积相同取**最早出现**；
     // 1 = 强制最早出现；2 = 强制最新出现（与 1 互补：改一行 ini 即可换成"另一路"验证）。
     std::uint32_t ffx12_single_instance_pick = 0;
@@ -651,6 +657,26 @@ static OptiOutput opti_output_current()
 static void record_adapter_info(std::uint32_t vendor, std::uint32_t device_id, const std::wstring &desc);
 static void resolve_backend_auto(std::uint32_t vendor, std::uint32_t device_id, const std::wstring &desc);
 static void route_from_d3d11_device(ID3D11Device *d3d11_device);
+// P1 单实例接管的**生效值**：ini 取值，或后端强制。
+// 为什么 NGX 必须强制（2026-11-13 代码审计）：NGX 的 feature 与资源池是**全局唯一实例**
+// （NgxBackend.cpp 的 `NgxInstance g_inst`，v8 起不再是 map + LRU），只支持一条流水线。
+// 全量接管 + 两路视图交替派发时：尺寸/格式不同 ⇒ 每次 instance_key 变化都
+// destroy_instance() + create_instance()；尺寸格式全等 ⇒ 走跨 key 复用，但每帧把
+// g_inst.first 置 true 复位时域（那里的原话：否则两个视图的时域累积互相污染）。
+// 两种都不可能两路同时正常出图 ⇒ 本键对 NGX 后端无效，一律只接管一个实例。
+static bool single_instance_takeover_effective()
+{
+    return g_config.ffx12_single_instance || ffx12::backend() == ffx12::BackendKind::Ngx;
+}
+
+// 后端选择行（`ngx_core backend=…`）的单实例状态后缀：只在「ini 写 0 却被强制」时出现，
+// 让日志里的**配置值**与**生效值**能分开读（AGENTS.md §五.6 日志口径自洽）。
+static std::string single_instance_log_suffix()
+{
+    return (!g_config.ffx12_single_instance && ffx12::backend() == ffx12::BackendKind::Ngx)
+        ? " single_instance=forced"
+        : "";
+}
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 std::mutex g_ps_trace_mutex;
 std::ofstream g_ps_trace_stream;
@@ -4279,10 +4305,13 @@ void load_config()
     ffx12::set_auto_exposure(g_config.ffx12_auto_exposure);
     ffx12::set_non_linear(g_config.ffx12_non_linear);
     ffx12::set_velocity_factor(g_config.ffx12_velocity_factor);
-    // 【正式功能】P1 单实例接管（默认开）——段必须是 `[Dx11FsrBridge]`。
+    // 【正式功能】P1 单实例接管（默认**关** = 全量接管）——段必须是 `[Dx11FsrBridge]`。
     // 它读在诊断守卫之外：这是**功能键**（消费者改变行为），发布构建必须保留。
+    // 缺省 0 必须与发布模板一致（Dx11FsrBridge.package.ini）：FFX 后端的共享层已按实例隔离
+    // （f9e52b3），全量接管才是分屏场景的正确值；NGX 后端无视本键、一律按 1 处理
+    // （见 single_instance_takeover_effective()）。
     g_config.ffx12_single_instance =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12SingleInstance", 1, config_path.c_str()) != 0;
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12SingleInstance", 0, config_path.c_str()) != 0;
     g_config.ffx12_single_instance_pick = std::clamp<std::uint32_t>(
         static_cast<std::uint32_t>(GetPrivateProfileIntW(
             L"Dx11FsrBridge", L"Ffx12SingleInstancePick", 0, config_path.c_str())),
@@ -11534,7 +11563,7 @@ bool try_fsr2_translation_draw(
         // 判据（全序 ⇒ 天然粘滞，不逐帧漂移）：① render 面积大者优先；② 面积相同取
         // **最早出现**的实例。候选只在"最近 k_p1_live_ms 内仍被匹配到"的实例间产生，
         // 已退场的实例不会长期占着接管权。理由见交付说明，Ffx12SingleInstancePick 可覆盖。
-        if (g_config.ffx12_single_instance && st != nullptr)
+        if (single_instance_takeover_effective() && st != nullptr)
         {
             constexpr std::uint64_t k_p1_live_ms = 200;
             const std::uint64_t p1_now = GetTickCount64();
@@ -11831,7 +11860,7 @@ bool try_fsr2_translation_draw(
         //   · 它的 FSR2 历史已过期，先用原生跑几百毫秒，避免"立刻重新接管 + reset"的跳变。
         // 说明：非接管实例本来就由上面的 passthrough 分支先放行，所以本窗口实际只在
         // "老接管者马上又被裁决回来"（flap）时才起作用 —— 那正是最需要兜底的情形。
-        if (g_config.ffx12_single_instance && st != nullptr && match_inst != 0 &&
+        if (single_instance_takeover_effective() && st != nullptr && match_inst != 0 &&
             st->native_until_tick != 0 && GetTickCount64() < st->native_until_tick)
         {
             const bool nw_consumed =
@@ -11889,7 +11918,7 @@ bool try_fsr2_translation_draw(
             // ⚠️ 放行前提必须是"**当前**确有另一个活跃实例"（非粘性）。见 g_sdk234_multi_instance
             // 的判据注释：用"历史上出现过第二个实例"会让这条放行在单视图场景长期生效 ⇒ 本桥的
             // 超分被大面积让给游戏原生（实机回归的直接机制之一）。
-            const bool release_now = g_config.ffx12_single_instance &&
+            const bool release_now = single_instance_takeover_effective() &&
                 g_sdk234_multi_instance.load(std::memory_order_relaxed) != 0 &&
                 p1_other_instance_live(match_inst);
             if (release_now)
@@ -12070,7 +12099,7 @@ bool try_fsr2_translation_draw(
             !output_belongs_to_instance && st->acc_in_color != 0 &&
             st->acc_in_color == claim_color_ptr;
         fsr2_family_takeover::TokenOnlyClaimFacts p2_facts {};
-        p2_facts.single_instance_takeover = g_config.ffx12_single_instance;
+        p2_facts.single_instance_takeover = single_instance_takeover_effective();
         // ⚠️ 必须用"**当前**确有另一个活跃实例"（非粘性），而不是"历史上出现过第二个实例"。
         // 实机回归（2026-09-28）：粘性版本 + `token_cands` 把幽灵实例也计入 ⇒ 接管者**每一个**
         // 累积 draw 都被拒（`ffx12_ambiguous_bootstrap` 涨到 5376，而另一路 :g 已冻住 54 秒）
@@ -12147,7 +12176,7 @@ bool try_fsr2_translation_draw(
         //   bootstrap 被拒 ⇒ 归属建立不起来 ⇒ 超分停止"的死锁（实机见过一次）。
         //   ⇒ 只用于 A/B 取证，不要长期打开；真要长期用它，请先看日志里
         //   `ffx12_strict_skip` 与 `ffx12_result` 是否同时在增长。
-        if (g_config.ffx12_single_instance_strict && g_config.ffx12_single_instance &&
+        if (g_config.ffx12_single_instance_strict && single_instance_takeover_effective() &&
             st != nullptr && match_inst != 0 && match_path == 2 && !output_belongs_to_instance &&
             match_inst == sdk234_take_cur && call_gen != 0)
         {
@@ -13680,7 +13709,7 @@ bool fsr2_family_should_skip_draw(ID3D11DeviceContext *context)
     // 至于"老实例掉出活性窗后互锁松开、它的预处理 pass 又被跳过"这个自锁风险：交棒时已对
     // 它做了逐实例处置（notify_takeover_leave + 纯原生窗口），原生路径是被显式交还的，
     // 不依赖本标记兜底 ⇒ 不会复发。
-    if (g_config.ffx12_single_instance &&
+    if (single_instance_takeover_effective() &&
         g_sdk234_multi_instance.load(std::memory_order_relaxed) != 0)
         return false;
     // cached_ps 由缓存持有引用：D3D11 对象地址在释放后可能被复用，不持引用就会
@@ -15391,7 +15420,7 @@ static void resolve_backend_auto(std::uint32_t vendor, std::uint32_t device_id, 
     LOG_INFO(blog::cat::config, std::string(ffx12::backend() == ffx12::BackendKind::Ngx
                                                ? "ngx_core backend=ngx "
                                                : "ngx_core backend=native ") +
-        g_backend_auto_note);
+        g_backend_auto_note + single_instance_log_suffix());
 #else
     // NGX 未编译进本产物：只有"型号判为 RTX"才值得告警（用户写了 auto，本意是让 RTX 走 ngx）。
     if (want_ngx)
@@ -15570,7 +15599,7 @@ void initialize()
         LOG_INFO(blog::cat::config, std::string(ffx12::backend() == ffx12::BackendKind::Ngx
                                                    ? "ngx_core backend=ngx"
                                                    : "ngx_core backend=native") +
-            auto_suffix);
+            auto_suffix + single_instance_log_suffix());
 #else
         LOG_INFO(blog::cat::config, "ngx_core backend=native" + auto_suffix);
 #endif
