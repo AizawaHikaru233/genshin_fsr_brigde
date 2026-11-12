@@ -122,6 +122,86 @@ Dx11wDx12SC::Present
 **为何不修**：阻塞发生在 OptiScaler 自身的 DLL 卸载路径，桥无法介入。
 完整证据链见本地留痕 `VERDICT_game_exit_hang_20261112.md`（不随仓库分发）。
 
+## 4. DLSS 质量档位由手写比例表决定，未向 NGX 查询合法尺寸区间
+
+**现状**
+
+- `Dx11FsrBridge/NgxBackend.cpp:1750-1760` 的 `quality_from_ratio()` 用手写比例表选档：
+  `ratio 1.0–1.3 → UltraQuality`、`1.3–1.5 → MaxQuality`、`1.5–1.7 → Balanced`、
+  `1.7–2.0 → MaxPerf`、`2.0–3.0 → UltraPerformance`、其余 → DLAA。
+- 两个调用点：`:1867` 传给 `create_feature`；`:2701` 算 `set_mismatch` 的期望值（同一处改，必须同源）。
+- `:1781-1784` 的 `perf_quality_for_create()` 把 `UltraQuality` 改成 `MaxQuality`，是 `b632cc5`
+  为渲染精度 0.8~0.999 建的兜底。
+
+**影响**
+
+- 每个 DLSS 档位能接受的 render 尺寸区间由驱动与模型决定，**不是固定比例**；手写表假设它是比例。
+  渲染精度 0.999（ratio≈1.001）落进 `UltraQuality` 分支 ⇒ `create_feature ok=0 rc=0xBAD00010`
+  （`UnsupportedParameter`），而当前失败锁存不重试（见下一条）⇒ 必须重启游戏才能恢复。
+- 兜底只改结果、不改判据：不同显卡、不同 DLSS 版本的真实区间可能不同，兜底挡不住下一个档位错配。
+
+**推进需要**
+
+- 改用 NGX 自带的合法区间查询：`NVSDK_NGX_DLSS_GET_OPTIMAL_SETTINGS` 是
+  `nvsdk_ngx_helpers.h:65` 的 `static inline`，本仓库**故意没有** vendor 这个头
+  （`tools/Fetch-NgxHeaders.ps1:28`），但可照它的实现重写约 40 行：在 capability params 上
+  `Set(Width/Height/PerfQualityValue/RTXValue)` → 取 `NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback`
+  调一次 → 读 `NVSDK_NGX_Parameter_OutWidth/OutHeight`、
+  `NVSDK_NGX_Parameter_DLSS_Get_Dynamic_{Max,Min}_Render_{Width,Height}`、`Sharpness`。
+  这些参数名字符串已全部在 `Dx11FsrBridge/third_party/ngx/nvsdk_ngx_defs.h` 里。
+- 五个档位各查一次，取各自合法的 render 宽高区间，挑**包含当前 render 尺寸**的那档；
+  允许每轴超出区间上限不超过最大尺寸的 1/64（约 2 像素）。都不包含时回退现有比例表。
+- 查询失败（callback 缺失 / 返回非 `NVSDK_NGX_Result_Success`）一律回退现有行为，不改原有可用性。
+
+**注意**
+
+- 只改「选哪个档」，不改 create flags、不碰资源与实例生命周期。
+- `:1867` 与 `:2701` 必须走同一条选档链，否则 `set_mismatch` 会误报。
+- 判据：渲染精度 0.8~0.999 时 `create_feature ok=1`，且日志里的 `pq=` 与区间查询结果一致；
+  对照 0.999 旧行为是 `ok=0 rc=0xBAD00010`。
+
+**相关代码**
+
+- `Dx11FsrBridge/NgxBackend.cpp:1750-1760`、`:1781-1784`、`:1867`、`:2701`；
+  `Dx11FsrBridge/third_party/ngx/nvsdk_ngx_defs.h`；`tools/Fetch-NgxHeaders.ps1`
+
+---
+
+## 5. `create_feature` 失败后永久不重试，参数变化本可自愈的场景必须重启游戏
+
+**现状**
+
+- `Dx11FsrBridge/NgxBackend.cpp:3106` 写明「永久不重试（§3.9.7 / S-81）：CreateFeature 失败的
+  根因（PathListInfo 配错）不会自愈」。`S-81` 是注释里的旧审查编号，含义在本文件可原地读到：
+  同一对象生命周期内锁存 `feature_create_failed`，尺寸/格式变化只释放资源、不重试
+  （`:205`、`:1848`、`:1893`）。
+- 锁存只在实例对象销毁时随对象消失（`:2743`）。
+
+**影响**
+
+- 「PathListInfo 配错」确实不会自愈，但失败原因不止这一类：`0xBAD00010` 是**参数性**失败，
+  玩家把渲染精度、分辨率或 HDR 改一下，本该能建起来，现在却必须重启游戏。
+- 失败后每帧 fail-open 回游戏原生 FSR2，玩家只看到「DLSS 不生效」，日志里才有一行 rc。
+
+**推进需要**
+
+- 把「永久」改成「输入 key 变化即允许重试」：记录失败时的 key = render 宽高 + display 宽高 +
+  档位 + NgxRenderPreset + HDR 标志（+ create flags）；下一次创建前 key 不同就清
+  `feature_create_failed` 重试一次，key 相同仍不重试。
+- 日志记录 key 变化与重试结果（成功/同一个 rc），便于区分「参数问题」与「环境问题」。
+
+**注意**
+
+- S-81 的原始理由仍然成立，**不能**改成无条件解锁：否则尺寸抖动或无关状态变化会反复触发
+  `0xBAD0000B` 这类每帧重试（`:2085` 记过这个教训）。触发条件只认上面那几个输入。
+- 与上一条配合看：上一条去掉参数错配的成因，本条是剩余失败类型的兜底；两条可分别验收。
+
+**相关代码**
+
+- `Dx11FsrBridge/NgxBackend.cpp:205`、`:1848`、`:1893`、`:2085`、`:3049-3069`、`:3106`、`:2743`
+
+---
+
 ## 已解决
 
 ### NGX 后端的画面与平台验证（2026-11-13）
