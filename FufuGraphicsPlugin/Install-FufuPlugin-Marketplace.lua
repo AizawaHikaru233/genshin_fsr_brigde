@@ -62,7 +62,7 @@ install.write_config(plugin_dir, {
         Description = "支持把原神的FSR2转换为FSR4（A卡 RX 9000/7000/6000 系独显与 RDNA3/3.5 核显）、DLSS/XeSS/FSR4 INT8（其余显卡）",
         Developer = "シリアCelia",
         File = "FSR-Bridge-Plugin.dll",
-        Version = "2.4.0"
+        Version = "2.5.0"
     },
     EnableBridge = {
         Name = "启用 FSR Bridge",
