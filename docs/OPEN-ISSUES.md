@@ -23,7 +23,7 @@
 **推进需要**
 
 - RTX 20 系及以上显卡 + 对应版本驱动；
-- 确认 NGX 能从驱动侧拿到 DLSS 模型：发布包只在「勾选 OptiScaler 且检测到 RTX」时才下载 `nvngx_dlss.dll`，只开桥的 NGX 后端时该文件可能不存在（本机无 N 卡，无法判断纯驱动是否够用）。
+- 确认 NGX 能从驱动侧拿到 DLSS 模型：安装器已改为「RTX 且（勾了 OptiScaler，或勾了桥且超分输入类型会走 NVNGX）」时就把 `nvngx_dlss.dll` 补到 `payload\NVIDIA\DLSS\`（2026-11-12），所以只开桥这条路线不再必然缺文件；仍待验证的是**完全不提供该文件**时纯驱动是否够用（本机无 N 卡）。
 - 判据：日志 `ngx_core init ok=1 available=1`；`ngx_hdr_decision is_hdr=… src=…` 与当前会话是否一致；同一场景分别用 native 与 ngx 截图对比。
 
 **相关代码**
@@ -149,14 +149,15 @@
 
 **影响**
 
-- RTX 机器但缺 `nvngx_dlss.dll`（发布包只在「勾选 OptiScaler 且检测到 RTX」时才下载该文件）⇒ auto 选中 ngx 后 `ensure_init` 失败，dispatch 逐帧返回 false 走 fail-open，表现为**没有超分**（回落到游戏原生路径），日志只有 `ngx_core init ok=0`。
+- RTX 机器但缺 `nvngx_dlss.dll` ⇒ auto 选中 ngx 后 `ensure_init` 失败，dispatch 逐帧返回 false 走 fail-open，表现为**没有超分**（回落到游戏原生路径），日志只有 `ngx_core init ok=0`。
+  安装器从 2026-11-12 起在「勾 OptiScaler」或「勾桥且超分输入类型会走 NVNGX」时补齐该文件（`payload\NVIDIA\DLSS\`），这一项因此从「必然缺」变成「只有用户手工删掉才会缺」。
 - 非 RTX + OptiScaler 的组合（借外部实现呈现 DLSS 接口那条路线）在**全新安装**下默认得到 native，必须显式写 `Ffx12Backend=ngx` 才会让 OptiScaler 接管；`Deploy-Bridge.ps1` 不写该键，所以既有安装保留用户原值。
 
 **推进需要**
 
 - RTX 实机：验 `auto` ⇒ `ngx` 的正向路径，以及缺 `nvngx_dlss.dll` 时的实际表现。
 - 若「缺运行时即无超分」不可接受，可在 NGX 确定性失败后把后端切回 native；注意别为此新增第二套可用性判据（`AGENTS.md` §五.1 判据单一来源）。
-- 可选的收紧：auto 除型号外再要求「特征目录里存在 `nvngx_dlss.dll`」或「注册表 NGXCore 存在」。
+- 可选的收紧：auto 除型号外再要求「特征目录里存在 `nvngx_dlss.dll`」或「注册表 NGXCore 存在」。安装器现在会在同一条判据（`srinput::uses_ngx()`：`ngx`，或 `auto` 且 RTX）下补齐文件，所以正常安装路径上两者已经对齐；剩下的差异只出现在用户手工删文件或换显卡之后。
 
 **相关代码**
 

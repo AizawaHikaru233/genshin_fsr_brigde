@@ -73,6 +73,9 @@
   .rvalue{font-size:13px;color:var(--ink2);margin-top:3px;letter-spacing:0}
   .rvalue.mono{font-family:var(--mono);font-size:12px;letter-spacing:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .rvalue.dim{color:var(--ink2)}
+  /* 超分输入类型的备注：一句话说明「接口 ≠ 选择」，允许折两行 */
+  .srnote{max-width:34em;line-height:1.35}
+  .srnote.dim{color:var(--ink2)}
   .ghost{font-size:13px;color:var(--ink);background:#F1F1F4;border:0;border-radius:8px;padding:6px 12px;transition:background .15s,transform .12s var(--ease),box-shadow .2s,color .15s}
   .ghost:hover{background:#E8E8EC}
   .ghost:active{transform:scale(.97)}
@@ -531,9 +534,29 @@
             <input class="fpsinput" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" maxlength="4" placeholder="自定义" aria-label="自定义帧率上限">
           </div>
         </div>
-  
+
+        <!-- 超分输入类型：只镜像 Dx11FsrBridge.ini 的 Ffx12Backend，选完立刻写回那份 ini -->
+        <div class="row intro" style="animation-delay:120ms">
+          <div class="ico">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="4" y="4" width="16" height="16" rx="3"/><rect x="9" y="9" width="6" height="6" rx="1"/>
+              <path d="M9 2.6v1.4M15 2.6v1.4M9 20v1.4M15 20v1.4M2.6 9H4M2.6 15H4M20 9h1.4M20 15h1.4"/>
+            </svg>
+          </div>
+          <div style="min-width:0">
+            <div class="rlabel">超分输入类型</div>
+            <div class="rvalue srnote">这是超分输入接口，不是超分选择，Auto 为 N 卡使用 NVNGX，A 卡使用 FFX 更稳定</div>
+          </div>
+          <div class="seg" id="srseg" role="group" aria-label="超分输入类型">
+            <span class="segthumb"></span>
+            <button type="button" data-v="auto" aria-pressed="true">Auto</button>
+            <button type="button" data-v="native" aria-pressed="false">FFX</button>
+            <button type="button" data-v="ngx" aria-pressed="false">NVNGX</button>
+          </div>
+        </div>
+
         <!-- 安装内容 -->
-        <div class="row headrow intro" style="animation-delay:120ms">
+        <div class="row headrow intro" style="animation-delay:160ms">
           <div class="ico">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 3.6 20 8v8l-8 4.4L4 16V8Z"/><path d="M12 12.1 20 8M12 12.1V20.4M12 12.1 4 8"/>
@@ -1001,6 +1024,8 @@
     uiLang: 'system',    // 界面语言：system | zh | en
     theme: 'system',     // 明暗主题：system | light | dark
     shortcutOn: true,    // 安装时创建桌面快捷方式
+    srInput: 'auto',     // 超分输入类型：auto | native | ngx（= Dx11FsrBridge.ini 的 Ffx12Backend）
+    srAvailable: false,  // 桥装好了、那份 ini 在，才允许改
     unlockerDir: '',     // 解帧工具目录（payload\FpsUnlocker）
     shortcutName: '',    // 快捷方式文件名（跟随界面语言）
     modsDefault: ''     // 默认 Mods 目录（payload\TextureLoader\Mods）
@@ -1664,6 +1689,7 @@
 
   function placeAllThumbs(){
     fpsControls.forEach(function(c){ placeThumb(c, false); });
+    if (srSeg) syncSegThumb(srSeg, false);
   }
 
   function syncFpsUI(){
@@ -1709,6 +1735,30 @@
   }
 
   [].forEach.call(document.querySelectorAll('[data-fpsctl]'), function(el){ createFpsControl(el); });
+
+  // ── 超分输入类型 ──
+  // 显示名与写入值不是一回事：FFX 写 native、NVNGX 写 ngx —— 后端只认后一套名字，
+  // 界面上照用户看得懂的说法叫。值由后端读回（post_state 的 srInput），这里只负责显示与点击。
+  var srSeg = $('#srseg');
+  function syncSrInput(){
+    if (!srSeg) return;
+    [].forEach.call(srSeg.querySelectorAll('button'), function(b){
+      b.setAttribute('aria-pressed', b.dataset.v === state.srInput ? 'true' : 'false');
+      b.disabled = !state.srAvailable;
+    });
+    syncSegThumb(srSeg, true);
+  }
+  if (srSeg){
+    [].forEach.call(srSeg.querySelectorAll('button'), function(b){
+      b.addEventListener('click', function(){
+        // 与 seg() 同一套判定：看当前 aria-pressed，不看建节点时的旧值
+        if (b.disabled || b.getAttribute('aria-pressed') === 'true') return;
+        state.srInput = b.dataset.v;
+        syncSrInput();
+        host.send({type:'srInput', value: b.dataset.v});
+      });
+    });
+  }
 
   // 装完之后改帧率：底部结论行跟着变，别让两处数字打架。
   function refreshDoneEnv(){
@@ -2632,7 +2682,10 @@ $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); }
       state.opacity = (typeof msg.opacity === 'number') ? msg.opacity : 80;
       syncMaximized();
       applyAppearance();
+      state.srInput = (msg.srInput && msg.srInput.value) || 'auto';
+      state.srAvailable = !!(msg.srInput && msg.srInput.available);
       syncFpsUI();
+      syncSrInput();
       buildRows();
       updateSummary();
       updateMain();
@@ -2827,6 +2880,8 @@ $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); }
     '已配置':'Configured', '未配置':'Not configured',
     '游戏目录':'Game folder', '正在查找原神安装位置…':'Locating Genshin…', '更换…':'Change…',
     '帧率上限':'Frame rate cap', '安装内容':'Injection list', '保存':'Save',
+    '超分输入类型':'Super resolution input',
+    '这是超分输入接口，不是超分选择，Auto 为 N 卡使用 NVNGX，A 卡使用 FFX 更稳定':'This picks the super resolution input interface, not the upscaler. Auto uses NVNGX on NVIDIA and FFX on AMD, which is more stable.',
     '启动游戏':'Launch game', '游戏运行中':'Game running',
     '先选一个游戏目录，再来这里启动。':'Pick the game folder first, then launch from here.',
     '解帧工具正在运行，关掉游戏后它会自己退出。':'The unlocker is running; it exits when the game closes.',

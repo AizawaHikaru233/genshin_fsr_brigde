@@ -16,6 +16,7 @@ mod paths;
 mod pkg;
 mod settings;
 mod shortcut;
+mod srinput;
 mod update;
 mod verify;
 
@@ -108,6 +109,10 @@ fn post_state(app: &AppHandle) {
                 "opti": version_list("opti", &s),
             },
             "unlocker": launch::unlocker_settings(),
+            "srInput": {
+                "value": srinput::effective(&s),
+                "available": srinput::ini_path(&s).is_some(),
+            },
             "modsDir": s.mods_dir,
             "modsDefault": paths::to_display(&paths::payload_dir().join("TextureLoader\\Mods")),
             "textureIni": paths::to_display(&paths::payload_dir().join("TextureLoader\\TextureLoader.ini")),
@@ -151,18 +156,36 @@ fn reapply(app: &AppHandle) -> String {
     install::apply(&game_exe, s.fps, &selected, &s, &cancel, |_| {}).error
 }
 
-/// DLSS 运行时的目标位置：OptiScaler 的**组件目录**（ini 里 `NvngxDlssPath = auto`
-/// 相对它解析，放版本根层在嵌套布局下找不到）。
-fn dlss_target(s: &settings::Settings) -> Option<PathBuf> {
-    pkg::dll_path_of("opti", s)
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .map(|dir| dir.join("nvngx_dlss.dll"))
+/// DLSS 运行时的落点：桥和 OptiScaler 各自按自己的规则找文件，所以不止一处。
+/// - 桥：`NgxBackend::resolve_feature_dirs()` 在 `<payload>/Bridge/../NVIDIA/DLSS` 里找
+///   `nvngx_dlss.dll` —— 只装桥（`Ffx12Backend=ngx`，或 RTX 上的 `auto`）时这条就是唯一来源；
+///   它同时也是「包内自带」的位置，所以排第一：先补齐它，后面的目标就能走「payload 里已有」。
+/// - OptiScaler：`NvngxDlssPath = auto` 相对**组件目录**解析（放版本根层在嵌套布局下找不到）。
+fn dlss_targets(s: &settings::Settings) -> Vec<PathBuf> {
+    let mut targets = vec![paths::payload_dir()
+        .join("NVIDIA")
+        .join("DLSS")
+        .join("nvngx_dlss.dll")];
+    if s.selected.iter().any(|id| id == "opti") {
+        // 2026-11-12：这里以前用版本目录（`dll_path_of(...).parent()`），而
+        // `prepare_opti` 写的 `Libraries.OptiDllPath` 是 `component_dir` —— 嵌套布局
+        // （0.10 起的 `OptiScaler_v0.10.0\OptiScaler\`）下两者差一层，放版本根层等于没放。
+        if let Some(version) = pkg::resolve("opti", s) {
+            let path = version.component_dir.join("nvngx_dlss.dll");
+            if !targets.iter().any(|t| t == &path) {
+                targets.push(path);
+            }
+        }
+    }
+    targets
 }
 
-/// 只有「勾了 OptiScaler + 判定为 RTX」才需要这份运行时；GTX 16 不部署 DLSS。
+/// 需要这份运行时的两种情况：勾了 OptiScaler（它自己的 DLSS 扩展），或只装桥但桥会走 NGX。
+/// GTX 16 / A 卡（没被判定成 RTX）不部署 DLSS。
 fn dlss_applicable(s: &settings::Settings) -> bool {
-    s.selected.iter().any(|id| id == "opti") && gpu::has_rtx()
+    gpu::has_rtx()
+        && (s.selected.iter().any(|id| id == "opti")
+            || s.selected.iter().any(|id| id == "bridge") && srinput::uses_ngx(s))
 }
 
 /// 补齐失败时**弹窗**（不再只是一条 toast）：把目标路径一起给界面，用户能直接打开目录手放。
@@ -178,39 +201,49 @@ fn report_dlss_error(app: &AppHandle, target: &Path, reason: &str) {
     );
 }
 
-/// RTX 卡 + 勾了 OptiScaler 时校验并补 `nvngx_dlss.dll`。
+/// 已存在即跳过、payload 有就同步复制、都没有才联网补；多个落点逐个处理（下载只下一次）。
 ///
-/// 四个时机共用这一个入口：**启动 / 保存 / 安装成功 / 切换 OptiScaler 版本**。
-/// 顺序：已有 → 跳过；payload 里有 → 同步复制；都没有 → 后台下载；下载失败 → 弹窗。
+/// 五个时机共用这一个入口：**启动 / 保存 / 安装成功 / 切换 OptiScaler 版本 / 改超分输入类型**。
 fn ensure_dlss(app: &AppHandle, s: &settings::Settings) {
     if !dlss_applicable(s) {
         return;
     }
-    let Some(target) = dlss_target(s) else {
-        return;
-    };
-    if target.is_file() {
+    let pending: Vec<PathBuf> = dlss_targets(s)
+        .into_iter()
+        .filter(|target| !target.is_file())
+        .collect();
+    if pending.is_empty() {
         return;
     }
-    if paths::payload_dir().join("NVIDIA").join("DLSS").join("nvngx_dlss.dll").is_file() {
-        match fetch::install_bundled(&target) {
-            Ok(()) => {
-                log::write(&format!(
+    let count = pending.len();
+
+    if paths::payload_dir()
+        .join("NVIDIA")
+        .join("DLSS")
+        .join("nvngx_dlss.dll")
+        .is_file()
+    {
+        for target in pending {
+            match fetch::install_bundled(&target) {
+                Ok(()) => log::write(&format!(
                     "[dlss] 已从 payload 补齐 nvngx_dlss.dll -> {}",
                     paths::to_display(&target)
-                ));
-                let message = if i18n::current() == "zh" {
-                    "已补齐 NVIDIA DLSS 组件（payload 里已有）".to_string()
-                } else {
-                    "NVIDIA DLSS runtime installed (bundled)".to_string()
-                };
-                send(
-                    app,
-                    json!({"type": "fetch", "id": "dlss", "status": "done", "message": message}),
-                );
+                )),
+                Err(err) => {
+                    report_dlss_error(app, &target, &format!("复制失败：{err}"));
+                    return;
+                }
             }
-            Err(err) => report_dlss_error(app, &target, &format!("复制失败：{err}")),
         }
+        let message = if i18n::current() == "zh" {
+            "已补齐 NVIDIA DLSS 组件（payload 里已有）".to_string()
+        } else {
+            "NVIDIA DLSS runtime installed (bundled)".to_string()
+        };
+        send(
+            app,
+            json!({"type": "fetch", "id": "dlss", "status": "done", "message": message}),
+        );
         return;
     }
 
@@ -224,21 +257,28 @@ fn ensure_dlss(app: &AppHandle, s: &settings::Settings) {
                 json!({"type": "fetch", "id": "dlss", "status": "working", "message": text}),
             );
         };
-        match fetch::fetch_dlss(&target, &report) {
-            Ok(source) => {
-                log::write(&format!("[dlss] 已补齐 nvngx_dlss.dll（{source}）"));
-                let message = if i18n::current() == "zh" {
-                    format!("已补齐 NVIDIA DLSS 组件（{source}）")
-                } else {
-                    format!("NVIDIA DLSS runtime installed ({source})")
-                };
-                send(
-                    &app_handle,
-                    json!({"type": "fetch", "id": "dlss", "status": "done", "message": message}),
-                );
+        let mut source = String::new();
+        for target in pending {
+            match fetch::fetch_dlss(&target, &report) {
+                Ok(from) => source = from,
+                Err(err) => {
+                    report_dlss_error(&app_handle, &target, &format!("下载失败：{err}"));
+                    return;
+                }
             }
-            Err(err) => report_dlss_error(&app_handle, &target, &format!("下载失败：{err}")),
         }
+        log::write(&format!(
+            "[dlss] 已补齐 nvngx_dlss.dll（{source}）到 {count} 个位置"
+        ));
+        let message = if i18n::current() == "zh" {
+            format!("已补齐 NVIDIA DLSS 组件（{source}）")
+        } else {
+            format!("NVIDIA DLSS runtime installed ({source})")
+        };
+        send(
+            &app_handle,
+            json!({"type": "fetch", "id": "dlss", "status": "done", "message": message}),
+        );
     });
 }
 
@@ -732,6 +772,25 @@ fn on_switch_version(app: &AppHandle, msg: &Value) {
     );
 }
 
+/// 主页「超分输入类型」：只改**已安装那份** `Dx11FsrBridge.ini` 的 `Ffx12Backend`。
+/// 规则跟随桥（只认精确小写的 auto / native / ngx），安装器不替它纠错；写成功后再补一次
+/// `nvngx_dlss.dll` —— 切到 ngx（或 RTX 上的 auto）时桥需要它，不能等下次安装。
+fn on_sr_input(app: &AppHandle, msg: &Value) {
+    let value = msg["value"].as_str().unwrap_or_default().to_string();
+    let s = snapshot(app);
+    match srinput::write(&s, &value) {
+        Ok(()) => {
+            log::write(&format!("[bridge] 超分输入类型 -> {value}"));
+            post_state(app);
+            ensure_dlss(app, &s);
+        }
+        Err(err) => {
+            log::write(&format!("[bridge] 写 Ffx12Backend 失败: {err}"));
+            send(app, json!({ "type": "error", "message": err }));
+        }
+    }
+}
+
 /// 解帧工具选项（fps_config.json 里除 GamePath/FPSTarget/DllList/UseHDR 之外的键）。
 fn on_unlocker_config(app: &AppHandle, msg: &Value) {
     let patch = msg.get("patch").cloned().unwrap_or_else(|| json!({}));
@@ -939,8 +998,9 @@ fn on_open_path(app: &AppHandle, what: &str) {
         "folder" => PathBuf::from(&s.game_dir),
         "log" => paths::log_file(),
         "payload" => paths::payload_dir(),
-        "opti" => dlss_target(&s)
-            .and_then(|p| p.parent().map(Path::to_path_buf))
+        "opti" => pkg::dll_path_of("opti", &s)
+            .parent()
+            .map(Path::to_path_buf)
             .unwrap_or_else(|| paths::payload_dir()),
         "config" => paths::config_dir(),
         _ => return,
@@ -1178,6 +1238,7 @@ fn bridge(window: WebviewWindow, app: AppHandle, msg: Value) {
         "openPath" => on_open_path(&app, msg["what"].as_str().unwrap_or_default()),
         "switchVersion" => on_switch_version(&app, &msg),
         "unlockerConfig" => on_unlocker_config(&app, &msg),
+        "srInput" => on_sr_input(&app, &msg),
         "modsDir" => on_mods_dir(&app, msg["dir"].as_str().map(str::to_string)),
         "pickMods" => {
             if let Some(dir) = gamepath::pick_folder() {

@@ -105,7 +105,9 @@ GenshinFSRBridge\
 
 - 后端只改被点的键（白名单：`AutoStart` `AutoClose` `StartMinimized` `UsePowerSave` `PopupWindow`
   `Fullscreen` `IsExclusiveFullscreen` `CustomResX` `CustomResY` `UseMobileUI` `SuspendLoad`
-  `MonitorNum` `Priority`），其余键（含 `GamePath`、`DllList` 与上游预留字段）原样保留。
+  `MonitorNum` `Priority` `FpsClamp`），其余键（含 `GamePath`、`DllList` 与上游预留字段）原样保留。
+- `FpsClamp`（界面名「高帧防检测」）：解帧工具自己读的开关，管的是「客户端看到的帧率被夹到 60/45/30、
+  实际帧率不变」，与桥无关；默认开。解帧工具正在运行时改它会被它在退出时覆盖，所以后端拒绝写入并提示先关闭。
 - 互斥关系与上游一致：开无边框就关全屏，开全屏就关无边框，独占全屏只在全屏开启时可用。
 - `UseHDR` 是只读的——它等于注入链里有没有 `ReShade64.dll`。
 - 没有 `fps_config.json`（还没完成过一次安装）时整卡置灰。
@@ -253,12 +255,41 @@ Windows 的 `curl.exe` 并不保证存在（本机 `System32` 里就没有）。
 - 芙芙启动器（FuFuLauncher）：插件已上架插件商城，在商城装「FSR-Bridge-Plugin（原神FSR2桥接插件）」后用芙芙启动即可，不需要填路径。
 - `state` 字段：`desktopShortcut` / `unlockerDir` / `shortcutName`。
 
-## NVIDIA DLSS 运行时（RTX 显卡 + OptiScaler）
+## 超分输入类型（Ffx12Backend）
 
-- **触发条件**：勾了 `OptiScaler` 且检测到 RTX 架构 N 卡（`gpu::has_rtx()`：设备 ID 属 RTX 世代且不是 GTX 16，或型号名含 `RTX`）。GTX 16 只吃 FSR4 INT8，不部署 DLSS。
-- **放在哪**：`nvngx_dlss.dll` 写进 OptiScaler 的**组件目录**（嵌套布局下是 `OptiScaler_v0.10.0\OptiScaler\`），因为 ini 的 `NvngxDlssPath = auto` 相对 `OptiDllPath` 解析，放根层 N 卡上会找不到 DLSS。同目录带一份 `nvngx_dlss.license.txt`。
-- **从哪来**：先看 `payload\NVIDIA\DLSS\` 里有没有现成的；没有就从 NVIDIA 官方 `NVIDIA-RTX/Streamline` 最新 release 的 `streamline-sdk-v*.zip` 取，挑 `bin\x64\nvngx_dlss.dll` 生产版（跳过 `development` 目录）。下载复用系统代理 + 加速线路 + 测速。
-- **时机**：安装/保存写入链之后、切换 OptiScaler 版本之后，后台线程跑，不挡界面；结果写 `installer.log`（`[dlss] …`），失败只提示不阻断安装。
+主页「帧率上限」与「安装内容」之间的一行，镜像已安装那份 `payload\Bridge\Dx11FsrBridge.ini` 的
+`[Dx11FsrBridge] Ffx12Backend`，改完立刻写盘（消息 `srInput`，只收 `auto` / `native` / `ngx`）。
+
+- **界面名 → 写入值**：`Auto` → `auto`、`FFX` → `native`、`NVNGX` → `ngx`。
+  界面上不出现 `native` 这个词：它选的是「超分输入接口由谁提供」，不是选超分算法。
+- **规则跟随桥**：文件里没有该键、或值不是这三个之一，一律按 `auto` 显示（桥对非法值也是回退 `native`，
+  所以界面显示 `FFX` 而文件里是脏值这种组合不会出现）。
+- **何时用到 NVNGX**：`ngx` ⇒ 一定；`auto` ⇒ 本机是 RTX 时；其余 ⇒ 不会。DLSS 运行时补齐按这个判据决定
+  （见下一节）。
+- **桥没装时置灰**：找不到 `Dx11FsrBridge.ini`（`srInput.available = false`）就禁用这一行。
+- 备注文案写在行内（`.srnote`）：说明这是超分输入接口、不是超分选择。
+
+## NVIDIA DLSS 运行时（RTX 显卡）
+
+- **触发条件**：检测到 RTX 架构 N 卡（`gpu::has_rtx()`：设备 ID 属 RTX 世代且不是 GTX 16，或型号名含 `RTX`）
+  时，只要满足下面任一条就补齐：
+  - 勾了 `OptiScaler`（它的 NGX 需要 `nvngx_dlss.dll`）；
+  - 勾了 `Dx11FsrBridge` 且「超分输入类型」实际会走 NVNGX（`srinput::uses_ngx()`：`NVNGX`，或 `Auto` 且本机是 RTX）。
+
+  只装桥的用户因此也能拿到运行时 —— 以前只在勾 OptiScaler 时才下载，`auto` 在 RTX 上选了 `ngx` 却没有
+  `nvngx_dlss.dll`，表现成「没有超分」。
+- **放在哪**（两个目标，缺哪个补哪个）：
+  - `payload\NVIDIA\DLSS\nvngx_dlss.dll`：桥的 `NgxBackend::resolve_feature_dirs()` 会在
+    `payload\Bridge\..\NVIDIA\DLSS` 下找它，也是「随包内置」的位置，所以排第一；
+  - OptiScaler 的**组件目录**（嵌套布局下是 `OptiScaler_v0.10.0\OptiScaler\`）：ini 的
+    `NvngxDlssPath = auto` 相对 `OptiDllPath` 解析，放根层 N 卡上会找不到 DLSS。
+
+  每个目标同目录带一份 `nvngx_dlss.license.txt`。
+- **从哪来**：先看 `payload\NVIDIA\DLSS\` 里有没有现成的；有就只拷不下载（两个目标只下一次网），
+  没有才从 NVIDIA 官方 `NVIDIA-RTX/Streamline` 最新 release 的 `streamline-sdk-v*.zip` 取，
+  挑 `bin\x64\nvngx_dlss.dll` 生产版（跳过 `development` 目录）。下载复用系统代理 + 加速线路 + 测速。
+- **时机**：安装/保存写入链之后、切换组件版本之后、切换「超分输入类型」之后，后台线程跑，不挡界面；
+  结果写 `installer.log`（`[dlss] …`），失败只提示不阻断安装。
 - 自测：`GFSR_TEST_DLSS=1 cargo test --bins dlss_probe -- --nocapture`（会真的下 ~257 MB 的 Streamline 包）。
 
 ## 初始勾选与显卡兼容性提示
