@@ -1760,6 +1760,25 @@ static NVSDK_NGX_PerfQuality_Value quality_from_ratio(std::uint32_t render_w, st
     return NVSDK_NGX_PerfQuality_Value_DLAA;
 }
 
+// 2026-11-13（0.8~0.999 渲染精度超分失效）：UltraQuality 兜底成 MaxQuality。
+// 为什么：DLSS 的 UltraQuality 对应固定 ratio ≈ 1.30，而 quality_from_ratio 把整个
+//   1.0~1.3 区间都映射到它。实测 0.8 / 0.9 / 0.999 三个精度（ratio 1.25 / 1.11 / 1.0016）
+//   全部 CreateFeature 失败，rc=0xBAD00010 = NVSDK_NGX_Result_FAIL_UnsupportedParameter
+//   （nvsdk_ngx_defs.h:169）—— NGX 认为「声明的档位」与「实际分辨率」不符。
+//   0.7（ratio 1.43）落 MaxQuality，故不受影响，与日志完全吻合。
+// 依据：上游 OptiScaler 同样在 CreateFeature 前做这一转换
+//   （upscalers/dlss/DLSSFeature.cpp:254-259，PerfQualityValue == UltraQuality 无条件改 MaxQuality）。
+//   旁证：芙芙启动器 + OptiScaler 环境下 0.8 精度实测 create_feature ok=1。
+// 注意：只做这一档转换，不动 quality_from_ratio 的六档语义（其它调用点按原档位工作）。
+//   MaxQuality 容差更宽，能接受 1.0~1.5 之间的任意 ratio，是「宁可慢一点也别失败」的取舍。
+// ★ 本函数必须同时用于 Set() 与 diag_check_create_params 的回读校验，否则对账会误报 set_mismatch。
+static NVSDK_NGX_PerfQuality_Value perf_quality_for_create(NVSDK_NGX_PerfQuality_Value q)
+{
+    if (q == NVSDK_NGX_PerfQuality_Value_UltraQuality)
+        return NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    return q;
+}
+
 // 3.8.3：v1 六档全设同一值（等价于 OptiScaler 的 RenderPresetForAll）。
 // v <= 0 直接 return，六个键一个都不设 —— 语义是「交给 NGX」，不是「默认预设」。
 static void apply_render_preset(int v)
@@ -1836,8 +1855,10 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     g_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,  inst.rw);
     g_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, inst.rh);
     // 4. PerfQualityValue
+    // ★ 经 perf_quality_for_create 兜底：UltraQuality 改 MaxQuality，否则 0.8~0.999 精度
+    //   CreateFeature 报 0xBAD00010（UnsupportedParameter）。详见该函数的注释。
     g_params->Set(NVSDK_NGX_Parameter_PerfQualityValue,
-                  quality_from_ratio(inst.rw, inst.dw));   // 两参：先 render 后 display
+                  perf_quality_for_create(quality_from_ratio(inst.rw, inst.dw)));   // 两参：先 render 后 display
     // 5. Create.Flags（3.8.2）
     // ★ T-8：同一份求值结果既用于 Set()、也用于日志与快照（见 CreateFlagsEval 的注释）。
     const CreateFlagsEval flag_eval = build_create_flags(inst.color_fmt);
@@ -2668,9 +2689,10 @@ static void diag_check_create_params(const NgxInstance &inst)
         ow != inst.dw)           { mismatch("OutWidth");  return; }
     if (g_params->Get(NVSDK_NGX_Parameter_OutHeight, &oh) != NVSDK_NGX_Result_Success ||
         oh != inst.dh)           { mismatch("OutHeight"); return; }
-    // PerfQualityValue 是 CreateFeature 时按 (rw, dw) 档位写进去的（§3.8.3 六档）。
+    // PerfQualityValue 是 CreateFeature 时按 (rw, dw) 档位写进去的（§3.8.3 六档），
+    // 并经过 perf_quality_for_create 兜底 —— 期望值必须同样走这条链，否则误报 set_mismatch。
     if (g_params->Get(NVSDK_NGX_Parameter_PerfQualityValue, &pq) != NVSDK_NGX_Result_Success ||
-        pq != static_cast<int>(quality_from_ratio(inst.rw, inst.dw)))
+        pq != static_cast<int>(perf_quality_for_create(quality_from_ratio(inst.rw, inst.dw))))
     {
         mismatch("PerfQualityValue");
         return;
