@@ -17,7 +17,7 @@
   <img src="assets/readme/hero.svg" alt="原神原生 FSR2 调用经 Dx11FsrBridge 转接到 AMD FFX12 SDK，输出 FSR4 / FSR3 / FSR2" width="100%">
 </div>
 
-面向原神 Windows DX11 客户端的图形插件。它独立 hook 游戏原生 FSR2 调用，并转接到 AMD FFX12 官方 SDK 实现超分：在支持的显卡上直接提供 FSR4/FSR3/FSR2，不依赖 OptiScaler 等外部插件；接入 OptiScaler 后可以进一步扩展 DLSS/XeSS/FSR4 INT8 等超分类型。
+面向原神 Windows DX11 客户端的图形插件。它独立 hook 游戏原生 FSR2 调用，并转接到 AMD FFX12 官方 SDK 实现超分：在支持的显卡上直接提供 FSR4/FSR3/FSR2，不依赖 OptiScaler 等外部插件；NVIDIA 显卡上还可以切到内置 NGX 后端直接输出 DLSS（同样不需要 OptiScaler），接入 OptiScaler 后可以进一步扩展 XeSS/FSR4 INT8 等超分类型。
 
 本仓库同时包含 `AntiPlayerMosaic/` 与 `TextureLoader/` 两个子项目：前者是独立构建的原神马赛克修复与 UID 隐藏插件；后者是 3DMigoto 兼容的纹理替换 / Mod 加载器（支持 DDS 与 DirectStorage GPU 解压的 GDDS）。用法分别见对应目录的 README 与 NOTICE。
 
@@ -83,7 +83,7 @@
 
 包由构建脚本直接组装，安装器默认就是 `Installer/` 里的图形安装器（详见 `Installer/README.md`）；旧的 PowerShell 安装脚本（`tools/FpsUnlockInstaller/`）已不参与发布包，源码暂时保留，需要时可加 `-ScriptInstaller` 打一个旧流程的包。反馈与组件清单位于 `assets/FpsUnlockPackage/`，运行资源和默认配置位于 `SharedResources/`。包根 `README.md` 就是本文件，`assets/readme/` 里的演示图会一起带上。
 
-GitHub 发布包不会内置 ReShade 二进制与 NVIDIA DLSS 运行时：勾了 ReShade 才从 reshade.me 取；勾了 OptiScaler 且检测到 RTX 显卡时，从 NVIDIA 官方 Streamline 取 `nvngx_dlss.dll` 放进 OptiScaler 的组件目录（GTX 16 只吃 FSR4 INT8，不部署 DLSS）。本地分发包里哪些组件需要自行补齐，按包内实际内容处理。
+GitHub 发布包不会内置 ReShade 二进制与 NVIDIA DLSS 运行时：勾了 ReShade 才从 reshade.me 取；RTX 显卡上勾了 Dx11FsrBridge（超分输入类型为 Auto 或 NVNGX）或者勾了 OptiScaler 时，从 NVIDIA 官方 Streamline 取 `nvngx_dlss.dll` —— 前者放进 `payload\NVIDIA\DLSS\`（Bridge 的 NGX 后端从这里读），后者另外再放一份到 OptiScaler 的组件目录（GTX 16 只吃 FSR4 INT8，不部署 DLSS）。本地分发包里哪些组件需要自行补齐，按包内实际内容处理。
 
 要生成 GitHub 发布包，请在 Windows 上运行：
 
@@ -128,13 +128,58 @@ flowchart LR
 
 | 组件 | AMD | NVIDIA | Intel |
 | --- | --- | --- | --- |
-| FSR Bridge（FSR4/FSR3/FSR2） | ✅ | ✅（含 DLSS/XeSS/FSR4 INT8） | ✅（XeSS） |
+| FSR Bridge（FSR4/FSR3/FSR2） | ✅ | ✅ | ✅（XeSS） |
+| FSR Bridge 内置 DLSS（NGX 后端） | ❌ 不适用 | ✅ RTX 20 系及以上（GTX 16 / MX 不支持） | ❌ 不适用 |
 | OptiScaler（DLSS/XeSS/FSR4 INT8） | ✅ | ✅ | ✅ |
 | 反虚化 / 隐藏 UID、ReShade + RenoDX | ✅ | ✅ | ✅ |
 | **OptiScaler + ReShade 同时启用** | ✅ | ⚠️ **可能不稳定** | ✅ |
 | **TextureLoader（纹理/Mod 加载器）** | ✅ 支持 | ⚠️ **不推荐（可能加载丢失，可手动开启）** | ⚠️ 未验证 |
 
 <sub>✅ 支持 · ⚠️ 有前提或不推荐</sub>
+
+### N 卡不接 OptiScaler 也能开 DLSS（NGX 后端）
+
+Bridge 内置了一个 **NVIDIA NGX 后端**：在 N 卡上直接把游戏原生的 FSR2 调用转成 **DLSS**，**不需要 OptiScaler**。走哪条后端由 `payload\Bridge\Dx11FsrBridge.ini` 的 `[Dx11FsrBridge] Ffx12Backend` 决定 —— 安装器主页的「超分输入类型」就是它的图形入口：
+
+| 安装器选项 | 写入值 | 含义 |
+| --- | --- | --- |
+| **Auto**（默认） | `auto` | 按显卡型号自动落位：RTX 走 NGX（DLSS），其余走 FFX（FSR4/FSR3/FSR2） |
+| **FFX** | `native` | 强制走自带的 FFX12 SDK，只出 FSR4/FSR3/FSR2 |
+| **NVNGX** | `ngx` | 强制走 NVIDIA NGX，只出 DLSS；非 N 卡 / 非 RTX 会失败并回退游戏原版 FSR2 |
+
+> [!NOTE]
+> 这是**超分输入接口**（把游戏的超分调用接到哪条后端），**不是**超分档位或超分类型的选择。
+
+`auto` 的判定在 `Dx11FsrBridge/GpuBackendPick.h`：厂商必须是 NVIDIA（`0x10DE`）；适配器描述含 `GTX` / `MX` 判否（这两条产品线没有 Tensor 核心，GTX 16 系也不行）；含 `RTX` 判是；描述被 OEM 改写认不出关键字时按 device id 兜底，只认 Ampere / Ada / Blackwell —— Turing 段与 GTX 16 系同段、无法区分，保守判否。判错不会坏：真跑不起来时逐帧 fail-open 回退游戏原生 FSR2。
+
+**开 DLSS 的三个前提（缺一不可）**：
+
+1. **NVIDIA RTX 显卡** + 正常安装的显卡驱动。`_nvngx.dll` 由驱动提供，Bridge 从注册表 `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore` 找到它（来源也可用 `NgxProvider` 指定：`nvidia` / `external` / `auto`）。
+2. **DLSS 运行时 `nvngx_dlss.dll` 必须存在**（仓库与发布包都**不内置**它）。放进下面任一位置即可，Bridge 按此顺序自动探测（判据是**目录里确实有 `nvngx_dlss.dll`**，不是目录存在）：
+   1. `payload\Bridge\`（`Dx11FsrBridge.dll` 同目录）
+   2. `payload\NVIDIA\DLSS\` ← **安装器的放置位置**
+   3. `payload\OptiScaler\Optiscaler\`（OptiScaler 自带的那份）
+
+   也可以用 `payload\Bridge\Dx11FsrBridge.ini` 的 `NgxFeatureDirs` 写死目录（分号分隔，写了就不再自动探测）。
+3. 有**可写**的 NGX 工作目录：默认 `payload\Bridge\ngx\`，不可写时回落到 `%LOCALAPPDATA%\GenshinFsrBridge\ngx\`；实际路径见日志 `ngx_core appdata=…`。
+
+**怎么拿到 `nvngx_dlss.dll`**：在安装器里勾选 **Dx11FsrBridge**，显卡是 RTX 且超分输入类型为 Auto / NVNGX 时，安装器会自动从 NVIDIA 官方 Streamline 取一份放到 `payload\NVIDIA\DLSS\`（勾了 OptiScaler 时同一份还会再放进 OptiScaler 的组件目录）。也可以自己下载 DLSS 运行时（`nvngx_dlss.dll`，例如从 NVIDIA Streamline 包里取）后**导入**到上面任一目录 —— 手动导入与自动下载完全等价。
+
+**验收判据**（`payload\Bridge\Dx11FsrBridge.log`，默认日志等级下即可见）：
+
+```text
+ngx_core backend=ngx auto=ngx vendor=0x10DE gpu="NVIDIA GeForce RTX 4070 SUPER"
+ngx_core provider resolved=nvidia_registry module=...\_nvngx.dll
+ngx_core init ok=1 available=1 rc=0x1
+ngx_core create_feature ok=1 preset=0 rc=0x1
+```
+
+游戏内应能看到 NVIDIA 的 DLSS 调试叠加层（形如 `DLSS V310.9.16 (default) DX11 chain d3d`）。叠加层消失、日志停在 `create_feature ok=0 rc=…`，说明这次会话的 NGX 没建起来。
+
+**参数语义**：通用段的键（`TransparentJitter`、`Ffx12DepthInverted`、`Ffx12JitterMode`、`Ffx12JitterDelay`、`Fsr2MotionVectorsJittered`）两条后端都生效；FFX 专用段的键（`Ffx12NonLinear`、`Ffx12Hdr`、`Ffx12FovScale`、`Ffx12CameraNear` 等）**只对 FFX 生效**，NGX 走自己的 `Ngx*` 段（`NgxHdr`、`NgxRenderPreset`、`NgxCrossKeyReuse`、`NgxLogLevel` 等）。
+
+> [!WARNING]
+> **已知问题**：把游戏渲染精度调到最高档 `0.999` 时，部分机器上 NGX 建 feature 会失败（`ngx_core create_feature ok=0 rc=0xBAD00010`，即 `UnsupportedParameter`），且**本次游戏会话内不会重试** —— 表现为 DLSS 调试叠加层消失、超分回到游戏原版 FSR2，必须重启游戏。渲染精度用 `0.9` 及以下可以避开。
 
 ### N 卡上 OptiScaler 与 ReShade 同时启用可能不稳定
 
@@ -147,7 +192,7 @@ flowchart LR
 
 - **先单独排查**：暂时只启用其中一个，确认问题是否消失；
 - 到 [OptiScaler 官方仓库](https://github.com/optiscaler/OptiScaler) 或本项目 [Issues](https://github.com/AizawaHikaru233/genshin_fsr_brigde/issues) 反馈，并附上游戏目录下的 `OptiScaler.log` 与 `ReShade.log`；
-- 若仍不稳定，建议**二者只保留一个**：FSR Bridge 自身的 FSR4/FSR3/FSR2 不依赖它们——需要 DLSS/XeSS/FSR4 INT8 时启用 OptiScaler，需要 HDR 时启用 ReShade。
+- 若仍不稳定，建议**二者只保留一个**：FSR Bridge 自身的 FSR4/FSR3/FSR2 与 N 卡上的 DLSS 都不依赖它们——需要 XeSS / FSR4 INT8 时启用 OptiScaler，需要 HDR 时启用 ReShade。
 
 ### TextureLoader 在 N 卡上不推荐（可能丢失贴图 Mod）
 
@@ -221,7 +266,10 @@ flowchart LR
    `payload\FpsUnlocker\fps_config.json` 的注入链（`DllList`），游戏目录里不会多出 DLL。
 
    - **只需替换超分模型** → 至少勾 **Dx11FsrBridge**（必装，默认已勾）
-   - **需要 DLSS 或 XeSS** → 再勾 **OptiScaler**
+   - **需要 DLSS（N 卡）** → 只勾 **Dx11FsrBridge** 就够：超分输入类型保持 **Auto**（或选 **NVNGX**），
+     安装器会顺带把 `nvngx_dlss.dll` 补到 `payload\NVIDIA\DLSS\`；说明见
+     「[N 卡不接 OptiScaler 也能开 DLSS](#n-卡不接-optiscaler-也能开-dlssngx-后端)」
+   - **需要 XeSS（或非 N 卡想用 DLSS 接口）** → 再勾 **OptiScaler**
    - **需要 HDR 增强** → 勾 **ReShade + RenoDX**（N 卡同时开 OptiScaler 会提示兼容性风险）
 
 5. 点「启动游戏」。安装器会在 `payload\FpsUnlocker\` 原地拉起解帧工具，由它注入并启动游戏。
@@ -246,7 +294,9 @@ GitHub 发布包内置 FPS Unlocker 与 OptiScaler；缺组件时安装器会在
 3. 安装组件：
 
    - **只需替换超分模型** → 至少安装 **Bridge**
-   - **需要 DLSS 或 XeSS** → 还需安装 **OptiScaler**
+   - **需要 DLSS（N 卡）** → 仍然只需 **Bridge**，但**必须**自备 `nvngx_dlss.dll`，放进
+     `payload\Bridge\`、`payload\NVIDIA\DLSS\` 或 `payload\OptiScaler\Optiscaler\`（发布包不内置它）
+   - **需要 XeSS（或非 N 卡想用 DLSS 接口）** → 还需安装 **OptiScaler**
 
 **注入顺序**：**Bridge 必须先于 OptiScaler**；其他插件没有严格要求。
 
@@ -276,8 +326,9 @@ GitHub 发布包内置 FPS Unlocker 与 OptiScaler；缺组件时安装器会在
 ### 组件说明与路径
 
 `Dx11FsrBridge.dll` 独立 hook 原神的 FSR2 调用并转接到 AMD FFX12 SDK，在支持的显卡上直接实现
-FSR4/FSR3/FSR2 超分，**无需 OptiScaler 等外部插件**。可选接入
-[OptiScaler](https://github.com/optiscaler/OptiScaler) 扩展超分类型（DLSS、XeSS、FSR4 INT8 等）。
+FSR4/FSR3/FSR2 超分，**无需 OptiScaler 等外部插件**；RTX 显卡上还可以切到内置 NGX 后端直接输出
+**DLSS**（同样不需要 OptiScaler，但需要 `nvngx_dlss.dll`，见上文）。可选接入
+[OptiScaler](https://github.com/optiscaler/OptiScaler) 扩展超分类型（XeSS、FSR4 INT8 等；非 N 卡也可借它提供 DLSS 接口）。
 安装包已按默认顺序配置好组件加载，通常无需手动指定；`AntiPlayerMosaic.dll` 为可选的反虚化 / UID 隐藏插件。
 
 接入 OptiScaler 与 ReShade 后，它们的运行配置位于各自组件目录。OptiScaler 的 DLL 与日志路径、
@@ -314,14 +365,17 @@ Bridge 和反虚化组件默认会保留错误日志（接入 OptiScaler/ReShade
 | # | 文件 / 信息 | 适用场景 |
 | :---: | --- | --- |
 | 1 | `payload/Bridge/Dx11FsrBridge.log` | **必须** |
-| 2 | `payload/OptiScaler/OptiScaler.log` 与 `payload/OptiScaler/OptiScaler.ini` | 使用 OptiScaler 时 |
-| 3 | `payload/ReShade/ReShade.log` | 涉及 ReShade 时 |
-| 4 | `payload/AntiPlayerMosaic/AntiPlayerMosaic.log` | 涉及反虚化、UID 或水下马赛克时 |
-| 5 | `payload/TextureLoader/TextureLoader.log` | 涉及纹理替换 / Mod 加载时 |
-| 6 | 芙芙插件目录下的 `FSR-Bridge-Plugin.log` | 使用芙芙启动器插件时 |
-| 7 | 显卡型号、游戏版本、异常发生阶段和所选超分模式 | — |
+| 2 | `payload/Bridge/ngx/nvngx.log` 与同目录的 `nvngx_dlss_*.log` | 使用内置 DLSS（NGX 后端）时；目录以日志里 `ngx_core appdata=` 那行为准 |
+| 3 | `payload/OptiScaler/OptiScaler.log` 与 `payload/OptiScaler/OptiScaler.ini` | 使用 OptiScaler 时 |
+| 4 | `payload/ReShade/ReShade.log` | 涉及 ReShade 时 |
+| 5 | `payload/AntiPlayerMosaic/AntiPlayerMosaic.log` | 涉及反虚化、UID 或水下马赛克时 |
+| 6 | `payload/TextureLoader/TextureLoader.log` | 涉及纹理替换 / Mod 加载时 |
+| 7 | 芙芙插件目录下的 `FSR-Bridge-Plugin.log` | 使用芙芙启动器插件时 |
+| 8 | 显卡型号、游戏版本、异常发生阶段和所选超分模式 | — |
 
 需要进一步排查时，可临时将 `OptiScaler.ini`（接入 OptiScaler 时）中 `Log` 下的 `LogLevel` 改为 `1（Debug）`或 `0（Trace）`，但诊断结束后应恢复正式配置以避免额外开销。
+
+排查内置 DLSS 时，可把 `payload\Bridge\Dx11FsrBridge.ini` 的 `[Dx11FsrBridge] NgxLogLevel` 从默认 `1` 调到 `2`（info）或 `3`（debug）；默认 `1` 只记录错误级的取证行（`ngx_core …` 与 NGX 自己的返回码）。
 
 > [!CAUTION]
 > 不要把游戏账号、登录信息或包含个人信息的截图提交到公开 Issue。
@@ -332,7 +386,7 @@ Bridge 和反虚化组件默认会保留错误日志（接入 OptiScaler/ReShade
 - NVIDIA NGX（DLSS）头文件同样仅作为构建依赖（编译可选的 DLSS 后端），来源、固定版本与 SHA-256 见 `Dx11FsrBridge/third_party/ngx/NOTICE.md`。它按 NVIDIA RTX SDKs License 授权，**不由 GPL-3.0-or-later 覆盖**；许可原文随该目录与发布包内 `payload/Bridge/NVIDIA-NGX-SDK-LICENSE.txt` 一并提供。
 - OptiScaler 是独立项目：<https://github.com/optiscaler/OptiScaler>。
 - 本地分发包需要自行补齐相应组件，并遵守各组件授权要求。
-- 本项目不包含 NVIDIA DLSS 与 AMD FSR SDK 运行时二进制（`_nvngx.dll` 由显卡驱动提供，`nvngx_dlss.dll` 由安装器在用户机器上获取）。
+- 本项目不包含 NVIDIA DLSS 与 AMD FSR SDK 运行时二进制（`_nvngx.dll` 由显卡驱动提供，`nvngx_dlss.dll` 由安装器在用户机器上获取，也可自行下载后放进上文列出的目录）。
 
 ## 许可证
 

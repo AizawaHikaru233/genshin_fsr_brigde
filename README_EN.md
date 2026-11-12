@@ -17,7 +17,7 @@
   <img src="assets/readme/hero-en.svg" alt="Genshin native FSR2 calls bridged by Dx11FsrBridge to the AMD FFX12 SDK, producing FSR4 / FSR3 / FSR2" width="100%">
 </div>
 
-A graphics plugin for the Genshin Impact Windows DX11 client. It independently hooks the game's native FSR2 calls and forwards them to the AMD FFX12 official SDK for upscaling: FSR4/FSR3/FSR2 are provided directly on supported GPUs without any external plugin such as OptiScaler. OptiScaler can additionally be connected to extend the upscaler types (DLSS, XeSS, FSR4 INT8, etc.).
+A graphics plugin for the Genshin Impact Windows DX11 client. It independently hooks the game's native FSR2 calls and forwards them to the AMD FFX12 official SDK for upscaling: FSR4/FSR3/FSR2 are provided directly on supported GPUs without any external plugin such as OptiScaler. On NVIDIA GPUs it can also switch to the built-in NGX backend and output DLSS directly (also without OptiScaler); OptiScaler can additionally be connected to extend the upscaler types (XeSS, FSR4 INT8, etc.).
 
 This repository also includes the `AntiPlayerMosaic/` and `TextureLoader/` subprojects: the former is an independently built plugin for fixing Genshin Impact's mosaic effects and hiding the UID; the latter is a 3DMigoto-compatible texture replacement / Mod loader (DDS replacement plus GDDS DirectStorage GPU decompression). See the README and NOTICE in each directory for details.
 
@@ -85,7 +85,7 @@ For the Chinese documentation, see [README.md](README.md).
 
 ## Release Packages
 
-Packages are assembled directly by the build script, and the default installer is the graphical installer in `Installer/` (details in `Installer/README.md`). The old PowerShell installer scripts (`tools/FpsUnlockInstaller/`) are no longer part of the release package; the source is kept for now, and `-ScriptInstaller` still produces a legacy-flow package. Package feedback and component metadata live in `assets/FpsUnlockPackage/`, and runtime resources and default configuration live in `SharedResources/`. The package-root `README.md` is this file, and the demo images in `assets/readme/` are shipped with it. GitHub release packages do not bundle the NVIDIA DLSS runtime or ReShade binaries: ReShade is fetched from reshade.me only when it is ticked, and with OptiScaler ticked on an RTX card the installer fetches `nvngx_dlss.dll` from NVIDIA Streamline and places it in the OptiScaler component directory (GTX 16 only gets FSR4 INT8, DLSS is not deployed). Local distributions must complete those components on their own.
+Packages are assembled directly by the build script, and the default installer is the graphical installer in `Installer/` (details in `Installer/README.md`). The old PowerShell installer scripts (`tools/FpsUnlockInstaller/`) are no longer part of the release package; the source is kept for now, and `-ScriptInstaller` still produces a legacy-flow package. Package feedback and component metadata live in `assets/FpsUnlockPackage/`, and runtime resources and default configuration live in `SharedResources/`. The package-root `README.md` is this file, and the demo images in `assets/readme/` are shipped with it. GitHub release packages do not bundle the NVIDIA DLSS runtime or ReShade binaries: ReShade is fetched from reshade.me only when it is ticked; on an RTX card the installer fetches `nvngx_dlss.dll` from NVIDIA Streamline when **Dx11FsrBridge** is ticked (super-resolution input Auto or NVNGX) **or** OptiScaler is ticked — the former lands in `payload\NVIDIA\DLSS\` (where the bridge's NGX backend reads it), and with OptiScaler ticked the same file is also copied into the OptiScaler component directory (GTX 16 only gets FSR4 INT8, DLSS is not deployed). Local distributions must complete those components on their own.
 
 To generate the GitHub release package, run the following command on Windows:
 
@@ -130,13 +130,58 @@ flowchart LR
 
 | Component | AMD | NVIDIA | Intel |
 | --- | --- | --- | --- |
-| FSR Bridge (FSR4/FSR3/FSR2) | ✅ | ✅ (incl. DLSS/XeSS/FSR4 INT8) | ✅ (XeSS) |
+| FSR Bridge (FSR4/FSR3/FSR2) | ✅ | ✅ | ✅ (XeSS) |
+| FSR Bridge built-in DLSS (NGX backend) | ❌ N/A | ✅ RTX 20 series and newer (GTX 16 / MX unsupported) | ❌ N/A |
 | OptiScaler (DLSS/XeSS/FSR4 INT8) | ✅ | ✅ | ✅ |
 | Anti-Mosaic / Hide UID, ReShade + RenoDX | ✅ | ✅ | ✅ |
 | **OptiScaler + ReShade enabled together** | ✅ | ⚠️ **May be unstable** | ✅ |
 | **TextureLoader (texture/Mod loader)** | ✅ Supported | ⚠️ **Not recommended (texture mods may fail to load; can be enabled manually)** | ⚠️ Untested |
 
 <sub>✅ Supported · ⚠️ Conditional or not recommended</sub>
+
+### DLSS on NVIDIA without OptiScaler (NGX backend)
+
+The bridge ships a **NVIDIA NGX backend**: on an NVIDIA card it turns the game's native FSR2 calls into **DLSS** directly, **without OptiScaler**. Which backend runs is decided by `Ffx12Backend` in `payload\Bridge\Dx11FsrBridge.ini` (section `[Dx11FsrBridge]`) — the installer's **Super resolution input** row is its graphical entry point:
+
+| Installer option | Value written | Meaning |
+| --- | --- | --- |
+| **Auto** (default) | `auto` | Picked by GPU model: RTX goes NGX (DLSS), everything else goes FFX (FSR4/FSR3/FSR2) |
+| **FFX** | `native` | Force the bundled FFX12 SDK: FSR4/FSR3/FSR2 only |
+| **NVNGX** | `ngx` | Force NVIDIA NGX: DLSS only; a non-NVIDIA / non-RTX card fails and falls back to the game's own FSR2 |
+
+> [!NOTE]
+> This is the **super-resolution input interface** (which backend the game's upscaling call is wired to), **not** an upscaling-quality or upscaling-type choice.
+
+`auto` is decided in `Dx11FsrBridge/GpuBackendPick.h`: the vendor must be NVIDIA (`0x10DE`); an adapter description containing `GTX` or `MX` is rejected (neither product line has Tensor cores, GTX 16 included); `RTX` is accepted; when an OEM rewrote the description beyond recognition it falls back to the device id and only accepts Ampere / Ada / Blackwell — the Turing range overlaps GTX 16 and cannot be told apart, so it conservatively says no. A wrong guess is harmless: when it cannot actually run, every frame fails open back to the game's native FSR2.
+
+**Three prerequisites for DLSS (all required)**:
+
+1. **An NVIDIA RTX card** with a properly installed driver. `_nvngx.dll` comes from the driver and the bridge locates it through the registry key `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore` (the source can also be pinned with `NgxProvider`: `nvidia` / `external` / `auto`).
+2. **The DLSS runtime `nvngx_dlss.dll` must be present** (neither the repository nor the release package bundles it). Put it in any of the following; the bridge probes them in this order (the test is **the directory really contains `nvngx_dlss.dll`**, not that the directory exists):
+   1. `payload\Bridge\` (next to `Dx11FsrBridge.dll`)
+   2. `payload\NVIDIA\DLSS\` — **where the installer puts it**
+   3. `payload\OptiScaler\Optiscaler\` (the copy OptiScaler ships)
+
+   You can also hard-code directories in `NgxFeatureDirs` in `payload\Bridge\Dx11FsrBridge.ini` (semicolon-separated; setting it disables auto-probing).
+3. A **writable** NGX working directory: `payload\Bridge\ngx\` by default, falling back to `%LOCALAPPDATA%\GenshinFsrBridge\ngx\` when it is not writable; the actual path is logged as `ngx_core appdata=…`.
+
+**How to obtain `nvngx_dlss.dll`**: tick **Dx11FsrBridge** in the installer; when the card is an RTX and the super-resolution input is Auto / NVNGX, the installer fetches one from NVIDIA Streamline into `payload\NVIDIA\DLSS\` (with OptiScaler also ticked, the same file is copied into the OptiScaler component directory as well). You can equally download the DLSS runtime yourself (`nvngx_dlss.dll`, e.g. from an NVIDIA Streamline package) and **import** it into any of those directories — a manual import behaves exactly like the automatic download.
+
+**Acceptance criteria** (`payload\Bridge\Dx11FsrBridge.log`, visible at the default log level):
+
+```text
+ngx_core backend=ngx auto=ngx vendor=0x10DE gpu="NVIDIA GeForce RTX 4070 SUPER"
+ngx_core provider resolved=nvidia_registry module=...\_nvngx.dll
+ngx_core init ok=1 available=1 rc=0x1
+ngx_core create_feature ok=1 preset=0 rc=0x1
+```
+
+The NVIDIA DLSS debug overlay (something like `DLSS V310.9.16 (default) DX11 chain d3d`) should show up in game. If the overlay disappears and the log stops at `create_feature ok=0 rc=…`, NGX did not come up for that session.
+
+**Parameter semantics**: the keys in the common section (`TransparentJitter`, `Ffx12DepthInverted`, `Ffx12JitterMode`, `Ffx12JitterDelay`, `Fsr2MotionVectorsJittered`) apply to both backends; the FFX-only keys (`Ffx12NonLinear`, `Ffx12Hdr`, `Ffx12FovScale`, `Ffx12CameraNear`, …) apply to **FFX only** — NGX reads its own `Ngx*` keys (`NgxHdr`, `NgxRenderPreset`, `NgxCrossKeyReuse`, `NgxLogLevel`, …).
+
+> [!WARNING]
+> **Known issue**: with the in-game render scale at the top slot `0.999`, NGX fails to create the feature on some machines (`ngx_core create_feature ok=0 rc=0xBAD00010`, i.e. `UnsupportedParameter`) and **does not retry within that game session** — the DLSS debug overlay disappears and upscaling drops back to the game's own FSR2; restart the game. Staying at `0.9` or below avoids it.
 
 ### Enabling OptiScaler and ReShade together may be unstable on NVIDIA
 
@@ -149,7 +194,7 @@ If you run into trouble:
 
 - **Isolate first**: temporarily enable only one of the two and check whether the problem disappears;
 - Report it to the [OptiScaler upstream repository](https://github.com/optiscaler/OptiScaler) or this project's [Issues](https://github.com/AizawaHikaru233/genshin_fsr_brigde/issues), attaching `OptiScaler.log` and `ReShade.log` from the game directory;
-- If it is still unstable, **keep only one of the two**: FSR Bridge's own FSR4/FSR3/FSR2 depends on neither — enable OptiScaler for DLSS/XeSS/FSR4 INT8, enable ReShade for HDR.
+- If it is still unstable, **keep only one of the two**: FSR Bridge's own FSR4/FSR3/FSR2 and DLSS on NVIDIA depend on neither — enable OptiScaler for XeSS / FSR4 INT8, enable ReShade for HDR.
 
 ### TextureLoader is not recommended on NVIDIA (texture Mods may fail to load)
 
@@ -221,7 +266,10 @@ The hashing algorithm is a verbatim port of 3DMigoto, so **pre-generated `hash=`
    injection chain (`DllList`) of `payload\FpsUnlocker\fps_config.json`, so no DLL is ever placed in the game directory.
 
    - **Replacing the upscaler only** → at least **Dx11FsrBridge** (required, ticked by default)
-   - **DLSS or XeSS needed** → also tick **OptiScaler**
+   - **DLSS needed (NVIDIA)** → **Dx11FsrBridge** alone is enough: keep the super-resolution input on **Auto**
+     (or pick **NVNGX**) and the installer fetches `nvngx_dlss.dll` into `payload\NVIDIA\DLSS\`; see
+     "[DLSS on NVIDIA without OptiScaler](#dlss-on-nvidia-without-optiscaler-ngx-backend)"
+   - **XeSS needed (or a non-NVIDIA card that wants the DLSS interface)** → also tick **OptiScaler**
    - **HDR enhancement needed** → tick **ReShade + RenoDX** (on NVIDIA cards the installer warns about running it together with OptiScaler)
 
 5. Click **Launch game**. The installer starts the frame-rate tool in place under `payload\FpsUnlocker\`, and that tool injects
@@ -247,7 +295,9 @@ legacy flow yourself, pass `-ScriptInstaller` to `Build-OnlineInstaller.ps1`.
 3. Install the components:
 
    - **Replacing the upscaler only** → install at least **Bridge**
-   - **DLSS or XeSS needed** → also install **OptiScaler**
+   - **DLSS needed (NVIDIA)** → **Bridge** is still all you install, but you **must** supply `nvngx_dlss.dll` yourself
+     and put it in `payload\Bridge\`, `payload\NVIDIA\DLSS\`, or `payload\OptiScaler\Optiscaler\` (the release package does not bundle it)
+   - **XeSS needed (or a non-NVIDIA card that wants the DLSS interface)** → also install **OptiScaler**
 
 **Injection order**: **Bridge must load before OptiScaler**. Other plugins have no strict requirement.
 
@@ -279,9 +329,11 @@ The main executable differs by release:
 ### Components and paths
 
 `Dx11FsrBridge.dll` independently hooks Genshin Impact's FSR2 calls and forwards them to the AMD FFX12 SDK, providing
-FSR4/FSR3/FSR2 upscaling directly on supported GPUs **without any external plugin**.
+FSR4/FSR3/FSR2 upscaling directly on supported GPUs **without any external plugin**; on an RTX card it can also switch
+to the built-in NGX backend and output **DLSS** directly (also without OptiScaler, but `nvngx_dlss.dll` is required —
+see above).
 [OptiScaler](https://github.com/optiscaler/OptiScaler) can optionally be connected to extend the upscaler types
-(DLSS, XeSS, FSR4 INT8, etc.). The package configures component loading in the default order, so manual ordering is
+(XeSS, FSR4 INT8, etc.; on a non-NVIDIA card it can also provide the DLSS interface). The package configures component loading in the default order, so manual ordering is
 normally not required; `AntiPlayerMosaic.dll` is an optional anti-mosaic / UID-hiding plugin.
 
 When OptiScaler and ReShade are used, their runtime configurations are located in their respective component
@@ -320,14 +372,17 @@ If the game fails to start, FSR cannot be activated, switching upscalers causes 
 | # | File / Information | When it applies |
 | :---: | --- | --- |
 | 1 | `payload/Bridge/Dx11FsrBridge.log` | **Required** |
-| 2 | `payload/OptiScaler/OptiScaler.log` and `payload/OptiScaler/OptiScaler.ini` | When using OptiScaler |
-| 3 | `payload/ReShade/ReShade.log` | For ReShade-related issues |
-| 4 | `payload/AntiPlayerMosaic/AntiPlayerMosaic.log` | For anti-mosaic, UID, or underwater mosaic issues |
-| 5 | `payload/TextureLoader/TextureLoader.log` | For texture replacement / Mod loading issues |
-| 6 | `FSR-Bridge-Plugin.log` from the FuFu plugin directory | When using the FuFu Launcher plugin |
-| 7 | GPU model, game version, the stage at which the issue occurs, and the selected upscaling mode | — |
+| 2 | `payload/Bridge/ngx/nvngx.log` and the `nvngx_dlss_*.log` next to it | When using the built-in DLSS (NGX backend); the real directory is the one in the `ngx_core appdata=` log line |
+| 3 | `payload/OptiScaler/OptiScaler.log` and `payload/OptiScaler/OptiScaler.ini` | When using OptiScaler |
+| 4 | `payload/ReShade/ReShade.log` | For ReShade-related issues |
+| 5 | `payload/AntiPlayerMosaic/AntiPlayerMosaic.log` | For anti-mosaic, UID, or underwater mosaic issues |
+| 6 | `payload/TextureLoader/TextureLoader.log` | For texture replacement / Mod loading issues |
+| 7 | `FSR-Bridge-Plugin.log` from the FuFu plugin directory | When using the FuFu Launcher plugin |
+| 8 | GPU model, game version, the stage at which the issue occurs, and the selected upscaling mode | — |
 
 When further diagnostics are needed, temporarily change `LogLevel` under `Log` in `OptiScaler.ini` (when OptiScaler is used) to `1 (Debug)` or `0 (Trace)`. Restore the release setting after diagnostics to avoid additional overhead.
+
+For the built-in DLSS, raise `NgxLogLevel` in `[Dx11FsrBridge]` of `payload\Bridge\Dx11FsrBridge.ini` from the default `1` to `2` (info) or `3` (debug); the default `1` only records the error-level evidence lines (`ngx_core …` and NGX's own return codes).
 
 > [!CAUTION]
 > Do not submit game account details, login information, or screenshots containing personal information to a public Issue.
@@ -338,7 +393,7 @@ When further diagnostics are needed, temporarily change `LogLevel` under `Log` i
 - The NVIDIA NGX (DLSS) headers are likewise a build dependency only (for the optional DLSS backend); their source, pinned version, and SHA-256 are documented in `Dx11FsrBridge/third_party/ngx/NOTICE.md`. They are licensed under the NVIDIA RTX SDKs License and are **not covered by GPL-3.0-or-later**; the license text ships with that directory and inside the package at `payload/Bridge/NVIDIA-NGX-SDK-LICENSE.txt`.
 - OptiScaler is an independent project: <https://github.com/optiscaler/OptiScaler>.
 - Local distributions must complete the required components on their own and comply with each component's licensing terms.
-- This project does not include NVIDIA DLSS or AMD FSR SDK runtime binaries (`_nvngx.dll` comes from the GPU driver; `nvngx_dlss.dll` is fetched on the user's machine by the installer).
+- This project does not include NVIDIA DLSS or AMD FSR SDK runtime binaries (`_nvngx.dll` comes from the GPU driver; `nvngx_dlss.dll` is fetched on the user's machine by the installer, or can be downloaded and placed in one of the directories listed above).
 
 ## License
 
