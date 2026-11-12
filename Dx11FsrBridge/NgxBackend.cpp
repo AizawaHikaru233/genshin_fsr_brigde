@@ -53,6 +53,10 @@
 #include "Ffx12Backend.h" // ffx12::FrameInput / ffx12::backend()
 #include "Ffx12ShaderSource.h" // g_depth_extract_hlsl / g_motion_decode_d11_hlsl
 #include "NgxBackend.h"
+// A 阶段重构（2026-11-10）：NGX 参数映射的**纯计算层**（零 D3D / 零 NGX / 零全局）。
+// 本 TU 只负责"取输入 → 调纯函数 → 写输出"；公式全部在 NgxParamMap.cpp，
+// 由 NgxParamMapTest.cpp 做离线位级回归（NGX=OFF 也能构建）。
+#include "NgxParamMap.h"
 
 // ---- ④ NGX（必须最后；且只这两个）----
 #include "third_party/ngx/nvsdk_ngx_defs.h"
@@ -73,6 +77,24 @@
 //   本 TU 不照抄，而是显式写一行（否则裸 ComPtr 处报 C7568：
 //   "ComPtr": 后面跟 "::" 的标识符必须是类或命名空间名）：
 using Microsoft::WRL::ComPtr;
+
+// ============================================================================
+// A 阶段（2026-11-10）：纯映射层的位定义与 NGX 头**编译期对齐**
+// ============================================================================
+// NgxParamMap.h 不能 include nvsdk_ngx_defs.h（那个头虽已随仓库正式分发，但纯映射层
+// 必须能在**裁剪了 third_party/ngx/ 的检出**下、以及 NGX=OFF / 无 NGX 头的机器上
+// 编译），所以它自带一份常量副本。
+// 副本就有漂移风险 ⇒ 在这里用 static_assert 把两边钉死：
+// 一旦 NGX 升级改了位定义，**构建直接失败**，而不是运行期静默错位。
+// ★ 只在 DX11FSRBRIDGE_ENABLE_NGX 打开时参与编译（本 TU 本身就在那个开关内）。
+static_assert(ngx_param_map::kFlagIsHdr == NVSDK_NGX_DLSS_Feature_Flags_IsHDR,
+              "NgxParamMap::kFlagIsHdr 与 NGX 头不一致");
+static_assert(ngx_param_map::kFlagMvLowRes == NVSDK_NGX_DLSS_Feature_Flags_MVLowRes,
+              "NgxParamMap::kFlagMvLowRes 与 NGX 头不一致");
+static_assert(ngx_param_map::kFlagMvJittered == NVSDK_NGX_DLSS_Feature_Flags_MVJittered,
+              "NgxParamMap::kFlagMvJittered 与 NGX 头不一致");
+static_assert(ngx_param_map::kFlagDepthInverted == NVSDK_NGX_DLSS_Feature_Flags_DepthInverted,
+              "NgxParamMap::kFlagDepthInverted 与 NGX 头不一致");
 
 namespace ngx {
 
@@ -1680,14 +1702,21 @@ static CreateFlagsEval build_create_flags(DXGI_FORMAT color_fmt)
     CreateFlagsEval ev;
     // ★ MINOR-1：把探测状态一并取出 ⇒ 决策（is_hdr）与下方日志（sw_known/sw_hdr）来自同一次 load。
     ev.is_hdr  = resolve_is_hdr(color_fmt, &ev.hdr_src, &ev.sw_state);
-    ev.flags   = 0;
-    if (ev.is_hdr)                              ev.flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
-                                                ev.flags |= NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;      // 1<<1，恒设
-    if (ffx12::motion_vectors_jittered())       ev.flags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;   // 1<<2，默认不设
-    // T-9：按 Ffx12DepthInverted 配置（1<<3）
-    if (ffx12::depth_inverted())
-        ev.flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+    // ---- A 阶段（2026-11-10）：flags 的决策部分搬进纯函数 NgxParamMap.cpp ----
+    // ★ 逐位等价：同一组输入（is_hdr / depth_inverted / mv_jittered），输出与
+    //   重构前的四行 `|=` **完全相同**，包括那行**恒设**的 MVLowRes。
+    //   对照 oracle（重构前原代码另抄一份）在 NgxParamMapTest.cpp 第 [1] 节。
+    // ★ 这里只搬"计算"，不搬"取值来源"：is_hdr 仍来自 resolve_is_hdr（本 TU 的
+    //   全局探测），另两位仍来自 ffx12::（ini 配置）—— 纯函数不读全局。
+    ngx_param_map::CreateFlagsInput cf {};
+    cf.is_hdr         = ev.is_hdr;
+    cf.depth_inverted = ffx12::depth_inverted();
+    cf.mv_jittered    = ffx12::motion_vectors_jittered();
+    ev.flags = ngx_param_map::map_create_flags(cf).flags;
     // ---- 同一组输入的位图（M4-a）----
+    // ★ 位图**保持原样不搬**：它是本文件的日志/重建判据，不属于 NGX 参数映射；
+    //   且它读的是同一组输入 —— 搬进纯函数反而要把两位配置值再传回来。
+    //   ★ 下面三行的读法（再各读一次 accessor）**与重构前逐字一致**，不改读次数。
     if (ev.is_hdr)                              ev.bits |= kFlagsInputIsHdr;
     if (ffx12::depth_inverted())                ev.bits |= kFlagsInputDepthInvert;
     if (ffx12::motion_vectors_jittered())       ev.bits |= kFlagsInputMvJittered;
@@ -3104,7 +3133,13 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     if (g_params == nullptr)
         return false;   // 防御：ensure_init 成功即非空，但不拿空指针去解引用（同陷阱 2 的纪律）
 
-    const int reset_val = (in.reset || inst.first) ? 1 : 0;
+    // A 阶段（2026-11-10）：判定搬进纯函数（零行为变更）。
+    // ★ 重构前原文：const int reset_val = (in.reset || inst.first) ? 1 : 0;
+    //   现在只把"或"搬走，1/0 的整数化与变量名/类型保持原样。
+    ngx_param_map::ResetInput ri {};
+    ri.frame_reset    = in.reset;
+    ri.instance_first = inst.first;
+    const int reset_val = ngx_param_map::map_reset(ri) ? 1 : 0;
 
     // ---- ngx_in 行（§3.10.1 输入侧；info；闸门 count <= 8 || count % 1024 == 0）----
     // ★ fmt 的三个值取自**实际输入纹理的 GetDesc()**，不得凭空构造。
@@ -3153,7 +3188,11 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
         g_params->Set(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, in.frame_time_delta_ms);
     // 13：reactive mask —— **仅当 NgxUseReactiveMask=1**，且必须先过尺寸守卫（§3.9.2）。
     //     守卫恒真（inst.reactive 就是按 inst.rw x inst.rh 建的），保留它是为了与 FFX 侧口径一致。
-    if (g_use_reactive && inst.rw >= in.render_w && inst.rh >= in.render_h)
+    // A 阶段（2026-11-10）：尺寸比较搬进纯函数；g_use_reactive 这一位留在原地
+    // （它是配置开关，不是尺寸计算）。
+    // ★ 重构前原文：if (g_use_reactive && inst.rw >= in.render_w && inst.rh >= in.render_h)
+    //   短路顺序保持：先看配置开关，再算尺寸比较。
+    if (g_use_reactive && ngx_param_map::reactive_size_ok(inst.rw, inst.rh, in.render_w, in.render_h))
         set_tex(g_params, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, inst.reactive.Get());
 
     // ---- 第 11 步：EvaluateFeature（含 eval_us 计时，§3.10.1）----

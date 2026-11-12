@@ -120,7 +120,7 @@ $configValues = [ordered]@{
     # ⚠️ Ffx12Backend **故意不在本表里**：见文件顶部"三个故意不写的例外"。
     'NgxApplicationId'          = '1337'
     'NgxFeatureDirs'            = ''    # 空 = 自动探测含 nvngx_dlss.dll 的目录
-    'NgxHdr'                    = 'auto' # 三态：auto（默认）/ 1 强制 HDR / 0 强制 SDR
+    'NgxHdr'                    = '0'    # 0 = 强制 SDR（默认，NGX 收到 IsHDR 会拖影）/ auto 自动探测 / 1 强制 HDR
     'NgxRenderPreset'           = '0'   # 0 = 六个 preset 参数都不设（跟随 NGX 自身规则）；5..15 可显式指定
     'NgxSetFrameTimeDelta'      = '1'
     'NgxUseReactiveMask'        = '0'

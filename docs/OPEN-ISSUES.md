@@ -30,6 +30,13 @@
 
 - `Dx11FsrBridge/NgxBackend.cpp`（`ensure_init` / `resolve_is_hdr` / `build_create_flags`）
 
+> **2026-11-12 补充（不修改上方原文）**
+>
+> 实测进展：RTX 4070 SUPER 上 `Ffx12Backend=ngx` 已长期使用；HDR10 会话中
+> `ngx_core provider resolved=nvidia_registry`（驱动自带 `_nvngx.dll`）与
+> `ngx_hdr_decision is_hdr=…` 两条判据均已验过。
+> 画质（鬼影 / 闪烁 / 锐度）与 A 卡、Intel 平台、多实例仍无证据。
+
 ---
 
 ## 2. 非 NVIDIA 平台借用外部 NGX 实现（机制已落地，画质契约与实机未验证）
@@ -62,6 +69,12 @@
 
 - `Dx11FsrBridge/NgxBackend.cpp`（`try_nvidia_registry` / `try_external` / `scan_loaded_modules` / `bind_entries_from` / `soft_fail_init` / `build_create_flags`）
 
+> **2026-11-12 补充（不修改上方原文）**
+>
+> 实测进展：纯 N 卡侧的 `auto` 路径已实机验证 —— RTX 4070 SUPER 上解析到
+> `provider resolved=nvidia_registry`（`...\DriverStore\...\_nvngx.dll`），未走 `external` 分支。
+> 「A 卡 + OptiScaler」这一组合仍无实机验证，上方结论对该组合依然成立。
+
 ---
 
 ## 3. `Ffx12SingleInstance` 缺省值改为 1，需要回归确认
@@ -84,6 +97,14 @@
 
 - **DX11 FSR2 导出层路线**：是否把 FSR2 以导出层形式暴露，至今未定案。
 - **OptiScaler `Dx11wDx12` 开启帧生成会闪退**：现象稳定复现，根因未定位。
+
+> **2026-11-12 补充（不修改上方原文）**
+>
+> 关于「`Dx11wDx12` 开启帧生成会闪退」这条：
+> · 该结论对应 `Ffx12Backend=native`（FFX 后端）下、以 FFX 作为帧生成输入的情形。
+> · 2026-11-12 实测 `Ffx12Backend=ngx` + `FGInput=Upscaler` + `FGOutput=DLSSG` + HDR10，
+>   连续多轮累计数万帧无崩溃，说明该闪退不是帧生成整体的限制。
+> · 两条后端路径的 FG 实现不同，需分别验证；上方描述的 FFX 路径闪退本次未复测。
 
 ---
 
@@ -142,6 +163,74 @@
 - `Dx11FsrBridge/GpuBackendPick.h`、`Dx11FsrBridge/Dx11FsrBridge.cpp`（`resolve_backend_auto` / `record_adapter_info` / `load_config` 的 Ffx12Backend 段）、`Dx11FsrBridge/Ffx12Backend.cpp`（dispatch 的 ngx 分支）
 
 ---
+
+
+## 7. 上游 OptiScaler 的已知缺陷（非本仓库代码，本仓库无法修复）
+
+### 帧生成开启 HDR 时画面发灰（2026-11-12）
+
+**结论：已定位为上游 OptiScaler 缺陷，本仓库已用本地补丁绕过并实测通过。**
+
+**现象**：HDR10 输出 + `FGInput=Upscaler` + `FGOutput=DLSSG`（XeFG 相同）时，画面整体发灰、
+对比度塌陷；把 `FGOutput` 改成 `nofg` 立刻恢复正常。与是否真的开启插帧无关 ——
+即使在菜单里不启用帧生成，只要 `FGOutput != nofg` 就发灰。
+
+**根因**：`Dx11wDx12` 互操作路径下，真正上屏的是 FG 交换链：
+
+```
+Dx11wDx12SC::Present
+  _CopyDx11BackBufferToShared(...)         D3D11 后缓冲 -> 共享纹理
+  _CopyDx11SharedToDx12FGBackBuffer(...)   共享纹理 -> D3D12 FG 后缓冲
+  _fgSwapChain->Present(...)               实际呈现
+```
+
+但 `_fgSwapChain` 的 HDR 色彩空间**从未被设置**：游戏调用的是 `WrappedIDXGISwapChain4::SetColorSpace1`，
+它只转发给真实 D3D11 交换链；`Dx11wDx12SC::SetColorSpace1` 虽实现了转发到 `_fgSwapChain` 的逻辑，
+但实测调用次数为 **0**。于是后缓冲是 PQ 编码、呈现链按 SDR 解释，画面发灰。
+
+**修复**：在 `Dx11wDx12SC::Present` 首帧把 `State::outputColorSpace`（`WrappedIDXGISwapChain4`
+记录的游戏设置值）同步给 `_fgSwapChain`，并加 `_fgColorSpaceSynced` 保证只做一次。
+补丁 +34 行，改 `dx11_with_dx12_sc.cpp` / `.h` 两个文件。
+
+**验证**：修复后日志出现 `FG swapchain colour space set to 12`（12 = `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`），
+仅在首帧一次；实机确认不再发灰。对照：官方 nightly-20261106（commit `d6b02459`）原版同样发灰，
+加此补丁后正常。
+
+**上游状态**：已检索 OptiScaler 全部 issue（`HDR+swapchain` / `HDR+framegen` / `HDR state:open` / `washed`），
+无相关报告；上游 master 至今仍是原始实现。
+
+**复现与维护要点**：
+
+- 构建必须用与已部署依赖匹配的 commit。用 master HEAD 会因 59 个提交差异导致 Streamline
+  初始化崩溃（日志 `Exception detected` + 迷你转储）。
+- 项目默认 `PlatformToolset=v143`（VS 2022）；只有 VS 18 的环境需改为 `v145`。
+- 上游若修复此处，本地补丁即可移除。
+
+### 游戏退出后进程卡死需手动结束（2026-11-12）
+
+**结论：上游 OptiScaler 缺陷，本仓库无法从桥侧修复。已归档，不再投入。**
+
+**现象**：关闭游戏窗口后 `YuanShen.exe` 残留，占用 4–5 GB 内存，必须任务管理器
+「结束任务」才能再次启动。每次退出都发生。
+
+**对照实验**：关闭 OptiScaler 后进程 3 秒内正常退出；开启时残留进程表现为
+线程数 1、模块数 0、`Stop-Process -Force` 被拒绝（内核已标记 terminating）。
+
+**根因定位**：OptiScaler.log 最后一行是 `DLSSG_Common::Deactivate`，之后无输出。
+该函数（`framegen/dlssg/DLSSG_Common.cpp:32`）以
+`queueParallelismMode = eBlockPresentingClientQueue` 调用 `sl::DLSSGSetOptions()`，
+上游在此处自带注释 `// Potential crash point on exit`。进程退出期间 present 队列
+已不可用，于是永久阻塞。
+
+配套的三个结构性问题（均在 `dllmain.cpp`）：`DLL_PROCESS_DETACH` 里所有 hook 卸载
+被注释（注释说明"causing issues during shutdown"）；`CreateThread(getGpuInfo)` 句柄
+丢弃无法等待；`isShuttingDown` 只是标志，没有真正的线程 join。
+
+**上游状态**：issue #512（2025-06-09，已关闭）报告了同一现象，维护者回复
+"known issue ... Will be eventually fixed"，此后 5 个月无修复。
+
+**为何不修**：阻塞发生在 OptiScaler 自身的 DLL 卸载路径，桥无法介入。
+完整证据链见本地留痕 `VERDICT_game_exit_hang_20261112.md`（不随仓库分发）。
 
 ## 已解决
 
