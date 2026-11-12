@@ -699,12 +699,12 @@ function Install-Unlocker {
                 $unlockExpectedSha = [string]$script:UpstreamVersions.fpsunlock.sha256
             }
             $asset = if ([string]::IsNullOrWhiteSpace($unlockTag)) {
-                Get-GitHubLatestAsset -Repository '34736384/genshin-fps-unlock' -AssetFilter { $_.name -eq 'unlockfps_nc.exe' }
+                Get-GitHubLatestAsset -Repository 'AizawaHikaru233/genshin-fps-unlock' -AssetFilter { $_.name -eq 'unlockfps_nc.exe' }
             }
             else {
-                Get-GitHubLatestAsset -Repository '34736384/genshin-fps-unlock' -Tag $unlockTag -AssetFilter { $_.name -eq 'unlockfps_nc.exe' }
+                Get-GitHubLatestAsset -Repository 'AizawaHikaru233/genshin-fps-unlock' -Tag $unlockTag -AssetFilter { $_.name -eq 'unlockfps_nc.exe' }
             }
-            Write-Host "正在从官方发行版下载 FPS Unlocker $($asset.Tag)..." -ForegroundColor Cyan
+            Write-Host "正在下载 FPS Unlocker $($asset.Tag)..." -ForegroundColor Cyan
             $source = Join-Path $temporaryDirectory 'unlockfps_nc.exe'
             $expectedSha = if (-not [string]::IsNullOrWhiteSpace($unlockExpectedSha)) { $unlockExpectedSha } else { $asset.Digest }
             Invoke-OfficialDownload -Url $asset.Url -Destination $source -ExpectedSha256 $expectedSha

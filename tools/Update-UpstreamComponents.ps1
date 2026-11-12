@@ -25,7 +25,7 @@ $userAgent = 'GenshinFsrBridge-UpstreamUpdater'
 #   - OptiScaler   : 固定 v0.9.4 正式版（构建基线，含 FFX 2.3 SDK / XeSS / XeLL / D3D12Core）
 #   - DLSS         : NVIDIA Streamline 最新正式版（提取 nvngx_dlss.dll + license）
 #   - ReShade      : reshade.me 官方最新正式版（Setup exe 提取 ReShade64.dll）
-#   - FPS Unlocker : 34736384/genshin-fps-unlock 最新正式版
+#   - FPS Unlocker : 本项目维护的 fork（AizawaHikaru233/genshin-fps-unlock），固定 v3.6.0
 #   - FFX SDK      : GPUOpen-LibrariesAndSDKs/FidelityFX-SDK 最新 tag（AMD 官方渠道，
 #                    取 Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_dx12.dll + 许可证）
 #   - RenoDX       : 闭源组件，作者书面授权随包分发，不自动获取
@@ -199,9 +199,12 @@ function Update-Dlss {
 }
 
 function Update-FpsUnlocker {
-    # 34736384/genshin-fps-unlock 最新正式版（MIT）。必须用非 signed 版才能加载第三方 DLL。
-    Write-Host '--- FPS Unlocker (最新正式版) ---' -ForegroundColor Cyan
-    $asset = Get-GitHubReleaseAsset -Repository '34736384/genshin-fps-unlock' -AssetFilter { $_.name -eq 'unlockfps_nc.exe' }
+    # AizawaHikaru233/genshin-fps-unlock：本项目的 fork（上游 34736384，MIT，基线 netcore @ 2b85d61 = v3.5.0），
+    # 从 v3.6.0 起带「高帧防检测」（客户端读到的帧率夹到 60/45/30，实际帧率不变）。
+    # 固定 tag 而不是追 latest：打包基线要可复现，换版本只改这一行。
+    # 必须用未签名版（unlockfps_nc.exe）才能用 DllList 加载第三方 DLL。
+    Write-Host '--- FPS Unlocker (fork v3.6.0) ---' -ForegroundColor Cyan
+    $asset = Get-GitHubReleaseAsset -Repository 'AizawaHikaru233/genshin-fps-unlock' -Tag 'v3.6.0' -AssetFilter { $_.name -eq 'unlockfps_nc.exe' }
     $work = Join-Path $env:TEMP ("GenshinUpstream-Unlocker-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $work | Out-Null
     try {
@@ -211,7 +214,7 @@ function Update-FpsUnlocker {
         $fileHash = Get-FileSha256 -Path $package
         if ($asset.Digest -match '^sha256:(.+)$' -and
             -not [string]::Equals($fileHash, $matches[1], [StringComparison]::OrdinalIgnoreCase)) {
-            throw 'FPS Unlocker 官方包 SHA-256 校验失败。'
+            throw 'FPS Unlocker 发行包 SHA-256 校验失败。'
         }
         New-Item -ItemType Directory -Force -Path $fpsRuntime | Out-Null
         Copy-Item -LiteralPath $package -Destination (Join-Path $fpsRuntime 'unlockfps_nc.exe') -Force

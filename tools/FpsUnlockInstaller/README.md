@@ -25,7 +25,7 @@
 
 ## 组件来源
 
-- FPS Unlocker：<https://github.com/34736384/genshin-fps-unlock/releases>
+- FPS Unlocker：<https://github.com/AizawaHikaru233/genshin-fps-unlock/releases>（本项目维护的 fork，带高帧防检测）
 - OptiScaler 0.9.4：<https://github.com/optiscaler/OptiScaler/releases/tag/v0.9.4>
 - NVIDIA DLSS 超分组件：<https://github.com/NVIDIA-RTX/Streamline/releases>
 - ReShade：<https://reshade.me/downloads>
