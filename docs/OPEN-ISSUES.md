@@ -220,6 +220,32 @@ Dx11wDx12SC::Present
 - 项目默认 `PlatformToolset=v143`（VS 2022）；只有 VS 18 的环境需改为 `v145`。
 - 上游若修复此处，本地补丁即可移除。
 
+### 游戏退出后进程卡死需手动结束（2026-11-12）
+
+**结论：上游 OptiScaler 缺陷，本仓库无法从桥侧修复。已归档，不再投入。**
+
+**现象**：关闭游戏窗口后 `YuanShen.exe` 残留，占用 4–5 GB 内存，必须任务管理器
+「结束任务」才能再次启动。每次退出都发生。
+
+**对照实验**：关闭 OptiScaler 后进程 3 秒内正常退出；开启时残留进程表现为
+线程数 1、模块数 0、`Stop-Process -Force` 被拒绝（内核已标记 terminating）。
+
+**根因定位**：OptiScaler.log 最后一行是 `DLSSG_Common::Deactivate`，之后无输出。
+该函数（`framegen/dlssg/DLSSG_Common.cpp:32`）以
+`queueParallelismMode = eBlockPresentingClientQueue` 调用 `sl::DLSSGSetOptions()`，
+上游在此处自带注释 `// Potential crash point on exit`。进程退出期间 present 队列
+已不可用，于是永久阻塞。
+
+配套的三个结构性问题（均在 `dllmain.cpp`）：`DLL_PROCESS_DETACH` 里所有 hook 卸载
+被注释（注释说明"causing issues during shutdown"）；`CreateThread(getGpuInfo)` 句柄
+丢弃无法等待；`isShuttingDown` 只是标志，没有真正的线程 join。
+
+**上游状态**：issue #512（2025-06-09，已关闭）报告了同一现象，维护者回复
+"known issue ... Will be eventually fixed"，此后 5 个月无修复。
+
+**为何不修**：阻塞发生在 OptiScaler 自身的 DLL 卸载路径，桥无法介入。
+完整证据链见本地留痕 `VERDICT_game_exit_hang_20261112.md`（不随仓库分发）。
+
 ## 已解决
 
 ### 发布管线不启用 NGX 构型（2026-11-10）
