@@ -30,6 +30,13 @@
 
 - `Dx11FsrBridge/NgxBackend.cpp`（`ensure_init` / `resolve_is_hdr` / `build_create_flags`）
 
+> **2026-11-12 补充（不修改上方原文）**
+>
+> 实测进展：RTX 4070 SUPER 上 `Ffx12Backend=ngx` 已长期使用；HDR10 会话中
+> `ngx_core provider resolved=nvidia_registry`（驱动自带 `_nvngx.dll`）与
+> `ngx_hdr_decision is_hdr=…` 两条判据均已验过。
+> 画质（鬼影 / 闪烁 / 锐度）与 A 卡、Intel 平台、多实例仍无证据。
+
 ---
 
 ## 2. 非 NVIDIA 平台借用外部 NGX 实现（机制已落地，画质契约与实机未验证）
@@ -62,6 +69,12 @@
 
 - `Dx11FsrBridge/NgxBackend.cpp`（`try_nvidia_registry` / `try_external` / `scan_loaded_modules` / `bind_entries_from` / `soft_fail_init` / `build_create_flags`）
 
+> **2026-11-12 补充（不修改上方原文）**
+>
+> 实测进展：纯 N 卡侧的 `auto` 路径已实机验证 —— RTX 4070 SUPER 上解析到
+> `provider resolved=nvidia_registry`（`...\DriverStore\...\_nvngx.dll`），未走 `external` 分支。
+> 「A 卡 + OptiScaler」这一组合仍无实机验证，上方结论对该组合依然成立。
+
 ---
 
 ## 3. `Ffx12SingleInstance` 缺省值改为 1，需要回归确认
@@ -84,6 +97,14 @@
 
 - **DX11 FSR2 导出层路线**：是否把 FSR2 以导出层形式暴露，至今未定案。
 - **OptiScaler `Dx11wDx12` 开启帧生成会闪退**：现象稳定复现，根因未定位。
+
+> **2026-11-12 补充（不修改上方原文）**
+>
+> 关于「`Dx11wDx12` 开启帧生成会闪退」这条：
+> · 该结论对应 `Ffx12Backend=native`（FFX 后端）下、以 FFX 作为帧生成输入的情形。
+> · 2026-11-12 实测 `Ffx12Backend=ngx` + `FGInput=Upscaler` + `FGOutput=DLSSG` + HDR10，
+>   连续多轮累计数万帧无崩溃，说明该闪退不是帧生成整体的限制。
+> · 两条后端路径的 FG 实现不同，需分别验证；上方描述的 FFX 路径闪退本次未复测。
 
 ---
 
@@ -144,42 +165,7 @@
 ---
 
 
-## 7. 帧生成拿不到 HUDless 缓冲（已放弃，非本项目可解）
-
-**结论：放弃。** 这条路线经反编译核实后判定**无法通过改造桥解决**，不再投入。
-
-**现状与已查清的事实**
-
-- 日志里 `Hudfix_Dx12::ResetCounters _hudlessList: 0` 恒为 0，整个会话没有检测到 HUDless 缓冲。
-- OptiScaler 的 Hudfix 是**纯 hook 式**的：`Hudfix_Dx12::CheckForHudless` 自己遍历游戏资源，
-  按尺寸/格式匹配后缓冲，再 `Create a copy of resource` 复制一份作为 HUDless 候选，
-  最后由 `HudCopy_Dx12` 的全屏 compute shader 用亮度差算出 UI 遮罩（`uiMask = smoothstep(threshold, threshold*2, delta)`）。
-  **它不依赖游戏主动提供任何标记。**
-- 唯一的「游戏主动提供」通道是资源私有数据标记 `Opti.Hudless`（`Hudfix_Dx11::PublishGameHudless`），
-  但目标游戏**没有这个机制**，该通道不可用。
-- 真正的阻塞点：本作是 D3D11 游戏，OptiScaler 走 `Dx11wDx12` 互操作，Hudfix 实际跑的是 **Dx12 路径**，
-  而 Dx12 侧看不到 D3D11 的纹理 ⇒ `_hudlessList` 永远为 0。
-  DLL 里虽有完整的 `Hudfix_Dx11` 实现（`CheckForHudless` / `CreateCaptureResource` / `PublishCaptureToFg`），
-  但日志中调用次数为 **0**，从未被启用。
-
-**为什么判定「桥救不了」**
-
-即便桥替 OptiScaler 完成「找 + 复制」两步，仍有两点绕不过去：
-
-1. `HudCopy` 的全屏 compute shader 省不掉 —— 帧生成必须有 UI 遮罩才能把 UI 与场景分开插帧。
-   4K 下每帧读 2 张全屏纹理、写 1 张（约 300 MB/帧显存带宽），这是 HUDless 路线的固有成本。
-2. 桥没有「无 UI 画面」可用 —— 游戏不存在独立的 UI 渲染通道，UI 与场景在同一 pass 混绘，
-   桥无法在 UI 绘制前截到干净的后缓冲。
-
-**若将来要重启这条线，先确认的前提**
-
-- 上游 OptiScaler 是否让 `Hudfix_Dx11` 在 `Dx11wDx12` 互操作下可用（当前不会启用）。
-- 目标游戏是否出现独立的 UI 渲染通道（当前没有）。
-
-**相关代码**
-
-- OptiScaler 侧：`Hudfix_Dx12` / `Hudfix_Dx11` / `HudCopy_Dx12`；日志前缀 `Hudfix_`。
-- 本仓库：`Dx11FsrBridge/Dx11FsrBridge.cpp`（Present / 交换链钩子；无 UI 绘制钩子）。
+## 7. 上游 OptiScaler 的已知缺陷（非本仓库代码，本仓库无法修复）
 
 ### 帧生成开启 HDR 时画面发灰（2026-11-12）
 
