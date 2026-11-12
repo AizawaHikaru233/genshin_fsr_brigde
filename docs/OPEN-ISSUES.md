@@ -181,6 +181,45 @@
 - OptiScaler 侧：`Hudfix_Dx12` / `Hudfix_Dx11` / `HudCopy_Dx12`；日志前缀 `Hudfix_`。
 - 本仓库：`Dx11FsrBridge/Dx11FsrBridge.cpp`（Present / 交换链钩子；无 UI 绘制钩子）。
 
+### 帧生成开启 HDR 时画面发灰（2026-11-12）
+
+**结论：已定位为上游 OptiScaler 缺陷，本仓库已用本地补丁绕过并实测通过。**
+
+**现象**：HDR10 输出 + `FGInput=Upscaler` + `FGOutput=DLSSG`（XeFG 相同）时，画面整体发灰、
+对比度塌陷；把 `FGOutput` 改成 `nofg` 立刻恢复正常。与是否真的开启插帧无关 ——
+即使在菜单里不启用帧生成，只要 `FGOutput != nofg` 就发灰。
+
+**根因**：`Dx11wDx12` 互操作路径下，真正上屏的是 FG 交换链：
+
+```
+Dx11wDx12SC::Present
+  _CopyDx11BackBufferToShared(...)         D3D11 后缓冲 -> 共享纹理
+  _CopyDx11SharedToDx12FGBackBuffer(...)   共享纹理 -> D3D12 FG 后缓冲
+  _fgSwapChain->Present(...)               实际呈现
+```
+
+但 `_fgSwapChain` 的 HDR 色彩空间**从未被设置**：游戏调用的是 `WrappedIDXGISwapChain4::SetColorSpace1`，
+它只转发给真实 D3D11 交换链；`Dx11wDx12SC::SetColorSpace1` 虽实现了转发到 `_fgSwapChain` 的逻辑，
+但实测调用次数为 **0**。于是后缓冲是 PQ 编码、呈现链按 SDR 解释，画面发灰。
+
+**修复**：在 `Dx11wDx12SC::Present` 首帧把 `State::outputColorSpace`（`WrappedIDXGISwapChain4`
+记录的游戏设置值）同步给 `_fgSwapChain`，并加 `_fgColorSpaceSynced` 保证只做一次。
+补丁 +34 行，改 `dx11_with_dx12_sc.cpp` / `.h` 两个文件。
+
+**验证**：修复后日志出现 `FG swapchain colour space set to 12`（12 = `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`），
+仅在首帧一次；实机确认不再发灰。对照：官方 nightly-20261106（commit `d6b02459`）原版同样发灰，
+加此补丁后正常。
+
+**上游状态**：已检索 OptiScaler 全部 issue（`HDR+swapchain` / `HDR+framegen` / `HDR state:open` / `washed`），
+无相关报告；上游 master 至今仍是原始实现。
+
+**复现与维护要点**：
+
+- 构建必须用与已部署依赖匹配的 commit。用 master HEAD 会因 59 个提交差异导致 Streamline
+  初始化崩溃（日志 `Exception detected` + 迷你转储）。
+- 项目默认 `PlatformToolset=v143`（VS 2022）；只有 VS 18 的环境需改为 `v145`。
+- 上游若修复此处，本地补丁即可移除。
+
 ## 已解决
 
 ### 发布管线不启用 NGX 构型（2026-11-10）
