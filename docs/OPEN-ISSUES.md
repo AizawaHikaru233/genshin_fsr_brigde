@@ -202,6 +202,81 @@ Dx11wDx12SC::Present
 
 ---
 
+## 6. 焦点日志块只描述 FFX 直连路径，看不出后端与真正上屏的超分模型
+
+**现状**
+
+- `Dx11FsrBridge/Dx11FsrBridge.cpp:3397-3411` 的 `log_focus_block()` 固定输出三行
+  `GPU :` / `SDK :` / `FSR : FSRx.y.z [OK|FAILED]`，取 `g_route_*`（`:594-596`，由
+  `record_adapter_info()` `:15379-15396` 写入）与 `ffx12::matched_version_name()`。
+- 只有两个调用点，都在 FFX 直连派发上：`:13028`（首次 dispatch 成功）与 `:13305`
+  （首次失败，`sdk234_fail_count==1`）。`Ffx12Backend=ngx` 时不走该路径 ⇒ **整块不出现**，
+  只有 `ngx_core …` 的零散行（provider / featuredirs / init / create_feature）。
+- 桥能确定的事实只有四类：自身后端（`ffx12::backend()`）、自己派发的 FSR 版本
+  （`matched_version_name()`，含 4.x→3.x→2.x 降级）、NGX provider（`NgxBackend.cpp:1471`
+  的 `hit.kind` / `hit.path`，目前**只打日志、未持久化**）、NGX 特征目录
+  （`resolve_feature_dirs()` `:947-976`，`PathListInfo` 首项 = `g_feature_dir_storage.front()`）。
+- `nvngx_dlss.dll` 的模型版本目前没有任何一行：仓库不链 `version.lib`，全库也没有
+  `GetFileVersionInfo` / `VerQueryValue` / `VS_FIXEDFILEINFO`。
+
+**影响**
+
+- 「这局到底谁在超分」在日志里答不出来：FFX 模式写 `FSR`，但外接 OptiScaler 时最终上屏
+  实现可能不是桥；NGX 模式则完全没有摘要块，只能翻 5~6 行分散日志。
+- 装/换 `nvngx_dlss.dll` 后想确认「新的 DLSS 到底生效没有」，现在没有任何一手判据。
+
+**推进需要**
+
+P1（只报事实，可独立验收）
+
+- 焦点块加 `BACKEND :` 行（`native` / `ngx`；`Ffx12Backend=auto` 时带 `g_backend_auto_note`
+  `:15416` 的 `auto=… vendor=…`），现有 `SDK :` 行改名为 `FFX SDK :` 以区分后端。
+- NGX 侧新增焦点块，触发点必须用**一次性闸门**（`create_feature` 每次 key 变化都会重跑，
+  `:1884` 不能直接当触发点）：块内 `BACKEND : ngx` + `UPSCALER : NVIDIA DLSS <FileVersion> [OK]`。
+- `ngx::` 增加两个只读 getter：provider kind/path（把 `:1471` 的 `hit.*` 存全局，与现有
+  `active()` / `available()` 同级），以及 DLSS 运行时版本。
+- DLSS 版本取「传给 NGX 的首个特征目录里 `nvngx_dlss.dll` 的 FileVersion」：实测
+  `payload\NVIDIA\DLSS\nvngx_dlss.dll` 的 FileVersion 为 `310,9,16,0`，打印成 `DLSS 310.9.16`。
+  初始化路径上读一次缓存即可（非热路径）。
+- 读版本需要 `version.dll`：`GetFileVersionInfoSizeW` → `GetFileVersionInfoW` → `VerQueryValueW`。
+  新增 import 还是 `GetModuleHandleW` + `GetProcAddress`（不加 import）在 `CMakeLists.txt`
+  里写明选择；两种都只能读**文件**版本，不代表已加载模块在内存里的版本。
+- provider 为 `external`（OptiScaler 之类别家实现）时打
+  `UPSCALER : <模块文件名> 外部 NGX 实现（实际模型由该实现决定）`——不猜模型名。
+- 该块用 `log_focus_line()`（`cat::core` INFO），不要用 `log_ngx_error()`：
+  `NgxLogLevel=0` 会把后者一起关掉，摘要不该受单后端日志等级影响。
+
+P2（可选，只报配置意图，与 P1 的测量行分开）
+
+- 已有现成读取器 `unsafe_dx11_on12_backend_selected()` `:9318-9357`：读
+  `<exe 目录>\OptiScaler.ini` 的 `[Upscalers] Dx11Upscaler`（带 250 ms 限流缓存）。
+  把「读值」抽成独立函数，块内加
+  `COEXIST : OptiScaler Dx11Upscaler=<值> source=optiscaler_ini(未核实)`。
+- 该行只能说明 OptiScaler 被**配置**成什么，不能说明它这局真的用了；不得与 P1 的测量行
+  混排（AGENTS.md §五.1：判据与动作分离，观测源必须是事实源头）。
+
+P3（可选）
+
+- 桥未接管时也打一次块（`state=SKIP` + 跳过原因），避免「日志里没有块 = 一切正常」的误读。
+
+**注意**
+
+- 所有取值一次性缓存，块走一次性闸门。禁止在每帧 / 每 draw 读 ini 或文件版本。
+- `matched_version_name()` 是**桥自己派发**的版本，不是游戏原本请求的版本
+  （另有 `selected_version_name()` `Ffx12Backend.cpp:3164`，两者别混用）。
+- 块排版沿用现状（分隔线上下各一个空行、`  KEY : ` 两空格 + 键 + 分隔符）；
+  行数变化若被文档或测试引用，需同步。
+- README 的验收判据里已有 `ngx_core provider resolved=… module=…` 行；新块引用同一事实时
+  复用该行的字段名，不要再造第二套口径。
+
+**相关代码**
+
+- `Dx11FsrBridge/Dx11FsrBridge.cpp:594-596`、`:3397-3411`、`:9318-9357`、`:13028`、`:13305`、
+  `:15379-15396`、`:15407-15432`
+- `Dx11FsrBridge/NgxBackend.cpp:947-976`、`:1104-1106`、`:1422-1472`、`:1884`；`Dx11FsrBridge/NgxBackend.h`
+- `Dx11FsrBridge/Ffx12Backend.cpp:2633-2721`、`:3164`、`:3169-3172`
+
+---
 ## 已解决
 
 ### NGX 后端的画面与平台验证（2026-11-13）
