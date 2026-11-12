@@ -1762,15 +1762,21 @@ static NVSDK_NGX_PerfQuality_Value quality_from_ratio(std::uint32_t render_w, st
 
 // 2026-11-13（0.8~0.999 渲染精度超分失效）：UltraQuality 兜底成 MaxQuality。
 // 为什么：DLSS 的 UltraQuality 对应固定 ratio ≈ 1.30，而 quality_from_ratio 把整个
-//   1.0~1.3 区间都映射到它。实测 0.8 / 0.9 / 0.999 三个精度（ratio 1.25 / 1.11 / 1.0016）
-//   全部 CreateFeature 失败，rc=0xBAD00010 = NVSDK_NGX_Result_FAIL_UnsupportedParameter
-//   （nvsdk_ngx_defs.h:169）—— NGX 认为「声明的档位」与「实际分辨率」不符。
-//   0.7（ratio 1.43）落 MaxQuality，故不受影响，与日志完全吻合。
+//   1.0~1.3 区间都映射到它。实测这些精度（ratio = display_w / render_w）：
+//   0.9 ⇒ ratio 1.11 ⇒ CreateFeature 失败，rc=0xBAD00010
+//   = NVSDK_NGX_Result_FAIL_UnsupportedParameter（nvsdk_ngx_defs.h:169）
+//   —— NGX 认为「声明的档位」与「实际分辨率」不符。
+//   0.7 ⇒ ratio 1.43 落 MaxQuality，故不受影响，修复前后都正常。
+//   （0.8 ⇒ 1.25、0.999 ⇒ 1.0016 与本条同落 UltraQuality 分支，但**未单独实测**；
+//    当时它们的失败记录在另一份环境日志里，未随仓库分发。）
 // 依据：上游 OptiScaler 同样在 CreateFeature 前做这一转换
 //   （upscalers/dlss/DLSSFeature.cpp:254-259，PerfQualityValue == UltraQuality 无条件改 MaxQuality）。
-//   旁证：芙芙启动器 + OptiScaler 环境下 0.8 精度实测 create_feature ok=1。
-// 注意：只做这一档转换，不动 quality_from_ratio 的六档语义（其它调用点按原档位工作）。
-//   MaxQuality 容差更宽，能接受 1.0~1.5 之间的任意 ratio，是「宁可慢一点也别失败」的取舍。
+// 注意：本文件是全仓唯一使用 quality_from_ratio 的地方，共两个调用点 —— Set()（下方 create_feature）
+//   与 diag_check_create_params 的回读校验。两处都已走本函数，因此 CreateFeature 路径上
+//   UltraQuality 不再到达 NGX（这是本修复的目的）；quality_from_ratio 自己的六档表未改。
+//   「MaxQuality 能接受 1.0~1.5 之间的任意 ratio」是**推断**（由 quality_from_ratio 相邻两条
+//   区间 1.0~1.3 与 1.3~1.5 合并得出、并经 0.9 实机验证），不是逐档实测。
+//   取舍：宁可保守选低一档，也不要 CreateFeature 失败导致整场上采样失效。
 // ★ 本函数必须同时用于 Set() 与 diag_check_create_params 的回读校验，否则对账会误报 set_mismatch。
 static NVSDK_NGX_PerfQuality_Value perf_quality_for_create(NVSDK_NGX_PerfQuality_Value q)
 {
