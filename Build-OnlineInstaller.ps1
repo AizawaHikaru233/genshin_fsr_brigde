@@ -720,6 +720,14 @@ try {
     New-Item -ItemType Directory -Path $bridge, $opti, $amd, $nvidia, $reshade, $textureLoader, $defaults -Force | Out-Null
     Copy-Item -LiteralPath $bridgeDll -Destination (Join-Path $bridge 'Dx11FsrBridge.dll') -Force
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $bridge 'Dx11FsrBridge.ini') -Force
+    # NVIDIA RTX SDKs License §2.c：分发对象须随附许可文本（NGX SDK 头是桥的编译期依赖）。
+    # 与 FPS 包同一规则；此前只加进了 FPS 包的 required 列表与复制流程，商城包漏了复制，
+    # 于是 2.5.0 首次打包在 Assert-RequiredFiles 处失败（缺 payload\Bridge\NVIDIA-NGX-SDK-LICENSE.txt）。
+    $ngxLicense = Join-Path $root 'Dx11FsrBridge\third_party\ngx\NVIDIA-SDK-LICENSE.txt'
+    if (-not (Test-Path -LiteralPath $ngxLicense -PathType Leaf)) {
+        throw "缺少 NVIDIA NGX SDK 许可文本: $ngxLicense（third_party\ngx 目录不完整，先跑 tools\Fetch-NgxHeaders.ps1）"
+    }
+    Copy-Item -LiteralPath $ngxLicense -Destination (Join-Path $bridge 'NVIDIA-NGX-SDK-LICENSE.txt') -Force
     Copy-DirectoryContents -Source $optiRuntime -Destination $opti
     # 临时方案：同上，芙芙包里的 OptiScaler 也换成 AMD 官方 FFX 运行时。
     Copy-Item -LiteralPath $ffxDll -Destination (Join-Path $opti 'amd_fidelityfx_upscaler_dx12.dll') -Force
