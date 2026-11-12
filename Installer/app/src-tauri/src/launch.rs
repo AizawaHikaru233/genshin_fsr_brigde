@@ -37,6 +37,7 @@ fn defaults() -> Map<String, Value> {
     m.insert("UseMobileUI".into(), json!(false));
     m.insert("UseHDR".into(), json!(false));
     m.insert("FPSTarget".into(), json!(240));
+    m.insert("FpsClamp".into(), json!(true));
     m.insert("CustomResX".into(), json!(1920));
     m.insert("CustomResY".into(), json!(1080));
     m.insert("MonitorNum".into(), json!(1));
@@ -96,6 +97,7 @@ const SWITCHES: &[(&str, &str)] = &[
     ("customRes", "UseCustomRes"),
     ("mobileUI", "UseMobileUI"),
     ("suspendLoad", "SuspendLoad"),
+    ("cloak", "FpsClamp"),
 ];
 
 fn flag(config: &Map<String, Value>, key: &str) -> bool {
@@ -126,6 +128,8 @@ pub fn unlocker_settings() -> Value {
         "resY": number(&c, "CustomResY", 1080),
         "monitor": number(&c, "MonitorNum", 1),
         "priority": number(&c, "Priority", 3),
+        // 缺键按开启：老配置与全新安装都应默认开启（C++ 侧读不到这个键时同样按 true 处理）
+        "cloak": c.get("FpsClamp").and_then(Value::as_bool).unwrap_or(true),
     })
 }
 
@@ -134,6 +138,11 @@ pub fn patch_config(patch: &Value) -> Result<Value, String> {
     let patch = patch.as_object().ok_or("无效的修改内容")?;
     if !config_path().is_file() {
         return Err("还没有写入注入链，先完成一次安装".into());
+    }
+    // unlockfps_nc 退出时会把内存里的配置整份写回，运行期间的外部改动会被它覆盖。
+    // 只拦「高帧防检测」这一项，其余既有开关保持原有行为。
+    if patch.get("cloak").and_then(Value::as_bool).is_some() && running() {
+        return Err("解帧工具正在运行，改动会在它退出时被覆盖；请先关闭解帧工具再改".into());
     }
     let mut config = config_map();
 

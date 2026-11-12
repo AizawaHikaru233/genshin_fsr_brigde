@@ -252,6 +252,11 @@
   .sfixed{font-size:12.5px;color:var(--ink2);font-variant-numeric:tabular-nums;white-space:nowrap}
   .sfixed b{font-weight:600;color:var(--ink)}
   .slabel{font-size:12.5px;color:var(--ink2);white-space:nowrap}
+  /* 高帧防检测：开关独占一行，说明与风险提示各占一行（文字比其它行宽） */
+  .srow.cloak{flex-direction:column;align-items:stretch;gap:5px}
+  .cloakhead{display:flex;align-items:center;gap:10px}
+  .cloakdesc{font-size:12px;color:var(--ink2);line-height:1.5}
+  .cloakwarn{font-size:12px;color:var(--red);line-height:1.5}
   .scard-note{padding:0 18px 12px;font-size:12px;color:var(--ink2);line-height:1.5}
   .lnklist{padding:2px 18px 12px}
   .lnkrow{display:flex;align-items:center;gap:10px;padding:7px 0}
@@ -1442,6 +1447,27 @@
     miscRow.group.appendChild(hdr);
     box.appendChild(miscRow);
 
+    // 高帧防检测：和上面的开关走同一条通道（fps_config.json 的 FpsClamp 键）
+    var cloakRow = document.createElement('div');
+    cloakRow.className = 'srow cloak';
+    var cloakHead = document.createElement('div');
+    cloakHead.className = 'cloakhead';
+    ui.cloakWrap = swItem(cloakHead, 'cloak', '高帧防检测', cfg.cloak !== false, false, function(){
+      var patch = {};
+      patch.cloak = !state.unlocker.cloak;
+      patchUnlocker(patch);
+    });
+    var cloakDesc = document.createElement('div');
+    cloakDesc.className = 'cloakdesc';
+    cloakDesc.textContent = '向游戏上报 60/45/30，避免解锁帧率被判为非法工具；不影响实际帧数';
+    var cloakWarn = document.createElement('div');
+    cloakWarn.className = 'cloakwarn';
+    cloakWarn.textContent = '此项会修改游戏代码，若游戏更新后失效或出现异常请关闭';
+    cloakRow.appendChild(cloakHead);
+    cloakRow.appendChild(cloakDesc);
+    cloakRow.appendChild(cloakWarn);
+    box.appendChild(cloakRow);
+
     var note = document.createElement('div');
     note.className = 'scard-note';
     note.id = 'unlockernote';
@@ -1478,6 +1504,12 @@
       sw.disabled = locked;
       wrap.classList.toggle('dim', locked);
     });
+
+    // 防检测开关写 fps_config.json，禁用条件与其它解帧工具选项保持一致
+    var cloakSw = ui.cloakWrap.querySelector('.sw');
+    cloakSw.setAttribute('aria-checked', cfg.cloak !== false ? 'true' : 'false');
+    cloakSw.disabled = locked;
+    ui.cloakWrap.classList.toggle('dim', locked);
 
     ui.mon.disabled = locked;
     if (document.activeElement !== ui.mon) ui.mon.value = String(cfg.monitor);
@@ -2868,6 +2900,9 @@ $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); }
     '改完立刻生效，下次启动游戏时应用。':'Changes apply immediately and take effect next launch.',
     '完成一次安装（写入注入链）后就能在这里调整。':'Finish one install (writes the injection chain) to edit these.',
     '已保存到 fps_config.json':'Saved to fps_config.json', '保存失败':'Save failed',
+    '高帧防检测':'Frame Rate Detection Prevention',
+    '向游戏上报 60/45/30，避免解锁帧率被判为非法工具；不影响实际帧数':'Reports 60/45/30 to the game so the unlocked frame rate is not flagged; the real frame rate is unaffected.',
+    '此项会修改游戏代码，若游戏更新后失效或出现异常请关闭':'This modifies game code; turn it off if it stops working after a game update or anything looks wrong.',
     '窗口模式':'Window mode', '窗口化':'Windowed', '无边框':'Borderless', '全屏':'Fullscreen', '独占全屏':'Exclusive fullscreen',
     '分辨率':'Resolution', '跟随游戏':'Follow game', '自定义':'Custom',
     '启动':'Startup', '即开游戏':'Auto-launch game', '随游戏退出':'Exit with game', '启动最小化':'Start minimized',
