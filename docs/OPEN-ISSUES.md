@@ -145,16 +145,17 @@ Dx11wDx12SC::Present
 - 画质契约：对方是 OptiScaler 自带的 FSR 2.2.1（D3D11 静态 FFX），**不读** `MV_Scale_X/Y`（按 UV 单位处理运动矢量），`IsHDR` 直接决定它走不走 HDR 分支。注意 `40a6d8e` 的提交说明写过「OptiScaler 会把 IsHDR 改回 1」⇒ 桥把 `NgxHdr` 默认改成 `0` 只覆盖**绕过** OptiScaler 的路径，外部实现路径上的 HDR 判定仍归 OptiScaler 的 ini。
 - 取证行：`ngx_core provider_mode=…`（配置要什么）与 `ngx_core provider resolved=… module=…`（实际用了谁，kind ∈ `nvidia_registry` / `nvngx_load` / `loaded_module`）。
 
-### `Ffx12SingleInstance` 缺省 1 的回归确认（2026-11-13）
+### `Ffx12SingleInstance` 缺省 0 + NGX 后端强制单实例（2026-11-13 复核）
 
-**解决提交**：`d76a437`（缺省由 0 改为 1，随 NGX 后端合并）、`2c78ba1`《perf(ngx): 跨 key 复用 NGX 实例，消除进出角色界面约 500ms 卡顿》。
+**~~旧结论（已证伪）~~**：曾记为「`d76a437` 把缺省由 0 改为 1 是有意修正，保留缺省 1，多实例场景无回归」。
 
-**结论**：保留缺省 1，多实例场景无回归。
+**证伪依据**：`379f343`（2026-09-28）引入时缺省 1，是为绕开当时**全局单份**的 FFX12 GPU 互操作共享层；同日 `f9e52b3` 起该层已改为按 `instance_key` 独占（纹理/UAV/SRV/尺寸池/context/挂起槽全部按实例隔离，只剩 fence 全局），`68ed170`（2026-10-02）因此把缺省改为 0 全量接管，并实测左右 1:1 分屏两路各自 100% 接管（0 拒绝 / 0 吞掉 / 无覆盖层 / 无冻结）。`d76a437` 在合并 NGX 后端时把代码与模板双双改回 1，提交说明写「缺省值与发布 ini 对齐」——改动前两处**本来都是 0**，所谓对齐不成立，属回归。
 
-- 代码与模板两处同为 1：`Dx11FsrBridge/Dx11FsrBridge.cpp:4285`、`Dx11FsrBridge.package.ini:114`；相关可调键 `Ffx12SingleInstancePick` / `Sticky` / `HoldMs` / `Diag` / `StrictMatch` 都保留。
-- 缓解分两层：① 单实例接管把多实例压成一个，消掉「键在两个值之间来回翻转」；② NGX 实例跨 key 复用，键变化不再触发整池重建。
-- 追加事实：进出角色界面那 ~500 ms 停顿的真因不是 NGX 重建，而是 OptiScaler `inputs/NVNGX_DLSS_Dx11.cpp` 的 `ReleaseFeature` 里 `sleep_for(500ms)`；`2c78ba1` 在本场景已经够用。
-- 维护者确认多实例实测无回归。局限如实保留：使用者显式把该键改回 0 时，多实例重建的行为会按原样出现。
+**现结论**：缺省恢复 0（全量接管），两处同步：`Dx11FsrBridge/Dx11FsrBridge.cpp` 的读取点与 `Dx11FsrBridge.package.ini`；`scripts/Deploy-Bridge.ps1` 不写该键（新增为第四个「故意不写」的例外），缺键时走代码内建缺省 0。FFX 后端多机位场景回到 `68ed170` 的已验证行为。
+
+**NGX 后端不同**：NGX 的 feature 与资源池是**真全局单实例**（`NgxBackend.cpp` 的 `g_inst`，v8 起不再是 map + LRU），只支持一条流水线。全量接管下两路视图交替派发时：尺寸/格式不同 ⇒ 每次 `instance_key` 变化都 `destroy_instance()` + `create_instance()`；尺寸格式全等 ⇒ 走跨 key 复用但每帧复位时域（原注释：否则两个视图的时域累积互相污染）。两种都不可能两路同时正常出图 ⇒ NGX 后端**无视该键**、一律只接管一个实例（`single_instance_takeover_effective()`），日志行 `ngx_core backend=ngx … single_instance=forced` 记录该强制。
+
+**未验证**：NGX 后端多机位场景未实机复测（结论来自代码审计：全局唯一实例 + 逐 key 重建/复位两条路径都不可并发）；FFX 全量接管沿用 `68ed170` 的分屏实测，本次只改缺省值，未重跑。
 
 ### `Ffx12Backend=auto` 与 DLSS 运行时（2026-11-13）
 
@@ -166,7 +167,7 @@ Dx11wDx12SC::Present
 - 主页新增「超分输入类型」行（界面 Auto / FFX / NVNGX ↔ ini `auto` / `native` / `ngx`），选完立刻写回**已安装**的 `Dx11FsrBridge.ini`；`scripts/Deploy-Bridge.ps1` 仍故意不写该键，保留用户原值。
 - 非 RTX 想借外部实现呈现 DLSS 接口时，仍须显式选 NVNGX（写 `Ffx12Backend=ngx`）。
 - 仍然成立的一条（**刻意保留，不算缺陷**）：运行时被手工删掉时，ngx 会 `init ok=0` 并逐帧 fail-open 到游戏原生 FSR2，不会自动改走 native —— 避免出现第二套可用性判据（`AGENTS.md` §五.1）。
-- 已核对 2.5.0 两个归档（`dist\原神解帧FSR插件包_v2.5.0.7z` 与 `dist\github-release\GenshinFSRBridge_v2.5.0.7z`）里的 `payload/Bridge/Dx11FsrBridge.ini`：`Ffx12Backend=auto`、`NgxHdr=0`、`Ffx12SingleInstance=1`，与代码缺省一致。
+- 已核对 2.5.0 两个归档（`dist\原神解帧FSR插件包_v2.5.0.7z` 与 `dist\github-release\GenshinFSRBridge_v2.5.0.7z`）里的 `payload/Bridge/Dx11FsrBridge.ini`：`Ffx12Backend=auto`、`NgxHdr=0`、`Ffx12SingleInstance=1`。末项是 2.5.0 自带的缺省回归（见本文《`Ffx12SingleInstance` 缺省 0 + NGX 后端强制单实例》一节）：两处当时确实同为 1，但值本身是错的，本轮已恢复 0。
 
 ### 发布管线不启用 NGX 构型（2026-11-10）
 
