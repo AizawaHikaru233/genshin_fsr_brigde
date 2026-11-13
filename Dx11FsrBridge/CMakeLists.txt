@@ -237,6 +237,18 @@ target_link_libraries(Dx11FsrBridge PRIVATE
     # T-10：DisplayConfigGetDeviceInfo / QueryDisplayConfig（Windows 显示配置 API）
     # 用于探测显示器真实 HDR 状态。这三个函数在 user32.lib。
     user32
+    # 2026-11-14：GetFileVersionInfoSizeW / GetFileVersionInfoW / VerQueryValueW ——
+    # NgxBackend.cpp 用它读 nvngx_dlss.dll 的 FileVersion（"ngx_core init ok=1 … dlss=" 行）。
+    # ★ 为什么直接链 version.lib，而不是 GetModuleHandleW("version.dll") + GetProcAddress：
+    #   ① version.dll 是 **KnownDLL**：进程启动时由内核映射，不经过我们的加载路径，
+    #      "为了调它而先把它加载起来"这件事根本不存在；
+    #   ② 本进程（原神）与桥自己都已在用 version.dll（FufuGraphicsPlugin 也链它），
+    #      同进程内它必然已映射 ⇒ 没有"加载顺序"风险可规避；
+    #   ③ 少一条运行期失败路径：GetProcAddress 拿不到就得在日志里加一种新的失败形态，
+    #      而它在本机上永远不会发生（§一.6：不引入测不到的分支）。
+    #   代价只是一条静态 import 表项（三个函数），与 FufuGraphicsPlugin 的 target_link_libraries
+    #   里链 version 的写法一致（那边是读自身 .rc 的版本资源，同一个库、同一种取舍）。
+    version
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/detours/detours.lib"
 )
 

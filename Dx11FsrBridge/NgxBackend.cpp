@@ -31,6 +31,7 @@
 // ---- ① 标准库 ----
 #include <atomic>         // std::atomic（g_release_all / g_logged_config / g_ngx_log_count）
 #include <cstdarg>        // va_list / va_start / va_end（log_ngx_* 的 varargs）
+#include <cstdint>        // std::uint8_t（DLSS 版本资源的读缓冲）
 #include <cstdio>         // _vsnwprintf_s / std::snprintf
 #include <cstdlib>        // std::wcstoull 兜底
 #include <cstring>        // memcpy / strlen
@@ -366,6 +367,25 @@ struct NgxInstance
 std::atomic<bool> g_release_all { false };   // D9 全局放手；0→1 后不可逆，只读于两道 gate
 bool g_inited    = false;   // ensure_init 成功过（**失败路径不置位**，见 §3.4.2 与 B-9 的更正）
 bool g_available = false;   // SuperSampling 可用
+
+// ---- provider / DLSS 运行时取证（2026-11-14）----
+// 为什么要把 ensure_init 里的局部量搬到这里：ProviderHit（§3.4.3A）在 ensure_init 里是
+//   **栈上局部量**，原先唯一消费点是紧随其后的一行 "provider resolved=" 日志；而"这局到底
+//   谁在超分"现在还要写进 "ngx_core init ok=1" 行（provider= 字段），出了作用域就取不到了。
+//   放在 g_inited / g_available 旁边（同为进程级事实），与 active() / available() 那组查询
+//   同级，不另起一段、也不在别处再造第二份口径（AGENTS.md §五.2）。
+// ★ 只存 kind，不存 ProviderHit 的 module / path：module 句柄按 §6-13 惯例不持有，
+//   而 path 已经打在紧邻的 "provider resolved=… module=…" 行上；再存一份**没有读取点**的
+//   副本只会变成死状态（本仓库对"加了字段却没人读"的历史事故有明确记录）。
+// ★ 形态纪律不变：它**不是** atomic —— 写方（ensure_init）与读方（日志）都在
+//   ffx12::dispatch() 持 g_mutex 的调用栈内，与 g_inited / g_available 的前提完全相同。
+const wchar_t *g_provider_kind = L"unknown";   // 指向字符串字面量（静态存储期），无需持有
+// DLSS 运行时版本（"310.9.16" = FileVersion 前三段）；"?" = 未取到。
+// 只在首次初始化成功时读一次（g_dlss_version_read 锁存）—— 读文件版本要打开文件，
+// 绝不能落在每帧/每 draw 路径上（§二.5 热路径红线）。
+// 宽串：唯一消费点 log_ngx_error 是宽格式串，存窄串等于每次打印都要再转一遍。
+std::wstring   g_dlss_version;
+bool           g_dlss_version_read = false;
 
 // ---- 设备与参数 ----
 Microsoft::WRL::ComPtr<ID3D11Device> g_device;   // 只 AddRef 一次；与游戏设备比对用
@@ -1097,6 +1117,77 @@ static void resolve_feature_dirs()
         g_feature_dir_ptrs.push_back(d.c_str());
 }
 
+// 从 VS_VERSION_INFO 取 FileVersion 的前三段（"310,9,16,0" → "310.9.16"）。
+// 实现照抄 FufuGraphicsPlugin/FufuGraphicsPlugin.cpp 的 module_version_string()
+// （GetFileVersionInfoSizeW → GetFileVersionInfoW → VerQueryValueW），只改两处：
+//   ① 取的是 **VS_FIXEDFILEINFO 的数值四元组**而不是 StringFileInfo 的 FileVersion 字符串 ——
+//      这里只要前三段数字，数值四元组不依赖语言/代码页（字符串版要试 0804/0409 两个 key）；
+//   ② 用已加载模块的实际路径，而不是"首个特征目录里的文件"（见下面 resolve_dlss_dll_path）。
+// 失败返回空串，调用方按"未取到"处理。返回**宽串**：调用点走 log_ngx_error（宽格式串），
+// 在这里转窄再转回宽纯属白做两次转换。
+static std::wstring file_version_three_segments(const std::wstring &path)
+{
+    if (path.empty())
+        return std::wstring {};
+
+    DWORD handle = 0;
+    const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &handle);
+    if (size == 0)
+        return std::wstring {};
+
+    std::vector<std::uint8_t> buffer(size);
+    if (GetFileVersionInfoW(path.c_str(), handle, size, buffer.data()) == FALSE)
+        return std::wstring {};
+
+    VS_FIXEDFILEINFO *info = nullptr;
+    UINT info_len = 0;
+    if (VerQueryValueW(buffer.data(), L"\\", reinterpret_cast<void **>(&info), &info_len) == FALSE ||
+        info == nullptr || info_len < sizeof(VS_FIXEDFILEINFO))
+        return std::wstring {};
+    // 签名不对说明这块资源不是版本资源（防御：VerQueryValueW 已成功时极少见）
+    if (info->dwSignature != 0xFEEF04BD)
+        return std::wstring {};
+
+    // 四段各 16 位：MS = (MS>>16).(MS&0xFFFF)，LS 同理 ⇒ 前三段取 MS>>16 / MS&0xFFFF / LS>>16。
+    wchar_t text[64] {};
+    swprintf_s(text, L"%u.%u.%u",
+               static_cast<unsigned>(info->dwFileVersionMS >> 16),
+               static_cast<unsigned>(info->dwFileVersionMS & 0xFFFFu),
+               static_cast<unsigned>(info->dwFileVersionLS >> 16));
+    return std::wstring(text);
+}
+
+// DLSS 运行时 DLL 的路径：**优先已加载模块的实际路径**，模块未加载才退回特征目录里的文件。
+//
+// 2026-11-14（为什么不是"首个特征目录里的文件"）：那份文件是**磁盘上的候选**，不等于本进程
+//   真正在跑的那一份。OptiScaler 之类的注入器会带自己的 nvngx_dlss.dll 副本、并且可能从
+//   与 PathListInfo 首项不同的目录装载 ⇒ 只看特征目录会把"实际生效的 DLSS 版本"报错。
+//   GetModuleHandleW 不增加引用计数、不触发加载（模块没加载就返回 nullptr，我们才退回去看文件），
+//   故这里没有"为了读版本反而把 DLL 拉起来"的副作用。
+// ★ 只在 ensure_init 成功路径上调一次（g_dlss_version_read 锁存），不在每帧路径上。
+static std::wstring resolve_dlss_dll_path()
+{
+    const HMODULE loaded = GetModuleHandleW(L"nvngx_dlss.dll");
+    if (loaded != nullptr)
+    {
+        wchar_t path[MAX_PATH] {};
+        const DWORD n = GetModuleFileNameW(loaded, path, MAX_PATH);
+        if (n != 0 && n < MAX_PATH)
+            return std::wstring(path, path + n);
+    }
+
+    // 退回特征目录里的文件：首个目录（= 传给 NGX 的 PathListInfo 首项），没有就放弃。
+    // 只用 GetFileAttributesW 判存在，不做任何装载。
+    for (const std::wstring &dir : g_feature_dir_storage)
+    {
+        const std::wstring probe = dir + L"\\nvngx_dlss.dll";
+        const DWORD attr = GetFileAttributesW(probe.c_str());
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0)
+            return probe;
+    }
+    return std::wstring {};
+}
+
 // 逐级建目录（先父后子，§3.4.4）。已存在算成功。
 static bool ensure_dir_tree(const std::wstring &dir)
 {
@@ -1596,6 +1687,11 @@ static bool ensure_init(ID3D11Device *dev)
     // 为什么要单独一行：`Ffx12Backend=ngx` 只说明"用户要 ngx"，这一行才说明"实际用的是谁"。
     log_ngx_error(L"ngx_core provider resolved=%s module=%s",
                   hit.kind, hit.path.empty() ? L"(unknown)" : hit.path.c_str());
+    // 2026-11-14：同一份事实**另存一份到全局**，供第 10 步的 init 行打印 provider= 字段。
+    //   为什么不能只靠上面那行：init 行与它相隔 50 行、中间还有 6 条失败早退路径，
+    //   排查时要同时看到"谁在超分 + 运行时版本 + 初始化成功"才够一次定位；而 hit 是局部量。
+    //   存的是同一份数据（不重新解析），故不产生第二套口径。
+    g_provider_kind = hit.kind;
 
     // ---- 第 4 步：组装 NVSDK_NGX_FeatureCommonInfo（§3.4.5）----
     NVSDK_NGX_FeatureCommonInfo fc {};
@@ -1645,8 +1741,21 @@ static bool ensure_init(ID3D11Device *dev)
     g_inited    = true;
     g_available = true;
     g_device    = dev;   // ComPtr::operator= 即 AddRef；只在首次成功时走到这里（g_inited 短路）
-    log_ngx_error(L"ngx_core init ok=1 available=1 rc=0x%X",
-                  static_cast<unsigned>(NVSDK_NGX_Result_Success));
+    // 2026-11-14（焦点块在 ngx 模式下把 AMD SDK 当成当前实现）：这一行原本只报 rc，
+    //   排查者从它看不出"实际在跑哪个 DLSS、由谁提供"。补 dlss= 与 provider= 两个字段，
+    //   与 provider resolved= 行同源（provider 直接取上一步存下的全局），不新增判据。
+    // ★ 版本只在**首次初始化成功**时读一次（g_dlss_version_read 锁存）：读版本要打开文件，
+    //   而 ensure_init 虽只在首次（及退避重试）调用，仍不应在可能被重试的路径上重复付 I/O。
+    //   读不到就打 dlss=?（不猜、不省略字段，保持行格式稳定便于脚本比对）。
+    if (!g_dlss_version_read)
+    {
+        g_dlss_version_read = true;
+        const std::wstring version = file_version_three_segments(resolve_dlss_dll_path());
+        g_dlss_version = version.empty() ? std::wstring(L"?") : version;
+    }
+    log_ngx_error(L"ngx_core init ok=1 available=1 rc=0x%X dlss=%s provider=%s",
+                  static_cast<unsigned>(NVSDK_NGX_Result_Success),
+                  g_dlss_version.c_str(), g_provider_kind);
 
     // ---- 第 10b 步（2026-11-13，OPEN-ISSUES §4）：为选档准备**独立的**查询参数对象 ----
     // 为什么放在这里、而不是第一次选档时懒建：

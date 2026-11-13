@@ -3392,20 +3392,51 @@ void log_focus_line(const std::string &line)
     blog::write(blog::Level::Info, blog::cat::core, line);
 }
 
-// 接管信息焦点框——显卡型号 / SDK 路径 / FSR 实际版本 相邻输出，
+// 接管信息焦点框——显卡型号 / 后端 / FFX SDK 路径 / FFX 实际版本 相邻输出，
 // 空行 + 分隔线制造明显焦点区域（排版参考：[ffx] Upscaler Version 风格）。
+//
+// 2026-11-14（焦点块在 ngx 模式下撒谎）：本块只描述 FFX 直连路径，但它的两个调用点
+//   （try_fsr2_translation_draw 里"首次派发成功"与"首次失败"两处，用行号会随本文件增删
+//   漂移，故只写位置）在 **ngx 模式同样可达** —— ffx12::dispatch() 在 ngx 分支里把结果
+//   透传给 ngx::dispatch() 后照样返回 true。实测 backend=ngx 的会话打出：
+//     GPU : NVIDIA GeForce RTX 4070 SUPER (vendor=0x10DE)
+//     SDK : ...\payload\AMD\amd_fidelityfx_upscaler_dx12.dll
+//     FSR : FSR?  [OK]
+//   而同一份日志的 ngx_core provider resolved=nvidia_registry 说明真正上屏的是 DLSS。
+//   这不是"缺信息"，是**主动误导**：排查者会顺着 AMD SDK 路径查下去。
+//   ⇒ ① 先加 BACKEND 行回答"谁在超分"；② ngx 模式下 FFX 两行明确标 unused，
+//      不再让"AMD 的 SDK + 未知版本 FSR + [OK]"冒充当前实现。
 static void log_focus_block(const char *state)
 {
     const std::string gpu =
         g_route_gpu_name.empty() ? std::string("unknown") : g_route_gpu_name;
     const std::string sdk =
         g_route_sdk_path.empty() ? std::string("unknown") : g_route_sdk_path;
+    // 后端取 ffx12::backend() 的真值（实现在 Ffx12Backend.cpp 的 set_backend/backend 一对），
+    // 不按 ini 字面量判 —— Ffx12Backend=auto 时 ini 里写的是 auto，实际落位由型号决定。
+    // g_backend_auto_note 只在"写了 auto 且已落位"时非空（由 resolve_backend_auto 写入），
+    // 直接附上即为 auto 的决策依据，不再造第二套摘要口径。
+    const bool ngx_backend = ffx12::backend() == ffx12::BackendKind::Ngx;
+    std::string backend_text = ngx_backend ? "ngx" : "native";
+    if (!g_backend_auto_note.empty())
+        backend_text += "  (" + g_backend_auto_note + ")";
     log_focus_line("");
     log_focus_line("====================================================");
     log_focus_line("  GPU : " + gpu + " (vendor=" + g_route_vendor_label + ")");
-    log_focus_line("  SDK : " + sdk);
-    log_focus_line("  FSR : FSR" + std::string(ffx12::matched_version_name()) +
-                   "  [" + state + "]");
+    log_focus_line("  BACKEND : " + backend_text);
+    // native：FFX 路径就是当前实现，保持原有三行语义不变。
+    // ngx：SDK 路径与 FSR 版本与实际上屏实现无关，必须写 unused —— 保留原值等于继续误导。
+    if (ngx_backend)
+    {
+        log_focus_line("  FFX SDK : (unused, backend=ngx)");
+        log_focus_line("  FFX : (unused, backend=ngx)");
+    }
+    else
+    {
+        log_focus_line("  FFX SDK : " + sdk);
+        log_focus_line("  FFX : FSR" + std::string(ffx12::matched_version_name()) +
+                       "  [" + state + "]");
+    }
     log_focus_line("====================================================");
     log_focus_line("");
 }
