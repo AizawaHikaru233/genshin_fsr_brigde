@@ -3406,6 +3406,10 @@ void log_focus_line(const std::string &line)
 //   这不是"缺信息"，是**主动误导**：排查者会顺着 AMD SDK 路径查下去。
 //   ⇒ ① 先加 BACKEND 行回答"谁在超分"；② ngx 模式下 FFX 两行明确标 unused，
 //      不再让"AMD 的 SDK + 未知版本 FSR + [OK]"冒充当前实现。
+// ⚠️ 2026-11-14（审查：说法与事实不符，更正）：本改动**对 native 模式也有影响** ——
+//   BACKEND 行是**无条件**打印的（不只在 ngx 分支），且 SDK :→FFX SDK :、FSR :→FFX :
+//   两个改名同样作用于 native。所以 native 下的块从 3 行变 4 行、两行改了名。
+//   原提交信息与文档曾写"native 输出不变"，那是错的。
 static void log_focus_block(const char *state)
 {
     const std::string gpu =

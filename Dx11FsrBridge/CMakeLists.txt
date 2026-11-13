@@ -240,12 +240,16 @@ target_link_libraries(Dx11FsrBridge PRIVATE
     # 2026-11-14：GetFileVersionInfoSizeW / GetFileVersionInfoW / VerQueryValueW ——
     # NgxBackend.cpp 用它读 nvngx_dlss.dll 的 FileVersion（"ngx_core init ok=1 … dlss=" 行）。
     # ★ 为什么直接链 version.lib，而不是 GetModuleHandleW("version.dll") + GetProcAddress：
-    #   ① version.dll 是 **KnownDLL**：进程启动时由内核映射，不经过我们的加载路径，
-    #      "为了调它而先把它加载起来"这件事根本不存在；
-    #   ② 本进程（原神）与桥自己都已在用 version.dll（FufuGraphicsPlugin 也链它），
-    #      同进程内它必然已映射 ⇒ 没有"加载顺序"风险可规避；
-    #   ③ 少一条运行期失败路径：GetProcAddress 拿不到就得在日志里加一种新的失败形态，
-    #      而它在本机上永远不会发生（§一.6：不引入测不到的分支）。
+    #   ① 少一条运行期失败路径：GetProcAddress 拿不到就得在日志里加一种新的失败形态，
+    #      而它在本机上永远不会发生（§一.6：不引入测不到的分支）；
+    #   ② 静态 import 表让依赖在加载期就暴露，而不是等到第一次读版本时才发现。
+    # ⚠️ 关于风险面，如实记录（2026-11-14 实测更正）：
+    #   version.dll **不是** KnownDLL（实测 HKLM\SYSTEM\CurrentControlSet\Control\
+    #   Session Manager\KnownDLLs 共 38 项，其中没有 VERSION）。因此这条 import 走的是
+    #   标准 DLL 搜索顺序 —— **游戏 exe 所在目录优先于 System32**。若该目录被放了一个
+    #   同名 version.dll，加载的就是它。
+    #   这与本仓库既有的 user32 / d3d11 / dxgi 等 import 是同一类风险面（它们同样按搜索
+    #   顺序解析），不是本改动新引入的类别；但**不能说成"不存在加载顺序风险"**。
     #   代价只是一条静态 import 表项（三个函数），与 FufuGraphicsPlugin 的 target_link_libraries
     #   里链 version 的写法一致（那边是读自身 .rc 的版本资源，同一个库、同一种取舍）。
     version

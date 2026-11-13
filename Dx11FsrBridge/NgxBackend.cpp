@@ -385,6 +385,9 @@ const wchar_t *g_provider_kind = L"unknown";   // 指向字符串字面量（静
 // 绝不能落在每帧/每 draw 路径上（§二.5 热路径红线）。
 // 宽串：唯一消费点 log_ngx_error 是宽格式串，存窄串等于每次打印都要再转一遍。
 std::wstring   g_dlss_version;
+// 版本取自哪条路：loaded（本进程已装载的模块）/ file（特征目录里的候选文件）/ none。
+// 加它是因为两条路可能给出同一个版本号 —— 只有数值无法证明走的是哪一条。
+std::wstring   g_dlss_source = L"none";
 bool           g_dlss_version_read = false;
 
 // ---- 设备与参数 ----
@@ -1166,25 +1169,38 @@ static std::wstring file_version_three_segments(const std::wstring &path)
 //   GetModuleHandleW 不增加引用计数、不触发加载（模块没加载就返回 nullptr，我们才退回去看文件），
 //   故这里没有"为了读版本反而把 DLL 拉起来"的副作用。
 // ★ 只在 ensure_init 成功路径上调一次（g_dlss_version_read 锁存），不在每帧路径上。
-static std::wstring resolve_dlss_dll_path()
+// ★ 2026-11-14（审查：来源无法区分）：同时回传来源标记，供日志区分
+//   loaded（本进程真正装载的那一份）与 file（特征目录里找到的候选文件）。
+//   两者可能给出**同一个版本号**，所以只看 dlss= 的数值无法证明取的是哪一条路 ——
+//   原提交信息用"另一副本是 310.9.1"当证据，但那不是特征目录，属旁证当结论。
+static std::wstring resolve_dlss_dll_path(const wchar_t **source)
 {
+    if (source != nullptr) *source = L"none";
+
     const HMODULE loaded = GetModuleHandleW(L"nvngx_dlss.dll");
     if (loaded != nullptr)
     {
         wchar_t path[MAX_PATH] {};
         const DWORD n = GetModuleFileNameW(loaded, path, MAX_PATH);
         if (n != 0 && n < MAX_PATH)
+        {
+            if (source != nullptr) *source = L"loaded";
             return std::wstring(path, path + n);
+        }
     }
 
     // 退回特征目录里的文件：首个目录（= 传给 NGX 的 PathListInfo 首项），没有就放弃。
     // 只用 GetFileAttributesW 判存在，不做任何装载。
+    // ⚠️ 这条路上取到的是"磁盘候选"，可能是玩家的另一份副本，与真正生效的那份未必相同。
     for (const std::wstring &dir : g_feature_dir_storage)
     {
         const std::wstring probe = dir + L"\\nvngx_dlss.dll";
         const DWORD attr = GetFileAttributesW(probe.c_str());
         if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0)
+        {
+            if (source != nullptr) *source = L"file";
             return probe;
+        }
     }
     return std::wstring {};
 }
@@ -1748,15 +1764,27 @@ static bool ensure_init(ID3D11Device *dev)
     // ★ 版本只在**首次初始化成功**时读一次（g_dlss_version_read 锁存）：读版本要打开文件，
     //   而 ensure_init 虽只在首次（及退避重试）调用，仍不应在可能被重试的路径上重复付 I/O。
     //   读不到就打 dlss=?（不猜、不省略字段，保持行格式稳定便于脚本比对）。
+    // ★ 2026-11-14（审查：锁存顺序）：原实现在**读之前**就置 g_dlss_version_read=true，
+    //   若首次读失败（例如 nvngx_dlss.dll 尚未被 NGX 装载、特征目录里也没有），
+    //   就会把 "?" 永久锁存 —— 之后再成功也刷不回来。改成**取到非空才锁存**：
+    //   读失败就保持 false，下次 ensure_init（退避重试路径）再试一次。
+    //   代价仅是"一直读不到就每次 init 都读一次"，而那种情形本身意味着环境异常。
     if (!g_dlss_version_read)
     {
-        g_dlss_version_read = true;
-        const std::wstring version = file_version_three_segments(resolve_dlss_dll_path());
-        g_dlss_version = version.empty() ? std::wstring(L"?") : version;
+        const wchar_t *src = L"none";
+        const std::wstring version = file_version_three_segments(resolve_dlss_dll_path(&src));
+        if (!version.empty())
+        {
+            g_dlss_version = version;
+            g_dlss_source  = src;
+            g_dlss_version_read = true;
+        }
     }
-    log_ngx_error(L"ngx_core init ok=1 available=1 rc=0x%X dlss=%s provider=%s",
+    log_ngx_error(L"ngx_core init ok=1 available=1 rc=0x%X dlss=%s source=%s provider=%s",
                   static_cast<unsigned>(NVSDK_NGX_Result_Success),
-                  g_dlss_version.c_str(), g_provider_kind);
+                  g_dlss_version.empty() ? L"?" : g_dlss_version.c_str(),
+                  g_dlss_source.empty() ? L"none" : g_dlss_source.c_str(),
+                  g_provider_kind);
 
     // ---- 第 10b 步（2026-11-13，OPEN-ISSUES §4）：为选档准备**独立的**查询参数对象 ----
     // 为什么放在这里、而不是第一次选档时懒建：
