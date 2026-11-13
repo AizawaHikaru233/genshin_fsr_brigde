@@ -476,7 +476,8 @@ std::atomic<unsigned>     g_displayconfig_hdr_state { 0 };
 std::atomic<unsigned>     g_hdr_probe_cache { 0 };
 
 // ★ m4：g_hdr_mode **故意保持普通 int**：它只由 load_config() 在 blog::init() 之前写入，
-//   之后运行期只读，配置无热重载（改 ini 后需重启游戏才生效，OptiScaler 与桥皆然）
+//   之后运行期只读，配置无热重载（桥侧已核实：load_config 只在模块初始化时调一次，
+//   改 ini 需重启游戏才生效；OptiScaler 亦然，但那一半不在本仓库内，未就地核实）
 //   ⇒ 不存在跨线程写，加 atomic 是纯开销。
 //   g_hdr 同理（且它已退化为「本次决策的回写镜像」，见 resolve_is_hdr 的注释）。
 int                       g_hdr_mode      = 0;         // 0=auto 1=force-on 2=force-off
@@ -544,7 +545,7 @@ unsigned g_config_warn = 0;
 // ★ 2026-11-09（计数闸门复核）：**上面两个函数都不做任何计数闸门**，
 //   这才是「等价」二字的实际含义。上一版只给 log_ngx_error 加了计数闸门，
 //   于是注释与实现互相矛盾（违反 AGENTS.md §二.2），且闸门本身是错的
-//   （见下方 log_ngx_error 内「全局共享计数器会吞掉新种类错误」的说明）。
+//   （见下方 log_ngx_error 的「缺陷原状（已删除）」段）。
 //   频次控制的责任在**调用方**，按错误性质二选一：
 //     · 致命错误（置 g_release_all / 设备丢失 / 一次性事件）⇒ log_ngx_error 或
 //       log_ngx_core(Level::Error, …)，**不加闸门**。它们承载的是「NGX 已全局放手」的
@@ -776,7 +777,7 @@ void log_ngx_core(blog::Level lv, const wchar_t *fmt, ...)
     va_list args;
     va_start(args, fmt);
     vlog_ngx(lv, fmt, args);
-    va_end(args);                                  // ★ va_list 只能消费一次，第二次消费会被 CRT 以 0xC0000409 终止
+    va_end(args);                                  // ★ 同一 va_list 只能消费一次；再消费前必须重新 va_start，否则 CRT 以 0xC0000409 终止进程
 }
 
 void log_ngx_error(const wchar_t *fmt, ...)
@@ -801,7 +802,7 @@ void log_ngx_error(const wchar_t *fmt, ...)
     va_end(args);
 }
 
-// 2026-11-09（新增）：按调用点独立限频的 Error 日志（实现说明见声明处）。
+// 2026-11-09（按调用点独立限频）：非致命的高频 Error 走这个函数，每个调用点各有一份计数闸门。
 //
 // ★★ 槽位（2026-11-09 改为编译期模板参数）：模板参数是 log_throttle_slot::Slot，
 //   **不接受裸整数**。上一版是在运行期对 tag 字符串做 FNV-1a 哈希取模来算槽，带来三个后果：
@@ -875,7 +876,7 @@ void log_ngx_error_throttled(const wchar_t *fmt, ...)
     va_list args;
     va_start(args, fmt);
     vlog_ngx(blog::Level::Error, fmt, args);
-    va_end(args);   // ★ va_list 只能消费一次，第二次消费会被 CRT 以 0xC0000409 终止
+    va_end(args);   // ★ 同一 va_list 只能消费一次；再消费前必须重新 va_start，否则 CRT 以 0xC0000409 终止进程
 }
 
 // §3.9A.1：输入是 9 个 bit 的 OR 结果；输出形如 IsHDR|MVLowRes|DepthInverted（无位时为 None）。
@@ -1027,7 +1028,8 @@ static void NVSDK_CONV ngx_log_cb(const char *message,
 
 // 本 DLL 所在目录（**不含**尾部分隔符）。
 // ★ 必须 GetModuleHandleExW(FROM_ADDRESS)：GetModuleFileNameW(nullptr, …) 取到的是**宿主 exe**
-//   （Ffx12Backend.cpp:691-692 注释的同一条教训）。
+//   （Ffx12Backend.cpp 里「GetModuleFileNameW(nullptr) 取到宿主 exe」那条注释是同一教训；
+//   行号会漂移，按内容定位）。
 static std::wstring self_module_dir()
 {
     HMODULE self = nullptr;
@@ -1837,7 +1839,8 @@ static bool ensure_init(ID3D11Device *dev)
 // ============================================================================
 
 // 3.9.6 唯一的资源参数写法：传 SRV/UAV 会在这里编译失败（无隐式转换），
-// 而不是悄悄落到 void* 重载上（Ffx12CameraNear 那类「参数名写错被静默丢弃」的教训）。
+// 而不是悄悄落到 void* 重载上（Ffx12CameraNear 那类教训：NGX 参数表里根本没有
+// FFX12 时代的那些名字，Set 时被静默丢弃，而 Set 返回 void，无从检测）。
 inline void set_tex(NVSDK_NGX_Parameter *p, const char *name, ID3D11Texture2D *t)
 {
     p->Set(name, static_cast<ID3D11Resource *>(t));
@@ -3639,7 +3642,8 @@ static bool sample_1x1_zero(ID3D11DeviceContext *ctx, ID3D11Texture2D *src,
 
 // 第 19 行：Set() 返回 void（nvsdk_ngx_params.h:55-62，物理上无法检测），
 // 所以只能 Get 回读抽检五个可回读项。任一不等（含 Get 本身失败）⇒ 说明 Set 被静默丢弃，
-// 正是 Ffx12CameraNear 教训（参数名写错被静默丢弃）在 NGX 参数袋上的形态
+// 正是 Ffx12CameraNear 教训在 NGX 参数袋上的形态：那些名字在 NGX 参数表里不存在，
+// Set 时被静默丢弃（不是拼写错误 —— 名字看起来完全合理，但 NGX 未定义它）
 // ⇒ 打 set_mismatch 并置 g_release_all。
 static void diag_check_create_params(const NgxInstance &inst)
 {
@@ -3781,7 +3785,7 @@ void set_application_id(unsigned long long id)
 {
     if (id == 0)
     {
-        // appId=0 ⇒ available=0、CreateFeature 必失败（E1 实测）⇒ 强制 1337 并记位
+        // appId=0 ⇒ available=0、CreateFeature 必失败（独立探针实测）⇒ 强制 1337 并记位
         g_app_id = 1337;
         g_config_warn |= kWarnAppIdZero;
         return;

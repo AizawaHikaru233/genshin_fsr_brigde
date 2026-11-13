@@ -7510,7 +7510,7 @@ HRESULT STDMETHODCALLTYPE hooked_resize_buffers(
         //   动机：ResizeBuffers 可能改变后缓冲格式（SDR↔HDR、分辨率切换等场景下游戏会
         //   重建 8-bit/10-bit 交换链）。不重读 ⇒ is_hdr10_color_space 读到的仍是安装钩子
         //   那一刻的旧格式，G10 判据会一直用错值（且是静默的：无日志、无报错）。
-        //   ★ 可达性（本段修的正是这一点）：本块只有 hooked_resize_buffers 被 attach
+        //   ★ 可达性（上面的重读正是为修这一点）：本块只有 hooked_resize_buffers 被 attach
         //     才会执行。attach 判据是 swapchain_control_hook_needed()（见 install_swapchain_hooks
         //     的 patches 段），该谓词现已包含 Ngx 后端。改动前它只有 dlssg 与
         //     HdrSwapchainForce 两项，后者在发布构型恒假 ⇒ 默认发布构型下本块不执行。
