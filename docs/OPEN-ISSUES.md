@@ -536,11 +536,16 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
   另有一份副本解出 `310.9.1`——这正是必须按**已加载模块**路径取版本的原因，按特征目录
   取会报错。
 
-**实机验证（2026-11-14 01:34，真实 ngx 会话）**
+**实机验证（2026-11-14，两次真实 ngx 会话）**
 
-- 焦点块输出 `BACKEND : ngx` / `FFX SDK : (unused, backend=ngx)` / `FFX : (unused, backend=ngx)`。
-- `init ok=1 available=1 rc=0x1 dlss=310.9.16 provider=nvidia_registry`。
-- 零回归：`create_feature ok=1` 一次、`DISPATCH_OK` 七次、`DISPATCH_FAILED` 零次。
+- 焦点块输出 `GPU : …` / `BACKEND : ngx` / `FFX SDK : (unused, backend=ngx)` /
+  `FFX : (unused, backend=ngx)` 四行，两次会话一致。
+- `init ok=1 available=1 rc=0x1 dlss=310.9.16 source=loaded provider=nvidia_registry`。
+- 零回归：两次会话均为 `create_feature ok=1` 一次、`DISPATCH_OK` 七次、`DISPATCH_FAILED` 零次。
+- **`source=loaded` 有独立价值**：它证明版本确实取自**本进程已装载的模块**，而不是特征目录里的
+  候选文件。两条路可能给出同一个版本号，只看 `dlss=` 的数值无法区分 —— 这正是加这个字段的原因。
+  实测同时说明 NGX 在 `ensure_init` 返回前就已装载 `nvngx_dlss.dll`，故「已加载模块优先」
+  这条路径真的会命中。
 
 **尚未验证**
 
