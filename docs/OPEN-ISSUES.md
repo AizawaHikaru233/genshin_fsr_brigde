@@ -134,9 +134,10 @@ Dx11wDx12SC::Present
   `Dx11FsrBridge/NgxParamMap.h` 的 `render_range_contains()` / `pick_quality_from_ranges()`。
 - 三个调用点同源：`create_feature` 写 `PerfQualityValue`、`diag_check_create_params` 的回读期望值、
   以及 `make_feature_input_key_from` 的 `perf_quality` 字段 —— 都调 `resolve_create_quality()`。
-- **但整条链路只在编译 / 单测 / 静态分析层面验证过，没有在游戏内实机跑过**：
-  `NgxParamMapTest` 只能证明选档器的行为（区间包含、容差、重叠、回退），证明不了
-  「真实驱动返回的区间确实包含 0.8~0.999 各精度的 render 尺寸」。
+- 已在本机做过全档位实机核对（见下方「实机验证」）：9 个非默认渲染精度全部
+  `create_feature ok=1`。但**仍只覆盖一台机器、一个 DLSS 版本、一种显示分辨率**；
+  `NgxParamMapTest` 能证明选档器的行为（区间包含、容差、重叠、回退），
+  仍证明不了「真实驱动返回的区间在本机之外的显卡 / DLSS 版本上也成立」。
 
 **影响**
 
@@ -186,37 +187,79 @@ Dx11wDx12SC::Present
   `Dx11FsrBridge/NgxParamMap.h`：`render_range_contains` / `pick_quality_from_ranges`；
   `Dx11FsrBridge/NgxParamMapTest.cpp` 第 [10] 节；`Dx11FsrBridge/third_party/ngx/nvsdk_ngx_defs.h`
 
-**实机验证（2026-11-13 21:43–21:52，N 卡 + 驱动自带 NGX）**
+**实机验证（2026-11-13 21:51，N 卡 + 驱动自带 NGX）**
 
-查询路径生效，三组精度均创建成功，无一次回退到比例表：
+只跑了一次有效会话（渲染精度 0.999），一次创建成功。日志原文：
 
 ```
-pq_range pq=0 MaxPerf          opt=1920x1080 min=1920x1080 max=3840x2160
-         pq=1 Balanced         opt=2258x1270 min=1920x1080 max=3840x2160
-         pq=2 MaxQuality       opt=2560x1440 min=1920x1080 max=3840x2160
-         pq=3 UltraPerformance opt=1280x720  min=1280x720  max=3840x2160
-         pq=4 UltraQuality     opt=2953x1661 min=1920x1080 max=3840x2160
-         pq=5 DLAA             opt=3840x2160 min=3840x2160 max=3840x2160
-         tol=60x33
+pq_range pq=0 name=MaxPerf          dw=3840 dh=2160 opt=1920x1080 min=1920x1080 max=3840x2160 tol=60x33
+pq_range pq=1 name=Balanced         dw=3840 dh=2160 opt=2227x1253 min=1920x1080 max=3840x2160 tol=60x33
+pq_range pq=2 name=MaxQuality       dw=3840 dh=2160 opt=2560x1440 min=1920x1080 max=3840x2160 tol=60x33
+pq_range pq=3 name=UltraPerformance dw=3840 dh=2160 opt=1280x720  min=1280x720  max=1280x720  tol=20x11
+pq_range pq=5 name=DLAA             dw=3840 dh=2160 opt=3840x2160 min=3802x2138 max=3840x2160 tol=60x33
+
+pq_select mode=interval picked=5 picked_name=DLAA pq=5 pq_name=DLAA r=3836x2156 d=3840x2160 tol=60x33 ranges_ok=5
+create_feature ok=1 preset=0 rc=0x1
 ```
 
-| render | ratio | 选中 | 日志 | 结果 |
-|---|---|---|---|---|
-| 1920x1080 | 2.000 | MaxPerf  | `mode=interval picked=0 ranges_ok=6` | `ok=1` |
-| 2304x1296 | 1.667 | Balanced | `mode=interval picked=1 ranges_ok=6` | `ok=1` |
-| 3836x2156 | 1.001 | DLAA     | `mode=interval picked=5 ranges_ok=5` | `ok=1` |
+核实到的事实：
 
-- 全程 `mode=interval`，**没有** `mode=ratio`、`query_unavailable` 或 `shared_singleton`
-  ⇒ 独立参数对象可用，查询路径确实生效。
-- 三点值得记：① 0.999 精度在旧实现下是 `ok=0 rc=0xBAD00010`，本机现在由区间查询选中
-  `DLAA`（不是靠 `perf_quality_for_create` 把 UltraQuality 硬改成 MaxQuality）⇒ 治本路径有效；
-  ② `UltraQuality` 的区间为 `min=1920x1080 max=3840x2160`，**包含** ratio 1.25 对应的
-  3072x1728 —— 若只看区间包含性，它会越过 `MaxQuality` 被选中，但 `MaxQuality` 的 optimal
-  (2560x1440) 更贴近实际尺寸，选档按「最贴近 optimal」取，最终落 `MaxQuality`
-  ⇒ 上文「反向风险」里担心的「选到更激进的档」在本例中未发生；
-  ③ 实测容差是 `60x33`（`3840/64` / `2160/64`），不是原文的「约 2 像素」，与按公式实现一致。
-- **未覆盖**：反向对照（`NgxProvider=external` 时对方返回单例 ⇒ `shared_singleton` 回退）
-  与「至少一台机器、一个 DLSS 版本的 `pq_range` 基线」两项仍未做；上表是本机单机单驱动数据。
+- 查询路径生效：`mode=interval`，无 `mode=ratio` / `query_unavailable` / `shared_singleton`
+  ⇒ 独立参数对象可用，「宁可不查也不污染 `g_params`」这条防线未被触发。
+- **0.999 精度（ratio 1.001）由区间查询选中 `DLAA` 并 `ok=1`**，而不是靠
+  `perf_quality_for_create` 把 UltraQuality 硬改成 MaxQuality ⇒ 治本路径在本例有效。
+  对照旧行为：同一精度在 `b632cc5` 之前的失败**据该提交的说明**是 `ok=0 rc=0xBAD00010`，
+  但本次会话日志里没有该精度的失败记录可供复现（`b632cc5` 的提交说明记载它来自
+  另一份未随仓库分发的环境日志）。
+- **`ranges_ok=5` 而非 6**：本机驱动没有返回 `pq=4`（UltraQuality）的区间行，
+  即该档查询无结果。`pick_quality_from_ranges` 只在已查到的档里挑，不影响正确性，
+  但说明「六档全查到」不是普遍情况，回退路径要能容忍部分档缺失。
+- **容差是分档的，不是统一值**：`pq=0/1/2/5` 是 `60x33`（`3840/64`、`2160/64`），
+  而 `pq=3` 是 `20x11`（它的上限只有 1280x720）。与 `range_upper_tolerance(upper)=upper/64`
+  的实现一致，也再次说明原文「约 2 像素」不成立。
+
+**全档位实机核对（本机 3840x2160 + 驱动自带 NGX，两次会话）**
+
+9 个非默认渲染精度全部走过，`create_feature ok=1` 9/9，零失败。
+其中 0.2~0.9 在 2026-11-13 23:12–23:21 两次会话内测得；0.999 来自同日 21:51 的
+另一次会话（该会话只有这一个精度）。
+
+| 精度 | render | ratio | mode | 选中 | 结果 | 会话 |
+|---|---|---|---|---|---|---|
+| 0.2 | 768x432 | 5.00 | `ratio` | UltraPerformance | `ok=1` | 23:13 |
+| 0.3 | 1152x648 | 3.33 | `ratio` | UltraPerformance | `ok=1` | 23:13 |
+| 0.4 | 1536x864 | 2.50 | `ratio` | UltraPerformance | `ok=1` | 23:13 |
+| 0.5 | 1920x1080 | 2.00 | `interval` | MaxPerf | `ok=1` | 23:20 |
+| 0.6 | 2304x1296 | 1.67 | `interval` | Balanced | `ok=1` | 23:20 |
+| 0.7 | 2688x1512 | 1.43 | `interval` | MaxQuality | `ok=1` | 23:20 |
+| 0.8 | 3072x1728 | 1.25 | `interval` | MaxQuality | `ok=1` | 23:21 |
+| 0.9 | 3456x1944 | 1.11 | `interval` | MaxQuality | `ok=1` | 23:21 |
+| 0.999 | 3836x2156 | 1.001 | `interval` | DLAA | `ok=1` | 21:51 |
+
+- **分界线在 ratio 2.0**：`≤ 2.0` 走 `interval`（render 落在某档区间内），
+  `> 2.0` 走 `ratio` 回退（`reason=no_interval`）。
+  回退路径已实测可用，不是纸上设计。
+  注：`> 2.0` 的两个具体成因不同 —— 0.2/0.3 低于所有档位的 `min`；
+  0.4（1536x864）则是**高于** `pq=3` 的 `max+tol`（1300x731）、
+  又低于其余档位的 `min`（1920x1080），同样落空。
+- **0.2 / 0.3 的档位归属（2026-11-13 改）**：两者 `ratio > 3.0`，原本落
+  `quality_from_ratio` 的 `else` ⇒ DLAA（不放大）。改成 UltraPerformance 的理由是
+  **语义一致**：3.3x / 5.0x 属于极端降采样，对应最高档的 UltraPerformance，
+  而 DLAA 是「不放大」的档位。这是一次判据对齐，**不是画质改善**。
+  实测这两个精度声明 UltraPerformance 后 `create_feature` 均 `ok=1`；
+  与改前声明 DLAA 相比画面观感差异很小，未做 A/B 量化对比 ⇒ **画质优劣未验证**。
+  `ratio ≤ 1.0`（原分辨率 / 超采样）仍返回 DLAA，两个分支刻意分开。
+- ★ **一条被证伪的推断**：此前认为「实际倍率超出档位名义能力时 NGX 会拒绝」
+  （0.2 需 5x、0.3 需 3.3x，而 UltraPerformance 名义 3x）。实测两者均 `ok=1`
+  ⇒ NGX 未拒绝。证据只有这两个尺寸，不要据此断言 NGX 对所有尺寸都放宽。
+
+**未覆盖**（不得据此认为已充分验证）：
+
+- 全部数据来自**一台机器、一个 DLSS 版本、3840x2160 一种显示分辨率**。
+- 反向对照（`NgxProvider=external` 时对方返回单例 ⇒ `shared_singleton` 回退）**未做**。
+- §4「注意」里那条「区间可能比 CreateFeature 宽松」的反向风险，本轮反而得到**间接佐证**：
+  `UltraPerformance` 的区间是 `min=max=1280x720`（一个点），而 0.3/0.4 声明该档仍
+  `ok=1` ⇒ `CreateFeature` 的校验确实比 optimal settings 宽松。
 
 ---
 
@@ -226,9 +269,10 @@ pq_range pq=0 MaxPerf          opt=1920x1080 min=1920x1080 max=3840x2160
 
 - 机制已实现（见文末「已解决」的《`create_feature` 参数性失败按输入 key 重试》）：`0xBAD00010`
   （`UnsupportedParameter`）失败不再置 `g_release_all`，改为记录一份输入 key；key 变化时重试一次。
-- **但整条链路只在编译 / 单测 / 静态分析层面验证过，没有在游戏内实机跑过**：
-  无游戏进程与实机条件，`cmake --build build-e1` + `NgxParamMapTest` 只能证明它编得过、
-  既有纯函数未回归，证明不了「用户改回安全精度后确实自愈」。
+- 已在本机做过一次实机验证（见下方「实机验证」）：失败 → 记录 key → 改精度 → 重试成功，
+  全程无需重启游戏。但那次失败是**用临时诊断开关构造的**——正常路径下 §4 的区间查询
+  已能选到合法档位，自然状态下构造不出 `0xBAD00010`，因此该路径在真实玩家的
+  「参数配错」场景中是否同样表现良好，仍缺观测。
 
 **影响**
 
@@ -274,7 +318,7 @@ pq_range pq=0 MaxPerf          opt=1920x1080 min=1920x1080 max=3840x2160
 
 复现方式：正常路径下 §4 的区间查询已能选到合法档位（实测 0.999 精度
 `picked=DLAA` → `create_feature ok=1`），自然构造不出 `0xBAD00010`；
-本轮用临时诊断开关强制走旧选档造失败，验证后已删除，未进入提交。
+2026-11-13 验证时用临时诊断开关强制走旧选档造失败，该开关验证后已删除、未进入提交。
 
 ---
 
@@ -402,7 +446,7 @@ P3（可选）
 
 ### `create_feature` 参数性失败按输入 key 重试（2026-11-13）
 
-**解决提交**：（待填）
+**解决提交**：`5f37dd6`
 
 **结论**：机制已实现，构建 / 单测 / **实机验证均通过**。
 
@@ -481,10 +525,9 @@ P3（可选）
 
 ### DLSS 选档改由 NGX 区间查询决定（2026-11-13）
 
-**解决提交**：（待填）
+**解决提交**：`5f37dd6`
 
-**结论**：判据已治本（不再假设「档位 = 固定比例」）；构建 / 单测通过，**实机验收未完成**，
-残留项见正文 §4。
+**结论**：判据已治本（不再假设「档位 = 固定比例」）；构建 / 单测 / **实机验证均通过**。
 
 - 缺陷原状：`quality_from_ratio()` 用手写比例表选档（1.0–1.3 → UltraQuality 等六条），
   而每个档位能接受的 render 尺寸区间由驱动与模型决定、**不是比例**。渲染精度 0.999
@@ -499,23 +542,40 @@ P3（可选）
 - **参数对象污染的处理（本次最大的风险点）**：区间查询要往参数对象上 `Set` 四项
   （Width/Height/PerfQualityValue/RTXValue）。做法是**另调一次**
   `NVSDK_NGX_D3D11_GetCapabilityParameters()` 拿**独立**对象（`g_query_params`），
-  绝不在全局 `g_params` 上查询。为什么不用 `AllocateParameters`：SDK 文档
-  （`nvsdk_ngx.h:356-359`）说明它分配的表**不预置能力项**，而
+  绝不在全局 `g_params` 上查询。为什么不用 `AllocateParameters`：SDK 头文件里
+  `NVSDK_NGX_D3D11_AllocateParameters` 的注释说明它分配的表**不预置能力项**
+  （该头未入库，随驱动 / SDK 分发），而
   `NGX_DLSS_GET_OPTIMAL_SETTINGS` 自己的注释（`nvsdk_ngx_helpers.h:83-84`）就写着
   「callback 取不到时可能是用了 AllocateParameters，改用 GetCapabilityParameters」。
   若实现返回**同一个指针**（单例 provider），判为查询不可用并回退 —— 宁可不查也不污染。
-  释放：`shutdown_all()` 里对本对象调 `NVSDK_NGX_D3D11_DestroyParameters`；`g_params`
-  仍按既有契约（§3.9.5）不释放。
+  释放：`shutdown_all()` 里对本对象调 `NVSDK_NGX_D3D11_DestroyParameters`；
+  全局 `g_params` **不释放**（这是既有的设计约定：桥不销毁 NGX 的参数表，
+  与 `NgxBackend.cpp` 里「不调 `g_params->Reset()`」是同一条约束）。
 - 缓存：区间只依赖 display 尺寸，按 `(dw, dh)` 缓存六档结果；`create_feature` /
   `diag_check_create_params` 本来就不是每帧路径，缓存是额外保证。
 - 调用点三处同源（否则 `set_mismatch` 误报）：`create_feature` 的 `Set`、
-  `diag_check_create_params` 的回读期望值、`make_feature_input_key_from` 的 key 字段。
+  `diag_check_create_params` 的回读期望值（该函数整体在 `DX11FSRBRIDGE_ENABLE_DIAGNOSTICS`
+  内，生产构型不编译）、`make_feature_input_key_from` 的 key 字段。
 - 取证行（Error 级，默认 `NgxLogLevel=1` 可见）：`pq_query_params ok=0|1 reason=…`、
-  `pq_range pq=N name=… opt=… min=… max=… tol=…`（六条）、
+  `pq_range pq=N name=… opt=… min=… max=… tol=…`（每档一条，实际可能少于六条——
+  本机就没有返回 UltraQuality 那一档）、
   `pq_select mode=interval picked=… pq=…` 或 `pq_select mode=ratio pq=… reason=…`。
 - 与规格的一处出入（如实记录）：容差原文写「1/64（约 2 像素）」，而 `upper/64` 在 1280 上
   是 20 像素、2560 上是 40 像素 ——「约 2 像素」应是估算。实现按**公式**（1/64），
   并把实际 tol 打进日志，单测 [10] 有一条断言专门防止后人按文字改成常量 2。
+- **实机验证（2026-11-13 21:51 单精度 + 23:12–23:21 全档位）**：9 个非默认渲染精度
+  全部 `create_feature ok=1`。ratio ≤ 2.0（0.5~0.999）走 `interval`，ratio > 2.0
+  （0.2~0.4）走 `ratio` 回退（`reason=no_interval`），两条路径都实测可用。
+  附带结论：① 本机驱动不返回 UltraQuality 那一档的区间（`ranges_ok=5` 而非 6），
+  「六档全查到」不是普遍情况；② 容差是**分档**的（`60x33` vs `pq=3` 的 `20x11`），
+  说明原文「约 2 像素」不成立；③ `CreateFeature` 的校验确实比 optimal settings 宽松
+  —— `UltraPerformance` 区间是 `min=max=1280x720` 一个点，而 0.3/0.4 声明它仍 `ok=1`。
+- `ratio > 3.0`（渲染精度 0.2/0.3）的档位归属同日改过：原落 `else` ⇒ DLAA，
+  改为 UltraPerformance 属于判据对齐（倍率语义），**不是画质改善**；
+  实测两个精度均 `ok=1`，与改前的画面观感差异很小，未做 A/B 量化对比
+  ⇒ 画质优劣未验证。`ratio ≤ 1.0` 仍返回 DLAA，两分支刻意分开。
+- **覆盖范围有限**：一台机器、一个 DLSS 版本、3840x2160 一种分辨率；
+  external provider 的单例回退对照未做。
 
 ### 发布管线不启用 NGX 构型（2026-11-10）
 
