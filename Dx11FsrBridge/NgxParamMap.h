@@ -171,4 +171,139 @@ bool map_reset(const ResetInput &in);
 bool reactive_size_ok(std::uint32_t pool_w, std::uint32_t pool_h,
                       std::uint32_t render_w, std::uint32_t render_h);
 
+// ===========================================================================
+// f) 按 NGX 报告的合法 render 尺寸区间选档（2026-11-13 新增；**不是**搬运既有公式）
+// ===========================================================================
+// 为什么要有这一段：原来的选档（NgxBackend.cpp 的 quality_from_ratio）假设
+// 「DLSS 档位 = 固定的 display/render 比例」（1.3 / 1.5 / 1.7 / 2.0 / 3.0）。
+// 实际上每个档位能接受的 render 尺寸区间由驱动与模型决定，不是比例：同一档位在
+// 不同 display 尺寸下的合法区间不同，相邻档位的区间还会重叠。已知事故：渲染精度
+// 0.999（ratio≈1.0016）被比例表判成 UltraQuality ⇒ CreateFeature 返回 0xBAD00010
+// （NVSDK_NGX_Result_FAIL_UnsupportedParameter，nvsdk_ngx_defs.h:169）。
+// ⇒ 正确判据是「问驱动：这个档位接受哪些 render 尺寸」，即
+//   NVSDK_NGX_DLSS_GET_OPTIMAL_SETTINGS 做的事（third_party/ngx/nvsdk_ngx_helpers.h:65）。
+//
+// 本段只做**纯计算**：真正的查询在 NgxBackend.cpp（需要 NGX 头），这里只判断
+// 「给定各档区间 + 当前 render 尺寸，选哪一档」。于是它能在无 GPU、无游戏、无 NGX
+// 头的机器上被 NgxParamMapTest.cpp 钉住 —— 与 a)~e) 五段的分层同构。
+//
+// ★ 零依赖约束照旧：本段不 include NGX 头。档位的整数值与
+//   NVSDK_NGX_PerfQuality_Value 的一致性由 NgxBackend.cpp 的 static_assert 保证。
+
+// 六个档位。**整数值必须与 NVSDK_NGX_PerfQuality_Value 完全一致**：
+//   MaxPerf=0 / Balanced=1 / MaxQuality=2 / UltraPerformance=3 / UltraQuality=4 / DLAA=5
+// （nvsdk_ngx_defs.h:251-260）。NgxBackend.cpp 用 static_assert 逐项钉死。
+enum class PerfQuality : int
+{
+    MaxPerformance   = 0,   // NVSDK_NGX_PerfQuality_Value_MaxPerf
+    Balanced         = 1,
+    MaxQuality       = 2,
+    UltraPerformance = 3,
+    UltraQuality     = 4,
+    Dlaa             = 5,   // NVSDK_NGX_PerfQuality_Value_DLAA（ratio = 1，不放大）
+};
+
+constexpr int kPerfQualityCount = 6;
+
+// 档位名（日志用）。越界返回 "?"，不返回 nullptr —— 调用方直接交给 %hs。
+const char *perf_quality_name(int index);
+
+// 一次区间查询的结果（= NGX_DLSS_GET_OPTIMAL_SETTINGS 的六项输出里的五项；
+// Sharpness 与选档无关，留在查询侧作取证，不进本层）。
+struct RenderRange
+{
+    std::uint32_t opt_w = 0;   // DLSS 建议的该档 optimal render 宽（NVSDK_NGX_Parameter_OutWidth）
+    std::uint32_t opt_h = 0;   // 同上（OutHeight）
+    std::uint32_t min_w = 0;   // DLSS.Get.Dynamic.Min.Render.Width
+    std::uint32_t min_h = 0;
+    std::uint32_t max_w = 0;   // DLSS.Get.Dynamic.Max.Render.Width
+    std::uint32_t max_h = 0;
+};
+
+// 单个档位的查询态。ok=false 表示查询失败（回调缺失 / 返回非 Success / 区间退化），
+// **绝不能**把失败当成"空区间"或"不限制"。
+struct RangeQuery
+{
+    bool        ok = false;
+    RenderRange range {};
+};
+
+// 选档结果。matched=false ⇒ 没有任何档位的区间包含当前 render 尺寸，
+// 调用方必须回退到既有的比例表（quality_from_ratio + perf_quality_for_create）。
+struct QualityPick
+{
+    bool          matched = false;
+    int           index   = -1;   // 命中档位（= static_cast<int>(PerfQuality)）
+    std::uint32_t tol_w   = 0;    // 命中档位在该轴上的上界容差（日志/验收用）
+    std::uint32_t tol_h   = 0;
+};
+
+// 上界容差：每轴允许超出区间上限 upper/64（OPEN-ISSUES §4「最大尺寸的 1/64」）。
+// ★ 与原文的出入（如实记录）：原文写「1/64（约 2 像素）」，但按本公式 upper=1280 时
+//   是 20 像素、upper=2560 时是 40 像素 ——「约 2 像素」在任何常见分辨率下都不成立，
+//   应是原文的估算。这里以**公式**为准（1/64），并把 tol 打进日志，实机可对照真实区校核。
+std::uint32_t range_upper_tolerance(std::uint32_t upper);
+
+// 该档的合法 render 尺寸区间是否包含 (render_w, render_h)。
+// 下界**无**容差（render 比 min 还小 = 这一档的倍率不够，正是要消除的错配形态）；
+// 上界允许 +range_upper_tolerance(max)。任一维为 0 或 min>max ⇒ 判为不包含（区间不可用）。
+bool render_range_contains(const RenderRange &r, std::uint32_t render_w, std::uint32_t render_h);
+
+// 在六档里挑区间包含当前 render 尺寸的那一档。
+//   · ranges[i] 必须对应 PerfQuality(i)（i 即档位整数值），count 不得超过 6；
+//   · 多个档位的区间同时包含时，取 **optimal 尺寸离实际 render 尺寸最近** 的那档
+//     （区间重叠是常态，最近者是"最贴合的档"）；
+//   · 距离完全相等时才看固定优先序（MaxQuality → Balanced → MaxPerf →
+//     UltraPerformance → UltraQuality → DLAA），因此结果确定、可复现。
+QualityPick pick_quality_from_ranges(const RangeQuery *ranges, int count,
+                                     std::uint32_t render_w, std::uint32_t render_h);
+
+// ===========================================================================
+// g) CreateFeature 输入 key 的相等判据（2026-11-13 新增；§5 自愈路径的唯一比较点）
+// ===========================================================================
+// 为什么把这条比较搬到纯函数层：它是"要不要重试 CreateFeature"的**唯一**判据。
+//   留在 NgxBackend.cpp 里时**只能靠读代码**保证"字段加齐了"，而漏字段不报编译错 ——
+//   那种失效形态是"自愈永远不触发"（key 恒相同）或"每帧都触发"（某字段每帧变），
+//   两者都不会崩、都不会报错，只有实机日志才看得出来。搬到这里后 NgxParamMapTest 能钉住它。
+//
+// ★ 判据是**逐字段相等**，不是哈希：碰撞会把"不同的输入"判成"相同" ⇒ 该重试的没重试，
+//   且这种漏在日志里看不出来（AGENTS.md §三 #21 的形态：检查通过 ≠ 内容正确）。
+//
+// ★ 字段清单 = CreateFeature 真正 Set 进 NGX 的全部可变输入（见 NgxBackend.cpp 的
+//   create_feature 第 1-7 项）。新增一个 Set 项时必须同时加字段 + 加比较，
+//   否则"改了参数却判不出变化"。
+//
+// ⚠️ 2026-11-13 修复（独立审查第 5 条）：**原实现漏了 color_fmt / output_fmt**。
+//   反例（审查给出，已核实成立）：后缓冲由 R10G10B10A2 换成 R16G16B16A16_FLOAT，
+//   而 HDR 决策不变（两者在 resolve_is_hdr 的回退层都不是"浮点 HDR"以外的分支…
+//   实际更关键的是 R10G10B10A2→R16G16B16A16 会改变 IsHDR 位的来源判定，
+//   但**存在**该位不变的组合）⇒ create_flags 不变 ⇒ 旧 key 判"相同" ⇒ **该重试的没重试**。
+//   格式是 CreateFeature 的输入吗？是 —— 它决定 IsHDR 位的取值来源，且资源池按它建；
+//   dispatch 第 5 步的**重建判据**里本来就有 cdesc.Format / odesc.Format 两项
+//   （见 NgxBackend.cpp "六元组比较"），key 判据漏掉它们属同族漏项。
+struct CreateFeatureInputKey
+{
+    std::uint32_t render_w       = 0;
+    std::uint32_t render_h       = 0;
+    std::uint32_t display_w      = 0;
+    std::uint32_t display_h      = 0;
+    int           perf_quality   = 0;
+    int           render_preset  = 0;
+    unsigned int  create_flags   = 0;
+    int           color_fmt      = 0;   // DXGI_FORMAT（本层零 D3D 依赖 ⇒ 存 int，调用点转）
+    int           output_fmt     = 0;
+    bool          is_hdr         = false;
+};
+
+// 逐字段相等。★ **唯一实现点就是本函数**（`NgxParamMap.cpp`）：NgxBackend.cpp 既不自己
+// 抄一份比较，也**不写**同名中转包装 —— 抄一份 = 两个维护点 = 下次加字段必漏一个；
+// 而写包装会因 ADL 引发二义（`CreateFeatureInputKey` 是 ngx_param_map 的类型 ⇒ ADL 会把
+// 本函数一起拉进候选集，与本文件外的同名包装签名完全一致 ⇒ C2668，实测记录见
+// `NgxBackend.cpp` 的 `kFeatureCreateRetryMinMs` 下方注释）。
+// ⇒ 调用点一律写**全限定**的 `ngx_param_map::same_feature_input_key(...)`（当前唯一调用点：
+//   `NgxBackend.cpp` 的 dispatch 重试判据）。
+// 本注释与代码的一致性由"全仓 grep 该函数名"核对：除本文件与本单测外，只应出现
+// NgxBackend.cpp 的**限定的**调用点与解释性注释，不应出现第二个定义或同名包装。
+bool same_feature_input_key(const CreateFeatureInputKey &a, const CreateFeatureInputKey &b);
+
 } // namespace ngx_param_map

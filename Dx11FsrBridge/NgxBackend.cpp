@@ -57,6 +57,21 @@
 // 本 TU 只负责"取输入 → 调纯函数 → 写输出"；公式全部在 NgxParamMap.cpp，
 // 由 NgxParamMapTest.cpp 做离线位级回归（NGX=OFF 也能构建）。
 #include "NgxParamMap.h"
+// ★ 2026-11-13（独立审查第 1 条）：白名单 rc 失败时必须回报"累积 pass 未被替换"，
+//   否则 FSR2 族预处理 pass 会继续被跳过、而这一路没有桥输出 ⇒ 冻帧到 500ms 过期。
+//   为什么**可以**从这里直接调（跨模块耦合的评估结论）：
+//     · 同 Dll：Fsr2FamilyTakeover.cpp 与本文件同在 Dx11FsrBridge.dll，符号外部链接；
+//     · 该模块的状态是 **std::atomic**（g_accumulate_replaced 是 atomic_bool），
+//       不在 ffx12::g_mutex 保护范围内也无所谓 —— 它自己的注释就写明是跨线程 atomic
+//       （Dx11FsrBridge.cpp 的钩子上每 draw 读写它，这里持 g_mutex 调用只是**更严**的串行化）；
+//     · 语义上是"上报一个事实"（本次累积替换失败），不是"命令对方做事" ——
+//       调用方向与既有的 note_family_notify 一致（都是 Dx11FsrBridge.cpp → 本模块的
+//       反向：本模块 → fsr2_family_takeover）。两个方向都只碰 atomic，无环、无锁序问题。
+//   ★ 备选方案（评估后否决）：在 NgxBackend.h 导出一个 ngx::notify_family_...
+//     再让 Dx11FsrBridge.cpp 转发 —— 那只是把同一次调用多绕一层；
+//     而"复用 g_release_all"（已评估）会**改变它的全局放手语义**（0→1 不可逆，
+//     置位后本实例再也回不来），远超本条要修的范围。⇒ 直接调是最小改动。
+#include "Fsr2FamilyTakeover.h"
 
 // ---- ④ NGX（必须最后；且只这两个）----
 #include "third_party/ngx/nvsdk_ngx_defs.h"
@@ -160,6 +175,73 @@ static std::uint64_t qpc_us()
 }
 
 // ============================================================================
+// 2026-11-13 增（§5 create_feature 不再"永久不重试"）：**CreateFeature 的输入 key**
+//
+// 为什么需要它：S-81 把 create_feature 的失败锁存成"进程内永久"，但 0xBAD00010 是
+//   参数性失败 —— 玩家改回安全精度/分辨率/HDR 后本应自愈。见 NgxInstance 里
+//   feature_create_failed 上方的事故日志。
+//
+// ★ 字段构成、逐字段比较的实现、以及"为什么不用哈希 / 不用 memcmp"的完整理由，
+//   都搬到了**纯函数层** `ngx_param_map::CreateFeatureInputKey`（NgxParamMap.h/.cpp）。
+//   搬家的唯一目的：让 `NgxParamMapTest` 能在无 GPU/无 NGX 头的机器上把这条判据钉住。
+//   留在本文件里时，"字段加齐了没有"只能靠读代码保证，而漏字段**不报编译错** ——
+//   失效形态是"自愈永远不触发"或"每帧都触发"，两者都不崩不报错。
+//
+// ⚠️ 2026-11-13（独立审查第 5 条）：原实现**漏了 color_fmt / output_fmt**。
+//   反例成立：后缓冲由 R10G10B10A2 换成 R16G16B16A16_FLOAT 时，完全可能存在
+//   create_flags 不变的组合 ⇒ 旧 key 判"相同" ⇒ 该重试的自愈被漏掉。
+//   格式**确实是** CreateFeature 的输入：它决定 IsHDR 位的来源，资源池也按它建；
+//   dispatch 第 5 步的**重建判据**里本来就有 cdesc.Format / odesc.Format
+//   （见下方"六元组比较"），key 判据漏掉它们属同族漏项。
+//   ⇒ 现在用纯函数层的结构（含 color_fmt / output_fmt，两个 DXGI_FORMAT 存成 int）。
+// ============================================================================
+using CreateFeatureInputKey = ngx_param_map::CreateFeatureInputKey;
+
+// 2026-11-13（§5）：两次 CreateFeature 重试之间的最小间隔（毫秒）。
+//
+// ★★ 2026-11-13（独立审查第 4 条）：**本值存在的真实理由已订正，原注释方向写反了。**
+//   ~~原注释："防止尺寸逐帧抖动或 HDR 反复翻转把重试变成每帧一次 CreateFeature"~~
+//     —— **该理由不成立**（保留原文并标注，见下方"已推翻"）。
+//   为什么不成立：key 的 10 个字段（render/display 宽高、选档结果、render preset、
+//     create_flags、color_fmt/output_fmt、is_hdr）**全部是低频、事件驱动的量**：
+//     尺寸随玩家改设置而变、格式随后缓冲切换而变、flags/HDR 由 ini 与 swapchain 探测决定。
+//     它们都不随帧变化 ⇒ 就算没有任何间隔保护，"key 变化"本身也已经是低频事件，
+//     不会退化成每帧重试。拿"尺寸抖动"当理由，等于给一个不存在的风险配保险。
+//   ⇒ 真实理由（这才是 2000 该被保留的原因）：**DLSS 的 CreateFeature 在失败时会阻塞**。
+//     依据见本文件 dispatch "第 5 步之后" 的注释（③）与 :1891 附近"每帧阻塞"的记录：
+//     S-81 当初把"永久不重试"定下来的直接动因就是"相同输入重试只会每帧阻塞 + 每帧重复日志"。
+//     参数性失败虽可自愈，但**自愈之前**每一次尝试仍要付这笔阻塞代价。
+//     间隔保护把"最坏情况下连续阻塞"压成"每 2 秒最多一次阻塞"，
+//     这是给**玩家已经改回安全设置、但驱动仍然拒绝**的那段窗口兜底。
+//
+// ★ 2000 这个数**怎么来的 —— 诚实标注：未实机标定，是保守猜测值**，不是测量值。
+//   它只保证"自愈不会被拖慢到玩家可感知"（用户改设置的操作间隔必然远大于 2 秒，
+//   见事故日志 00:18:02 → 00:18:30，间隔 28 秒），
+//   以及"最坏阻塞频率 <= 1 次/2 秒"。
+//   ⇒ 若将来实机测得 CreateFeature 失败阻塞很轻（例如 < 1ms），本值可下调；
+//     若测得阻塞很重（例如几百 ms），应上调。两种调整都**不影响**验收判据
+//     "改回安全精度后能自愈"。
+//   ★ 是否保留 2000 的结论：**保留**。理由与方向无关 —— 只要 CreateFeature 失败
+//     会阻塞，就需要一个频率上限；而"频率上限"正是本常量唯一的职责。
+//     （审查也问了"是否该保留"：保留，但理由换成上面这条真实理由。）
+static constexpr std::uint64_t kFeatureCreateRetryMinMs = 2000;
+
+// key 相等判据：**直接调用纯函数层**，本文件不再自己抄一份比较、也不加同名的中转包装。
+//
+// ★ 2026-11-13（独立审查第 5 条）：原来这里有一份 8 字段的手写比较。抄在 TU 里的问题是
+//   "两个维护点"—— 纯函数层加字段时这里若忘了加，比较就恒为"相等" ⇒ 自愈永远不触发，
+//   而编译零告警（AGENTS.md §三 #21 的形态）。现在只有 NgxParamMap.cpp 一处实现，
+//   NgxParamMapTest 逐字段钉住它。
+// ★★ 为什么**不**在这里写一个 `static bool same_feature_input_key(...)` 中转包装
+//   （第一版这么写，编译报 C2668 重载不明确 —— 实测记录）：
+//   CreateFeatureInputKey 是 ngx_param_map::CreateFeatureInputKey 的别名，于是调用点
+//   `same_feature_input_key(a, b)` 的实参类型是 ngx_param_map 的 ⇒ **ADL 会把
+//   ngx_param_map::same_feature_input_key 一起拉进候选集**，与本文件的同名包装
+//   签名完全一致 ⇒ 二义。要么改名、要么不写包装。
+//   ⇒ 选择"不写包装"：中转本身不产生任何信息，反而多一个可能与纯函数层漂移的名字。
+//   调用点写成限定的 ngx_param_map::same_feature_input_key(...)，读起来同样明确。
+
+// ============================================================================
 // §3.3.4.1 struct NgxInstance（本 TU 内，**不对外暴露**）
 // T-2 只需要字段存在：资源池 / feature 句柄的实际创建在 T-4。
 // ============================================================================
@@ -204,7 +286,46 @@ struct NgxInstance
     int  feature_preset       = 0;         // **仅日志与 Q18 对账用，不在重建判据内**（ini 无热重载 ⇒ 运行期不变）
     // ★ v7 改（S-81）：**同一对象生命周期内永不清除**。尺寸/格式变化只释放资源、不重试 CreateFeature。
     //   只有设备更换/丢失触发 shutdown_all() 时随实例表整体销毁 —— 那是"对象没了"，不是"清锁重试"。
+    //   ⚠️ 上面这条 S-81 结论**已被部分推翻**（2026-11-13，见下方"为什么放宽"），原文保留不删。
     bool feature_create_failed = false;
+
+    // ---- 2026-11-13 改（§5 / 推翻 S-81 的"永久"）：**失败输入 key** ----
+    // 为什么放宽：S-81 的前提是"CreateFeature 失败的根因不会自愈"。该前提对
+    //   PathListInfo 配错成立，但**对参数性失败不成立**。实机日志（用户提供的事故记录）：
+    //     00:18:00  render_scale_written index=8 scale=0.999000
+    //     00:18:02  create_feature ok=0 rc=0xBAD00010      <- UnsupportedParameter（参数性）
+    //     00:18:30  selection_changed index=3 scale=0.500000   <- 用户已把精度改回安全值
+    //     00:18:30  DISPATCH_FAILED ...                    <- 仍一路失败 43517 次到日志结束
+    //   ⇒ 用户改回安全精度后本应自愈，却因锁存而进程内永久失败，只能重启游戏。
+    // 放宽到什么程度（**必须窄**，见 :2005 记过的 0xBAD0000B 每帧重试教训）：
+    //   ① 只有 rc == NVSDK_NGX_Result_FAIL_UnsupportedParameter 的失败**不置** g_release_all；
+    //      其余一切 rc（含未知 rc、含 0xBAD0000B）维持原样置 g_release_all（白名单，不是黑名单）。
+    //   ② 且只有**下列 10 个输入**中的任何一个变化才允许重试一次 —— 它们就是下面这份 key。
+    //   ③ 再叠一个最小重试间隔（kFeatureCreateRetryMinMs）。
+    //      ⚠️ 2026-11-13（独立审查第 4 条）：③ 的理由**已订正**。原写「防止尺寸逐帧抖动在
+    //        参数持续失败时把重试变成每帧一次 CreateFeature」—— 该理由**不成立**：
+    //        构成 key 的 10 个字段全是低频、事件驱动的量（没有一个是帧级量），
+    //        "尺寸逐帧抖动"在本 key 上不会发生。③ 的真实理由是 **CreateFeature 失败时会
+    //        阻塞**（见 :1891 附近"每帧阻塞"与 kFeatureCreateRetryMinMs 的注释），
+    //        需要给连续失败一个频率上限。原文保留（要求：被推翻的旧注释不删，就地标注）。
+    //
+    // key 的字段选择依据（为什么是这几个、而不是别的）：
+    //   · render / display 宽高 —— 直接进 Width/Height/OutWidth/OutHeight 与子矩形；
+    //   · 选档结果 —— resolve_create_quality(...) 的返回值（= 实际写进 PerfQualityValue 的那个值）；
+    //   · g_render_preset —— 六个 NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_* 的值；
+    //   · HDR / create flags —— IsHDR 等位由 resolve_is_hdr 决定，见 build_create_flags；
+    //   · color_fmt / output_fmt —— ★ 2026-11-13（独立审查第 5 条）补入。它们决定
+    //     IsHDR 位的来源判定，也决定资源池按什么格式建（create_pool 直读这两个字段）。
+    //     漏掉它们的反例：后缓冲 R10G10B10A2 → R16G16B16A16_FLOAT 而 create_flags 不变
+    //     ⇒ 旧 key 判"相同" ⇒ 该重试的自愈被漏掉。
+    // ★ HDR **必须**取 resolve_is_hdr 的决策，不能用 g_hdr：后者只是回写镜像、与真实决策
+    //   可能不同（见 :1076-1077 的 M2 修复注释）。
+    // ★ 刻意**不**把尺寸/格式之外的运行期状态（jitter、frame_index、reset）纳入 key：
+    //   它们每帧都变 ⇒ key 每帧都"变化" ⇒ 等于无条件解锁，正是 §一.5 / :2005 的禁区。
+    CreateFeatureInputKey feature_fail_key {};       // 失败时那一次的输入 key（类型见下方定义）
+    bool                 feature_fail_key_valid = false;   // 区分"没记录过"与"记录过且全 0"
+    std::uint32_t        feature_fail_rc = 0;        // 失败那一次的 rc，供"同一个 rc / 不同 rc"日志
+    std::uint64_t        feature_fail_tick = 0;      // 失败时刻（GetTickCount64），供最小重试间隔
 
     // ---- T-8 修复（M4-a）：本次 CreateFeature **实际**使用的 CreateFlags 可变输入快照 ----
     // 为什么必须记录而不是每帧重算后直接用：
@@ -1383,6 +1504,11 @@ static bool soft_fail_init(const std::wstring &detail)
 // 唯一调用点：ngx::dispatch() 内部、GetDevice 之后（§3.4.1）。**没有公开 init()**。
 // 幂等；只在首次成功时 AddRef 存 g_device；失败路径不设 g_inited。
 // ============================================================================
+// 2026-11-13（OPEN-ISSUES §4）：第 10b 步要用到独立的查询参数对象，而它的定义在
+//   "§3.8.1 辅助函数"段（本函数之后）—— 直接调即 C3861（本项目已因"定义在后"烧过两次）。
+//   这里只放声明；理由写在此处，免得下一个人把它当成可以随意挪动的顺序。
+static bool ensure_query_params(const char **why);
+
 static bool ensure_init(ID3D11Device *dev)
 {
     // ---- 幂等契约（§3.4.1 第一行）----
@@ -1521,6 +1647,28 @@ static bool ensure_init(ID3D11Device *dev)
     g_device    = dev;   // ComPtr::operator= 即 AddRef；只在首次成功时走到这里（g_inited 短路）
     log_ngx_error(L"ngx_core init ok=1 available=1 rc=0x%X",
                   static_cast<unsigned>(NVSDK_NGX_Result_Success));
+
+    // ---- 第 10b 步（2026-11-13，OPEN-ISSUES §4）：为选档准备**独立的**查询参数对象 ----
+    // 为什么放在这里、而不是第一次选档时懒建：
+    //   ① 建这个对象要多调一次 GetCapabilityParameters，SDK 文档明说它"预置能力项"因而
+    //      有开销（nvsdk_ngx.h:394-396）；放在初始化路径上，代价只付一次、且不落在
+    //      CreateFeature 之前那一瞬间（那里已经是尺寸刚变、正要重建的时刻）。
+    //   ② 失败无害：建不出来只是选档回退到比例表，**不影响可用性**（§4 明文要求）。
+    //      ⇒ 这里只记日志，不返回失败、不置任何锁存。
+    // ★ 失败原因写进行内（no_entry / no_params / shared_singleton），便于按 §4 判据验收时
+    //   区分"查询不可用所以走的比例表"与"区间查了但都不包含"。
+    {
+        const char *why = "ok";
+        if (!ensure_query_params(&why))
+        {
+            log_ngx_error(L"ngx_core pq_query_params ok=0 reason=%hs（选档回退比例表）", why);
+        }
+        else
+        {
+            // 判据：这一行出现 ⇒ 后续 pq_range / pq_select 的查询路径是真实生效的。
+            log_ngx_error(L"ngx_core pq_query_params ok=1（选档将优先使用 NGX 区间查询）");
+        }
+    }
     // 2026-11-09（PR #12 审查次要项 8）：首次初始化的**实测**耗时（含 LoadLibraryW
     // 与第 9 步的 Sleep(500)）。这一行是**固定一次**的（不是条件触发）——
     // 判据是 first_init_us 的**值**，不是这行出不出现；名字里的 slow 指
@@ -1697,7 +1845,30 @@ struct CreateFlagsEval
 // ★ 这是 **CreateFlags 的唯一构造点**：flags 与 bits 在同一个函数体内、对同一组输入求值一次。
 //   （flags_input_bits() 是它的「只算位图」精简版，只给每帧的重建判据用；
 //     两者必须对同一组输入给出同一个 bits —— 见 flags_input_bits 的注释。）
-static CreateFlagsEval build_create_flags(DXGI_FORMAT color_fmt)
+// ★★ 2026-11-13（独立审查第 3 条）：新增 log_decision 形参，默认 true。
+//   缺陷原状：本函数**无条件**打一条 Error 级 ngx_hdr_decision。而 dispatch 在
+//   inst.feature_create_failed && inst.feature_fail_key_valid（= 白名单 rc 的失败）时，
+//   **每帧**都会调 make_feature_input_key() → 本函数 ⇒ 每帧一条 Error 日志 + 每帧格式化。
+//   这与本文件 :1765 附近"不能每帧调 build_create_flags，因为它会打日志"的注释直接矛盾
+//   —— 那条注释描述的规避手法只用在 flags_input_bits 那一路，而失败判据那一路没躲开。
+//   AGENTS.md §二.5 热路径红线 + 错误 #9（日志参数在等级过滤之前求值）。
+//
+//   ★ 方案选择（三个候选，选 B）：
+//     A) 在 dispatch 侧缓存 key（只在 key 变化时重算）—— **不可行**：判据本身就是
+//        "key 变没变"，缓存会让它退化成"永远认为没变"（自循环）。
+//     B) 加一个 bool 形参，失败判据那一路传 false ⇒ **只跳过日志，不跳过计算**。
+//        计算仍每次重算 ⇒ 绝不漏判 flags 变化（那才是本 key 存在的意义）。
+//     C) 复用 inst 里已有的 feature_flags_bits 快照 —— **不可行**：那份快照只在
+//        create_feature **成功**后写（见 :2470 附近的注释），失败路径上它是旧值/全 0，
+//        用它当 key 的 create_flags 会得到一个**与本次失败无关**的数。
+//   ⇒ B 是唯一既满足"热路径不刷日志"、又不削弱判据的选项。
+//
+//   ★ 为什么加形参而不是把日志挪出去：日志要打印 ev 的五个中间量（is_hdr/hdr_src/
+//     sw_state/...），挪出去就得把它们再传一次 ⇒ 两个出参口径可能分叉（M2 同族缺陷）。
+//     留在这里、用一个开关控制"要不要说"，是单点真相。
+//   ★ 默认值 true ⇒ 既有调用点（create_feature 的 Set 路径）**逐字不动**，
+//     它们的日志行为与改动前完全相同。
+static CreateFlagsEval build_create_flags(DXGI_FORMAT color_fmt, bool log_decision = true)
 {
     CreateFlagsEval ev;
     // ★ MINOR-1：把探测状态一并取出 ⇒ 决策（is_hdr）与下方日志（sw_known/sw_hdr）来自同一次 load。
@@ -1733,15 +1904,25 @@ static CreateFlagsEval build_create_flags(DXGI_FORMAT color_fmt)
     //   ★ ev.sw_state 是 resolve_is_hdr **入口处**那唯一一次 load 的原始值，因此它描述的是
     //     「swapchain 探测到了什么」，**与是否处于强制模式无关**：NgxHdr=1/0 时 sw_known/sw_hdr
     //     仍然如实反映探测结果（改动前正是如此，本项改动不改变这两个字段的语义）。
-    log_ngx_core(blog::Level::Error,
-                 L"ngx_hdr_decision is_hdr=%d src=%hs mode=%d sw_known=%d sw_hdr=%d "
-                 L"sw_fmt=%u color_fmt=%d depth_inv=%d flags=0x%X",
-                 ev.is_hdr ? 1 : 0, ev.hdr_src, g_hdr_mode,
-                 (ev.sw_state != 0) ? 1 : 0,
-                 (ev.sw_state == 2) ? 1 : 0,
-                 g_swapchain_format.load(std::memory_order_relaxed),
-                 static_cast<int>(color_fmt),
-                 (ev.bits & kFlagsInputDepthInvert) ? 1 : 0, ev.flags);
+    // ★★ 2026-11-13（独立审查第 3 条）：**只有 log_decision 为真才格式化并打印**。
+    //   失败判据那一路（dispatch 的 feature_create_failed 分支）传 false ⇒
+    //   一旦锁存就不再每帧刷这条 Error 日志。
+    //   ★ 注意判据的位置：log_decision 挡在**整条 log_ngx_core 调用**外面，
+    //     而不是在函数内部靠等级过滤漏掉 —— 后者仍会先求值那 10 个实参
+    //     （含一次 g_swapchain_format 的 atomic load 与 %hs 的字符串解引用），
+    //     正是错误 #9 的形态（日志参数在等级过滤之前求值）。
+    if (log_decision)
+    {
+        log_ngx_core(blog::Level::Error,
+                     L"ngx_hdr_decision is_hdr=%d src=%hs mode=%d sw_known=%d sw_hdr=%d "
+                     L"sw_fmt=%u color_fmt=%d depth_inv=%d flags=0x%X",
+                     ev.is_hdr ? 1 : 0, ev.hdr_src, g_hdr_mode,
+                     (ev.sw_state != 0) ? 1 : 0,
+                     (ev.sw_state == 2) ? 1 : 0,
+                     g_swapchain_format.load(std::memory_order_relaxed),
+                     static_cast<int>(color_fmt),
+                     (ev.bits & kFlagsInputDepthInvert) ? 1 : 0, ev.flags);
+    }
     return ev;
 }
 
@@ -1785,6 +1966,366 @@ static NVSDK_NGX_PerfQuality_Value perf_quality_for_create(NVSDK_NGX_PerfQuality
     return q;
 }
 
+// ============================================================================
+// 2026-11-13（OPEN-ISSUES §4 治本）：DLSS 选档改由 NGX 报告的合法尺寸区间决定
+// ============================================================================
+// 背景（为什么改判据，而不是继续加兜底）：
+//   quality_from_ratio() 假设「档位 = 固定 display/render 比例」（1.3/1.5/1.7/2.0/3.0）。
+//   实际上每个档位能接受的 render 尺寸区间由驱动与模型决定，**不是比例**。已发生的事故：
+//   渲染精度 0.999（ratio≈1.0016）被比例表判成 UltraQuality ⇒ CreateFeature 返回
+//   0xBAD00010（NVSDK_NGX_Result_FAIL_UnsupportedParameter，nvsdk_ngx_defs.h:169）。
+//   perf_quality_for_create() 是 b632cc5 的临时兜底：只改结果、不改判据 —— 换个档位
+//   错配就照样失败。本段把判据换成"问驱动：这一档接受哪些 render 尺寸"。
+//
+// ★★ 本段最大的风险：参数对象污染（**这里的选择就是本次改动最关键的一处**）
+//   区间查询必须往参数对象上 Set(Width/Height/PerfQualityValue/RTXValue) 四项。
+//   如果直接在全局 g_params 上做：
+//     ① Width/Height 会被改成 display 尺寸，而 create_feature 之后要用它们**创建** feature
+//        （若查询发生在 Set 之后，CreateFeature 拿到的 render 尺寸就是错的）；
+//     ② 即便顺序上"查询在前、Set 在后"，GetCapabilityParameters 返回的对象里还留着
+//        CreateFeature/EvaluateFeature 依赖的其它键，反复覆盖是**隐式共享状态**，
+//        下一个改这里的看不到这层耦合；
+//     ③ g_params 不能 Reset()（§3.9.5 的原注释：会清掉 CreateFeature 设的 7 项），
+//        所以"改完再恢复"要么手工逐键缓存旧值（漏一个键就污染），要么无解。
+//   ⇒ 选 **独立的参数对象**：另调一次 NVSDK_NGX_D3D11_GetCapabilityParameters()，
+//     把它当作**只读能力表 + 可写查询暂存区**，与 g_params 完全分开。
+//     为什么不是 NVSDK_NGX_D3D11_AllocateParameters()：SDK 文档（nvsdk_ngx.h:356-359）
+//     明说 AllocateParameters 分配的表 **不预置 NGX 能力项**；而
+//     NGX_DLSS_GET_OPTIMAL_SETTINGS 自己的注释（nvsdk_ngx_helpers.h:83-84）写着
+//     "callback 取不到时，可能是用了 AllocateParameters —— 改用 GetCapabilityParameters"。
+//     ⇒ 用 GetCapabilityParameters 才是 SDK 指定的用法。
+//     生命周期：与 g_params 一样由 NGX 管理（nvsdk_ngx.h:27-30「allocated and released
+//     by SDK, no memory management on client side」）。SDK 同时说明这两种来源的表
+//     "must be freed using NVSDK_NGX_DestroyParameters"（nvsdk_ngx.h:398-401）⇒
+//     在 shutdown_all() 里对**我们自己要来的那一份**调 g_destroy，且只调一次。
+//     ★ 为什么 g_params 仍然不 Destroy：那是既有契约（§3.9.5「由进程回收」），改动它
+//       属于本次范围外；新对象只是"我们多要了一份"，按 SDK 文档释放即可。
+//   ★ 防御：若实现返回**同一个指针**（OptiScaler 之类的单例实现可能如此），直接在
+//     g_params 上查询就会污染 ⇒ 判为"查询不可用"，走回退路径，行为与改动前一致。
+//
+// ★ 调用频率（AGENTS.md §二.5 热路径红线）：
+//   create_feature() 只在 dispatch 第 5 步"尺寸/格式/flags 变化或还没建 feature"时调用
+//   （NgxBackend.cpp 的 dispatch 第 5 步之后「feature 的建与不建」段），**不是每帧**。
+//   diag_check_create_params() 紧跟 create_feature 成功之后，同样不是每帧。
+//   ★ 但真实的最坏路径比上面两条都糟，而且它**确实每帧**（2026-11-13 补记）：dispatch 在
+//     inst.feature_create_failed 为真、且已记下失败输入 key（= 白名单 rc 的失败）时，
+//     每帧都会调 make_feature_input_key() → build_create_flags()，而后者**无条件**打
+//     一条 Error 级 ngx_hdr_decision（:1845 附近）⇒ 一旦锁存，就是每帧一条 Error 日志、
+//     外加每帧一次格式化，与"尺寸是否抖动"无关。
+//     ★ 本段**不修**那条（它属 §5 的失败分支与 build_create_flags 的调用点，另案处理），
+//       缓存也治不了它 —— 缓存能省的只是它顺带调到的选档（见下）。写在这里是要让读者知道
+//       "为什么这里必须缓存"，同时知道**还有一个缓存覆盖不到的每帧成本**。
+//   但"是不是每帧"是调用方保证，不是本段能保证的 ⇒ 仍**必须**加缓存：
+//   六次回调 + 每次若干次 Set/Get 不该在尺寸抖动时重复做。缓存键 = display 宽高
+//   （查询的输入只有 display 尺寸与档位；render 尺寸只用于"挑哪一档"，不进查询输入）。
+//   ⇒ 同一 (dw, dh) 下六档区间只查一次，之后每次选档只是一次整数比较。
+
+// 独立查询对象（不与 g_params 共用，见上）。
+NVSDK_NGX_Parameter *g_query_params = nullptr;
+// 本对象是不是**我们自己要来的独立对象**（决定 shutdown_all 里要不要 Destroy）。
+// ★ 单独一个标志而不是"g_query_params != g_params"：后者在两者都为 nullptr 时恒等，
+//   把"还没建"错当成"共用"，随后就可能对 g_params 调 Destroy。
+bool g_query_params_owned = false;
+// 查询对象**确定性地建不起来**的原因（non-null ⇒ 不再尝试）。为什么需要这个粘滞位：
+//   选档链不只在建 feature 时被调 —— dispatch 的 feature_create_failed 分支里，
+//   make_feature_input_key 会**每帧**调一次 resolve_create_quality（那时本来就要
+//   return false，但仍然是每帧）。若失败时每帧都重调一次 g_get_caps，就把一个纯查找
+//   变成了每帧一次 NGX 入口调用 —— AGENTS.md §二.5 的形态。
+//   ⇒ 失败一次即记下原因、永不再试，直到 shutdown_all 把整套状态清掉（换设备/换 provider
+//     是唯一值得重试的时机）。
+const char *g_query_params_fail = nullptr;   // "no_entry" / "no_params" / "shared_singleton"
+
+// 六档区间的缓存。key 只用 display 宽高：查询输入 = (Width=display, Height=display, 档位)，
+// 与 render 尺寸无关（render 只决定"选哪档"）。尺寸变化才重查。
+//
+// ★★ render 不进键，因为**它不是查询输入**（2026-11-13 补记，防后人"好心修坏"）：
+//    区间只随 display 尺寸与档位变化；render 变了不需要重查，也不会因此拿到过期选档 ——
+//    resolve_create_quality 每次都拿**当前** render 尺寸重新跑一遍 pick_quality_from_ranges，
+//    所以 render 一变，选档结果当场就变。
+//    ⚠️ 因此**不要**把键改成四元组 (rw, rh, dw, dh)：那会让每次渲染精度变化（含逐帧抖动）
+//       都使整批缓存失效、六档回调重查一遍 —— 正是本缓存要消除的成本。
+//
+// ★★ 本文件里有两级**不同**的"粘滞失败"，不要混为一谈（2026-11-13 补记）：
+//    ① 本结构的 q[]/fails = **半粘滞**：refresh_optimal_ranges 里 c.valid 是**无条件**置 true
+//       （不看成功性），fails 只用于日志与验收 ⇒ 一旦首查六档全失败，只要 display 尺寸不变，
+//       就一直命中缓存、一直回退比例表，**不会重试**；直到尺寸再变才重新查一次。
+//    ② g_query_params_fail（下方）= **真粘滞**：查询对象本身建不起来（入口缺失 / 返回空 /
+//       单例共享），记下原因后全局永久放弃，直到 shutdown_all 才清。
+//    ⇒ 两者后果不同：①是"这一组 display 尺寸下没有区间可用"（换尺寸即可恢复），
+//      ②是"本进程内彻底不查了"（换尺寸也没用）。
+struct OptimalRangeCache
+{
+    bool          valid = false;
+    std::uint32_t dw = 0, dh = 0;
+    int           fails = 0;                       // 本批查询里失败的档位数（日志/验收用）
+    ngx_param_map::RangeQuery q[ngx_param_map::kPerfQualityCount] {};
+};
+OptimalRangeCache g_pq_range_cache;
+
+// 档位枚举与纯映射层的对齐（编译期）。ngx_param_map::PerfQuality 是一份副本，
+// 一旦 NGX 头升级改了枚举顺序/取值，构建直接失败而不是运行期静默错位。
+static_assert(static_cast<int>(ngx_param_map::PerfQuality::MaxPerformance)
+                  == NVSDK_NGX_PerfQuality_Value_MaxPerf, "PerfQuality 整数值与 NGX 头不一致");
+static_assert(static_cast<int>(ngx_param_map::PerfQuality::Balanced)
+                  == NVSDK_NGX_PerfQuality_Value_Balanced, "PerfQuality 整数值与 NGX 头不一致");
+static_assert(static_cast<int>(ngx_param_map::PerfQuality::MaxQuality)
+                  == NVSDK_NGX_PerfQuality_Value_MaxQuality, "PerfQuality 整数值与 NGX 头不一致");
+static_assert(static_cast<int>(ngx_param_map::PerfQuality::UltraPerformance)
+                  == NVSDK_NGX_PerfQuality_Value_UltraPerformance, "PerfQuality 整数值与 NGX 头不一致");
+static_assert(static_cast<int>(ngx_param_map::PerfQuality::UltraQuality)
+                  == NVSDK_NGX_PerfQuality_Value_UltraQuality, "PerfQuality 整数值与 NGX 头不一致");
+static_assert(static_cast<int>(ngx_param_map::PerfQuality::Dlaa)
+                  == NVSDK_NGX_PerfQuality_Value_DLAA, "PerfQuality 整数值与 NGX 头不一致");
+
+// 归还独立查询对象。幂等。
+static void release_query_params()
+{
+    // ★ 顺序：先判 owned 再 Destroy，最后清标志。任何一条路径漏清标志都会导致
+    //   下一次 shutdown_all 对已释放的指针再 Destroy 一次。
+    if (g_query_params != nullptr && g_query_params_owned && g_destroy != nullptr)
+        (void)g_destroy(g_query_params);
+    g_query_params = nullptr;
+    g_query_params_owned = false;
+    // ★ 粘滞失败原因也一并清：本函数只在 shutdown_all 里调用（设备级关停），
+    //   而换设备/换 provider 正是唯一值得重新尝试建立查询对象的时机。
+    g_query_params_fail = nullptr;
+}
+
+// 确保独立查询对象就绪。返回 false ⇒ 本次选档走回退路径（**不降级可用性**）。
+// 失败原因一次性记在 *why 里（只在调用点需要日志时传，避免热路径构造字符串）。
+static bool ensure_query_params(const char **why)
+{
+    if (g_query_params != nullptr)
+        return true;
+    // ★ 粘滞失败：一次失败之后不再重试（见 g_query_params_fail 的注释）。
+    //   本分支是**每帧**可能走到的路径，所以必须是"读一个指针然后返回"。
+    if (g_query_params_fail != nullptr)
+    {
+        if (why) *why = g_query_params_fail;
+        return false;
+    }
+    if (g_get_caps == nullptr)
+    {
+        g_query_params_fail = "no_entry";
+        if (why) *why = g_query_params_fail;
+        return false;
+    }
+
+    NVSDK_NGX_Parameter *qs = nullptr;
+    const NVSDK_NGX_Result rc = g_get_caps(&qs);
+    if (rc != NVSDK_NGX_Result_Success || qs == nullptr)
+    {
+        g_query_params_fail = "no_params";
+        if (why) *why = g_query_params_fail;
+        return false;
+    }
+    // ★★ 单例实现（返回的就是 g_params）⇒ 在它上面查询会污染 CreateFeature 的
+    //    Width/Height。判为不可用、走回退，**绝不**为了拿到区间去改共享对象。
+    if (qs == g_params)
+    {
+        g_query_params_fail = "shared_singleton";
+        if (why) *why = g_query_params_fail;
+        return false;
+    }
+    g_query_params = qs;
+    g_query_params_owned = true;
+    return true;
+}
+
+// 照抄 NVSDK_NGX_DLSS_GET_OPTIMAL_SETTINGS 的逻辑（third_party/ngx/nvsdk_ngx_helpers.h:65-114）。
+// 为什么自己重写而不 include 那个头：它末尾 include 了 nvsdk_ngx_helpers_d3d.h /
+// _cuda.h，这两个文件不在本仓库的 third_party/ngx/ 里（tools/Fetch-NgxHeaders.ps1 只取
+// defs/params），vendor 进来会连带一串编译错误。逻辑只有 ~40 行，照抄即可。
+//
+// 与上游的**唯一差异**（逐条声明，便于日后对照）：
+//   ① 上游用 NVSDK_NGX_Parameter_GetVoidPointer / SetUI / SetI 这些 C 导出；本仓库
+//      不链 NVSDK_NGX_*.lib（只用 GetProcAddress 拿 D3D11_* 十个入口），调 C 导出会
+//      变成 __imp_ 未解析 ⇒ 改用 NVSDK_NGX_Parameter 的**虚函数**：
+//      Get(name, void**) / Set(name, unsigned) / Set(name, int) / Get(name, unsigned*) /
+//      Get(name, float*)。语义一一对应（见 nvsdk_ngx_params.h:53-74 的接口定义）。
+//   ② 上游不检查每次 Get 的返回值；这里记录最后一次的 rc 并在退化区间上返回失败
+//      （宁可不选该档，也不要拿 0 当区间 —— 那会被判成"不包含"，等价于静默降档）。
+//   ③ Sharpness 照上游取回，但**不使用**：本次只改"选哪个档"，不碰锐化（§4「注意」）。
+static bool query_dlss_optimal_range(NVSDK_NGX_Parameter *p,
+                                     std::uint32_t display_w, std::uint32_t display_h,
+                                     int perf_quality,
+                                     ngx_param_map::RenderRange *out,
+                                     float *sharpness_out)
+{
+    if (p == nullptr || out == nullptr)
+        return false;
+
+    void *callback = nullptr;
+    if (p->Get(NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback, &callback)
+            != NVSDK_NGX_Result_Success)
+        return false;
+    // 空指针 = DLSS 运行时过旧 / 用错了参数对象来源（上游注释：改用 GetCapabilityParameters）。
+    if (callback == nullptr)
+        return false;
+
+    // 用户选择的输出尺寸（= 游戏 display 尺寸），不是 render 尺寸。
+    p->Set(NVSDK_NGX_Parameter_Width,  display_w);
+    p->Set(NVSDK_NGX_Parameter_Height, display_h);
+    p->Set(NVSDK_NGX_Parameter_PerfQualityValue, perf_quality);
+    // 老版本 DLSS DLL 仍会读这个键（上游注释原文：Some older DLSS dlls still expect this value）。
+    p->Set(NVSDK_NGX_Parameter_RTXValue, 0);
+
+    const auto cb = reinterpret_cast<PFN_NVSDK_NGX_DLSS_GetOptimalSettingsCallback>(callback);
+    const NVSDK_NGX_Result rc = cb(p);
+    if (rc != NVSDK_NGX_Result_Success)
+        return false;
+
+    // optimal：先取值，再作为 max/min 的默认值（兼容不带 Dynamic.* 的老 DLL）。
+    unsigned int ow = 0, oh = 0;
+    if (p->Get(NVSDK_NGX_Parameter_OutWidth, &ow) != NVSDK_NGX_Result_Success ||
+        p->Get(NVSDK_NGX_Parameter_OutHeight, &oh) != NVSDK_NGX_Result_Success)
+        return false;
+
+    unsigned int mxw = ow, mxh = oh, mnw = ow, mnh = oh;
+    (void)p->Get(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width,  &mxw);
+    (void)p->Get(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Height, &mxh);
+    (void)p->Get(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Width,  &mnw);
+    (void)p->Get(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Height, &mnh);
+    // ★ 老 DLL 没有这四个键时 Get 返回失败，上面的初始化让 max=min=optimal（与上游同口径）。
+
+    if (sharpness_out != nullptr)
+    {
+        float sharp = 0.0f;
+        if (p->Get(NVSDK_NGX_Parameter_Sharpness, &sharp) == NVSDK_NGX_Result_Success)
+            *sharpness_out = sharp;
+    }
+
+    out->opt_w = ow; out->opt_h = oh;
+    out->min_w = mnw; out->min_h = mnh;
+    out->max_w = mxw; out->max_h = mxh;
+    // 退化（任一维为 0 或 min>max）⇒ 判失败，让调用方回退而不是拿它当区间。
+    if (out->opt_w == 0 || out->opt_h == 0 || out->min_w == 0 || out->min_h == 0 ||
+        out->max_w == 0 || out->max_h == 0 ||
+        out->min_w > out->max_w || out->min_h > out->max_h)
+        return false;
+    return true;
+}
+
+// 刷新六档区间缓存（只在 display 尺寸变化时真正查询）。
+// 返回值 = 成功查到的档位数（0~6）；0 表示本次查询全失败 ⇒ 调用方必须回退。
+static int refresh_optimal_ranges(std::uint32_t display_w, std::uint32_t display_h)
+{
+    OptimalRangeCache &c = g_pq_range_cache;
+    if (c.valid && c.dw == display_w && c.dh == display_h)
+        return ngx_param_map::kPerfQualityCount - c.fails;
+
+    // 先把缓存置为不可用：查询期间任何提前返回都不会留下"上一次尺寸的区间"。
+    c.valid = false;
+    c.dw = display_w;
+    c.dh = display_h;
+    c.fails = ngx_param_map::kPerfQualityCount;
+    for (int i = 0; i < ngx_param_map::kPerfQualityCount; ++i)
+        c.q[i] = ngx_param_map::RangeQuery {};
+
+    if (display_w == 0 || display_h == 0)
+        return 0;
+    // ★ 本行在查询对象**粘滞失败**后仍然每次都走到，但它已经退化成"读一个指针然后返回"
+    //   （见 g_query_params_fail 的注释）—— 这是刻意的：把"要不要重试"的判据放在
+    //   ensure_query_params 内部，调用方不必各自再记一遍状态。
+    //   仍然成立的代价约束：区间缓存命中时**不会**走到这里（上方首行即返回）。
+    if (!ensure_query_params(nullptr))
+        return 0;
+
+    int ok_count = 0;
+    for (int i = 0; i < ngx_param_map::kPerfQualityCount; ++i)
+    {
+        ngx_param_map::RenderRange r {};
+        if (!query_dlss_optimal_range(g_query_params, display_w, display_h, i, &r, nullptr))
+            continue;                        // 该档查询失败：q[i].ok 保持 false
+        c.q[i].ok = true;
+        c.q[i].range = r;
+        ++ok_count;
+        // 取证行：六档各一条，含区间与容差。Error 级（NgxLogLevel 默认 1 才看得到，
+        // 本文件 §3.10.2 的约定：要验收的证据必须用 Error 级）。
+        log_ngx_core(blog::Level::Error,
+                     L"ngx_core pq_range pq=%d name=%hs dw=%u dh=%u "
+                     L"opt=%ux%u min=%ux%u max=%ux%u tol=%ux%u",
+                     i, ngx_param_map::perf_quality_name(i), display_w, display_h,
+                     r.opt_w, r.opt_h, r.min_w, r.min_h, r.max_w, r.max_h,
+                     ngx_param_map::range_upper_tolerance(r.max_w),
+                     ngx_param_map::range_upper_tolerance(r.max_h));
+    }
+    c.fails = ngx_param_map::kPerfQualityCount - ok_count;
+    // ★ 半粘滞（见 OptimalRangeCache 的注释）：本行**无条件**置位，即使上面六档全部失败也一样
+    //   ⇒ 同一 display 尺寸下不再重试，一直回退比例表；尺寸一变才重来。
+    //   fails 只用于日志与验收，不参与任何判据。
+    c.valid = true;                          // ★ 只缓存"已经查过"这个事实，不缓存成功性
+    return ok_count;
+}
+
+// 选档链：区间查询优先，任何异常都回退到既有的比例表 + 兜底。
+// 形参顺序刻意与 NgxInstance 的字段顺序一致（rw, rh, dw, dh）—— 四个尺寸都是
+// std::uint32_t，传反了编译器不报错，只能用命名与顺序来防。
+// ★ 两个调用点（create_feature 的 Set、diag_check_create_params 的回读校验）**必须**
+//   都调本函数，否则期望值与实际写入值不同源 ⇒ set_mismatch 误报。
+//   本函数是**纯函数式**的：不写 g_params、不改实例、不碰资源与生命周期。
+static int resolve_create_quality(std::uint32_t render_w, std::uint32_t render_h,
+                                  std::uint32_t display_w, std::uint32_t display_h,
+                                  bool log_decision)
+{
+    // ---- 回退路径（与改动前逐字等价）----
+    // quality_from_ratio 的两参是 (render_w, display_w)，与既有调用点同序。
+    const auto fallback = [&]()
+    {
+        return static_cast<int>(perf_quality_for_create(quality_from_ratio(render_w, display_w)));
+    };
+
+    const int ok_count = refresh_optimal_ranges(display_w, display_h);
+    if (ok_count == 0)
+    {
+        if (log_decision)
+        {
+            log_ngx_core(blog::Level::Error,
+                         L"ngx_core pq_select mode=ratio pq=%d r=%ux%u d=%ux%u "
+                         L"reason=query_unavailable",
+                         fallback(), render_w, render_h, display_w, display_h);
+        }
+        return fallback();
+    }
+
+    const ngx_param_map::QualityPick pick =
+        ngx_param_map::pick_quality_from_ranges(g_pq_range_cache.q,
+                                                ngx_param_map::kPerfQualityCount,
+                                                render_w, render_h);
+    if (!pick.matched)
+    {
+        // 六档的区间都不包含当前 render 尺寸。**不能**瞎猜一个档：回退到比例表，
+        // 至少保住改动前的可用性（§4「推进需要」明确要求）。
+        if (log_decision)
+        {
+            log_ngx_core(blog::Level::Error,
+                         L"ngx_core pq_select mode=ratio pq=%d r=%ux%u d=%ux%u "
+                         L"reason=no_interval ranges_ok=%d",
+                         fallback(), render_w, render_h, display_w, display_h, ok_count);
+        }
+        return fallback();
+    }
+
+    // ★ 仍要过 perf_quality_for_create：它是"最后一道兜底"（保留不动）。
+    //   区间查询若把 UltraQuality 选出来，仍按 b632cc5 的口径改成 MaxQuality ——
+    //   实测 UltraQuality 在多个精度下都被 NGX 拒绝（0xBAD00010），在拿到
+    //   "区间查询选出的 UltraQuality 能建成功"的实机证据之前，不放宽这一步。
+    const int final_pq = static_cast<int>(
+        perf_quality_for_create(static_cast<NVSDK_NGX_PerfQuality_Value>(pick.index)));
+    if (log_decision)
+    {
+        // pq= 是验收字段（§4 判据：日志里的 pq= 必须与区间查询结果一致）；
+        // picked= 是区间查询的原始结论，两者不同即说明被 perf_quality_for_create 改写。
+        log_ngx_core(blog::Level::Error,
+                     L"ngx_core pq_select mode=interval picked=%d picked_name=%hs pq=%d pq_name=%hs "
+                     L"r=%ux%u d=%ux%u tol=%ux%u ranges_ok=%d",
+                     pick.index, ngx_param_map::perf_quality_name(pick.index),
+                     final_pq, ngx_param_map::perf_quality_name(final_pq),
+                     render_w, render_h, display_w, display_h, pick.tol_w, pick.tol_h, ok_count);
+    }
+    return final_pq;
+}
+
 // 3.8.3：v1 六档全设同一值（等价于 OptiScaler 的 RenderPresetForAll）。
 // v <= 0 直接 return，六个键一个都不设 —— 语义是「交给 NGX」，不是「默认预设」。
 static void apply_render_preset(int v)
@@ -1798,13 +2339,158 @@ static void apply_render_preset(int v)
     g_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality,     v);
 }
 
+// 2026-11-13 增（§5）：算出"这一次 CreateFeature 用的输入 key"。
+//
+// ★ 调用点只有两处，且都在**已经注定要失败/已经在失败状态**的路径上：
+//   ① create_feature 失败时（记录 key）；
+//   ② dispatch 里 feature_create_failed 为真时（比较 key）。
+//   正常成功路径（每帧建好 feature 后继续）**不调用本函数** —— 这是刻意的：
+//   build_create_flags 会打一条 Error 级 ngx_hdr_decision 行，放在每帧路径上
+//   就是日志洪水 + 每帧格式化开销（AGENTS.md §二.5，错误 #9）。
+//
+// ★ 这里的取值口径必须与 create_feature 里真正 Set() 进 NGX 的那些值**逐项同源**，
+//   否则会出现"key 没变但参数变了"或反之 ⇒ 重试判据失效：
+//   · perf_quality：就是 create_feature 第 4 项那个表达式（先 render 后 display）；
+//   · create_flags / is_hdr：取自**同一次** build_create_flags(color_fmt) 求值，
+//     保证两字段互相一致（见 CreateFlagsEval 的"一次求值、多处取用"注释）；
+//   · color_fmt 用调用方传进来的 inst.color_fmt（= 本帧实际参与 Set 的那份）。
+
+// 从**已有的**一次 CreateFlagsEval 求值构造 key —— 供 create_feature 失败路径复用：
+//   那里已经为 Set() 调过一次 build_create_flags（存进 flag_eval），再调一次会多打一条
+//   ngx_hdr_decision、且两次求值之间探测状态可能被写方改写（CreateFlagsEval 的注释记过
+//   这个"M2 同族"的撕裂风险）。所以失败路径必须走本重载，**不要**在那里另调一次。
+static CreateFeatureInputKey make_feature_input_key_from(const NgxInstance &inst,
+                                                         const CreateFlagsEval &ev)
+{
+    CreateFeatureInputKey k;
+    k.render_w      = inst.rw;
+    k.render_h      = inst.rh;
+    k.display_w     = inst.dw;
+    k.display_h     = inst.dh;
+    // 2026-11-13（OPEN-ISSUES §4）：本字段的口径 = "create_feature 实际 Set 进 NGX 的那个值"。
+    //   §4 的改动把选档换成 resolve_create_quality（区间查询 → 回退比例表 → 兜底），
+    //   这里若继续用旧的 perf_quality_for_create(quality_from_ratio(...))，key 里记的
+    //   pq 就**不是**实际写进去的那个 ⇒ 区间查询选了别的档时 key 判据看不到变化
+    //   （key 相同 ⇒ 不重试）。⇒ 与 create_feature 走同一个函数。
+    // ★ log_decision=false：失败路径不重复打 pq_select（决策已在 create_feature 里打过），
+    //   且区间查询有缓存 ⇒ 这里通常不触发任何 NGX 调用。
+    k.perf_quality  = resolve_create_quality(inst.rw, inst.rh, inst.dw, inst.dh, false);
+    k.render_preset = g_render_preset;
+    k.create_flags  = ev.flags;
+    // 2026-11-13（独立审查第 5 条）：**格式也是 CreateFeature 的输入**，必须进 key。
+    //   反例：后缓冲 R10G10B10A2 → R16G16B16A16_FLOAT。两者在 resolve_is_hdr 的回退层
+    //   取值不同，但只要 IsHDR 位恰好不变（例如 swapchain 探测成功且判 SDR），
+    //   create_flags 就不变 ⇒ 旧 key 判"相同"⇒ 该重试的自愈被漏掉。
+    //   格式另外还决定资源池按什么建（create_pool 直接读 inst.color_fmt/output_fmt），
+    //   所以它对本判据是"实打实的输入"，不是旁证。
+    //   ★ 取 inst 的字段而不是形参：与 create_feature 里 Set() 的取值来源同源
+    //     （那里也是 inst.color_fmt）。DXGI_FORMAT 在这里转 int，保持本 key 零 D3D 依赖。
+    k.color_fmt     = static_cast<int>(inst.color_fmt);
+    k.output_fmt    = static_cast<int>(inst.output_fmt);
+    k.is_hdr        = ev.is_hdr;     // ★ 取 resolve_is_hdr 的决策，**不是** g_hdr（见 :1076-1077）
+    return k;
+}
+
+static CreateFeatureInputKey make_feature_input_key(const NgxInstance &inst,
+                                                    DXGI_FORMAT color_fmt)
+{
+    // 只在失败判据路径（dispatch 的 feature_create_failed 分支）调用 ——**每帧一次**。
+    //
+    // ★★ 2026-11-13（独立审查第 3 条）：log_decision=false **必须**传。
+    //   本函数在"白名单 rc 已锁存"状态下每帧被调一次（dispatch 的
+    //   feature_create_failed && feature_fail_key_valid 分支），而 build_create_flags
+    //   原先无条件打一条 Error 级 ngx_hdr_decision ⇒ 一旦锁存就是每帧一条 Error 日志
+    //   外加每帧一次格式化（AGENTS.md §二.5 热路径红线、错误 #9）。
+    //   ⇒ 只关日志、**不关计算**：flags 仍每次重算，所以绝不可能漏判 flags 变化
+    //     （那正是本 key 存在的意义）。
+    //
+    // ★ 取值来源与 create_feature 的 Set 路径**同源**：两边都走 build_create_flags，
+    //   只是这一路静默。两处若哪天改成"一处走 flags_input_bits、一处走 build_create_flags"，
+    //   就会重新引入 M2 那类"判据与决策不同源"的缺陷 —— 不要那样改。
+    return make_feature_input_key_from(inst, build_create_flags(color_fmt, false));
+}
+
+// 2026-11-13 增（§5）：CreateFeature 因**参数性 rc** 失败时，记录本次输入 key。
+//
+// ★ 唯一调用点：create_feature 的 rr != Success 分支、且 rr 命中白名单时。
+//   另外两个置位点（no_params / null_resource）**刻意不调用** —— 见各自注释：
+//   它们没有"输入 key"可言，记一份全 0 的 key 会在日志里制造假证据。
+//   ⇒ 因此"是否允许重试"**状态**由 feature_fail_key_valid 单一表达（本函数恒置 true，
+//     其余路径从不置位）。
+//   ⚠️ 2026-11-13（独立审查第 2 条）：上面这句原写"不必再叠一个 retry_eligible 形参"
+//      —— 该结论**只对状态成立、对日志不成立**，已部分推翻（原文保留，见下）。
+//      · 状态侧**确实**不需要额外标志：feature_fail_key_valid 已经是唯一事实源，
+//        再存一个 bool 就是两个可能漂移的副本。这条不变。
+//      · 但**日志侧**需要它：docs/OPEN-ISSUES.md 的验收判据要求日志里能 grep 到
+//        retry_eligible=1，而原代码没打这个字段 ⇒ 验收 grep 恒 0 命中。
+//      ⇒ 现在把它作为**形参**传入，只用于日志；不参与任何判据，也**不**与
+//        feature_fail_key_valid 并存为两个状态 —— 值由调用点按同一个条件算出来，
+//        传进来的就是这个条件的真值，不是第二份存储。
+//
+// ★ 结构化字段，不拼长字符串：日志要能逐字段对账，且本条只在失败路径上打。
+// ★ 本函数**不**决定是否置 g_release_all —— 那是调用点的事（白名单外的 rc 才置）。
+//
+// ⚠️ 2026-11-13（独立审查第 2 条）：**必须打 retry_eligible 字段**。
+//   原实现没有这个字段，而 docs/OPEN-ISSUES.md 的 §5 验收步骤写着
+//   「确认日志出现 create_feature key_fail … retry_eligible=1」—— 那条 grep 恒为 0 命中，
+//   验收步骤永远"不通过"。这正是 AGENTS.md §三 #21 的形态：文档里的验收判据
+//   与代码实际打出的字段对不上，而两边各自看都"没问题"。
+//   ⇒ 修在代码侧（文档已按这个字段名写死了验收口径，改文档等于改验收标准）。
+//
+// ★ 为什么把 retry_eligible 做成**形参**而不是在格式串里写死 1：
+//   本函数目前只有白名单那一个调用点（值恒 1），但"恒 1"是**调用点的性质**、
+//   不是本函数的性质。写成形参后，将来若有第二个调用点（例如把某个环境性失败
+//   也接进来观察），它必须显式说明自己是 0 还是 1 ⇒ 不会打出一行撒谎的日志。
+//   这与本文件"单一事实源"的纪律一致：值从**做判据的那一处**传进来，不在这里猜。
+static void record_feature_create_failure(NgxInstance &inst, const CreateFeatureInputKey &key,
+                                          unsigned int rc, bool retry_eligible)
+{
+    inst.feature_fail_key       = key;
+    inst.feature_fail_key_valid = true;
+    inst.feature_fail_rc        = rc;
+    inst.feature_fail_tick      = GetTickCount64();
+    // ★ retry_eligible 放在行尾：docs 里的 grep 判据写成 "key_fail … retry_eligible=1"，
+    //   中点号是通配语义 ⇒ 位置不敏感；但放在行尾更便于人眼对账（先看 key，再看判定）。
+    // ★ 同时补 color_fmt / output_fmt（第 5 条新增的两个 key 字段）——
+    //   "日志里能逐字段对账"是这条日志存在的理由，key 加了字段而日志不加
+    //   就等于验收时看不见那个字段。
+    log_ngx_error(L"ngx_core create_feature key_fail rw=%u rh=%u dw=%u dh=%u pq=%d preset=%d "
+                  L"flags=0x%X hdr=%d cfmt=%d ofmt=%d rc=0x%X retry_eligible=%d",
+                  key.render_w, key.render_h, key.display_w, key.display_h,
+                  key.perf_quality, key.render_preset, key.create_flags,
+                  key.is_hdr ? 1 : 0, key.color_fmt, key.output_fmt, rc,
+                  retry_eligible ? 1 : 0);
+}
+
 // 3.8.1 七项参数 + create flags + 六个 preset 键。
 // 签名保持 SDS 原样；资源一律从 inst 读（T-4 建池、T-5 保证调用时已就位）。
+// 2026-11-13（独立审查第二轮 · 建议 6）：`create_feature` 的**出参 rc 哨兵值**。
+//
+// 为什么需要它：调用方要打"本次尝试真实的失败 rc"，而 `create_feature` 有两条**根本没
+//   调用 NGX** 的失败路径（no_params / null_resource）—— 那时没有任何 rc 可言。
+//   若让出参保持 0，日志里的 `new_rc=0x0` 会被读成"NGX 返回了 0"，那是**假证据**。
+//   0xFFFFFFFF 不是合法的 NVSDK_NGX_Result（成功是 0x1，失败是 0xBAD0xxxx / 0xE*******），
+//   因此可以无歧义地表示"本次没有走到 NGX 调用"。
+static constexpr unsigned int kCreateFeatureRcNgxNotCalled = 0xFFFFFFFFu;
+
+// ★ 2026-11-13（独立审查第二轮 · 建议 6）给 create_feature 增加**出参** `out_rc`（可为 nullptr）。
+//   语义变化仅限于"多给调用方一个事实"：返回 bool 与全部既有分支**逐字不变**。
+//   存在理由（缺陷原状）：dispatch 的重试结果日志曾取 `inst.feature_fail_rc`，而那个字段
+//   **只有白名单 rc 才写**（见 record_feature_create_failure 的唯一调用点）⇒ 若重试那次
+//   改成**非白名单** rc 失败，字段仍是上一次的旧值 ⇒ 日志里 `same=1` 恒真 ⇒
+//   **描述了一种压根没发生的情况**（AGENTS.md §二.2：禁止日志/注释撒谎）。
+//   要让日志说实话，只能由本函数把本次的真实 rc 交出来。
 static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
-                           ID3D11DeviceContext *ctx)
+                           ID3D11DeviceContext *ctx, unsigned int *out_rc = nullptr)
 {
     // 签名由 SDS 3.8.1 写死，但本函数不读 in（资源全在 inst 里）=> 显式标注避免 C4100。
     static_cast<void>(in);
+
+    // 出参初值 = "NGX 没有被调用"。下面**只有**在 g_create 真正返回之后才覆盖它
+    //   ⇒ no_params / null_resource 两条早退路径自动保持哨兵值，不需要各自再写一遍
+    //   （少一个写入点就少一处会漏的地方）。
+    if (out_rc != nullptr)
+        *out_rc = kCreateFeatureRcNgxNotCalled;
 
     // 释放旧 handle。返回值【不处理】：handle 已失效时 NGX 返回失败，不影响后续 CreateFeature。
     // 不调 g_params->Reset()（3.9.5）—— 那会清掉 CreateFeature 设的 7 项。
@@ -1817,6 +2503,17 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     {
         log_ngx_error(L"ngx_core create_feature ok=0 preset=%d reason=no_params", g_render_preset);
         inst.feature_create_failed = true;
+        // 2026-11-13（§5）：**本置位点不记录 key、也不参与 key 变化重试**。
+        //   理由：no_params 的根因是 ensure_init 从未成功（g_params/g_create 为空），
+        //   那是**环境性**失败、与本节说的"输入 key"无关；写一份 key 只会误导后续排查
+        //   （看起来像"参数性问题可自愈"）。retry_eligible 因此恒为 0。
+        //   g_release_all 照旧置位 ⇒ 维持 S-81 原语义。
+        // ★ 刻意**不**调 record_feature_create_failure：本路径没有"输入 key"可言
+        //   （g_params/g_create 为空，CreateFeature 根本没被调用）。若为了日志整齐
+        //   记一份全 0 的 key，日志里会出现 rw=0 rh=0 dh=0 这种**看起来像真 key** 的行
+        //   —— 那正是 AGENTS.md §二.2 禁止的"制造错误证据"。上面的 ok=0 行已经
+        //   用 reason=no_params 说明了原因，信息不缺。
+        //   ⇒ feature_fail_key_valid 保持 false ⇒ dispatch 的 key_changed 恒假 ⇒ 不重试。
         g_release_all.store(true, std::memory_order_relaxed);
         return false;
     }
@@ -1845,7 +2542,13 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
             // 与 ok=1 行的区别：无 rc= 字段、带 reason=null_resource 与具体缺哪个资源名。
             log_ngx_error(L"ngx_core create_feature ok=0 preset=%d reason=null_resource missing=%hs",
                           g_render_preset, missing.c_str());
-            inst.feature_create_failed = true;   // S-81：同一对象生命周期内永不清锁
+            // S-81：同一对象生命周期内永不清锁
+            inst.feature_create_failed = true;
+            // 2026-11-13（§5）：与 no_params 同一处置 —— **不记录 key、不参与重试**。
+            //   缺资源是接线/建池缺陷，不是"输入参数换一个就能建起来"那一类；
+            //   把它纳入重试会让建池失败反复重跑 CreateFeature。
+            //   同理不记全 0 的假 key（见 no_params 处的说明）。
+            //   g_release_all 照旧置位 ⇒ 维持 S-81 原语义。
             g_release_all.store(true, std::memory_order_relaxed);
             return false;
         }
@@ -1861,10 +2564,17 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     g_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,  inst.rw);
     g_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, inst.rh);
     // 4. PerfQualityValue
-    // ★ 经 perf_quality_for_create 兜底：UltraQuality 改 MaxQuality，否则 0.8~0.999 精度
-    //   CreateFeature 报 0xBAD00010（UnsupportedParameter）。详见该函数的注释。
-    g_params->Set(NVSDK_NGX_Parameter_PerfQualityValue,
-                  perf_quality_for_create(quality_from_ratio(inst.rw, inst.dw)));   // 两参：先 render 后 display
+    // 2026-11-13（OPEN-ISSUES §4 治本）：选档改走 resolve_create_quality ——
+    //   ① 先向 NGX 查询六个档位各自的合法 render 尺寸区间，挑区间包含当前 render 尺寸的那档；
+    //   ② 查询不可用 / 六档都不包含 ⇒ 回退 quality_from_ratio + perf_quality_for_create
+    //      （= 改动前的行为，逐字不变）；
+    //   ③ 仍然过 perf_quality_for_create（UltraQuality → MaxQuality 的兜底保留）。
+    // ★ 参数顺序（render, display, render_h, display_h）见该函数的声明处；
+    //   quality_from_ratio 内部的形参序是 (render_w, display_w)，两处不要弄反。
+    // ★★ 本函数**只决定"选哪个档"**：create flags、资源、实例生命周期一律不动。
+    // ★★★ 必须与 diag_check_create_params 的回读校验同源，否则 set_mismatch 误报。
+    const int perf_quality = resolve_create_quality(inst.rw, inst.rh, inst.dw, inst.dh, true);
+    g_params->Set(NVSDK_NGX_Parameter_PerfQualityValue, perf_quality);
     // 5. Create.Flags（3.8.2）
     // ★ T-8：同一份求值结果既用于 Set()、也用于日志与快照（见 CreateFlagsEval 的注释）。
     const CreateFlagsEval flag_eval = build_create_flags(inst.color_fmt);
@@ -1881,6 +2591,12 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     const NVSDK_NGX_Result rr =
         g_create(ctx, NVSDK_NGX_Feature_SuperSampling, g_params, &inst.feature);
 
+    // 2026-11-13（独立审查第二轮 · 建议 6）：**成功与失败都写出真实 rc**。
+    //   放在这里（g_create 之后、日志之前）而不是各 return 点各写一遍：本函数的结局
+    //   全部由 rr 决定 ⇒ 一处写入即可覆盖 rr != Success 的白名单 / 非白名单两条分支与成功分支。
+    if (out_rc != nullptr)
+        *out_rc = static_cast<unsigned int>(rr);
+
     log_ngx_core(blog::Level::Error, L"ngx_core create_feature ok=%d preset=%d rc=0x%X",
                  rr == NVSDK_NGX_Result_Success ? 1 : 0, g_render_preset, rr);
     if (rr != NVSDK_NGX_Result_Success)
@@ -1889,8 +2605,88 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
         inst.feature_create_failed = true;
         // 偏离 3：SDS 3.8.1 的代码块漏了下面这一行，但 4.2 第 10 行与 3.9.7 明文要求
         //   置 g_release_all（确定性失败，重试不会好，让原生接手）。
+        //
+        // ⚠️ 2026-11-13（§5）起，这一行**有条件的**——不是无条件置位了。原因见下。
+        //
+        // ---- 为什么对 UnsupportedParameter 破例：白名单，不是黑名单 ----
+        // 0xBAD00010 = NVSDK_NGX_Result_FAIL_UnsupportedParameter
+        //   （third_party/ngx/nvsdk_ngx_defs.h:169，注释原文「A parameter supplied to the
+        //    feature is either unsupported by the current version or has an unsupported value」）
+        //   —— 它是**参数性**失败：换一组参数就可能建得起来，与"根因不会自愈"的前提不符。
+        //   实机证据（用户提供的事故日志）：
+        //     create_feature ok=0 rc=0xBAD00010  ⇒ 用户把渲染精度从 0.999 改回 0.5
+        //     ⇒ 仍 DISPATCH_FAILED 一路失败；本应自愈，却因锁存 + g_release_all 只能重启游戏。
+        // 判据写成**只认这一个常量**，而不是"排除某些 rc"：
+        //   将来 NGX 新增任何 rc 时，默认落回 else 分支 ⇒ 仍是保守的"放手让原生接手"
+        //   （AGENTS.md §一.6：默认行为要保守；新增量不能自动获得重试权）。
+        //   特别是 S-81 记录过的 0xBAD0000B（PathListInfo 配错）**不在白名单**里 ⇒
+        //   它照旧置 g_release_all ⇒ 仍然不会每帧重试（:2005 记过的教训不受影响）。
+        const bool retry_eligible = (rr == NVSDK_NGX_Result_FAIL_UnsupportedParameter);
+        if (retry_eligible)
+        {
+            // 只有白名单 rc 才记 key（= 才允许 dispatch 里那个"key 变化则重试"的判据生效）。
+            record_feature_create_failure(
+                inst, make_feature_input_key_from(inst, flag_eval), static_cast<unsigned int>(rr),
+                retry_eligible);
+            // 不置 g_release_all：让 dispatch 能继续走到"key 变化才重试"那一步。
+            // ★ 这是本次唯一的语义放宽点，代价与止损见 dispatch 里对应注释。
+            //
+            // ---- 2026-11-13（独立审查第 1 条）：必须在这里回报"累积 pass 未被替换" ----
+            // 缺陷：白名单 rc 是**唯一**不置 g_release_all 的失败路径。而 g_release_all 原本
+            //   承担了双重职责 —— 除了"让原生接手"，它还顺带关掉了「跳过原生 FSR2 预处理
+            //   pass」的许可（见 Dx11FsrBridge.cpp 的 fsr2_family_should_skip_draw：
+            //   那里有一句 if (ngx::should_release_all()) return false;）。
+            //   ⇒ 本次不置位后，那道 gate 不再关闭，而 fsr2_family_takeover 里的
+            //     g_accumulate_replaced 可能**仍是上次成功时的 true**。
+            //   后果：后续帧的原生 3-draw 预处理 pass 被继续跳过，可这一路此刻**没有**
+            //   桥产出的输出（feature 没建起来）⇒ 原生 FSR2 拿不到输入 ⇒ 画面冻在最后一帧。
+            //   冻帧窗口最长 = fsr2_family_expire_ms（默认 500ms），之后 should_skip_pre
+            //   因超时才自行放手。
+            //
+            // 为什么在这里显式回报 false、而不是只依赖 Dx11FsrBridge.cpp 的 note_family_notify：
+            //   note_family_notify 确实会在**本次累积 draw** 结尾回报 false —— 但那次回报发生在
+            //   try_fsr2_translation_draw 返回**之后**，而本帧的原生预处理 pass 在它**之前**
+            //   就已经被判过要不要跳过了。且若该帧根本没走到累积 draw（视图/场景切换、
+            //   游戏停派发），回报就根本不会发生，跳过许可会一直留到过期。
+            //   ⇒ 在这里（= 确定失败的当场）回报，把窗口从"最长 500ms + 若干帧"
+            //     压到"本次失败立刻失效"。这与"失败要立刻、无延迟地交还原生路径"的
+            //     既有纪律一致（见 notify_takeover_leave 的注释：立刻、无条件）。
+            //
+            // 为什么**不**顺手清 g_accumulate_tick、也不调 notify_takeover_leave：
+            //   notify_accumulate_result(false, …) 只置 g_accumulate_replaced=false，
+            //   不清 tick、不动计数 —— 这正是需要的语义（只解除许可）。
+            //   notify_takeover_leave() 会额外递增 leave 计数，那个计数专用于
+            //   "单实例接管交棒"，在本路径上递增会污染它的统计口径（§五.6 日志口径自洽）。
+            //
+            // 为什么放在 record_… **之后**：先记录失败事实（key/rc/tick），再解除许可。
+            //   顺序反了也不会错，但"先记事实"让日志行的时序与机制发生的时序一致。
+            //
+            // ⚠️ 诚实标注：本调用**未实机验证**（无游戏进程条件）。可达性已由静态分析确认：
+            //   本 TU 与 Fsr2FamilyTakeover.cpp 同在 Dx11FsrBridge.dll 内，
+            //   fsr2_family_takeover 的符号是外部链接（该文件无匿名命名空间包裹）。
+            fsr2_family_takeover::notify_accumulate_result(false, GetTickCount64());
+            // 2026-11-13（独立审查第二轮 · 建议 5）：把"这行调用真的执行了"留成一条**只打一次**的
+            //   证据行，并带上进程级累计次数（accumulate_cleared_count() 在**同一行**之后读，
+            //   因此本行的 cleared= 至少为 1 —— 它同时是"计数接线正确"的自检）。
+            //   ★ 为什么不用"每次打印"：这里是失败路径，参数持续失败时每 2 秒一次 ⇒ 若每次
+            //     都打，等于给失败路径加日志洪水（AGENTS.md §五.6 要求诊断日志有计数闸门）。
+            //   ★ 为什么用 std::atomic 而不是普通 static bool：本函数在渲染线程上，但"首次"
+            //     本身不需要严格性；用 atomic 是为了不给将来的并发读取留数据竞争（§二.4）。
+            //   ★ 热路径：本行**只在白名单 rc 失败时**执行，成功路径一次都不走（§二.5）。
+            //   ⚠️ 诚实标注：本行与整条白名单路径**未实机验证**（无游戏进程条件）。
+            static std::atomic_bool g_family_release_logged { false };
+            if (!g_family_release_logged.exchange(true, std::memory_order_relaxed))
+            {
+                log_ngx_error(L"ngx_core family_release reason=create_feature_rc reason_rc=0x%X "
+                              L"cleared=%llu",
+                              static_cast<unsigned int>(rr),
+                              static_cast<unsigned long long>(
+                                  fsr2_family_takeover::accumulate_cleared_count()));
+            }
+            return false;
+        }
         g_release_all.store(true, std::memory_order_relaxed);
-        return false;                          // 不重试（3.9.7 / S-81）
+        return false;                          // 其余一切 rc：不重试（3.9.7 / S-81）
     }
     // 偏离 3b：3.12.1 注 5 要求成功时写 feature_preset，而 3.8.1 的代码块漏了。
     //   该字段只用于日志与 Q18 对账，不参与重建判据。
@@ -2196,6 +2992,13 @@ static void destroy_instance()
         g_inst.feature = nullptr;
     }
     g_inst.feature_create_failed = false;   // 对象销毁 ⇒ 锁存随对象消失（不是「清锁重试」）
+    // 2026-11-13（§5）：失败 key 与锁存同寿。**必须一起清** —— 否则换了设备/尺寸后
+    //   新实例会拿旧实例的 key 作比较，key_changed 可能恒假 ⇒ 白丢一次重试机会；
+    //   更糟的是 feature_fail_key_valid 残留时，间隔判据会以旧 tick 为起点。
+    g_inst.feature_fail_key       = CreateFeatureInputKey {};
+    g_inst.feature_fail_key_valid = false;
+    g_inst.feature_fail_rc        = 0;
+    g_inst.feature_fail_tick      = 0;
     // T-8 M4-a：feature 句柄没了 ⇒ 那份「本次 CreateFlags 输入」快照也就不再描述任何活对象。
     // ★ 必须一起清：否则 key 切换后（destroy + create_instance）旧快照会残留，
     //   若此时位图恰好不同，第 5 步会判定 flags_changed 再白重建一次刚建好的资源池。
@@ -2695,10 +3498,17 @@ static void diag_check_create_params(const NgxInstance &inst)
         ow != inst.dw)           { mismatch("OutWidth");  return; }
     if (g_params->Get(NVSDK_NGX_Parameter_OutHeight, &oh) != NVSDK_NGX_Result_Success ||
         oh != inst.dh)           { mismatch("OutHeight"); return; }
-    // PerfQualityValue 是 CreateFeature 时按 (rw, dw) 档位写进去的（§3.8.3 六档），
-    // 并经过 perf_quality_for_create 兜底 —— 期望值必须同样走这条链，否则误报 set_mismatch。
+    // PerfQualityValue 是 CreateFeature 时写进去的，值来自 resolve_create_quality
+    // （NGX 区间查询 → 回退 quality_from_ratio → 再经 perf_quality_for_create 兜底）。
+    // ★★ 期望值必须**同样走这条链**，否则误报 set_mismatch（OPEN-ISSUES §4「注意」第二条）。
+    //   本次改动（2026-11-13）把这一行从"直接算比例表"改成调同一个函数 —— 这正是
+    //   §4 点名要求的那一条：两个调用点同源。
+    // ★ 下面传 log_decision=false：本函数在统计口径上不是"决策点" —— 决策已在 create_feature
+    //   里打过一条 pq_select。本函数传 log_decision=false，故不会重复打 pq= 行；否则日志里
+    //   会出现两条 pq= 行，验收时无法判断哪条对应 CreateFeature。区间查询本身有缓存 ⇒ 这里
+    //   不走查询、只取缓存。
     if (g_params->Get(NVSDK_NGX_Parameter_PerfQualityValue, &pq) != NVSDK_NGX_Result_Success ||
-        pq != static_cast<int>(perf_quality_for_create(quality_from_ratio(inst.rw, inst.dw))))
+        pq != resolve_create_quality(inst.rw, inst.rh, inst.dw, inst.dh, false))
     {
         mismatch("PerfQualityValue");
         return;
@@ -2742,6 +3552,11 @@ void shutdown_all()
     g_inst.key_valid = false;
     // 对象销毁 ⇒ 锁存随对象消失（这不是"清锁重试"，§3.9.7 / S-81 只禁止尺寸变化时清它）
     g_inst.feature_create_failed = false;
+    // 2026-11-13（§5）：与 destroy_instance() 同步清失败 key（两处都是"对象没了"的语义）。
+    g_inst.feature_fail_key       = CreateFeatureInputKey {};
+    g_inst.feature_fail_key_valid = false;
+    g_inst.feature_fail_rc        = 0;
+    g_inst.feature_fail_tick      = 0;
     // T-8 M4-a：同上 —— 第 1 步已经把 feature 释放掉了，那份 CreateFlags 输入快照不再描述任何
     // 活对象。★ 必须与 destroy_instance() 同步清（两处都是"对象没了"的语义）；
     // 漏了它，换设备后第一次 dispatch 会拿旧快照比对，可能白重建一次刚建好的池。
@@ -2761,6 +3576,24 @@ void shutdown_all()
 
     // ---- 4. 清设备与参数 ----
     // ★ 不调 DestroyParameters：g_params 是 NGX 内部分配的，v1 不释放（§3.9.5）。
+    //
+    // 2026-11-13（OPEN-ISSUES §4）：独立查询对象**要释放**，且必须在这里（设备级关停）释放。
+    //   为什么这里释放、而 g_params 不释放：两者来源相同（都是 GetCapabilityParameters），
+    //   但 g_params 的"不释放"是既有契约（§3.9.5，本次不改它）；查询对象是本次改动
+    //   **新多要来的一份**，按 SDK 文档（nvsdk_ngx.h:398-401）应由调用方 DestroyParameters。
+    //   漏了它就是每次设备重建泄漏一个参数表。
+    // ★★ 顺序：先释放查询对象、再清 g_query_params/g_params —— release_query_params 内部
+    //   只读自己的指针，不读 g_params，所以先清哪个都不影响；但必须在**同一段**里，
+    //   否则下一次 ensure_init 重建 g_params 后，缓存里还留着上一个设备的区间。
+    // ★ 区间缓存必须一起清：换设备 = 换驱动/换 DLSS 运行时，旧区间不再可信。
+    // ⚠️ 残余风险（诚实标注，未实机验证）：这里调 DestroyParameters 与 §3.9.5「v1 不释放
+    //   g_params、交给进程回收」的既有纪律**不一致** —— 理由是「这份是我们多要的、按 SDK
+    //   文档该由调用方释放」，但**没有实测过**外部 provider（OptiScaler）的
+    //   NVSDK_NGX_D3D11_DestroyParameters 在设备刚丢失的时刻是否安全。
+    //   若实机在 dev_removed 之后出现崩溃，第一嫌疑就是这一行：届时把它删掉即可
+    //   （代价只是每次设备重建泄漏一个参数表，设备重建在本项目里是低频事件）。
+    release_query_params();
+    g_pq_range_cache = OptimalRangeCache {};
     g_device.Reset();
     g_params = nullptr;
     // ★★ 陷阱 3（T-5 任务书）：**漏清 g_inited ⇒ 下次 dispatch 以为已初始化、直接拿空表 ⇒ 崩溃**。
@@ -3105,12 +3938,111 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     // ---- 第 5 步之后：feature 的建与不建 ----
     // 永久不重试（§3.9.7 / S-81）：CreateFeature 失败的根因（PathListInfo 配错）不会自愈，
     // 相同输入重试只会每帧阻塞 + 每帧重复日志。锁存只在对象销毁时随对象消失。
+    //
+    // ⚠️ 2026-11-13（§5）起不再"永久"：**输入 key 变化允许重试一次**。S-81 的原始理由
+    //   仍然成立，所以放宽被限制成三重窄门（任何一条不满足都回到"不重试"）：
+    //     ① 失败必须是**白名单 rc**（0xBAD00010）—— 由 create_feature 决定是否记录 key，
+    //        并在此用 feature_fail_key_valid 体现；其余 rc 早已置 g_release_all、
+    //        在更早的 gate 就返回了，根本到不了这里；
+    //     ② 当前 key 必须与失败时记录的 key **不同**（逐字段整数比较，10 个字段，见
+    //        same_feature_input_key）；相同 ⇒ 原样 return false，行为与改前一致；
+    //     ③ 距离上次失败必须 >= kFeatureCreateRetryMinMs。
+    //   ★★ 2026-11-13（独立审查第 4 条）：③ 的**理由已订正**（原文方向写反，保留在下方）。
+    //     已推翻的旧说法：「②保证输入变了才重试，但输入可以每帧都变（例如尺寸在
+    //       1920x1080 / 1919x1080 间抖动、或 HDR 探测反复翻转）」—— **不成立**：
+    //       构成 key 的 10 个字段全是低频、事件驱动的量（尺寸随玩家改设置、格式随后缓冲
+    //       切换、flags/HDR 由 ini 与 swapchain 探测决定），没有一个随帧变化。
+    //       "尺寸逐帧抖动"在本 key 上压根不会发生 ⇒ 无间隔保护也不会退化成每帧重试。
+    //     真实理由：**DLSS CreateFeature 在失败时会阻塞**（:1891 附近"每帧阻塞"的记录，
+    //       也正是 S-81 当初定"永久不重试"的直接动因）。参数性失败虽可自愈，但自愈之前
+    //       每一次尝试都要付这笔阻塞代价 ⇒ 需要给"连续失败"一个频率上限。
+    //       ③ 的职责就是那个上限：最坏情况下每 2 秒最多阻塞一次。
+    //     ★ 2000 是**保守猜测值，未实机标定**（诚实标注）：它只保证自愈不会被拖慢到
+    //       玩家可感知（用户改设置的间隔必然 >> 2 秒，见事故日志 00:18:02 -> 00:18:30），
+    //       以及"最坏阻塞频率 <= 1 次/2 秒"。实机若测得阻塞很轻可下调、很重应上调；
+    //       两种调整都不影响"用户改回安全精度后能自愈"这一验收判据。
+    //     ★ 是否保留 2000 的结论：**保留** —— 只要失败会阻塞，就需要频率上限，
+    //       而这正是本常量唯一的职责（与"输入会不会抖动"无关）。
+    //
+    // ★ 热路径开销（AGENTS.md §二.5）：这些比较**只在 feature_create_failed 为真时**才做
+    //   ——此时本次 dispatch 本来就要 return false，计算成本被吞掉；成功路径上是**一次
+    //   bool 判断**，与改前完全相同（改前那一行也是 if (inst.feature_create_failed)）。
+    // ★ 重试簿记：只在下面的 feature_create_failed 分支里置 is_retry=true。
+    //   放在 if 之外是因为"重试结果"要在**建完之后**才打（成功行与失败行共用 prev_rc）。
+    bool         is_retry     = false;
+    unsigned int retry_prev_rc = 0;
     if (inst.feature_create_failed)
-        return false;
+    {
+        // ★ 第 1-5 步已核对**无昂贵操作**（静态分析结论，未实机测帧数）：
+        //   第 1 步 GetDevice（COM，AddRef + 随后的 Release）；第 2 步设备指针比较；
+        //   第 2b 步一次 atomic load；第 3 步 ensure_init —— g_inited 为真时**首行短路**
+        //   （:1389，只有首次调用会走注册表/LoadLibrary）；第 4 步两次 GetDesc + 一次
+        //   ensure_instance（key 未变时**首行短路**，:2243）；第 5 步六元组比较 + 一次
+        //   flags_input_bits（1 次 atomic load）。⇒ **create_pool 在 key 未变时不会被调用**，
+        //   没有每帧重复分配。真正会被重跑的是第 5 步的建池判据与下面的 key 比较，都是常数级。
+        //   ⚠️ 诚实标注：以上为**读代码得出的结论**，未在实机测帧数（无游戏进程条件）。
+        CreateFeatureInputKey now_key;
+        if (inst.feature_fail_key_valid)
+            now_key = make_feature_input_key(inst, cdesc.Format);
+        // ★ 只在 key 确实变化且过了最小间隔时才重试；否则与改前**逐字相同**地放弃。
+        const bool key_changed = inst.feature_fail_key_valid &&
+                                 !ngx_param_map::same_feature_input_key(now_key, inst.feature_fail_key);
+        const bool interval_ok = inst.feature_fail_key_valid &&
+                                 (GetTickCount64() - inst.feature_fail_tick) >= kFeatureCreateRetryMinMs;
+        if (!key_changed || !interval_ok)
+            return false;
+        // ---- 到这里：白名单 rc 失败 + 输入 key 变化 + 间隔足够 ⇒ 清锁重试一次 ----
+        // ★ 为什么三个字段要一起清：任何一项残留都会让下一帧重新进入本分支
+        //   （key_valid 残留 ⇒ key_changed 恒假 ⇒ 永远不重试；tick 残留 ⇒ 间隔判据错）。
+        // ★ 2026-11-13（独立审查第 5 条）：补 cfmt=/ofmt= —— key 新增了这两个字段，
+        //   日志不同步就会出现"判据用了格式、验收时看不见格式"的取证缺口。
+        log_ngx_error(L"ngx_core create_feature key_retry rw=%u rh=%u dw=%u dh=%u pq=%d preset=%d "
+                      L"flags=0x%X hdr=%d cfmt=%d ofmt=%d prev_rc=0x%X",
+                      now_key.render_w, now_key.render_h, now_key.display_w, now_key.display_h,
+                      now_key.perf_quality, now_key.render_preset, now_key.create_flags,
+                      now_key.is_hdr ? 1 : 0, now_key.color_fmt, now_key.output_fmt,
+                      inst.feature_fail_rc);
+        is_retry      = true;
+        retry_prev_rc = inst.feature_fail_rc;
+        inst.feature_create_failed = false;
+        inst.feature_fail_key_valid = false;
+        inst.feature_fail_key       = CreateFeatureInputKey {};
+        inst.feature_fail_rc        = 0;
+        inst.feature_fail_tick      = 0;
+        // ★ 清锁后**不 return**：直接落进下面的 if (!inst.feature) 建 feature，
+        //   复用同一条创建路径（含诊断回读）。重试成功后必须继续走第 6-11 步，
+        //   在这里 return 会让本帧白丢一次派发 —— 那是把修复写成"自愈了但仍不出图"。
+    }
     if (!inst.feature)
     {
-        if (!create_feature(inst, in, ctx))
+        // ★ 2026-11-13（独立审查第二轮 · 建议 6）：本次真实的 rc 由 create_feature 交出。
+        //   缺陷原状：下面曾读 `inst.feature_fail_rc`，而它**只在白名单 rc 时**被写
+        //   （record_feature_create_failure 的唯一调用点）⇒ 重试若改成非白名单 rc 失败，
+        //   读到的是**上一次**的旧值 ⇒ `same=` 恒 1 ⇒ 日志把"rc 变了"说成"rc 没变"。
+        //   现在取的是本次调用的返回值，与 NGX 实际给的一致。
+        unsigned int new_rc = kCreateFeatureRcNgxNotCalled;
+        if (!create_feature(inst, in, ctx, &new_rc))
+        {
+            // ---- 重试结果日志：区分"参数问题自愈"与"环境问题" ----
+            // 同一个 rc ⇒ 与参数无关，更像是环境性问题（驱动/特征目录/显存）；
+            // 不同 rc ⇒ 参数确实影响到了失败类型，需要看新 rc 的含义。
+            // ★ new_rc=0xFFFFFFFF ⇒ 本次**没走到 NGX 调用**（no_params / null_resource），
+            //   此时 same= 的比较无意义，单独用 rc_known=0 标出来，避免被读成"NGX 返回了 -1"。
+            if (is_retry)
+            {
+                const bool rc_known = (new_rc != kCreateFeatureRcNgxNotCalled);
+                log_ngx_error(L"ngx_core create_feature key_retry_result ok=0 prev_rc=0x%X "
+                              L"new_rc=0x%X same=%d rc_known=%d",
+                              retry_prev_rc, new_rc,
+                              (rc_known && new_rc == retry_prev_rc) ? 1 : 0, rc_known ? 1 : 0);
+            }
             return false;                  // 内部已置位 feature_create_failed 与 g_release_all
+        }
+        if (is_retry)
+        {
+            log_ngx_error(L"ngx_core create_feature key_retry_result ok=1 prev_rc=0x%X rw=%u rh=%u dw=%u dh=%u",
+                          retry_prev_rc, inst.rw, inst.rh, inst.dw, inst.dh);
+        }
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         // §4.2 第 19 行：Set() 返回 void，只能 Get 回读抽检。不等 ⇒ set_mismatch + 置位。
         diag_check_create_params(inst);

@@ -45,6 +45,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <string>   // std::string（第 [10] 节的档位名断言）
 
 namespace
 {
@@ -607,6 +608,310 @@ void test_jitter_valid_bit()
     CHECK_BITS(nan_out.px, want.x, "NaN path px still equals oracle");
 }
 
+// ===========================================================================
+// [10] 按 NGX 区间选档（2026-11-13 新增；本段**没有** oracle —— 见下）
+// ===========================================================================
+// 与 [1]~[9] 的性质不同：那些段是"重构、零行为变更"，靠 oracle 逐位对照；
+// 本段是**新判据**，没有"重构前原文"可抄。所以这里钉的是**契约断言**：
+//   ① 容差公式（1/64）与下界无容差的非对称；
+//   ② 区间退化（含查询成功但字段为 0）一律判"不包含"，绝不退化成"不限制"；
+//   ③ 多档重叠时取 optimal 最近者；距离完全相等时取固定优先序；
+//   ④ 一个都不包含 / 全部查询失败 ⇒ matched=false（调用方据此回退比例表）。
+// ===========================================================================
+// [11] same_feature_input_key —— §5 自愈判据（2026-11-13 新增）
+// ===========================================================================
+// 为什么必须钉住它：这是"要不要重试一次 CreateFeature"的**唯一**判据。
+//   漏一个字段 ⇒ 该重试的没重试（自愈失效）；多认一个每帧变的量 ⇒ 每帧重试（卡顿）。
+//   两种失效都**不崩、不报错、编译零告警**，只有实机日志能看出来。
+// ★ 断言方式是逐字段单独翻转再比较，而不是"整体相等/不等"两下 ——
+//   后者在"比较函数少写一个字段"时**依然全绿**（那正是要抓的形态，AGENTS.md §三 #21）。
+void test_same_feature_input_key()
+{
+    std::printf("[11] same_feature_input_key: 逐字段敏感 + 反射性 + 全等\n");
+
+    CreateFeatureInputKey base {};
+    base.render_w      = 1920;
+    base.render_h      = 1080;
+    base.display_w     = 2560;
+    base.display_h     = 1440;
+    base.perf_quality  = 2;
+    base.render_preset = 0;
+    base.create_flags  = 0x2u;
+    base.color_fmt     = 23;   // R10G10B10A2_TYPELESS
+    base.output_fmt    = 23;
+    base.is_hdr        = false;
+
+    // ---- 反射性：同一份 key 与自身相等（逐字段比较漏字段时这条仍会过，故不能只靠它）----
+    CHECK(same_feature_input_key(base, base));
+    {
+        CreateFeatureInputKey copy = base;
+        CHECK(same_feature_input_key(base, copy));   // 逐字段拷贝也必须相等
+    }
+
+    // ---- 逐字段敏感：**每一个**字段单独改一格，都必须判"不相等" ----
+    //   ★ 这里刻意用表驱动 + 逐条 CHECK，让失败信息能指名道姓是哪个字段漏了比较。
+    {
+        CreateFeatureInputKey k = base; k.render_w     = base.render_w + 1;
+        CHECK(!same_feature_input_key(base, k));
+    }
+    {
+        CreateFeatureInputKey k = base; k.render_h     = base.render_h + 1;
+        CHECK(!same_feature_input_key(base, k));
+    }
+    {
+        CreateFeatureInputKey k = base; k.display_w    = base.display_w + 1;
+        CHECK(!same_feature_input_key(base, k));
+    }
+    {
+        CreateFeatureInputKey k = base; k.display_h    = base.display_h + 1;
+        CHECK(!same_feature_input_key(base, k));
+    }
+    {
+        CreateFeatureInputKey k = base; k.perf_quality = base.perf_quality + 1;
+        CHECK(!same_feature_input_key(base, k));
+    }
+    {
+        CreateFeatureInputKey k = base; k.render_preset = base.render_preset + 1;
+        CHECK(!same_feature_input_key(base, k));
+    }
+    {
+        CreateFeatureInputKey k = base; k.create_flags = base.create_flags | 0x1u;
+        CHECK(!same_feature_input_key(base, k));
+    }
+    {
+        CreateFeatureInputKey k = base; k.is_hdr       = !base.is_hdr;
+        CHECK(!same_feature_input_key(base, k));
+    }
+
+    // ---- ★★ 独立审查第 5 条的反例：只改格式、其余全同 ----
+    //   这正是原实现漏掉两个格式字段时"判为相同"的那个场景。
+    //   AGENTS.md §三 #24：先自证前提 —— 除格式外其余字段确实完全相同，
+    //   否则下面两条断言可能因别的原因通过（那会让它们变成假证据）。
+    {
+        CreateFeatureInputKey k = base;
+        k.color_fmt  = 10;   // R16G16B16A16_FLOAT
+        k.output_fmt = 10;
+        // 前提自证：其余 8 个字段与 base 逐项相同。
+        CHECK(k.render_w      == base.render_w);
+        CHECK(k.render_h      == base.render_h);
+        CHECK(k.display_w     == base.display_w);
+        CHECK(k.display_h     == base.display_h);
+        CHECK(k.perf_quality  == base.perf_quality);
+        CHECK(k.render_preset == base.render_preset);
+        CHECK(k.create_flags  == base.create_flags);
+        CHECK(k.is_hdr        == base.is_hdr);
+        // ⇒ 唯一差异就是格式 ⇒ 必须判不相等（否则自愈漏判）。
+        CHECK(!same_feature_input_key(base, k));
+        // 反向：单独改 output_fmt 也一样。
+        CreateFeatureInputKey k2 = base;
+        k2.output_fmt = 10;
+        CHECK(k2.color_fmt == base.color_fmt);   // 前提自证
+        CHECK(!same_feature_input_key(base, k2));
+    }
+
+    // ---- ★★ 2026-11-13（独立审查第二轮 · 阻断项 1）：color_fmt **单独**变化必须被判出来 ----
+    //   缺陷原状（上述两块）：「只改格式」那个反例**同时**改了 color_fmt 与 output_fmt
+    //   （见上块 k.color_fmt / k.output_fmt 两行）⇒ 它证明的是"至少有一个格式字段被比较"，
+    //   **不是**"color_fmt 被比较"。实测：把 NgxParamMap.cpp 的 `a.color_fmt == b.color_fmt`
+    //   换成 `true &&` 重新编译后，本段**依然** `3647 checks, 0 failures` / ALL PASS ——
+    //   因为 output_fmt 仍不同，上面那条 CHECK 靠它通过，掩盖了 color_fmt 的比较缺失。
+    //   而 k2 那条确实只改了 output_fmt ⇒ 缺的正是 color_fmt 的对称用例。
+    //   ⇒ 这就是本函数开头注释警告、却恰好没被覆盖的形态（AGENTS.md §三 #21：
+    //     "检查通过"不等于"内容正确"）。下面补一条，只动 color_fmt。
+    //   AGENTS.md §三 #24（先自证前提）：先断言 output_fmt 与其余 8 个字段都与 base 相同，
+    //   否则这条 CHECK 可能因**别的原因**通过，变成假证据。
+    {
+        CreateFeatureInputKey k = base;
+        k.color_fmt = 10;   // R16G16B16A16_FLOAT；**只有这一个字段**变化
+        // 前提自证（★ 最关键的一条）：output_fmt 必须仍等于 base
+        // —— 它一旦不同，本块就退化成上面那块，抓不到 color_fmt 漏比。
+        CHECK(k.output_fmt == base.output_fmt);
+        CHECK(k.render_w      == base.render_w);
+        CHECK(k.render_h      == base.render_h);
+        CHECK(k.display_w     == base.display_w);
+        CHECK(k.display_h     == base.display_h);
+        CHECK(k.perf_quality  == base.perf_quality);
+        CHECK(k.render_preset == base.render_preset);
+        CHECK(k.create_flags  == base.create_flags);
+        CHECK(k.is_hdr        == base.is_hdr);
+        // ⇒ 唯一差异就是 color_fmt ⇒ 必须判不相等。
+        //   变异测试（本轮实测）：只把 color_fmt 的比较换成 `true` ⇒ 本条变红。
+        CHECK(!same_feature_input_key(base, k));
+    }
+
+    // ---- 非对称性护栏：两份**不同**的 key 不能因为"某字段恰好相等"而被判相同 ----
+    {
+        CreateFeatureInputKey a = base;
+        CreateFeatureInputKey b = base;
+        a.render_w = 1280; b.render_w = 1920;   // 只有 render_w 不同
+        b.create_flags = base.create_flags;      // 其余保持
+        CHECK(!same_feature_input_key(a, b));
+    }
+
+    // ---- 全 0 key：默认构造的两份必须相等（feature_fail_key 清零后与新建的比较）----
+    {
+        CreateFeatureInputKey z1 {};
+        CreateFeatureInputKey z2 {};
+        CHECK(same_feature_input_key(z1, z2));
+        // 全 0 与 base 不同（避免"默认值恰好等于真实 key"的退化）。
+        CHECK(!same_feature_input_key(z1, base));
+    }
+}
+
+void test_quality_from_ranges()
+{
+    std::printf("[10] pick_quality_from_ranges: 区间包含 / 容差 / 重叠 / 回退\n");
+
+    // ---- 档位整数值必须与 NGX 的枚举一致（NgxBackend.cpp 另有 static_assert 钉同一件事）----
+    CHECK(static_cast<int>(PerfQuality::MaxPerformance)   == 0);
+    CHECK(static_cast<int>(PerfQuality::Balanced)         == 1);
+    CHECK(static_cast<int>(PerfQuality::MaxQuality)       == 2);
+    CHECK(static_cast<int>(PerfQuality::UltraPerformance) == 3);
+    CHECK(static_cast<int>(PerfQuality::UltraQuality)     == 4);
+    CHECK(static_cast<int>(PerfQuality::Dlaa)             == 5);
+
+    // ---- 档位名 ----
+    CHECK(std::string(perf_quality_name(0)) == "MaxPerf");
+    CHECK(std::string(perf_quality_name(5)) == "DLAA");
+    CHECK(std::string(perf_quality_name(-1)) == "?");
+    CHECK(std::string(perf_quality_name(6)) == "?");
+
+    // ---- 容差公式：upper/64，整数除法 ----
+    CHECK(range_upper_tolerance(0)    == 0);
+    CHECK(range_upper_tolerance(63)   == 0);
+    CHECK(range_upper_tolerance(64)   == 1);
+    CHECK(range_upper_tolerance(127)  == 1);
+    CHECK(range_upper_tolerance(1280) == 20);
+    CHECK(range_upper_tolerance(2560) == 40);
+    // ★ 明确钉住"不是 2 像素"：OPEN-ISSUES §4 原文写「1/64（约 2 像素）」，
+    //   而公式在 1280 上是 20 像素。以公式为准，此断言防止后人按文字改成常量 2。
+    CHECK(range_upper_tolerance(1280) != 2);
+
+    // ---- 单档包含判定 ----
+    RenderRange r {};
+    r.opt_w = 1706; r.opt_h = 960;   // 2560x1440 输出、MaxQuality 档的典型值（**推断**，非实测）
+    r.min_w = 1280; r.min_h = 720;
+    r.max_w = 1706; r.max_h = 960;
+
+    CHECK(render_range_contains(r, 1706, 960));          // 正好 optimal（本例中也是上界）
+    CHECK(render_range_contains(r, 1280, 720));          // 正好下界
+    CHECK(render_range_contains(r, 1706 + 26, 960 + 14)); // 上界 + (26, 14)，正好等于容差 (26, 15)
+    CHECK(!render_range_contains(r, 1706 + 27, 960));    // 超容差 1 像素 ⇒ 不包含
+    CHECK(!render_range_contains(r, 1706, 960 + 16));    // 高同理（容差 15）
+    CHECK(!render_range_contains(r, 1279, 720));         // 低于下界 1 像素 ⇒ 不包含（下界无容差）
+    CHECK(!render_range_contains(r, 1706, 719));
+
+    // ---- 退化区间：一律"不包含"，不退化成"不限制" ----
+    RenderRange zero = r;
+    zero.min_w = 0;
+    CHECK(!render_range_contains(zero, 1706, 960));
+    RenderRange zero_max = r;
+    zero_max.max_h = 0;
+    CHECK(!render_range_contains(zero_max, 1706, 960));
+    RenderRange inverted = r;
+    inverted.min_w = 2000; inverted.max_w = 1000;
+    CHECK(!render_range_contains(inverted, 1706, 960));
+    CHECK(!render_range_contains(r, 0, 960));            // render 为 0 的防御
+
+    // ---- 六档一起选：单个档位命中 ----
+    RangeQuery q[6] {};
+    auto set_ok = [&q](int i, std::uint32_t ow, std::uint32_t oh,
+                       std::uint32_t mnw, std::uint32_t mnh,
+                       std::uint32_t mxw, std::uint32_t mxh)
+    {
+        q[i].ok = true;
+        q[i].range.opt_w = ow; q[i].range.opt_h = oh;
+        q[i].range.min_w = mnw; q[i].range.min_h = mnh;
+        q[i].range.max_w = mxw; q[i].range.max_h = mxh;
+    };
+    // 只让 MaxQuality 命中 1920x1080
+    set_ok(0, 1280, 720, 1100, 620, 1300, 730);   // MaxPerf
+    set_ok(1, 1481, 833, 1400, 790, 1500, 850);   // Balanced
+    set_ok(2, 1920, 1080, 1700, 960, 1920, 1080); // MaxQuality ← 命中
+    set_ok(3, 853, 480, 800, 450, 900, 500);      // UltraPerformance
+    set_ok(4, 1920, 1080, 1800, 1000, 1900, 1070);// UltraQuality（max 略小 ⇒ 不命中）
+    set_ok(5, 2560, 1440, 2500, 1400, 2560, 1440);// DLAA
+
+    QualityPick p = pick_quality_from_ranges(q, 6, 1920, 1080);
+    CHECK(p.matched == true);
+    CHECK(p.index == static_cast<int>(PerfQuality::MaxQuality));
+    CHECK(p.tol_w == 1920u / 64u);
+
+    // ---- 区间重叠：取 optimal 离实际最近的那档 ----
+    // 让 MaxQuality 与 Balanced 都包含 1500x850，但 Balanced 的 optimal 更近。
+    set_ok(1, 1500, 850, 1400, 790, 1600, 900);   // Balanced  optimal=1500x850 ⇒ 距离 0
+    set_ok(2, 1920, 1080, 1400, 790, 2000, 1120); // MaxQuality optimal=1920x1080 ⇒ 距离 420+230
+    p = pick_quality_from_ranges(q, 6, 1500, 850);
+    CHECK(p.matched == true);
+    CHECK(p.index == static_cast<int>(PerfQuality::Balanced));
+
+    // ---- 距离完全相等：按固定优先序（MaxQuality 先于 Balanced）----
+    set_ok(1, 1500, 850, 1400, 790, 1600, 900);
+    set_ok(2, 1500, 850, 1400, 790, 2000, 1120);
+    p = pick_quality_from_ranges(q, 6, 1500, 850);
+    CHECK(p.matched == true);
+    CHECK(p.index == static_cast<int>(PerfQuality::MaxQuality));
+
+    // ---- 一个都不包含 ⇒ matched=false（调用方回退比例表）----
+    p = pick_quality_from_ranges(q, 6, 4000, 3000);
+    CHECK(p.matched == false);
+    CHECK(p.index == -1);
+
+    // ---- 查询失败的档位不参与：把唯一命中的那档标成 ok=false ----
+    q[2].ok = false;
+    p = pick_quality_from_ranges(q, 6, 1500, 850);
+    CHECK(p.matched == true);                                     // Balanced 仍命中
+    CHECK(p.index == static_cast<int>(PerfQuality::Balanced));
+
+    // ---- 全部查询失败 ⇒ matched=false ----
+    for (int i = 0; i < 6; ++i) q[i].ok = false;
+    p = pick_quality_from_ranges(q, 6, 1920, 1080);
+    CHECK(p.matched == false);
+
+    // ---- count 截断：只在传入的档位里选 ----
+    for (int i = 0; i < 6; ++i) q[i].ok = true;
+    p = pick_quality_from_ranges(q, 2, 1500, 850);   // 只允许 MaxPerf / Balanced
+    CHECK(p.matched == true);
+    CHECK(p.index == static_cast<int>(PerfQuality::Balanced));
+
+    // ---- nullptr / count=0 不崩、判不命中 ----
+    p = pick_quality_from_ranges(nullptr, 6, 1920, 1080);
+    CHECK(p.matched == false);
+    p = pick_quality_from_ranges(q, 0, 1920, 1080);
+    CHECK(p.matched == false);
+
+    // ---- 回归：0.999 精度那一档（2560x1440 display / 2556x1438 render）----
+    // 旧比例表把它判成 UltraQuality ⇒ 实机 0xBAD00010。这里用**假设**的驱动区间。
+    // ★ 断言的是"选档器行为"，不是"驱动真实区间"——后者只有实机日志能证明。
+    // ★★ 本用例必须让 UltraQuality **因区间不包含而被排除**，不能靠平局优先序取胜：
+    //    首版写成两档 opt 相同 ⇒ 距离相等 ⇒ 靠 kTieOrder 选中 MaxQuality，那样即使
+    //    包含判据完全失效本用例也是绿的（AGENTS.md §三 #21 的形态）。
+    //    ⇒ 现在让两档 opt **不同**，且 UltraQuality 的上界**不够**：
+    //      max_w=2500 ⇒ 容差 2500/64=39 ⇒ 上界 2539 < 2556 ⇒ 宽超限；
+    //      max_h=1400 ⇒ 容差 1400/64=21 ⇒ 上界 1421 < 1438 ⇒ 高超限。
+    RangeQuery real[6] {};
+    // DLAA 只接受恰好等于输出尺寸（不放大）；2556x1438 不在其中。
+    real[5].ok = true;
+    real[5].range = { 2560, 1440, 2560, 1440, 2560, 1440 };
+    // MaxQuality：opt=1974x1111，min 低到 1280x720、max 顶到 2560x1440 ⇒ 2556x1438 在区间内。
+    real[2].ok = true;
+    real[2].range = { 1974, 1111, 1280, 720, 2560, 1440 };
+    // UltraQuality：opt 与 MaxQuality 相同（距离也就相同），但上界太小 ⇒ 不包含。
+    //   这样"选中 MaxQuality"只可能来自包含判据，不可能来自平局优先序。
+    real[4].ok = true;
+    real[4].range = { 1974, 1111, 1280, 720, 2500, 1400 };
+
+    p = pick_quality_from_ranges(real, 6, 2556, 1438);
+    CHECK(p.matched == true);
+    CHECK(p.index == static_cast<int>(PerfQuality::MaxQuality));   // ★ 0.999 落 MaxQuality
+    CHECK(p.index != static_cast<int>(PerfQuality::UltraQuality)); // ★ 不再落 UltraQuality
+    // ★ 关键前提自证（AGENTS.md §三 #24）：证明 UltraQuality 确实是**因包含判据**被排除，
+    //   而不是它压根没被查出来（那会让上一条断言以另一种方式"通过"）。
+    CHECK(real[4].ok == true);                                     // 它是查到了的
+    CHECK(!render_range_contains(real[4].range, 2556, 1438));      // 只是区间不包含
+    CHECK(render_range_contains(real[2].range, 2556, 1438));       // MaxQuality 确实包含
+}
+
 } // namespace
 
 int main()
@@ -621,6 +926,8 @@ int main()
     test_reset();
     test_reactive_size_ok();
     test_jitter_valid_bit();
+    test_quality_from_ranges();
+    test_same_feature_input_key();
 
     std::printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
     if (g_failures == 0)
