@@ -1938,6 +1938,23 @@ static NVSDK_NGX_PerfQuality_Value quality_from_ratio(std::uint32_t render_w, st
     if (ratio > 1.5f && ratio <= 1.7f) return NVSDK_NGX_PerfQuality_Value_Balanced;
     if (ratio > 1.3f && ratio <= 1.5f) return NVSDK_NGX_PerfQuality_Value_MaxQuality;
     if (ratio > 1.0f && ratio <= 1.3f) return NVSDK_NGX_PerfQuality_Value_UltraQuality;
+    // 2026-11-13（ratio > 3.0 的档位归属）：原本落本函数末尾的 else ⇒ DLAA（不放大），
+    //   改为 UltraPerformance。
+    // 为什么：渲染精度 0.2（ratio 5.0）/ 0.3（ratio 3.33）的 render 尺寸低于所有档位的
+    //   optimal 区间 ⇒ 区间查询必然 no_interval ⇒ 落这条回退分支。这两个倍率对应的是
+    //   "极端降采样"，语义上属于最高档的 UltraPerformance，而 DLAA 是"不放大"的档位，
+    //   与 3.3x / 5x 的实际倍率不符。本改动的目的是让档位与倍率的语义一致，
+    //   **不是**改善画质。
+    // 实测：这两个精度声明 UltraPerformance 后 create_feature 均 ok=1；与改前声明 DLAA 相比，
+    //   画面观感差异很小，未做两者的 A/B 量化对比 ⇒ **画质优劣未验证**，不要据此宣称提升。
+    // ★ 一条被证伪的推断：曾认为「实际倍率超出档位名义能力时 NGX 会拒绝」（0.2 需 5x、
+    //   0.3 需 3.3x，而 UltraPerformance 名义 3x）。实测两者均 ok=1 ⇒ NGX 未拒绝。
+    //   证据只有这两个尺寸，不要据此断言 NGX 对所有尺寸都放宽。
+    if (ratio > 3.0f) return NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+    // ratio <= 1.0（render >= display：原分辨率或超采样）必须留 DLAA —— 这是唯一
+    //   "不放大"的档位。若与上面合并成同一个 else，会把它错选成 UltraPerformance
+    //   （放大 3x），画面对不上。当前档位表最大 0.999（ratio 1.001 > 1.0）不触发，
+    //   属"碰巧安全"，不是结构安全 ⇒ 两个分支必须分开。
     return NVSDK_NGX_PerfQuality_Value_DLAA;
 }
 
