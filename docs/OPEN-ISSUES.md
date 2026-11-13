@@ -396,7 +396,112 @@ P3（可选）
 - `Dx11FsrBridge/NgxBackend.cpp:947-976`、`:1104-1106`、`:1422-1472`、`:1884`；`Dx11FsrBridge/NgxBackend.h`
 - `Dx11FsrBridge/Ffx12Backend.cpp:2633-2721`、`:3164`、`:3169-3172`
 
+**评估结论（2026-11-14）**
+
+**一、事实核验：6 条断言与代码不符**
+
+按 HEAD 逐条复核，「现状」段里有 6 处描述与代码不符：
+
+1. 「`Ffx12Backend=ngx` 时整块不出现」——**实际会出现**，且报的是未被使用的 AMD SDK 与
+   `FSR?`（详见下节，这是要修的真实缺陷）。`ffx12::dispatch()` 在 ngx 模式下同样返回 true
+   （`Ffx12Backend.cpp:2934-2956` 分流后走 `ngx::dispatch`），`Dx11FsrBridge.cpp:13028` 的成功分支
+   照常执行 ⇒ 块照常打印。
+2. 「全库没有 `GetFileVersionInfo`/`VerQueryValue`」——`FufuGraphicsPlugin/FufuGraphicsPlugin.cpp:252-269`
+   已有完整实现，`FufuGraphicsPlugin/CMakeLists.txt:41` 已链 `version`；只有 `Dx11FsrBridge` 没链。
+3. `resolve_feature_dirs()` 位置——实际在 `NgxBackend.cpp:1068-1098`；`:947-976` 是三个日志闸门。
+4. `NgxBackend.cpp:1471` 的 `hit.kind` / `hit.path`——该行是 `g_init_retry_after_us`；真正赋值在
+   `:1378-1379` / `:1415-1416` / `:1439-1440`，唯一消费点 `:1597-1598`。「只打日志、未持久化」
+   属实：`ProviderHit` 是 `ensure_init` 内的局部量（`:1551`）。
+5. `:1884` 不能当触发点——该行是 `build_create_flags` 里的 `cf.depth_inverted`；`create_feature`
+   定义在 `:2500`，调用点 `:4041`。
+6. 「DLSS 版本没有任何一行」——日志里已有
+   `[NGXSecureLoadFeature:1621] ... nvngx_dlss.dll version: 310.9.16`，由 `ngx_log_cb`
+   （`NgxBackend.cpp:984-998`）原样透传。但它受 `NgxLogLevel>0` 与回调内 200 条硬限流约束，
+   `NgxLogLevel=0` 时整条消失。
+
+**属实的断言（已核验）**
+
+- `log_focus_block` 的位置与三行内容（`Dx11FsrBridge.cpp:3397-3411`）、两个调用点（`:13028`、`:13305`）、
+  `g_route_*`（`:596` 起）、`record_adapter_info`（`:15379-15396`）。
+- `unsafe_dx11_on12_backend_selected()`（`:9318-9357`）读的 ini 键 `[Upscalers] Dx11Upscaler`
+  与 250 ms 限流缓存。
+- `log_focus_line`（恒 `core` INFO）与 `log_ngx_error`（恒 Error、无计数闸门）的等级差异。
+- `matched_version_name()`（`Ffx12Backend.cpp:3169`）与 `selected_version_name()`（`:3164`）并存，
+  且前者只在 native 侧匹配成功时被赋值（`:2710`）——ngx 模式下它保持初值 `"?"`。
+- 实测 `nvngx_dlss.dll` 的 FileVersion = `310,9,16,0`，条目里的版本号准确。
+
+**二、真实问题比条目描述的更严重**
+
+不是「缺摘要」，是「有摘要，但内容是错的」。`backend=ngx` 的会话实测：
+
+```
+  GPU : NVIDIA GeForce RTX 4070 SUPER (vendor=0x10DE)
+  SDK : ...\payload\AMD\amd_fidelityfx_upscaler_dx12.dll
+  FSR : FSR?  [OK]
+```
+
+同一次会话里 `ngx_core provider resolved=nvidia_registry module=...\_nvngx.dll`——真正上屏的是
+DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此认定「这局在跑 FSR」，方向正好相反。
+
+原因：`ffx12::dispatch()` 在 ngx 模式下同样返回 true（`Ffx12Backend.cpp:2934-2956` 分流后走
+`ngx::dispatch`），所以焦点块的触发条件成立；而块里取的 `g_route_sdk_path`（由
+`record_adapter_info` 从 `g_config.ffx12_dll_path` 抄来）与 `matched_version_name()` 在 ngx 下
+从未被赋值 ⇒ 两行都是「默认值」而非「事实」。
+
+**三、已做的修复**
+
+四处改动均已落到工作区，构建与单测通过（证据见节末）：
+
+- 焦点块加 `BACKEND :` 行（`native` / `ngx`；`Ffx12Backend=auto` 时带 `g_backend_auto_note`
+  的 `auto=… vendor=…`），排在 `GPU :` 之后。后端取 `ffx12::backend()` 的真值而非 ini 字面量
+  ——`Ffx12Backend=auto` 时 ini 里写的是 `auto`，实际落位由型号决定。
+- `SDK :` → `FFX SDK :`、`FSR :` → `FFX :`；ngx 模式下这两行明确标注 `(unused, backend=ngx)`，
+  不再把未使用的 AMD SDK 与 `FSR?` 当成「这局在用什么」；native 模式下保持原三行语义不变。
+- `ngx_core init ok=1` 行追加 `dlss=<版本>` 与 `provider=<kind>`：`ProviderHit` 的 `kind`
+  提升为全局供该行读取；DLSS 版本取**已加载模块**的 FileVersion（`GetModuleHandleW` +
+  `GetModuleFileNameW` + 版本 API），模块未加载时才退回特征目录里的文件。取不到打 `dlss=?`，
+  不省略字段，保持行格式稳定便于脚本比对。版本只在首次初始化成功时读一次（锁存），
+  不在每帧路径上。
+- `Dx11FsrBridge/CMakeLists.txt` 链 `version` 库。用直接链接而非 `GetProcAddress`：
+  `version.dll` 是 KnownDLL，进程启动即映射，同进程已有依赖，直接链少一条运行期失败路径
+  （与 `FufuGraphicsPlugin/CMakeLists.txt` 同写法）。
+
+改后 `backend=ngx` 的会话里，焦点块第一行即为 `BACKEND : ngx`、FFX 两行标 unused，
+`ngx_core init ok=1 … dlss=310.9.16 provider=nvidia_registry` 给出真正上屏的实现与版本。
+
+**构建核验（2026-11-14）**
+
+- `cmake --build build-e1 --clean-first`：exit 0，0 error / 0 warning，`Building CXX object`
+  11 条（含 `NgxBackend.cpp.obj` 与 `Dx11FsrBridge.cpp.obj`，非只有 Linking），末行 `Linking`。
+- `NgxParamMapTest`：3657 checks / 0 failures，ALL PASS。
+- DLL 660,480 B（改前 656,896 B，+3,584 B）。产物内确有 ASCII `BACKEND : ` ×1、
+  `FFX SDK : ` ×2、`(unused, backend=ngx)` ×2，以及 UTF-16 `dlss=%s provider=%s` ×1；
+  `dumpbin /imports` 有 `GetFileVersionInfoSizeW` / `GetFileVersionInfoW` / `VerQueryValueW`，
+  `/dependents` 有 `VERSION.dll`。
+- 版本解析独立探针：`payload\NVIDIA\DLSS\nvngx_dlss.dll` → `310.9.16`；
+  另有一份副本解出 `310.9.1`——这正是必须按**已加载模块**路径取版本的原因，按特征目录
+  取会报错。
+
+**尚未验证（如实标注）**
+
+- **未实机**：没有进游戏跑一次真实 ngx 会话，焦点块与 `init ok=1` 行的实际输出未取得日志。
+- **native 模式输出与改前逐字一致**属代码路径推断（native 分支逻辑未改），未实测比对。
+- `hit.path` **未持久化**：只保留了有消费者的 `kind`，不引入没有读者的状态。
+
+**四、未做与理由**
+
+- **P2（读 OptiScaler.ini 的 `Dx11Upscaler`）不做**：`unsafe_dx11_on12_backend_selected()`
+  （`:9318-9357`）返回的是 bool 不是值，要改签名；且它读的是**游戏 exe 目录**的 ini，仓库里
+  只有 `SharedResources/OptiScaler/runtime/OptiScaler.ini` 这份模板（打包进
+  `payload\default_config\`），真实运行目录里的那份由谁写入、何时写入未核实。它报的也只是
+  「配置意图」不是事实，价值低。
+- **P3（未接管时打 `state=SKIP`）不做**：`ngx_core backend=`、`fsr2_translation_blocked` 等已有
+  信号，新增块的收益不抵噪声。
+- **独立 NGX 摘要块不做**：把 `BACKEND :` 与 DLSS 版本并入现有行已覆盖主要痛点，独立块与
+  焦点块内容重复。
+
 ---
+
 ## 已解决
 
 ### NGX 后端的画面与平台验证（2026-11-13）
