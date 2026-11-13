@@ -1,5 +1,10 @@
 // NgxBackend.h —— D3D11 NGX（DLSS Super Resolution）后端
 // 与 Ffx12Backend 完全解耦：不共享全局、不共享 D3D12 设备、不共享已编译 CS。
+//
+// 【编号】本文件里的 `SDS §x.x`（设计文档章节）、`T-n`（实施任务）、
+//   `E0`–`E3`（证据强度：E0 推断 / E1 探针实测 / E2 实机实测 / E3 外部确证）、
+//   `D-n`（设计审核发现）均来自本后端的设计基线文档，该文档**不随仓库分发**。
+//   含义见 NgxBackend.cpp 文件头的图例；判断可信度看注释旁的具体证据，不要只看编号。
 #pragma once
 #include <d3d11.h>
 #include <cstdint>
