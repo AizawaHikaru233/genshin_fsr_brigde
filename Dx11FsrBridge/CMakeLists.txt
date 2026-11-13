@@ -241,6 +241,18 @@ target_link_libraries(Dx11FsrBridge PRIVATE
 )
 
 if(DX11FSRBRIDGE_BUILD_FAMILY_TEST)
+    # ⚠️ 配对开关检查（2026-11-13 补）：只开 BUILD_FAMILY_TEST、不开 DIAGNOSTICS 时，
+    #   下面第 10 / 11 / 13 节的被测符号全在 `#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)`
+    #   里 ⇒ 会得到一片 `C2065: 未声明的标识符`，而根因只是一个宏没开，极易被误判成
+    #   「源码编不过」（本仓库已发生过一次：有人据此判定该测试「从 HEAD 起就编译不过」，
+    #   实际是配置缺开关）。这里提前拦下，避免再去读那一屏编译错误。
+    if(NOT DX11FSRBRIDGE_DIAGNOSTICS_ON)
+        message(WARNING
+            "DX11FSRBRIDGE_BUILD_FAMILY_TEST=ON 但 DX11FSRBRIDGE_DIAGNOSTICS=OFF："
+            "Fsr2FamilyTakeoverTest 的第 10/11/13 节被测符号由 DX11FSRBRIDGE_ENABLE_DIAGNOSTICS 门控，"
+            "本配置下必然出现一片 C2065。请成对开启："
+            "-DDX11FSRBRIDGE_BUILD_FAMILY_TEST=ON -DDX11FSRBRIDGE_DIAGNOSTICS=ON")
+    endif()
     add_executable(Fsr2FamilyTakeoverTest
         Fsr2FamilyTakeoverTest.cpp
         Fsr2FamilyTakeover.cpp
