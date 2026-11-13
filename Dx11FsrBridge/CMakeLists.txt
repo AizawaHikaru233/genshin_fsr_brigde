@@ -244,12 +244,18 @@ target_link_libraries(Dx11FsrBridge PRIVATE
     #      而它在本机上永远不会发生（§一.6：不引入测不到的分支）；
     #   ② 静态 import 表让依赖在加载期就暴露，而不是等到第一次读版本时才发现。
     # ⚠️ 关于风险面，如实记录（2026-11-14 实测更正）：
-    #   version.dll **不是** KnownDLL（实测 HKLM\SYSTEM\CurrentControlSet\Control\
-    #   Session Manager\KnownDLLs 共 38 项，其中没有 VERSION）。因此这条 import 走的是
+    #   version.dll **不是** KnownDLL（本机 Windows 10.0.26300 实测 HKLM\SYSTEM\
+    #   CurrentControlSet\Control\Session Manager\KnownDLLs 共 38 项，其中没有 VERSION；
+    #   换 Windows 版本数量会变，故注明环境）。因此这条 import 走的是
     #   标准 DLL 搜索顺序 —— **游戏 exe 所在目录优先于 System32**。若该目录被放了一个
     #   同名 version.dll，加载的就是它。
-    #   这与本仓库既有的 user32 / d3d11 / dxgi 等 import 是同一类风险面（它们同样按搜索
-    #   顺序解析），不是本改动新引入的类别；但**不能说成"不存在加载顺序风险"**。
+    #   补充两点常被说错的事实（2026-11-14 用 PE 导入表与 KnownDLLs 实测核对）：
+    #   · SafeDllSearchMode 只影响"当前目录"的位置，**exe 目录恒在 System32 之前**；
+    #     而**本 DLL 自身所在目录不会被搜索**（DLL 搜索不使用"本模块目录"）。
+    #   · 不能拿 user32 当同类：user32 **是** KnownDLL，根本不走搜索顺序；
+    #     d3d11 / dxgi 也不在本 DLL 的导入表里（d3d11 是运行期 LoadLibrary）。
+    #   真正同类的例子是导入表里那些非 KnownDLL 项：MSVCP140 / VCRUNTIME140 /
+    #   D3DCOMPILER_47 / d3d12 —— 它们同样按搜索顺序解析。
     #   代价只是一条静态 import 表项（三个函数），与 FufuGraphicsPlugin 的 target_link_libraries
     #   里链 version 的写法一致（那边是读自身 .rc 的版本资源，同一个库、同一种取舍）。
     version
