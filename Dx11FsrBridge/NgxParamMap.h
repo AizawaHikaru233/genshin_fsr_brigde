@@ -71,6 +71,11 @@ struct CreateFlagsInput
     bool is_hdr;
     bool depth_inverted;
     bool mv_jittered;
+    // 2026-11-13：MVLowRes 由"恒设"改为可配置（见 .cpp 的 map_create_flags 注释）。
+    // 为什么必须能关：本游戏（原神）给的是**渲染分辨率**的 MV，但实测恒设
+    // MVLowRes 会和 dlss-input 分支产生明显画质差异（后者只在 MV 非显示分辨率时置位）。
+    // 由调用方按 Fsr2MotionVectorsLowRes 配置传入；默认 true 保持历史行为。
+    bool mv_low_res;
 };
 
 struct CreateFlagsOutput

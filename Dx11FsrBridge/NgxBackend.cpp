@@ -1883,6 +1883,9 @@ static CreateFlagsEval build_create_flags(DXGI_FORMAT color_fmt, bool log_decisi
     cf.is_hdr         = ev.is_hdr;
     cf.depth_inverted = ffx12::depth_inverted();
     cf.mv_jittered    = ffx12::motion_vectors_jittered();
+    // 2026-11-13：MVLowRes 由配置决定（默认 true = 历史行为）。
+    // 关掉它的动机与实测见 NgxParamMap.cpp 的 map_create_flags 注释。
+    cf.mv_low_res     = ffx12::motion_vectors_low_res();
     ev.flags = ngx_param_map::map_create_flags(cf).flags;
     // ---- 同一组输入的位图（M4-a）----
     // ★ 位图**保持原样不搬**：它是本文件的日志/重建判据，不属于 NGX 参数映射；
