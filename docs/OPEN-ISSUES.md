@@ -53,6 +53,53 @@
 
 - `Dx11FsrBridge/NgxBackend.cpp`、`Dx11FsrBridge/NgxBackend.h`、`Dx11FsrBridge/Dx11FsrBridge.cpp`
 
+**评估结论（2026-11-14）**
+
+**一、成因判断需要更正**
+
+§2 称这些编号「来自合并前的外部审查与整改记录」。这个说法只对一部分成立：
+
+| 引用 | 真实来历 |
+|---|---|
+| `AGENTS §8.5`、`§15`、`§16.1-3` | 旧版 AGENTS.md 的真实章节 |
+| `T-FIX-*`、`R-5 MAJOR`、`R-9 MINOR-*`、`D-1/D-2` | 确为外部审查记录，从未随代码入库 |
+
+第一行指的是旧版 AGENTS.md 里真实存在的 `§8.5 部署与回滚纪律`、`§15 已知无效线索（不要重试）`、
+`§16.1 写 C/C++ 源码`：这些引用写下时准确且可原地查证，是 AGENTS.md 改用 §零–§六 编号之后才失效。
+
+这个区别决定修法不同：前者应**就地写出旧章节的结论**（现 AGENTS.md 已无这些节，内容整体删除，
+无法换成现有章节号）；后者**删掉编号前缀、保留结论**即可。
+
+**二、数量与范围**
+
+- 原条目列的 20 个位置在写下时准确，但代码演进后行号已漂移（`NgxBackend.cpp` 从约 2,930 行增至 4,341 行）。
+- 实际存量约 30 行，且原条目**漏列**了裸 `§15` 一处，以及若干纯审核过程叙述的段落。
+- 原条目的方案二（保留编号并就地补图例）**不应采用**：那些审核过程叙述（谁在第几轮改了什么、
+  用什么编译器验证）本身就是改动历史，写进注释违反 AGENTS.md 中「改动历史不进仓库」的约定。
+
+**三、2026-11-14 的清理**
+
+共 27 处（`NgxBackend.cpp` 19、`Dx11FsrBridge.cpp` 7、`NgxBackend.h` 1），只改注释、不动逻辑：
+
+- 旧版 AGENTS.md 章节引用 → 就地写出结论。例如 `va_list` 那条写成「只能消费一次，
+  第二次消费会被 CRT 以 `0xC0000409` 终止」。
+- 外部审查编号 → 删前缀保留结论；纯审核叙述压缩成一句结论。
+
+验证：剥掉全部注释后逐行比对，三个文件的非注释代码行与改动前完全一致（2268 / 13147 / 30 行），
+DLL 大小 660,480 B 未变。
+
+**四、未纳入 2026-11-14 清理范围**
+
+`SDS §x.x` 的 27 处引用**刻意未动**。那份设计文档（`docs/SDS_NgxBackend.md`，3,253 行）存在于归档分支
+`archive/feat-ngx-backend-20261110`，由 `c3bd66a` 引入、从未删除，文档内定义了代码里全部编号体系：
+`S-n` 变更编号、`E0`–`E3` 证据等级、`M2`–`M4` 里程碑、`T-n` 任务编号、`D-n` 审核发现。
+
+因此这些引用**不是悬空引用**，清理会破坏信息。真正的问题是这份文档不在主分支上 ——
+从主分支视角读者无法原地自解，属文档归属问题而非注释问题。
+
+另注：`B1xx` 编号（约 230 处）在 `Dx11FsrBridge.cpp` 文件头有就地图例
+（「本项目历次变更批次的编号，每个编号的实质内容即紧随其后的注释段落」），符合就地定义要求，同样不应清理。
+
 ---
 
 ## 3. 上游 OptiScaler 的已知缺陷（非本仓库代码，本仓库无法修复）
@@ -400,7 +447,9 @@ P3（可选）
 
 **一、事实核验：6 条断言与代码不符**
 
-按 HEAD 逐条复核，「现状」段里有 6 处描述与代码不符：
+逐条复核「现状」段，有 6 处描述与代码不符。**下列行号均指修复前的代码位置**
+（`f945231` 之前；修复后 `log_focus_block` 在 `:3413`，两个调用点在 `:13063` / `:13340`，
+`record_adapter_info` 在 `:15414`）：
 
 1. 「`Ffx12Backend=ngx` 时整块不出现」——**实际会出现**，且报的是未被使用的 AMD SDK 与
    `FSR?`（详见下节，这是要修的真实缺陷）。`ffx12::dispatch()` 在 ngx 模式下同样返回 true
@@ -463,15 +512,20 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
   不省略字段，保持行格式稳定便于脚本比对。版本只在首次初始化成功时读一次（锁存），
   不在每帧路径上。
 - `Dx11FsrBridge/CMakeLists.txt` 链 `version` 库。用直接链接而非 `GetProcAddress`：
-  `version.dll` 是 KnownDLL，进程启动即映射，同进程已有依赖，直接链少一条运行期失败路径
+  少一条运行期失败路径，且依赖在加载期就暴露，不必等第一次读版本时才发现
   （与 `FufuGraphicsPlugin/CMakeLists.txt` 同写法）。
+  ⚠️ 风险面如实记录：`version.dll` **不是** KnownDLL（实测 KnownDLLs 共 38 项，其中无 VERSION），
+  这条 import 走标准 DLL 搜索顺序，**游戏 exe 目录优先于 System32**。
+  这与仓库既有的 `user32` / `d3d11` / `dxgi` 等 import 属同一类风险面，不是本改动新引入的类别。
 
-改后 `backend=ngx` 的会话里，焦点块第一行即为 `BACKEND : ngx`、FFX 两行标 unused，
-`ngx_core init ok=1 … dlss=310.9.16 provider=nvidia_registry` 给出真正上屏的实现与版本。
+改后 `backend=ngx` 的会话里，焦点块输出四行：`GPU : …` / `BACKEND : ngx` /
+`FFX SDK : (unused, backend=ngx)` / `FFX : (unused, backend=ngx)`；
+`ngx_core init ok=1 … dlss=310.9.16 source=loaded provider=nvidia_registry`
+给出真正上屏的实现与版本。
 
 **构建核验（2026-11-14）**
 
-- `cmake --build build-e1 --clean-first`：exit 0，0 error / 0 warning，`Building CXX object`
+- `cmake --build <构建目录> --clean-first`：exit 0，0 error / 0 warning，`Building CXX object`
   11 条（含 `NgxBackend.cpp.obj` 与 `Dx11FsrBridge.cpp.obj`，非只有 Linking），末行 `Linking`。
 - `NgxParamMapTest`：3657 checks / 0 failures，ALL PASS。
 - DLL 660,480 B（改前 656,896 B，+3,584 B）。产物内确有 ASCII `BACKEND : ` ×1、
@@ -482,10 +536,17 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
   另有一份副本解出 `310.9.1`——这正是必须按**已加载模块**路径取版本的原因，按特征目录
   取会报错。
 
-**尚未验证（如实标注）**
+**实机验证（2026-11-14 01:34，真实 ngx 会话）**
 
-- **未实机**：没有进游戏跑一次真实 ngx 会话，焦点块与 `init ok=1` 行的实际输出未取得日志。
-- **native 模式输出与改前逐字一致**属代码路径推断（native 分支逻辑未改），未实测比对。
+- 焦点块输出 `BACKEND : ngx` / `FFX SDK : (unused, backend=ngx)` / `FFX : (unused, backend=ngx)`。
+- `init ok=1 available=1 rc=0x1 dlss=310.9.16 provider=nvidia_registry`。
+- 零回归：`create_feature ok=1` 一次、`DISPATCH_OK` 七次、`DISPATCH_FAILED` 零次。
+
+**尚未验证**
+
+- **native 模式的实际输出**未实机确认。注意 native 下的块**并非**与改前逐字一致：
+  `BACKEND` 行无条件打印、`SDK :`→`FFX SDK :`、`FSR :`→`FFX :` 同样作用于 native，
+  故 native 从三行变四行、两行改名。
 - `hit.path` **未持久化**：只保留了有消费者的 `kind`，不引入没有读者的状态。
 
 **四、未做与理由**
