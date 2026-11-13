@@ -505,16 +505,23 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
   的 `auto=… vendor=…`），排在 `GPU :` 之后。后端取 `ffx12::backend()` 的真值而非 ini 字面量
   ——`Ffx12Backend=auto` 时 ini 里写的是 `auto`，实际落位由型号决定。
 - `SDK :` → `FFX SDK :`、`FSR :` → `FFX :`；ngx 模式下这两行明确标注 `(unused, backend=ngx)`，
-  不再把未使用的 AMD SDK 与 `FSR?` 当成「这局在用什么」；native 模式下保持原三行语义不变。
-- `ngx_core init ok=1` 行追加 `dlss=<版本>` 与 `provider=<kind>`：`ProviderHit` 的 `kind`
-  提升为全局供该行读取；DLSS 版本取**已加载模块**的 FileVersion（`GetModuleHandleW` +
+  不再把未使用的 AMD SDK 与 `FSR?` 当成「这局在用什么」。
+  注意 `BACKEND :` 行**无条件打印**、两个改名对 native 同样生效，故 native 下也从三行变四行。
+- `ngx_core init ok=1` 行追加 `dlss=<版本>`、`source=<来源>` 与 `provider=<kind>`：
+  `ProviderHit` 的 `kind` 提升为全局供该行读取；`source` 取 `loaded` / `file` / `none`，
+  用来区分「本进程已装载的模块」与「特征目录里的候选文件」—— 两条路可能给出同一版本号，只看数值无法区分。
+  DLSS 版本取**已加载模块**的 FileVersion（`GetModuleHandleW` +
   `GetModuleFileNameW` + 版本 API），模块未加载时才退回特征目录里的文件。取不到打 `dlss=?`，
   不省略字段，保持行格式稳定便于脚本比对。版本只在首次初始化成功时读一次（锁存），
-  不在每帧路径上。
+  不在每帧路径上。锁存条件是**取到非空**：原实现先置标志再读，首次读失败会把 `?` 永久锁存。
+  ⚠️ 该修复在**本会话内不可观测** —— 这段代码在 `g_inited = true` 之后，而 `ensure_init` 首行是
+  `if (g_inited) return g_available`，一旦成功就再不会走到这里；退避窗口只用于**失败**的 init。
+  真正会重读的只有 `shutdown_all()` 之后重建的情形。
 - `Dx11FsrBridge/CMakeLists.txt` 链 `version` 库。用直接链接而非 `GetProcAddress`：
   少一条运行期失败路径，且依赖在加载期就暴露，不必等第一次读版本时才发现
   （与 `FufuGraphicsPlugin/CMakeLists.txt` 同写法）。
-  ⚠️ 风险面如实记录：`version.dll` **不是** KnownDLL（实测 KnownDLLs 共 38 项，其中无 VERSION），
+  ⚠️ 风险面如实记录：`version.dll` **不是** KnownDLL（本机 Windows 10.0.26300 实测
+  KnownDLLs 共 38 项，其中无 VERSION），
   这条 import 走标准 DLL 搜索顺序，**游戏 exe 目录优先于 System32**。
   这与仓库既有的 `user32` / `d3d11` / `dxgi` 等 import 属同一类风险面，不是本改动新引入的类别。
 
@@ -525,15 +532,15 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 
 **构建核验（2026-11-14）**
 
-- `cmake --build <构建目录> --clean-first`：exit 0，0 error / 0 warning，`Building CXX object`
-  11 条（含 `NgxBackend.cpp.obj` 与 `Dx11FsrBridge.cpp.obj`，非只有 Linking），末行 `Linking`。
+- 构建：0 error / 0 warning。改动源文件的构建里均能看到 `Building CXX object`
+  与 `NgxBackend.cpp.obj` / `Dx11FsrBridge.cpp.obj`（非只有 Linking）。
 - `NgxParamMapTest`：3657 checks / 0 failures，ALL PASS。
 - DLL 660,480 B（改前 656,896 B，+3,584 B）。产物内确有 ASCII `BACKEND : ` ×1、
-  `FFX SDK : ` ×2、`(unused, backend=ngx)` ×2，以及 UTF-16 `dlss=%s provider=%s` ×1；
-  `dumpbin /imports` 有 `GetFileVersionInfoSizeW` / `GetFileVersionInfoW` / `VerQueryValueW`，
-  `/dependents` 有 `VERSION.dll`。
+  `FFX SDK : ` ×2、`(unused, backend=ngx)` ×2，以及 UTF-16 `dlss=%s source=%s provider=%s` ×1。
+  PE 导入表含 `VERSION.dll` 与 `GetFileVersionInfoSizeW` / `GetFileVersionInfoW` / `VerQueryValueW`。
 - 版本解析独立探针：`payload\NVIDIA\DLSS\nvngx_dlss.dll` → `310.9.16`；
-  另有一份副本解出 `310.9.1`——这正是必须按**已加载模块**路径取版本的原因，按特征目录
+  另一份副本解出 `310.9.1`。⚠️ 那**不是特征目录**，只能算「不同副本版本确实不同」的旁证，
+  不能单独证明「必须按已加载模块取值」—— 后者由实机 `source=loaded` 直接给出。按特征目录
   取会报错。
 
 **实机验证（2026-11-14，两次真实 ngx 会话）**
@@ -541,7 +548,9 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 - 焦点块输出 `GPU : …` / `BACKEND : ngx` / `FFX SDK : (unused, backend=ngx)` /
   `FFX : (unused, backend=ngx)` 四行，两次会话一致。
 - `init ok=1 available=1 rc=0x1 dlss=310.9.16 source=loaded provider=nvidia_registry`。
-- 零回归：两次会话均为 `create_feature ok=1` 一次、`DISPATCH_OK` 七次、`DISPATCH_FAILED` 零次。
+- 零回归：两次会话均为 `create_feature ok=1` 一次、`DISPATCH_FAILED` 零次；
+  `DISPATCH_OK` 各 7 行 —— 注意这是**日志行数不是累计派发次数**：该行只在
+  `dcount<=8 || dcount%1024==0` 时打印，实际派发次数远多于此。
 - **`source=loaded` 有独立价值**：它证明版本确实取自**本进程已装载的模块**，而不是特征目录里的
   候选文件。两条路可能给出同一个版本号，只看 `dlss=` 的数值无法区分 —— 这正是加这个字段的原因。
   实测同时说明 NGX 在 `ensure_init` 返回前就已装载 `nvngx_dlss.dll`，故「已加载模块优先」
