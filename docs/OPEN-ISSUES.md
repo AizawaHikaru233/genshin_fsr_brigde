@@ -122,83 +122,159 @@ Dx11wDx12SC::Present
 **为何不修**：阻塞发生在 OptiScaler 自身的 DLL 卸载路径，桥无法介入。
 完整证据链见本地留痕 `VERDICT_game_exit_hang_20261112.md`（不随仓库分发）。
 
-## 4. DLSS 质量档位由手写比例表决定，未向 NGX 查询合法尺寸区间
+## 4. DLSS 选档的**实机验收**尚未完成（机制已实现）
 
 **现状**
 
-- `Dx11FsrBridge/NgxBackend.cpp:1750-1760` 的 `quality_from_ratio()` 用手写比例表选档：
-  `ratio 1.0–1.3 → UltraQuality`、`1.3–1.5 → MaxQuality`、`1.5–1.7 → Balanced`、
-  `1.7–2.0 → MaxPerf`、`2.0–3.0 → UltraPerformance`、其余 → DLAA。
-- 两个调用点：`:1867` 传给 `create_feature`；`:2701` 算 `set_mismatch` 的期望值（同一处改，必须同源）。
-- `:1781-1784` 的 `perf_quality_for_create()` 把 `UltraQuality` 改成 `MaxQuality`，是 `b632cc5`
-  为渲染精度 0.8~0.999 建的兜底。
+- 选档判据已改为向 NGX 查询合法 render 尺寸区间：`Dx11FsrBridge/NgxBackend.cpp` 的
+  `query_dlss_optimal_range()`（照 `NGX_DLSS_GET_OPTIMAL_SETTINGS` 的逻辑重写）、
+  `refresh_optimal_ranges()`（六档各查一次，按 display 尺寸缓存）、
+  `resolve_create_quality()`（挑区间包含当前 render 尺寸的那一档；都不包含或查询失败则
+  回退 `quality_from_ratio()` + `perf_quality_for_create()`）。纯计算部分在
+  `Dx11FsrBridge/NgxParamMap.h` 的 `render_range_contains()` / `pick_quality_from_ranges()`。
+- 三个调用点同源：`create_feature` 写 `PerfQualityValue`、`diag_check_create_params` 的回读期望值、
+  以及 `make_feature_input_key_from` 的 `perf_quality` 字段 —— 都调 `resolve_create_quality()`。
+- **但整条链路只在编译 / 单测 / 静态分析层面验证过，没有在游戏内实机跑过**：
+  `NgxParamMapTest` 只能证明选档器的行为（区间包含、容差、重叠、回退），证明不了
+  「真实驱动返回的区间确实包含 0.8~0.999 各精度的 render 尺寸」。
 
 **影响**
 
-- 每个 DLSS 档位能接受的 render 尺寸区间由驱动与模型决定，**不是固定比例**；手写表假设它是比例。
-  渲染精度 0.999（ratio≈1.001）落进 `UltraQuality` 分支 ⇒ `create_feature ok=0 rc=0xBAD00010`
-  （`UnsupportedParameter`），而当前失败锁存不重试（见下一条）⇒ 必须重启游戏才能恢复。
-- 兜底只改结果、不改判据：不同显卡、不同 DLSS 版本的真实区间可能不同，兜底挡不住下一个档位错配。
+- 若驱动返回的区间与假设不符，可能出现三种情况，日志里都能区分：
+  ① `pq_select mode=ratio reason=query_unavailable` ⇒ 查询本身不可用（可能是
+  `shared_singleton`，即 provider 返回了同一个参数对象），选档退回旧比例表 ⇒ 0.8~0.999 仍会
+  走 `perf_quality_for_create` 兜底；
+  ② `pq_select mode=ratio reason=no_interval ranges_ok=6` ⇒ 区间查到了但都不包含当前尺寸
+  ⇒ 也退回旧比例表；③ `pq_select mode=interval` ⇒ 查询路径生效。
 
 **推进需要**
 
-- 改用 NGX 自带的合法区间查询：`NVSDK_NGX_DLSS_GET_OPTIMAL_SETTINGS` 是
-  `nvsdk_ngx_helpers.h:65` 的 `static inline`，本仓库**故意没有** vendor 这个头
-  （`tools/Fetch-NgxHeaders.ps1:28`），但可照它的实现重写约 40 行：在 capability params 上
-  `Set(Width/Height/PerfQualityValue/RTXValue)` → 取 `NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback`
-  调一次 → 读 `NVSDK_NGX_Parameter_OutWidth/OutHeight`、
-  `NVSDK_NGX_Parameter_DLSS_Get_Dynamic_{Max,Min}_Render_{Width,Height}`、`Sharpness`。
-  这些参数名字符串已全部在 `Dx11FsrBridge/third_party/ngx/nvsdk_ngx_defs.h` 里。
-- 五个档位各查一次，取各自合法的 render 宽高区间，挑**包含当前 render 尺寸**的那档；
-  允许每轴超出区间上限不超过最大尺寸的 1/64（约 2 像素）。都不包含时回退现有比例表。
-- 查询失败（callback 缺失 / 返回非 `NVSDK_NGX_Result_Success`）一律回退现有行为，不改原有可用性。
+- 实机验收（需有游戏 + N 卡环境）：渲染精度依次取 0.999 / 0.9 / 0.8 / 0.7，每一个都确认
+  `create_feature ok=1`，并逐条对账：`pq_range` 六行给出的区间 → `pq_select mode=interval picked=N`
+  → `pq=N` → `create_feature ok=1`。
+- 反向对照：把 `NgxProvider` 切到 `external`（OptiScaler），确认若对方返回单例参数对象，
+  日志出现 `pq_query_params ok=0 reason=shared_singleton` 且选档退回比例表 —— 即
+  「宁可不查，也不污染共享对象」这条防线确实生效。
+- 记录至少一台机器、一个 DLSS 版本的 `pq_range` 六行原文：这是判断「区间是不是比例」的
+  唯一一手数据，也是本机制日后回归的基线。
 
 **注意**
 
 - 只改「选哪个档」，不改 create flags、不碰资源与实例生命周期。
-- `:1867` 与 `:2701` 必须走同一条选档链，否则 `set_mismatch` 会误报。
+- 三个调用点必须走同一条选档链，否则 `set_mismatch` 会误报。
 - 判据：渲染精度 0.8~0.999 时 `create_feature ok=1`，且日志里的 `pq=` 与区间查询结果一致；
   对照 0.999 旧行为是 `ok=0 rc=0xBAD00010`。
+- 容差按 `upper/64` 计算（与原文「约 2 像素」不符，见 `range_upper_tolerance` 的注释）；
+  `pq_range` 行会打出实际容差，实机可据此校核。
+- **NGX 的 optimal settings 与 `CreateFeature` 的校验可能不是同一套规则**（推断，未验证）。
+  `NGX_DLSS_GET_OPTIMAL_SETTINGS` 返回的是「该档能接受哪些 render 尺寸」，而 `CreateFeature`
+  另有自己的 `PerfQualityValue` × 分辨率校验；两者是否逐条一致，本轮**没有**一手证据。
+  - 已守住的一个方向：区间选出的档**仍要过一遍** `perf_quality_for_create`（UltraQuality → MaxQuality），
+    所以即使驱动报「UltraQuality 区间包含你」，也不会把 UltraQuality 送进 NGX。
+  - **反向风险仍在**：若区间查询比 `CreateFeature` 宽松，就可能选到更激进的档；
+    `perf_quality_for_create` **拦不住**这种情况（它只拦 UltraQuality 一个值）。
+    推断的后果与今天同形：`create_feature ok=0 rc=0xBAD00010`（§5 的重试路径会兜住一部分）。
+  - 缓解：选档规则是「**最贴近 optimal** 的那一档」（`pick_quality_from_ranges` 按 optimal 尺寸
+    与实际 render 尺寸的距离取最近），**不是**「最接近区间上限的那档」⇒ 结果倾向保守而不是激进。
+  - 目前唯一能证实或证伪它的手段仍是**实机**：看 `pq_select mode=interval picked=N` 之后是否
+    `create_feature ok=1`（见上文「推进需要」）。
 
 **相关代码**
 
-- `Dx11FsrBridge/NgxBackend.cpp:1750-1760`、`:1781-1784`、`:1867`、`:2701`；
-  `Dx11FsrBridge/third_party/ngx/nvsdk_ngx_defs.h`；`tools/Fetch-NgxHeaders.ps1`
+- `Dx11FsrBridge/NgxBackend.cpp`：`query_dlss_optimal_range` / `refresh_optimal_ranges` /
+  `resolve_create_quality` / `ensure_query_params` / `release_query_params`；
+  `Dx11FsrBridge/NgxParamMap.h`：`render_range_contains` / `pick_quality_from_ranges`；
+  `Dx11FsrBridge/NgxParamMapTest.cpp` 第 [10] 节；`Dx11FsrBridge/third_party/ngx/nvsdk_ngx_defs.h`
+
+**实机验证（2026-11-13 21:43–21:52，N 卡 + 驱动自带 NGX）**
+
+查询路径生效，三组精度均创建成功，无一次回退到比例表：
+
+```
+pq_range pq=0 MaxPerf          opt=1920x1080 min=1920x1080 max=3840x2160
+         pq=1 Balanced         opt=2258x1270 min=1920x1080 max=3840x2160
+         pq=2 MaxQuality       opt=2560x1440 min=1920x1080 max=3840x2160
+         pq=3 UltraPerformance opt=1280x720  min=1280x720  max=3840x2160
+         pq=4 UltraQuality     opt=2953x1661 min=1920x1080 max=3840x2160
+         pq=5 DLAA             opt=3840x2160 min=3840x2160 max=3840x2160
+         tol=60x33
+```
+
+| render | ratio | 选中 | 日志 | 结果 |
+|---|---|---|---|---|
+| 1920x1080 | 2.000 | MaxPerf  | `mode=interval picked=0 ranges_ok=6` | `ok=1` |
+| 2304x1296 | 1.667 | Balanced | `mode=interval picked=1 ranges_ok=6` | `ok=1` |
+| 3836x2156 | 1.001 | DLAA     | `mode=interval picked=5 ranges_ok=5` | `ok=1` |
+
+- 全程 `mode=interval`，**没有** `mode=ratio`、`query_unavailable` 或 `shared_singleton`
+  ⇒ 独立参数对象可用，查询路径确实生效。
+- 三点值得记：① 0.999 精度在旧实现下是 `ok=0 rc=0xBAD00010`，本机现在由区间查询选中
+  `DLAA`（不是靠 `perf_quality_for_create` 把 UltraQuality 硬改成 MaxQuality）⇒ 治本路径有效；
+  ② `UltraQuality` 的区间为 `min=1920x1080 max=3840x2160`，**包含** ratio 1.25 对应的
+  3072x1728 —— 若只看区间包含性，它会越过 `MaxQuality` 被选中，但 `MaxQuality` 的 optimal
+  (2560x1440) 更贴近实际尺寸，选档按「最贴近 optimal」取，最终落 `MaxQuality`
+  ⇒ 上文「反向风险」里担心的「选到更激进的档」在本例中未发生；
+  ③ 实测容差是 `60x33`（`3840/64` / `2160/64`），不是原文的「约 2 像素」，与按公式实现一致。
+- **未覆盖**：反向对照（`NgxProvider=external` 时对方返回单例 ⇒ `shared_singleton` 回退）
+  与「至少一台机器、一个 DLSS 版本的 `pq_range` 基线」两项仍未做；上表是本机单机单驱动数据。
 
 ---
 
-## 5. `create_feature` 失败后永久不重试，参数变化本可自愈的场景必须重启游戏
+## 5. `create_feature` 参数性失败的自愈路径**未经实机验证**（机制已实现）
 
 **现状**
 
-- `Dx11FsrBridge/NgxBackend.cpp:3106` 写明「永久不重试（§3.9.7 / S-81）：CreateFeature 失败的
-  根因（PathListInfo 配错）不会自愈」。`S-81` 是注释里的旧审查编号，含义在本文件可原地读到：
-  同一对象生命周期内锁存 `feature_create_failed`，尺寸/格式变化只释放资源、不重试
-  （`:205`、`:1848`、`:1893`）。
-- 锁存只在实例对象销毁时随对象消失（`:2743`）。
+- 机制已实现（见文末「已解决」的《`create_feature` 参数性失败按输入 key 重试》）：`0xBAD00010`
+  （`UnsupportedParameter`）失败不再置 `g_release_all`，改为记录一份输入 key；key 变化时重试一次。
+- **但整条链路只在编译 / 单测 / 静态分析层面验证过，没有在游戏内实机跑过**：
+  无游戏进程与实机条件，`cmake --build build-e1` + `NgxParamMapTest` 只能证明它编得过、
+  既有纯函数未回归，证明不了「用户改回安全精度后确实自愈」。
 
 **影响**
 
-- 「PathListInfo 配错」确实不会自愈，但失败原因不止这一类：`0xBAD00010` 是**参数性**失败，
-  玩家把渲染精度、分辨率或 HDR 改一下，本该能建起来，现在却必须重启游戏。
-- 失败后每帧 fail-open 回游戏原生 FSR2，玩家只看到「DLSS 不生效」，日志里才有一行 rc。
+- 若判据有误，可能的表现是：① 自愈不生效（日志有 `key_fail retry_eligible=1` 但**没有**
+  `key_retry` 行 ⇒ 说明 key 判据恒假）；② 自愈了但不出图（有 `key_retry_result ok=1` 而
+  `DISPATCH_OK` 仍为 0）；③ 参数持续失败时反复重试造成卡顿（`key_retry` 行的出现频次
+  高于每 2 秒一次）。
 
 **推进需要**
 
-- 把「永久」改成「输入 key 变化即允许重试」：记录失败时的 key = render 宽高 + display 宽高 +
-  档位 + NgxRenderPreset + HDR 标志（+ create flags）；下一次创建前 key 不同就清
-  `feature_create_failed` 重试一次，key 相同仍不重试。
-- 日志记录 key 变化与重试结果（成功/同一个 rc），便于区分「参数问题」与「环境问题」。
-
-**注意**
-
-- S-81 的原始理由仍然成立，**不能**改成无条件解锁：否则尺寸抖动或无关状态变化会反复触发
-  `0xBAD0000B` 这类每帧重试（`:2085` 记过这个教训）。触发条件只认上面那几个输入。
-- 与上一条配合看：上一条去掉参数错配的成因，本条是剩余失败类型的兜底；两条可分别验收。
+- 实机验收（需有游戏 + N 卡的环境）：
+  1. 把渲染精度调到会造成 `create_feature ok=0 rc=0xBAD00010` 的档位（历史实测 0.8 / 0.9 / 0.999），
+     确认日志出现 `create_feature key_fail … cfmt=<n> ofmt=<n> rc=0xBAD00010 retry_eligible=1`；
+     ★ `retry_eligible=1` 这个字段是**代码侧**补上的验收判据（原代码没打它 ⇒ 本条 grep 恒 0 命中）。
+  2. 改回安全精度（如 0.5 / 0.7），确认出现 `key_retry` 与 `key_retry_result ok=1`，
+     且随后 `DISPATCH_OK` 递增、画面出 DLSS；
+     ★ 同时确认**不再**每帧刷 `ngx_hdr_decision`（该行在失败判据路径上已静默，见 §5 的 `log_decision`）。
+  3. 反向对照：不改任何设置，确认**不会**出现 `key_retry`（key 相同必须不重试）。
+  4. 冻帧对照（第 1 条修复）：确认失败发生后**不出现**「画面冻在最后一帧最多 500ms」。
+     机制：白名单 rc 不置 `g_release_all`，故 `fsr2_family_should_skip_draw` 那道 gate
+     不会关闭；现在由 `create_feature` 失败分支当场调
+     `fsr2_family_takeover::notify_accumulate_result(false, …)` 解除「跳过预处理 pass」许可。
+- 若第 3 步不成立（即不做任何操作也反复重试），说明某个每帧变化的量混进了 key，
+  必须查 `CreateFeatureInputKey` 的 10 个字段是否都在运行期稳定
+  （`NgxParamMapTest` 第 [11] 节对每个字段各有一条敏感断言，加字段必须同步加断言）。
 
 **相关代码**
 
-- `Dx11FsrBridge/NgxBackend.cpp:205`、`:1848`、`:1893`、`:2085`、`:3049-3069`、`:3106`、`:2743`
+- `Dx11FsrBridge/NgxBackend.cpp`：`CreateFeatureInputKey` / `same_feature_input_key` /
+  `kFeatureCreateRetryMinMs`（结构定义与比较）、`make_feature_input_key[_from]`、
+  `record_feature_create_failure`（记录 key）、`create_feature` 的 `rr != Success` 分支
+  （rc 白名单）、`dispatch` 第 5 步之后的 `feature_create_failed` 分支（重试判据与三行日志）。
+
+**实机验证（2026-11-13 22:02–22:03）**
+
+四条验收项逐条通过，日志时序与结论见文末「已解决」的
+《`create_feature` 参数性失败按输入 key 重试》。
+
+- 失败被复现：`key_fail … retry_eligible=1`（`rc=0xBAD00010`）。
+- 改精度后出现 `key_retry` 与 `key_retry_result ok=1`，随后出图。
+- 反向对照：精度不变时**没有** `key_retry`（22:02:48 那次失败未触发重试）。
+- 冻帧对照：失败瞬间出现 `family_release … cleared=1`，未观察到冻帧；该行只打一次。
+
+复现方式：正常路径下 §4 的区间查询已能选到合法档位（实测 0.999 精度
+`picked=DLAA` → `create_feature ok=1`），自然构造不出 `0xBAD00010`；
+本轮用临时诊断开关强制走旧选档造失败，验证后已删除，未进入提交。
 
 ---
 
@@ -323,6 +399,123 @@ P3（可选）
 - 非 RTX 想借外部实现呈现 DLSS 接口时，仍须显式选 NVNGX（写 `Ffx12Backend=ngx`）。
 - 仍然成立的一条（**刻意保留，不算缺陷**）：运行时被手工删掉时，ngx 会 `init ok=0` 并逐帧 fail-open 到游戏原生 FSR2，不会自动改走 native —— 避免出现第二套可用性判据（`AGENTS.md` §五.1）。
 - 已核对 2.5.0 两个归档（`dist\原神解帧FSR插件包_v2.5.0.7z` 与 `dist\github-release\GenshinFSRBridge_v2.5.0.7z`）里的 `payload/Bridge/Dx11FsrBridge.ini`：`Ffx12Backend=auto`、`NgxHdr=0`、`Ffx12SingleInstance=1`。末项是 2.5.0 自带的缺省回归（见本文《`Ffx12SingleInstance` 缺省 0 + NGX 后端强制单实例》一节）：两处当时确实同为 1，但值本身是错的，本轮已恢复 0。
+
+### `create_feature` 参数性失败按输入 key 重试（2026-11-13）
+
+**解决提交**：（待填）
+
+**结论**：机制已实现，构建 / 单测 / **实机验证均通过**。
+
+- **实机验证（2026-11-13 22:02–22:03，同一次游戏运行内完成，未重启）**：
+  为复现失败，临时加入诊断开关强制走"§4 之前"的旧选档（绕过区间查询与
+  `UltraQuality`→`MaxQuality` 兜底；该开关验证后已删除，未进入任何提交）。日志时序：
+  ```
+  22:02:29  pq_select mode=legacy_diag pq=4 UltraQuality r=3072x1728
+            create_feature ok=0 rc=0xBAD00010
+            key_fail … retry_eligible=1
+            family_release reason=create_feature_rc reason_rc=0xBAD00010 cleared=1
+  22:02:48  create_feature ok=0 rc=0xBAD00010        ← 精度未变 ⇒ key 相同 ⇒ 未重试
+            key_fail … retry_eligible=1              ← 闸门已打，family_release 不再重复
+  22:03:13  key_retry … prev_rc=0xBAD00010           ← 精度改为 0.7 ⇒ key 变了
+            create_feature ok=1 rc=0x1
+            key_retry_result ok=1 prev_rc=0xBAD00010
+  ```
+  验证到的事实：① 失败被复现；② `retry_eligible=1` 字段确实存在（验收 grep 可用）；
+  ③ `family_release` 在失败瞬间解除 family skip 且**只打一次**（无日志洪水）；
+  ④ **key 相同不重试**（22:02:48）；⑤ **key 变化才重试并成功**（22:03:13）；
+  ⑥ **全程无需重启游戏**。
+- 注意：本次是通过诊断开关构造的失败。正常路径下 §4 的区间查询已能选到合法档位
+  （同日 21:51 实测 0.999 精度 `picked=DLAA` → `create_feature ok=1`），
+  因此该重试路径在未注入失败的会话中通常不会触发 —— 这是预期行为，不是未生效。
+
+- 缺陷原状（用户提供的事故日志）：`create_feature ok=0 rc=0xBAD00010` 后，用户把渲染精度
+  由 0.999 改回 0.5，日志仍 `DISPATCH_FAILED` 一路失败到结束 —— 只能重启游戏。
+- 根因有两层，缺一不可：
+  1. `NgxInstance::feature_create_failed` 在对象生命周期内永不清除（`S-81` 的"永久不重试"）。
+     ★ `S-81` 是 `NgxBackend.cpp` 注释里的**旧审查编号**，含义就地说明（读者不必去别处找）：
+     同一对象生命周期内锁存 `feature_create_failed`，尺寸/格式变化只释放资源、**不重试**；
+     锁存只在实例对象销毁时随对象消失。最初的理由是 `CreateFeature` 失败的根因
+     （`PathListInfo` 配错，rc=`0xBAD0000B`）**不会自愈**，相同输入重试只会每帧阻塞 + 每帧重复日志。
+     ★ 本轮为何放宽：该理由只覆盖"根因不会自愈"这一类，而实机出事的是**参数性**失败
+     （rc=`0xBAD00010` `UnsupportedParameter`）—— 玩家把渲染精度改回去，输入就变了，
+     本该能建起来。⇒ 保留 S-81 的保守默认（非白名单 rc 仍然不重试、`g_release_all` 照旧置位），
+     只对"白名单 rc + 输入 key 确实变化 + 间隔足够"这三个条件同时成立的情形放行一次；
+     任何一条不满足都退回 S-81 的原始行为。
+  2. 三个置位点都同时置 `g_release_all`，而它是 **0→1 不可逆**的全局放手信号，被
+     `Dx11FsrBridge.cpp` 的两道每 draw gate 与 `NgxBackend.cpp` 的一处 gate 读取
+     ⇒ 一旦置位，`dispatch` 在**到达**锁存判据之前就返回了。**只清锁存不会生效**，
+     这是原待办配方里漏掉的一环。
+- 修复（三重窄门，任何一条不满足都回到"不重试"）：
+  1. **rc 白名单**：只有 `NVSDK_NGX_Result_FAIL_UnsupportedParameter`（`0xBAD00010`，
+     `third_party/ngx/nvsdk_ngx_defs.h:169`）不置 `g_release_all`；其余一切 rc（含未知 rc、
+     含 `0xBAD0000B`）维持原样置位 ⇒ 未知新 rc 默认仍是保守放手。
+  2. **输入 key 变化**：`ngx_param_map::CreateFeatureInputKey` 记录 render/display 宽高、
+     选档结果、`g_render_preset`、create flags、`color_fmt`/`output_fmt`、
+     `resolve_is_hdr` 的决策（**不是** `g_hdr`，后者只是回写镜像）。key 相同 ⇒ 仍然不重试。
+     比较实现已搬进纯函数层 `ngx_param_map::same_feature_input_key`，由 `NgxParamMapTest`
+     第 [11] 节逐字段钉住（每加一个字段必须同时加断言，否则该段会红）。
+     ★ `color_fmt`/`output_fmt` 是后补的：原实现漏了它们，反例是后缓冲由 `R10G10B10A2`
+     换成 `R16G16B16A16_FLOAT` 而 create flags 不变 ⇒ key 判「相同」⇒ 自愈被漏判。
+  3. **最小重试间隔 2000 ms**（`kFeatureCreateRetryMinMs`）：给「连续失败」一个频率上限。
+     真实理由是 **DLSS `CreateFeature` 失败时会阻塞**（不是「尺寸逐帧抖动」——key 的 10 个
+     字段全是低频事件驱动量，不随帧变化，该说法已证伪并就地标注）。该值**未实机标定**，
+     是保守猜测值，不是测量值。
+- 另两个置位点（`no_params` / `null_resource`）**不记录 key、不参与重试**：它们是环境性 /
+  接线缺陷，与"换一组输入参数"无关；纳入重试会让每帧的建池失败反复重跑 `CreateFeature`。
+- 取证行（默认 `NgxLogLevel=1` 即可见，均为 Error 级）：`create_feature key_fail … retry_eligible=1`
+  （失败并记下 key）、`create_feature key_retry …`（key 变化、即将重试）、
+  `create_feature key_retry_result ok=1 …` 或 `ok=0 … same=1|0 rc_known=1|0`（重试结果；
+  `same=1` 说明本次 rc 与上次相同、更像环境性问题）。
+  ★ `new_rc` 取的是**本次调用**真实的 rc（`create_feature` 的出参），**不是**
+  `feature_fail_rc` —— 后者只在白名单 rc 时才被写，读它会得到上一次的旧值。
+  ★ `rc_known=0` + `new_rc=0xFFFFFFFF` 表示本次**没走到 NGX 调用**（`no_params` /
+  `null_resource` 两条早退路径），此时 `same=` 无意义、固定为 0。
+- 冻帧对照的取证行：`ngx_core family_release reason=create_feature_rc reason_rc=0x… cleared=N`
+  —— 白名单失败分支里**只打一次**（进程级 `std::atomic` 闸门）。它出现即证明那行
+  `notify_accumulate_result(false, …)` 真的执行过；`cleared=` 是该调用的累计次数（≥1）。
+- 热路径影响：key 比较**只在 `feature_create_failed` 为真时**执行 —— 那时 `dispatch`
+  本来就要 `return false`；成功路径上仍是一次 bool 判断，与改动前相同。
+- 未改动的边界（刻意）：`release_pool_resources` / `create_pool` 仍然不碰锁存
+  （否则 `0xBAD0000B` 会每帧重试）；`quality_from_ratio` / `perf_quality_for_create`
+  行为未变。
+
+### DLSS 选档改由 NGX 区间查询决定（2026-11-13）
+
+**解决提交**：（待填）
+
+**结论**：判据已治本（不再假设「档位 = 固定比例」）；构建 / 单测通过，**实机验收未完成**，
+残留项见正文 §4。
+
+- 缺陷原状：`quality_from_ratio()` 用手写比例表选档（1.0–1.3 → UltraQuality 等六条），
+  而每个档位能接受的 render 尺寸区间由驱动与模型决定、**不是比例**。渲染精度 0.999
+  （ratio≈1.0016）因此落进 UltraQuality ⇒ `create_feature ok=0 rc=0xBAD00010`
+  （`NVSDK_NGX_Result_FAIL_UnsupportedParameter`，`third_party/ngx/nvsdk_ngx_defs.h:169`）。
+  `perf_quality_for_create()`（`b632cc5`）只改结果、不改判据，挡不住下一个档位错配。
+- 新判据：`query_dlss_optimal_range()` 照 `nvsdk_ngx_helpers.h:65` 的
+  `NGX_DLSS_GET_OPTIMAL_SETTINGS` 重写（不 vendor 那个头 —— 它末尾 include 了仓库里没有的
+  `nvsdk_ngx_helpers_d3d.h` / `_cuda.h`）；六档各查一次合法 render 区间，挑包含当前
+  render 尺寸的那档，每轴上界留 `max/64` 容差。都不包含或查询失败 ⇒ 回退
+  `quality_from_ratio` + `perf_quality_for_create`（= 改动前行为，逐字不变）。
+- **参数对象污染的处理（本次最大的风险点）**：区间查询要往参数对象上 `Set` 四项
+  （Width/Height/PerfQualityValue/RTXValue）。做法是**另调一次**
+  `NVSDK_NGX_D3D11_GetCapabilityParameters()` 拿**独立**对象（`g_query_params`），
+  绝不在全局 `g_params` 上查询。为什么不用 `AllocateParameters`：SDK 文档
+  （`nvsdk_ngx.h:356-359`）说明它分配的表**不预置能力项**，而
+  `NGX_DLSS_GET_OPTIMAL_SETTINGS` 自己的注释（`nvsdk_ngx_helpers.h:83-84`）就写着
+  「callback 取不到时可能是用了 AllocateParameters，改用 GetCapabilityParameters」。
+  若实现返回**同一个指针**（单例 provider），判为查询不可用并回退 —— 宁可不查也不污染。
+  释放：`shutdown_all()` 里对本对象调 `NVSDK_NGX_D3D11_DestroyParameters`；`g_params`
+  仍按既有契约（§3.9.5）不释放。
+- 缓存：区间只依赖 display 尺寸，按 `(dw, dh)` 缓存六档结果；`create_feature` /
+  `diag_check_create_params` 本来就不是每帧路径，缓存是额外保证。
+- 调用点三处同源（否则 `set_mismatch` 误报）：`create_feature` 的 `Set`、
+  `diag_check_create_params` 的回读期望值、`make_feature_input_key_from` 的 key 字段。
+- 取证行（Error 级，默认 `NgxLogLevel=1` 可见）：`pq_query_params ok=0|1 reason=…`、
+  `pq_range pq=N name=… opt=… min=… max=… tol=…`（六条）、
+  `pq_select mode=interval picked=… pq=…` 或 `pq_select mode=ratio pq=… reason=…`。
+- 与规格的一处出入（如实记录）：容差原文写「1/64（约 2 像素）」，而 `upper/64` 在 1280 上
+  是 20 像素、2560 上是 40 像素 ——「约 2 像素」应是估算。实现按**公式**（1/64），
+  并把实际 tol 打进日志，单测 [10] 有一条断言专门防止后人按文字改成常量 2。
 
 ### 发布管线不启用 NGX 构型（2026-11-10）
 
