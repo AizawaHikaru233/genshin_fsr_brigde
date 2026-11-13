@@ -556,6 +556,24 @@
         </div>
 
         <!-- 安装内容 -->
+
+        <!-- 帧生成：只镜像 OptiScaler.ini 的 [FrameGen] FGInput + FGOutput，选完立刻写回 -->
+        <div class="row intro" style="animation-delay:140ms">
+          <div class="ico">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 12h4l3-8 4 16 3-8h4"/>
+            </svg>
+          </div>
+          <div style="min-width:0">
+            <div class="rlabel">帧生成</div>
+            <div class="rvalue srnote">在超分之后插入补间帧提升流畅度；需要 OptiScaler。开启时按显卡自动选 DLSSG（NVIDIA RTX）或 FSRFG（其余）。开启时 ReShade 改由 OptiScaler 加载（否则设置面板不可见），关闭时改回外部注入</div>
+          </div>
+          <div class="seg" id="fgseg" role="group" aria-label="帧生成">
+            <span class="segthumb"></span>
+            <button type="button" data-v="on" aria-pressed="false">开</button>
+            <button type="button" data-v="off" aria-pressed="false">关</button>
+          </div>
+        </div>
         <div class="row headrow intro" style="animation-delay:160ms">
           <div class="ico">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
@@ -1026,6 +1044,8 @@
     shortcutOn: true,    // 安装时创建桌面快捷方式
     srInput: 'auto',     // 超分输入类型：auto | native | ngx（= Dx11FsrBridge.ini 的 Ffx12Backend）
     srAvailable: false,  // 桥装好了、那份 ini 在，才允许改
+    frameGen: 'off',     // 帧生成：on | off（2026-11-14 起不再有 auto，具体实现在后端按显卡选）
+    frameGenAvailable: false,  // 装了 OptiScaler、那份 ini 在，才允许改
     unlockerDir: '',     // 解帧工具目录（payload\FpsUnlocker）
     shortcutName: '',    // 快捷方式文件名（跟随界面语言）
     modsDefault: ''     // 默认 Mods 目录（payload\TextureLoader\Mods）
@@ -1761,6 +1781,31 @@
   }
 
   // 装完之后改帧率：底部结论行跟着变，别让两处数字打架。
+
+  // ── 帧生成 ──
+  // 两态：on / off（值见 post_state 的 frameGen.value）。
+  // 2026-11-14 起没有 auto：开的时候由后端按显卡写 DLSSG（NVIDIA RTX）或 FSRFG（其余），
+  // 避免 A 卡 / 非 RTX 的 N 卡被 auto 判到 DLSSG 后因缺 Streamline 进不去游戏。
+  // 与「超分输入类型」同一套模式：只负责显示与点击，真实值由后端读回。
+  var fgSeg = $("#fgseg");
+  function syncFrameGen(){
+    if (!fgSeg) return;
+    [].forEach.call(fgSeg.querySelectorAll("button"), function(b){
+      b.setAttribute("aria-pressed", b.dataset.v === state.frameGen ? "true" : "false");
+      b.disabled = !state.frameGenAvailable;
+    });
+    syncSegThumb(fgSeg, true);
+  }
+  if (fgSeg){
+    [].forEach.call(fgSeg.querySelectorAll("button"), function(b){
+      b.addEventListener("click", function(){
+        if (b.disabled || b.getAttribute("aria-pressed") === "true") return;
+        state.frameGen = b.dataset.v;
+        syncFrameGen();
+        host.send({type:"frameGen", value: b.dataset.v});
+      });
+    });
+  }
   function refreshDoneEnv(){
     if (state.phase !== 'done') return;
     env.className = 'env';
@@ -2684,8 +2729,11 @@ $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); }
       applyAppearance();
       state.srInput = (msg.srInput && msg.srInput.value) || 'auto';
       state.srAvailable = !!(msg.srInput && msg.srInput.available);
+      state.frameGen = (msg.frameGen && msg.frameGen.value) || '';
+      state.frameGenAvailable = !!(msg.frameGen && msg.frameGen.available);
       syncFpsUI();
       syncSrInput();
+      syncFrameGen();
       buildRows();
       updateSummary();
       updateMain();
