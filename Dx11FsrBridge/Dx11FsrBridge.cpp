@@ -7502,13 +7502,13 @@ HRESULT STDMETHODCALLTYPE hooked_resize_buffers(
         update_swapchain_backbuffer_resources(swapchain);
         apply_hdr_swapchain_force(swapchain);
 #if defined(DX11FSRBRIDGE_ENABLE_NGX)
-        // T-FIX-11 MINOR-1 + T-FIX-25 M-1：ResizeBuffers 成功后重读后缓冲格式，交给 ngx 侧。
+        // ResizeBuffers 成功后重读后缓冲格式，交给 ngx 侧。
         //   动机：ResizeBuffers 可能改变后缓冲格式（SDR↔HDR、分辨率切换等场景下游戏会
         //   重建 8-bit/10-bit 交换链）。不重读 ⇒ is_hdr10_color_space 读到的仍是安装钩子
         //   那一刻的旧格式，G10 判据会一直用错值（且是静默的：无日志、无报错）。
-        //   ★ 可达性（T-FIX-25 修的正是这一点）：本块只有 hooked_resize_buffers 被 attach
+        //   ★ 可达性（本段修的正是这一点）：本块只有 hooked_resize_buffers 被 attach
         //     才会执行。attach 判据是 swapchain_control_hook_needed()（见 install_swapchain_hooks
-        //     的 patches 段），该谓词现已包含 Ngx 后端。T-FIX-25 之前它只有 dlssg 与
+        //     的 patches 段），该谓词现已包含 Ngx 后端。改动前它只有 dlssg 与
         //     HdrSwapchainForce 两项，后者在发布构型恒假 ⇒ 默认发布构型下本块不执行。
         //     ⇒ 判断本块是否生效请看 swapchain_control_hook_needed()，不要只看这段注释。
         //   ★ 为何 GetDesc 在这里安全：ResizeBuffers 成功后交换链已处于可用状态，
@@ -7608,7 +7608,7 @@ bool is_hdr10_color_space(DXGI_COLOR_SPACE_TYPE color_space)
     //     resolve_is_hdr 上方「M3 修复」段，搜「回退层保守化」；
     //     **按内容定位，不写绝对行号** —— 行号随改动漂移，写了必然过期）。
     //
-    //   ★★ T-FIX-11 MAJOR-1：「SDR 不会是 FP16」是**假设**，不是定理，不得当确定前提用。
+    //   ★★ 「SDR 不会是 FP16」是**假设**，不是定理，不得当确定前提用。
     //      本仓库自己就有反例（就地引用）：
     //        · NgxBackend.cpp 的 srv_typed_format（搜「SDR 半浮点」）明文写这三种是
     //          「本机/目标平台真会出现的 **SDR** 半浮点与广色域格式」，其中
@@ -7625,7 +7625,7 @@ bool is_hdr10_color_space(DXGI_COLOR_SPACE_TYPE color_space)
     //          **未经 E2 证实的假设**，不是已验证结论。
     //        · 因此本判据只提供**充分性**（命中即判 HDR），不提供必要性（未命中不排除 HDR）。
     //
-    //   ★★ T-FIX-11 MAJOR-2：**对本项目唯一目标程序，本分支实质不可达**。
+    //   ★★ **对本项目唯一目标程序，本分支实质不可达**。
     //      实机日志（2026-11-09 实机运行；SDR/HDR 各两份独立会话，逐字一致）：
     //        HDR 会话：ngx_hdr_decision is_hdr=1 src=swapchain mode=0 sw_known=1
     //                  sw_hdr=1 sw_fmt=24 color_fmt=23 depth_inv=1 flags=0xB
@@ -7709,7 +7709,7 @@ HRESULT STDMETHODCALLTYPE hooked_set_color_space1(
     DXGI_COLOR_SPACE_TYPE color_space)
 {
     void *const caller = _ReturnAddress();
-    // T-FIX-11 MINOR-2：原实现在本调用点对 is_hdr10_color_space(color_space) **求值两次**
+    // 原实现在本调用点对 is_hdr10_color_space(color_space) **求值两次**
     //   （① spoof 判据、② ngx::set_swapchain_hdr 的实参）。该函数内部读
     //   ngx::swapchain_format()（atomic），两次求值之间可能被写方翻转
     //   ⇒「放行/拦截的判定」与「告诉 NGX 的状态」可能不是同一个结论。
@@ -14736,7 +14736,7 @@ bool swapchain_present_hook_needed()
 
 bool swapchain_control_hook_needed()
 {
-    // ★ 修复 M-1（R-14B 复审）：把 Ngx 后端并入本谓词 —— 这是修既有刷新块的
+    // ★ 把 Ngx 后端并入本谓词 —— 这是修既有刷新块的
     //   **可达性**，不是新功能。原实现把「ResizeBuffers 成功后重读后缓冲格式」
     //   （hooked_resize_buffers 内、ngx::set_swapchain_format 那一段）当成缺口已修，
     //   但本谓词当时只有 dlssg 与 HdrSwapchainForce 两项，而 HdrSwapchainForce 在

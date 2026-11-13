@@ -37,7 +37,7 @@ void set_swapchain_hdr(bool hdr);            // 由 Dx11FsrBridge 的 SetColorSp
 //   DXGI_FORMAT_UNKNOWN(0) 表示"未知/不参与判定"。
 void set_swapchain_format(DXGI_FORMAT f);    // 由 install_swapchain_hooks() 主动调用
 
-// T-FIX-2：供 Dx11FsrBridge 的 is_hdr10_color_space 判断「G10 + FP16」组合。
+// 供 Dx11FsrBridge 的 is_hdr10_color_space 判断「G10 + FP16」组合。
 // 返回 0 = 未知（DXGI_FORMAT_UNKNOWN），否则是当前 swapchain 后缓冲格式。
 DXGI_FORMAT swapchain_format();
 void set_render_preset(int v);                              // NgxRenderPreset，默认 0（跟随 NGX）
