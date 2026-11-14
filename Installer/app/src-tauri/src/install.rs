@@ -466,9 +466,11 @@ fn prepare_opti(settings: &Settings, game_dir: &Path) -> Result<(), String> {
     //     而且不依赖 OptiScaler 的加载顺序。
     //   · 联动还顺带解决"重复注入"：任一时刻只有一方加载 ReShade。
     //
-    // ★ 判据必须与 pkg::dll_list 完全一致（都用 pkg::reshade_via_opti），否则会出现
-    //   「DllList 里没有 ReShade、OptiScaler 也不加载」⇒ 用户勾了却没效果。
-    let reshade_via_opti = pkg::reshade_via_opti(&settings.selected, settings);
+    // ★ 这里用 `reshade_via_opti_wanted`（**意愿**判据），不是 `reshade_via_opti`：
+    //   本函数要先写 `LoadReshade=true`、再复制 DLL；若判据里含「DLL 已在游戏根目录」，
+    //   第一次安装时文件还不存在 ⇒ 返回 false ⇒ 不复制 ⇒ 永远装不上（先有鸡还是先有蛋）。
+    //   DLL 缺失的回退由 `pkg::reshade_via_opti`（注入链那一步）负责。
+    let reshade_via_opti = pkg::reshade_via_opti_wanted(&settings.selected, settings);
     write("Plugins", "LoadReshade", if reshade_via_opti { "true" } else { "false" })?;
     log::write(&format!(
         "[install] ReShade 加载方: {}（帧生成{}）",

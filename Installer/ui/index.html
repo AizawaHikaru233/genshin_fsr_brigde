@@ -811,6 +811,18 @@
           <div class="row">
             <div class="ico">
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3.4l7 2.6v5.2c0 4-2.9 7.6-7 8.8-4.1-1.2-7-4.8-7-8.8V6l7-2.6Z"/><path d="M9.2 12.2l2 2 3.6-3.8"/>
+              </svg>
+            </div>
+            <div>
+              <div class="rlabel">移除自签名证书</div>
+              <div class="rvalue">签名 ReShade64.dll 时，安装器会向「当前用户」的受信任根写入一个自签名证书（否则反作弊会拦截 OptiScaler 加载它）。移除后需重新安装才能再次签名</div>
+            </div>
+            <button class="ghost" id="btn-remove-cert">移除…</button>
+          </div>
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M10.2 6.6H6.4A2.4 2.4 0 0 0 4 9v8.6A2.4 2.4 0 0 0 6.4 20h8.6a2.4 2.4 0 0 0 2.4-2.4v-3.8"/><path d="M13.4 4h6.6v6.6"/><path d="M20 4l-7.4 7.4"/>
               </svg>
             </div>
@@ -2269,6 +2281,32 @@
     env.innerHTML = '<b>正在恢复默认设置…</b>';
     host.send({type:'restoreDefaults'});
   });
+  /* ── 移除自签名证书（同一套"两次点击确认"，因为这会断掉 ReShade 的签名） ── */
+  var btnRemoveCert = $('#btn-remove-cert'), certArmed = false, certTimer = 0;
+  function disarmCert(){
+    certArmed = false;
+    clearTimeout(certTimer);
+    if (btnRemoveCert){
+      btnRemoveCert.textContent = '移除…';
+      btnRemoveCert.classList.remove('danger');
+    }
+  }
+  if (btnRemoveCert){
+    btnRemoveCert.addEventListener('click', function(){
+      if (state.phase === 'installing') return;
+      if (!certArmed){
+        certArmed = true;
+        btnRemoveCert.textContent = '确认移除';
+        btnRemoveCert.classList.add('danger');
+        certTimer = setTimeout(disarmCert, 4000);
+        return;
+      }
+      disarmCert();
+      env.className = 'env';
+      env.innerHTML = '<b>正在移除自签名证书…</b>';
+      host.send({type:'removeCert'});
+    });
+  }
   /* ── 桌面快捷方式 + 与其他启动器联动 ── */
   var swShortcut = $('#sw-shortcut');
   var unlockerDirEl = $('#unlockerdir');
@@ -2876,6 +2914,15 @@ $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); }
         env.className = 'env bad';
         env.innerHTML = '<b>' + (msg.error || '恢复失败') + '</b>';
       }
+    }
+    else if (msg.type === 'certRemoved'){
+      // 移除自签名证书的结果。0 个也当成功（本来就没有），只说"未找到"。
+      env.className = msg.ok ? 'env' : 'env bad';
+      var removed = msg.removed || 0;
+      env.innerHTML = msg.ok
+        ? '<b>' + (removed > 0 ? '已移除 ' + removed + ' 个自签名证书' : '没有找到需要移除的证书') + '</b>'
+          + '<span class="sep">·</span>' + (msg.message || '')
+        : '<b>' + (msg.message || '移除失败') + '</b>';
     }
     else if (msg.type === 'logs'){
       if (msg.cancelled) {

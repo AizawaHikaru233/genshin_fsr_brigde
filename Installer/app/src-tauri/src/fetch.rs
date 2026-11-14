@@ -546,8 +546,25 @@ fn find_signtool() -> Option<PathBuf> {
 }
 
 /// 确保「本机自签名代码签名证书」存在，返回指纹。
+///
+/// **Subject 刻意用本项目自己的标识，不冒充 ReShade 官方作者。**
+///
+/// 2026-11-14 复审修正：原实现用 `CN=crosire, O=ReShade, ...`（ReShade 作者的身份）。
+/// 那会带来两个真实风险：
+///   · **身份冒充**：用户证书根里会长期存在一个名为 "crosire / ReShade" 的可信锚，
+///     任何用这把私钥签的二进制都被本机当可信 —— 而私钥就留在用户的证书存储里，
+///     泄露即可伪造「ReShade 官方签名」。
+///   · **用户不可见**：安装器会静默向 `CurrentUser\Root` 写入一个根证书，卸载也不移除。
+///
+/// 现在用 `CN=GenshinFsrBridge Local Self-Sign`：一眼能看出是本机自签，
+/// 不与上游身份混淆；有效期缩到 **1 年**（配合安装器的移除入口，见 `remove_signing_cert`）。
+///
+/// ⚠️ 注意：换 Subject 后，**旧版本安装器签过的 ReShade64.dll 不会再被 `has_valid_signature`
+///   认作同一张证书** —— 那不影响功能（`has_valid_signature` 只看 Status 是否 Valid，
+///   不看颁发者），但会遗留一个旧的 "crosire" 根证书。`remove_signing_cert` 会一并清掉。
 fn ensure_signing_cert() -> Result<String, String> {
-    const SUBJECT: &str = "CN=crosire, O=ReShade, L=Boston, S=Massachusetts, C=US";
+    const SUBJECT: &str = "CN=GenshinFsrBridge Local Self-Sign";
+    const VALID_YEARS: i32 = 1;
 
     // 1) 已有就复用
     let find = format!(
@@ -567,7 +584,7 @@ fn ensure_signing_cert() -> Result<String, String> {
 
     // 2) 没有就建一个，并装进 CurrentUser\\Root
     let create = format!(
-        "$c = New-SelfSignedCertificate -Type CodeSigningCert -Subject '{SUBJECT}' -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -CertStoreLocation 'Cert:\\\\CurrentUser\\\\My' -NotAfter (Get-Date).AddYears(5); $s = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root','CurrentUser'); $s.Open('ReadWrite'); $s.Add($c); $s.Close(); $c.Thumbprint"
+        "$c = New-SelfSignedCertificate -Type CodeSigningCert -Subject '{SUBJECT}' -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -CertStoreLocation 'Cert:\\\\CurrentUser\\\\My' -NotAfter (Get-Date).AddYears({VALID_YEARS}); $s = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root','CurrentUser'); $s.Open('ReadWrite'); $s.Add($c); $s.Close(); $c.Thumbprint"
     );
     let out = hidden_command(Path::new("powershell"))
         .args(["-NoProfile", "-NonInteractive", "-Command", create.as_str()])
@@ -584,12 +601,53 @@ fn ensure_signing_cert() -> Result<String, String> {
     Ok(tp)
 }
 
+/// 从当前用户的 `My` 与 `Root` 里移除本项目的自签名证书（卸载 / 用户主动清理时调用）。
+///
+/// 为什么需要：自签名证书会向 `CurrentUser\Root` 写入一个**用户看不见**的可信根，
+/// 且**不会随安装器卸载自动消失**。没有移除入口就等于在用户机器上留了一个永久信任锚。
+///
+/// 一并清掉旧版本用过的 `CN=crosire, O=ReShade ...`（那时冒充了 ReShade 作者身份）。
+/// 返回移除的证书数量。
+pub fn remove_signing_cert() -> Result<usize, String> {
+    const SUBJECTS: [&str; 2] = [
+        "CN=GenshinFsrBridge Local Self-Sign",
+        "CN=crosire, O=ReShade, L=Boston, S=Massachusetts, C=US",
+    ];
+    let mut removed = 0usize;
+    for subject in SUBJECTS {
+        let script = format!(
+            "$n = 0; foreach ($store in @('My','Root')) {{ \
+               $s = New-Object System.Security.Cryptography.X509Certificates.X509Store($store,'CurrentUser'); \
+               $s.Open('ReadWrite'); \
+               foreach ($c in @($s.Certificates | Where-Object {{ $_.Subject -eq '{subject}' }})) {{ $s.Remove($c); $n++ }}; \
+               $s.Close() }}; $n"
+        );
+        if let Ok(out) = hidden_command(Path::new("powershell"))
+            .args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
+            .output()
+        {
+            if out.status.success() {
+                if let Ok(n) = String::from_utf8_lossy(&out.stdout).trim().parse::<usize>() {
+                    removed += n;
+                }
+            }
+        }
+    }
+    log::write(&format!("[reshade] 已移除 {removed} 个自签名证书"));
+    Ok(removed)
+}
+
 /// `Get-AuthenticodeSignature` 判断签名状态。
 /// `Some(true)` = Valid；`Some(false)` = 有签名但无效；`None` = 查不出来。
+///
+/// **用 `-LiteralPath` 而不是把路径塞进单引号字符串**：路径里含 `'` 时
+/// （例如 `C:\Users\O'Brien\...`）原写法会把 PowerShell 命令截断，得到一个语法错误
+/// 而被当成「查不出来」。`-LiteralPath` 走参数传递，不经过 PowerShell 的解析器。
 fn has_valid_signature(dll: &Path) -> Option<bool> {
-    let cmd = format!("(Get-AuthenticodeSignature '{}').Status", dll.display());
+    let cmd = "(Get-AuthenticodeSignature -LiteralPath $env:GFSR_SIGN_TARGET).Status";
     let out = hidden_command(Path::new("powershell"))
-        .args(["-NoProfile", "-NonInteractive", "-Command", cmd.as_str()])
+        .args(["-NoProfile", "-NonInteractive", "-Command", cmd])
+        .env("GFSR_SIGN_TARGET", dll)
         .output()
         .ok()?;
     if !out.status.success() {
