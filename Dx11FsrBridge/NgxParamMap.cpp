@@ -33,18 +33,16 @@ CreateFlagsOutput map_create_flags(const CreateFlagsInput &in)
     if (in.is_hdr)            out.flags |= kFlagIsHdr;
     // 2026-11-13：MVLowRes 改为按 `in.mv_low_res` 决定（**不再恒设**）。
     //
-    // 历史：这里曾是恒设一行（"与重构前逐字对应"）。但 dlss-input 分支的对照实现是
-    //   add(!in.mvs_at_display_resolution, kFlagMvLowRes, "mvs_at_render_resolution");
-    // 即**只有 MV 不是显示分辨率时才置位**。实机对比（同一份 OptiScaler、同为
-    // NGX 输入、同开帧生成）：dlss-input 的桥无拖影，main 的桥全程拖影 ⇒ 两边的
-    // 这一位处理不同是首要嫌疑。
+    // 历史：这里曾是恒设一行（"与重构前逐字对应"）。
     //
-    // 该位语义：告诉 DLSS "运动矢量是**渲染分辨率**的、需要内部放大到显示分辨率"。
+    // 该位语义：告诉 DLSS「运动矢量是**渲染分辨率**的、需要内部放大到显示分辨率」。
     // 若游戏实际给的是显示分辨率 MV 却置了这位，DLSS 会按错误比例缩放 MV
-    // ⇒ 运动补偿错位 ⇒ 全屏拖影（与本项目早期"若游戏给的是像素单位会出现全屏拖影"
+    // ⇒ 运动补偿错位 ⇒ 全屏拖影（与本项目早期「若游戏给的是像素单位会出现全屏拖影」
     // 那条记录同源）。
     //
-    // 默认由调用方传 true（保持历史行为）；实测需要关掉时用 Fsr2MotionVectorsLowRes=0。
+    // 改为可配置的依据：本键设 0 后实机拖影明显减轻（未完全根除 —— 剩余部分与
+    // `NgxHdr`、OptiScaler 侧 `[InitFlags] HDR` 有关，不在本仓库范围）。
+    // 默认仍由调用方传 true（保持历史行为），需要 A/B 时用 Fsr2MotionVectorsLowRes=0。
     if (in.mv_low_res)        out.flags |= kFlagMvLowRes;
     if (in.mv_jittered)       out.flags |= kFlagMvJittered;
     if (in.depth_inverted)    out.flags |= kFlagDepthInverted;

@@ -110,6 +110,9 @@ $configValues = [ordered]@{
     # ---- 6. FSR2 输入 / 蒙版 / 合成族 / FSR2 input, masks, compositing ----
     'Fsr2MotionVectorScaleMode' = '1'
     'Fsr2MotionVectorsJittered' = '0'
+    # 2026-11-13: MVLowRes (motion vectors are at render resolution).
+    #           1 = historical behaviour (default); 0 = omit the NGX MVLowRes bit.
+    'Fsr2MotionVectorsLowRes' = '1'
     'Fsr2JitterMode'            = '3'
     'Fsr2UseReactiveMask'       = '0'   # 代码内建缺省是 1
     'Fsr2UseTransparencyMask'   = '0'

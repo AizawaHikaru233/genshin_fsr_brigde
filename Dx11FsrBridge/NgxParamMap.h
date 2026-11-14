@@ -12,7 +12,7 @@
 // 调用方只负责"取输入 → 调函数 → 写输出"，**公式一个字符都不改**
 // （改公式 = 改行为，不属本次重构范围）。
 // 于是 `NgxParamMapTest.cpp` 可以在**无 GPU、无游戏、无 NGX 头**的机器上把公式钉住
-// —— 与 `DlssInput.h`（build-t6verify/_ref-dlss-input，只读参考）的分层同构。
+// —— 分层方式与「输入映射层 / 公式层分离」的同构：映射层只取标量，公式层无副作用。
 //
 // ============================================================================
 // 命名空间为什么是小写 snake_case
@@ -72,9 +72,11 @@ struct CreateFlagsInput
     bool depth_inverted;
     bool mv_jittered;
     // 2026-11-13：MVLowRes 由"恒设"改为可配置（见 .cpp 的 map_create_flags 注释）。
-    // 为什么必须能关：本游戏（原神）给的是**渲染分辨率**的 MV，但实测恒设
-    // MVLowRes 会和 dlss-input 分支产生明显画质差异（后者只在 MV 非显示分辨率时置位）。
     // 由调用方按 Fsr2MotionVectorsLowRes 配置传入；默认 true 保持历史行为。
+    //
+    // 注意：本字段是**常量输入**（load_config 一次性读入、进程内不变），
+    // 不是逐帧可变量 —— 因此不需要像 is_hdr / depth_inverted / mv_jittered 那样
+    // 进 NgxBackend 的 flags_input_bits 位图（那张图是给逐帧日志用的）。
     bool mv_low_res;
 };
 

@@ -657,47 +657,34 @@ static OptiOutput opti_output_current()
 static void record_adapter_info(std::uint32_t vendor, std::uint32_t device_id, const std::wstring &desc);
 static void resolve_backend_auto(std::uint32_t vendor, std::uint32_t device_id, const std::wstring &desc);
 static void route_from_d3d11_device(ID3D11Device *d3d11_device);
-// P1 单实例接管的**生效值**：只跟 ini 走，**不再对 NGX 后端强制**。
+// P1 单实例接管的**生效值**：ini 取值，或后端强制。
+// 为什么 NGX 必须强制（2026-11-13 代码审计）：NGX 的 feature 与资源池是**全局唯一实例**
+// （NgxBackend.cpp 的 `NgxInstance g_inst`，v8 起不再是 map + LRU），只支持一条流水线。
+// 全量接管 + 两路视图交替派发时：尺寸/格式不同 ⇒ 每次 instance_key 变化都
+// destroy_instance() + create_instance()；尺寸格式全等 ⇒ 走跨 key 复用，但每帧把
+// g_inst.first 置 true 复位时域（那里的原话：否则两个视图的时域累积互相污染）。
+// 两种都不可能两路同时正常出图 ⇒ 本键对 NGX 后端无效，一律只接管一个实例。
 //
-// 【2026-11-13 修正】原实现在 NGX 后端强制返回 true（无论 ini 写什么），理由是
-//   「NGX 的 feature 与资源池是全局唯一实例，两路交替派发只会反复重建或复位时域」。
-//   实机日志证明该推论不成立，而且**强制单实例本身就是卡顿的根源**：
-//
-//   2026-11-13 12:45:32 进角色界面的实测（NgxHdr=0 / Ffx12Backend=ngx / FG 开启）：
-//     32.763  ffx12_instance_new inst=0x2DB40EA0        ← 角色界面那路出现
-//     32.763  single_instance_take take=0x29017600      ← 接管权仍留在世界那路
-//             all=[0x29017600(take), 0x2DB40EA0(pass)]  live=2
-//     32.763~32.971  passthrough count=1..8             ← 208 ms：
-//             角色界面那路被放行给**游戏原生 FSR**，原生侧要重建自己的资源
-//     32.971  take 切换成 0x2DB40EA0                    ← 接管权跳到角色界面那路
-//     33.371  ffx12_instance frame=31                   ← 又 399 ms
-//     34.209  take 又切回 0x29017600                    ← 再切一次
-//     35.711  frame=120                                 ← 共约 2.7 秒才恢复
-//
-//   也就是说：**不是 NGX 在重建**（同期日志 `ngx_inst reuse rebuild_us=0`，零开销），
-//   而是「只接管一个 ⇒ 另一路被迫回退原生 FSR ⇒ 原生 FSR 重建资源 ⇒ 卡顿」。
-//   尺寸/格式全等的跨 key 复用路径本来就是 0 开销，两路交替并无问题。
-//
-//   对照：dlss-input 分支不做单实例裁决（纯映射层，所有 draw 都进 NGX），实测同一场景
-//   无卡顿 ⇒ 佐证「卡顿由接管权切换引起」，而非 NGX 实例能力不足。
-//
-// 现在的语义：
-//   Ffx12SingleInstance=0（**新默认**）⇒ 全量接管，两路都走 NGX，靠跨 key 复用避免重建；
-//   Ffx12SingleInstance=1            ⇒ 保留旧行为（只接管一个），供需要时回退/对照。
-// 日志后缀 `single_instance=forced` 因此不再出现 —— 生效值恒等于配置值。
+// 【2026-11-14 复审记录】曾尝试改成只返回 `g_config.ffx12_single_instance`（全量接管），
+// 依据是「进/出角色界面卡顿 2.7 秒」的时间线日志。该改动已撤回，理由：
+//   · 上面的三条限制（g_inst 全局唯一 / 六元组全等才复用 / 复用也要 first=true）
+//     今天仍然成立 ⇒ 两路并发时每帧 destroy+create（~500ms）或每帧 Reset（时域不累积）。
+//   · 原始证据只有 2 条 ngx_inst 记录（1 次 switch + 1 次 reuse），只能证明
+//     「单实例路径下接管权切换 + 原生回退慢」，**不能**证明两路并发 NGX 可行。
+//   · 缺少的关键证据：两路同时 `ngx_out` 的日志。
+// 要改善那 2.7 秒，走已有的 Ffx12SingleInstanceSticky / HoldMs / Pick 压切换频率。
 static bool single_instance_takeover_effective()
 {
-    return g_config.ffx12_single_instance;
+    return g_config.ffx12_single_instance || ffx12::backend() == ffx12::BackendKind::Ngx;
 }
 
-// 后端选择行（`ngx_core backend=…`）的单实例状态后缀。
-//
-// 2026-11-13 修正后，生效值**恒等于**配置值（不再对 NGX 强制），因此这个后缀
-// 永远是空串。保留函数是为了让调用点不必改（一旦将来再现「配置值与生效值不一致」
-// 的情形，只需在这里恢复判定即可）。
+// 后端选择行（`ngx_core backend=…`）的单实例状态后缀：只在「ini 写 0 却被强制」时出现，
+// 让日志里的**配置值**与**生效值**能分开读（AGENTS.md §五.6 日志口径自洽）。
 static std::string single_instance_log_suffix()
 {
-    return "";   // 生效值恒等于配置值，无「被强制」状态需要标注
+    return (!g_config.ffx12_single_instance && ffx12::backend() == ffx12::BackendKind::Ngx)
+        ? " single_instance=forced"
+        : "";
 }
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 std::mutex g_ps_trace_mutex;
@@ -3965,9 +3952,9 @@ void load_config()
     g_config.fsr2_motion_vectors_jittered =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2MotionVectorsJittered", 0, config_path.c_str()) != 0;
         // 2026-11-13：MVLowRes（"MV 是渲染分辨率的"）开关，默认 1 = 历史行为。
-        // 设为 0 时不再向 NGX 传 MVLowRes 位。动机：dlss-input 分支的对照实现只在
-        // "MV 非显示分辨率"时置位；实机对比同一份 OptiScaler 下它的桥无拖影、
-        // main 的桥全程拖影 ⇒ 这一位处理差异是首要嫌疑。详见 NgxParamMap.cpp。
+        // 设为 0 时不再向 NGX 传 MVLowRes 位。动机：本键设 0 后实机拖影明显减轻
+        // （未根除 —— 剩余部分与 NgxHdr、OptiScaler 侧 InitFlags.HDR 有关，不属本仓库）。
+        // 详见 NgxParamMap.cpp。
         const bool mv_low_res =
             GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2MotionVectorsLowRes", 1, config_path.c_str()) != 0;
         ffx12::set_motion_vectors_low_res(mv_low_res);
