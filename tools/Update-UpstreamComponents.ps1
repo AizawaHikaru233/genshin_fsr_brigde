@@ -379,7 +379,11 @@ $versions = [ordered]@{
     ffx         = $ffx
     renodx      = $renodx
 }
-$versions | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $versionsPath -Encoding UTF8
+    # 2026-11-15：**不用 Set-Content -Encoding UTF8**（PS 5.1 会写 BOM，
+    #   而 serde_json::from_str 不接受前导 BOM ⇒ 安装器把清单判成"缺失"）。
+    #   改为显式无 BOM 的 UTF8Encoding，从生成侧根除这个问题。
+    $json = $versions | ConvertTo-Json -Depth 6
+    [System.IO.File]::WriteAllText($versionsPath, $json, (New-Object System.Text.UTF8Encoding($false)))
 
 # 自检：清单里写的哈希必须与**刚落盘的文件**一致。
 # GUI 的下载校验、打包脚本的"清单 ↔ 包内实物"断言都以这份清单为准 ⇒ 这里不一致就立刻失败。

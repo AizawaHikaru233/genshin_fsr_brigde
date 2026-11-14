@@ -122,6 +122,200 @@ Dx11wDx12SC::Present
 **为何不修**：阻塞发生在 OptiScaler 自身的 DLL 卸载路径，桥无法介入。
 完整证据链见本地留痕 `VERDICT_game_exit_hang_20261112.md`（不随仓库分发）。
 
+### 开关 2D 界面时帧生成被 Streamline 判定失败并整体重建（2026-11-14）
+
+**现象**：开启帧生成后，进/出角色界面、打开/关闭背包与地图时，画面卡顿一瞬，
+同时性能面板可见 FG 被关闭再开启。
+
+**实测证据**（`OptiScaler.log`，NVIDIA RTX 4070 SUPER / `Ffx12Backend=auto` /
+`FGOutput=DLSSG` / ReShade 经 OptiScaler 加载）：
+
+```
+14:16:30.774  [E] dlfgPresent.cpp:141[updateStatus]
+              eDLSSGStatusFailReflexNotDetectedAtRuntime
+              - sl.reflex must be enabled and active 9985 != 10660
+14:16:30.774  [I] dlfgPresent.cpp:1220[presentCommon]
+              DLSS-G interpolation state changed from disabled to enabled
+14:16:33.143  [I] DLSS-G interpolation state changed from enabled to disabled
+              伴随 generic.cpp:962[collectGarbage] Destroyed ...（多个 cubin 对象）
+```
+
+同一时段反复出现 `IFGFeature::StartNewFrame Frame count jumped too much!`
+（每次跳 3–5 帧）与 `presentCommon: Frame rate over 100.00ms, reseting frame timer`。
+
+**根因链**：
+
+1. 2D 界面出现/消失 ⇒ 桥的 P1 接管权交棒（`Dx11FsrBridge.cpp` 的
+   `ffx12_takeover_leave`，并给前任实例 `k_p1_native_release_ms` 纯原生窗口）。
+2. 该路这一帧不再由桥 dispatch ⇒ 游戏原生 FSR 与桥产出交替 ⇒ Streamline 侧
+   帧进度一次性跳 3–5 帧。
+3. Streamline 要求 Reflex 与 DLSS-G 帧计数同步。跳帧后两者偏离
+   （如 `9985 != 10660`），Streamline 报 `eDLSSGStatusFailReflexNotDetectedAtRuntime`。
+4. OptiScaler 收到失败后走 `DLSSG_Dx12.cpp:861` 的 `PauseAfterError()`
+   （`framegen/dlssg/DLSSG_Common.cpp:112`）：`Deactivate()` 把 DLSS-G
+   整体关掉并销毁全部资源；下一帧再重建 ⇒ 可见的 FG 闪断与卡顿。
+
+**影响**：每次 2D 界面出现/消失各触发一次。`Ffx12SingleInstanceSticky=1` +
+`Ffx12SingleInstanceHoldMs` 只能压低**交棒频率**（已验证可消除进出角色界面的卡顿），
+但只要仍有一次交棒，就会触发上述整链。
+
+**为何桥侧修不了**：失败判定与 `Deactivate()` 都在 OptiScaler / Streamline 内部；
+桥只能改「是否交棒」与「交棒时机」，不能改 Streamline 的 Reflex 同步要求。
+
+**可能的方向**（均未验证）：
+
+- **对齐上游对 FFX 后端的处理**：FFX 后端同样有交棒与原生回退，但该路径下
+  Streamline 不参与，所以没有 Reflex 同步要求 —— 可对比两个后端在同一场景的
+  `ffx12_takeover_*` 时序，找出 NGX 特有的额外跳帧来源。
+  （这是上游维护者给出的方向：在 NGX 输入下仿照 FFX 对齐后端。）
+- 让桥在交棒瞬间**不跳过任何一帧**（保持每帧都有 dispatch，即使要复用上一帧的
+  输出），避免帧进度跳跃。风险：画面可能重复一帧，但不会触发 FG 重建。
+- 在 OptiScaler 侧放宽 Reflex 同步判定（需要改上游代码，且可能掩盖真实问题）。
+
+**推进需要**：能同时采集「桥的交棒时刻」与「Streamline 的 `Interpolation state
+changed` 时刻」的对照日志，确认跳帧是否**必然**发生在交棒当帧；再决定是否走
+「交棒不跳帧」方向。
+
+---
+
+#### 2026-11-14 二次排查：上面的「Reflex 同步失败」不是这条卡顿的成因
+
+上面的根因链已被更完整的日志**部分推翻**。必须原样保留（失败的结论比成功的更有价值），
+但以本小节为准。
+
+**推翻依据**（同一份 `OptiScaler.log`，19:22–19:23 一轮开关界面）：
+
+| 探针 | 命中次数 | 结论 |
+|---|---|---|
+| `fgChanged` | 0 | 上面第 4 步（OptiScaler 主动 Deactivate）**从未发生** |
+| `DestroyFGContext` | 0 | 同上 |
+| `Deactivate` | 0 | 同上 |
+| `PauseAfterError` | 0 | 同上 |
+| `eDLSSGStatusFailReflexNotDetectedAtRuntime` | 仅在 **14:16 那一轮**出现 | 19:22–19:23 这一轮**没有** |
+
+**实际发生的时序**（19:23:04，关闭角色界面）：
+
+```
+19:23:04.447  释放 feature id 3        ← id < DLSS_MOD_ID_OFFSET，是【游戏自己的】handle
+19:23:04.448  100+ 条 [FrameGeneration] 日志在 12ms 内密集打印
+19:23:04.464  D3D12_ReleaseFeature result for (3): 1
+19:23:04.464  DLSS-G interpolation state changed enabled -> disabled   ← Streamline 内部
+19:23:04.510  collectGarbage Destroyed ×2
+19:23:05.303  IFGFeature::StartNewFrame Frame count jumped（5 条）
+19:23:05.374  CreateFeature for feature 11（= DLSS-G）
+19:23:05.564  Native CreateFeature success, HandleId: 4   ← 重建耗时 190ms
+```
+
+`HandleId` 单调递增 `1→2→3→4→5→6` ⇒ **每关闭一次界面，游戏释放并重建一次 DLSS-G
+feature**，`CreateFeature` 本身 190ms。
+
+**桥侧状态同期完全正常**：`ngx_inst reuse rebuild_us=0`（无重建）、
+`reset=0`（`NgxSuppressReset=1` 生效）、`eval_us` 仅 216–268μs。
+
+**同时确认两件事已生效**：
+
+- `NgxSuppressReset=1` 确实消掉了「打开」界面时的卡顿（打开时新实例出现，
+  `reset_next` 不再传到 NGX）。
+- `Ffx12SingleInstanceSticky=1` + `HoldMs=5000` 确实压住了交棒频率。
+
+**为什么「关闭」仍卡**：「关闭」路径上**游戏自己**释放并重建 DLSS-G feature，
+这一步不经过桥、也不经过 OptiScaler 的 FG 销毁逻辑。桥无法阻止游戏释放自己的
+feature。
+
+**尝试过但走错的方向**（勿重复）：在 `OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp` 的
+`IsFGSourceFeature()` 里加「必须有活跃对手才允许胜出」的约束。该函数用于
+`NVSDK_NGX_D3D12_ReleaseFeature` 的 FG 清理分支，而本轮日志证明那个分支
+（`fgChanged` / `DestroyFGContext`）**一次都没进**，所以改动无效。该修改目前仍在
+本地工作区，**未产生效果，可回退**。
+
+**还剩的方向**（均未验证）：
+
+- 让 `CreateFeature` 变快：190ms 主要是 DLSS-G 的 GPU 资源分配与 cubin 初始化。
+  若能把同一批资源在 release 时**不真正归还**、create 时**复用**，可压缩这 190ms。
+  但 DLSS-G 的内部对象由 Streamline 管理，从桥侧无接口介入。
+- 在 OptiScaler 侧**拦截**游戏对 feature 11 的 release/create，改为自行维持一份。
+  风险高：游戏释放后可能立即用新 handle 做 Evaluate，语义要完全等价。
+- 上游方向：对齐 FFX 后端。FFX 路径下没有 DLSS-G，因此不存在这条链 ——
+  只能解释「为什么 FFX 没有这问题」，**不能**直接修掉 NGX 路径的 190ms 重建。
+
+**当前状态**：现象稳定可复现，根因已定位到「游戏自行 release+create DLSS-G」，
+本仓库与 OptiScaler 侧均无干净修复点。需要上游（OptiScaler / Streamline）支持，
+或接受这 190ms。
+
+---
+
+#### 2026-11-15 第三次排查：把 dlss-input 的 NGX 直连层移植进 main 并实测
+
+**做了什么**：把 `dlss-input` 分支的 `DlssInput.h` / `DlssInput.cpp` / `DlssInputTest.cpp`
+（共约 2280 行）与 `dlss_gate` 命名空间（1196 行，含 depth 提取、motion 解码 CS）整体
+移植进 main，新增配置键 `DlssInputMode`（0=off 默认 / 1=dlss / 2=ffx / 3=auto）。
+思路：让桥**自己**以 DLSS 客户端身份持一份 NGX feature（`dlss_input::Runtime`），
+游戏释放它自己的 feature 时不影响桥那份 ⇒ 不重建。
+
+**移植结果**：编译通过，DLL `1,890,304 → 1,957,888` B（+67,584）。实机
+`DlssInputMode=1` 时日志出现 `dlss_input_first_dispatch render=2556x1438 display=2560x1440`，
+证明直连层确实接管了超分，且无 fallback。
+
+**踩到的坑（已修）**：初次移植时三个配置键的默认值抄错（只看了代码 `Config` 的裸默认值，
+没对照 `dlss-input` 分支实际发布的 `.package.ini`）：
+
+| 键 | 错设 | 正确（dlss-input 实测基线） | 后果 |
+|---|---|---|---|
+| `DlssInputJitterMode` | 0（`PlusMinusHalf`，符号反转）| **3**（`ZeroCentred`）| 全屏拖影模糊 |
+| `DlssInputMotionSign` | 0 | **1**（`RequireNativeSign`）| 运动矢量方向错 |
+| `DlssInputDepthScale` | 0 | **32** | 深度归一化错 |
+
+改正后画质正常。**教训：移植要连「实测基线配置」一起搬，不能只看代码默认值。**
+
+**关键结论：直连层修不好 FG 卡顿。**
+
+改正后画质正常，但**关闭界面仍卡**，日志显示 `HandleId` 依旧 `1→2→3→4` 递增：
+
+```
+03:08:37.108  桥 ffx12_instance_new（角色界面出现）
+03:08:37.203  sl.dlss_g turned off, releasing all resources
+03:08:37.226  ReleaseFeature releasing feature with id 2
+03:08:38.155  Frame count jumped: _frameCount 21237 vs _lastDispatchedFrame 21234
+03:08:38.391  eDLSSGStatusFailReflexNotDetectedAtRuntime 27229 != 27347
+03:08:38.390  CreateFeature → HandleId: 3
+```
+
+**为什么救不了** —— 超分与帧生成不在同一层：
+
+| 组件 | 由谁处理 | 直连层能否介入 |
+|---|---|---|
+| 超分（DLSS）| 直连层 `dlss_input::Runtime` | ✅ 能（已验证）|
+| 帧生成（DLSSG）| **OptiScaler → Streamline** | ❌ **不能** |
+
+三条硬约束：
+
+1. **`dlss-input` 分支全文 0 次 Reflex 代码**（`DlssInput.cpp` / `Dx11FsrBridge.cpp` 均 0 命中）
+   ⇒ 原作者也没打算让直连层管 FG，它只做超分。
+2. **Reflex 与 DLSS-G 的帧计数对齐由 OptiScaler 的 `hooks/Reflex_Hooks.cpp` 维护**
+   （`_updatesWithoutMarker` / `processGameMarker` / `reflexFrameId`），依赖 hook
+   `NvAPI_D3D_SetLatencyMarker`。而**那个 hook 点已被 OptiScaler 占用** —— 直连层再插一手
+   只会让两套计数互相打架。
+3. **游戏可以直接调 `sl.dlss_g` 释放 feature**，桥无法阻止；即使 Reflex 对齐了，
+   重建照样发生。
+
+**Streamline 接口现状**（已核实，供后人参考）：
+
+| 导出 | 所在 DLL |
+|---|---|
+| `slSetData` / `slGetNewFrameToken` | `sl.interposer.dll` |
+| `slReflexSetOptions` / `slReflexSleep` | `sl.reflex.dll` |
+| `slDLSSGSetOptions` / `slDLSSGGetState` | `sl.dlss_g.dll` |
+
+注意 `sl.interposer.dll` **不导出** Reflex / DLSSG 的 SetOptions —— 必须到对应插件 DLL 解析。
+
+**当前状态**：已停止推进。直连层保留在代码中（`DlssInputMode=0` 默认关闭，
+行为与移植前完全一致），作为超分路径的备选实现；FG 的 190ms 重建仍无解，
+归入本节「接受或等上游」的结论。
+
+**若要继续**：需要上游提供「DLSS-G feature 重建时复用内部池」的能力，或允许应用暂缓
+release。这不是桥或 OptiScaler 单方面能解决的。
+
+
 ## 4. DLSS 选档的**实机验收**尚未完成（机制已实现）
 
 **现状**

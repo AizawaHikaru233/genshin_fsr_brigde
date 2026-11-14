@@ -372,6 +372,10 @@ float g_depth_scale = 1.0f;     // XeSS/DLSS 定向——depth 值域归一化�
 bool g_motion_vectors_jittered = false; // 游戏配置：motion 是否已包含投影 jitter
 // 2026-11-13：MVLowRes 开关（默认 true = 历史行为）。语义与动机见 NgxParamMap.cpp。
 bool g_motion_vectors_low_res = true;
+// 2026-11-14：NGX 后端是否抑制 Reset（默认 true）。语义与动机见 NgxParamMap.h 的
+// ResetInput::suppress —— Reset 在 DLSS-G 在场时会让 Streamline 重置帧计时器，
+// 导致帧生成被判失败并整体重建（进出 2D 界面时必现的卡顿）。
+bool g_suppress_reset = true;
 bool g_hdr_input = true;        // 游戏 10-bit HDR 管线（useRealType）
 bool g_auto_exposure = true;    // 自动曝光（OptiScaler 日志 initFlags 实证：AutoExposure=true）
 bool g_non_linear = true;       // 非线性色彩空间（OptiScaler 日志：FsrNonLinearColorSpace=true）
@@ -2355,6 +2359,7 @@ bool finish_all_instances()
 bool hdr_input() { return g_hdr_input; }
 bool motion_vectors_jittered() { return g_motion_vectors_jittered; }
 bool motion_vectors_low_res() { return g_motion_vectors_low_res; }
+bool suppress_reset() { return g_suppress_reset; }
 bool depth_inverted() { return g_depth_inverted; }
 
 void set_backend(BackendKind k) { g_backend = k; }
@@ -3261,6 +3266,11 @@ void set_depth_scale(float scale) // XeSS/DLSS 定向——depth 值域归一化
 void set_motion_vectors_jittered(bool jittered)
 {
     g_motion_vectors_jittered = jittered;
+}
+
+void set_suppress_reset(bool suppress)
+{
+    g_suppress_reset = suppress;
 }
 
 void set_motion_vectors_low_res(bool low_res)

@@ -63,6 +63,11 @@ void set_motion_vectors_jittered(bool jittered);
 // 2026-11-13：MVLowRes（"MV 是渲染分辨率的"）开关。默认 true = 历史行为。
 // 关掉它的动机与实测见 NgxParamMap.cpp 的 map_create_flags 注释。
 void set_motion_vectors_low_res(bool low_res);
+
+// 2026-11-14：NGX 后端是否抑制 Reset（默认 true）。
+// 动机见 NgxParamMap.h 的 ResetInput::suppress —— Reset 会让 Streamline 重置帧计时器，
+// 导致 DLSS-G 帧计数偏离、被判定失败并整体重建（进出 2D 界面时的卡顿）。
+void set_suppress_reset(bool suppress);
 // 输入颜色为 HDR（10-bit 线性 HDR 管线）时置 true（FSR2 需按 HDR 处理颜色/曝光）。
 void set_hdr_input(bool hdr);
 // 后端选择（SDS §3.9A.3）：Native = 改造前行为（默认，REQ-04）；Ngx = 走 D3D11 NGX 后端。
@@ -75,6 +80,7 @@ BackendKind backend();
 bool hdr_input();                 // ↔ set_hdr_input()
 bool motion_vectors_jittered();   // ↔ set_motion_vectors_jittered()
 bool motion_vectors_low_res();     // ↔ set_motion_vectors_low_res()（供 NgxBackend 读）
+bool suppress_reset();     // ↔ set_suppress_reset()
 bool depth_inverted();            // ↔ set_depth_inverted()（T-9：供 NgxBackend 读）
 // 自动曝光 + 非线性色彩空间（OptiScaler 实测 initFlags 含 AUTO_EXPOSURE|NON_LINEAR_COLORSPACE）。
 void set_auto_exposure(bool auto_exposure);

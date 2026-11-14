@@ -523,11 +523,36 @@ pub fn reshade_via_opti(selected: &[String], settings: &Settings) -> bool {
 }
 
 /// 游戏根目录是否已有 `ReShade64.dll`（OptiScaler 的 `Util::ReShadePath()` 从那里找）。
+///
+/// ★ 2026-11-14 复审修正：目录必须与 `install::prepare_opti` **同源**。
+///
+/// 原来这里直接用 `settings.game_dir`，而 `prepare_opti` 用的是
+/// `game_exe.parent()`（`install.rs` 的 `apply()` 里由 `game_exe` 推出）。
+/// 两者在「用户选到上一层目录」时**不是同一个目录** —— `gamepath::normalize`
+/// 明确允许这种选法（先看它自己、再看常见子目录、最后看直接子目录）：
+///
+///   复制到 A（真实游戏根目录）
+///   却查 B（用户选的那层）
+///   ⇒ 本函数恒 false ⇒ `reshade_via_opti` 恒 false
+///   ⇒ ReShade 同时「进了 DllList（外部注入）」而 `LoadReshade` 又是 `true`
+///   ⇒ **双重加载**，正是这套判据要避免的形态。
+///
+/// 现在统一走 `gamepath` 的解析：先 `normalize` 拿到真实游戏目录，
+/// 再退化为「在 `settings.game_dir` 下递归找 `ReShade64.dll`」——
+/// 后者覆盖 `normalize` 失败但文件确实已在的场景。
 fn reshade_dll_in_game_dir(settings: &Settings) -> bool {
     let game_dir = settings.game_dir.trim();
     if game_dir.is_empty() {
         return false;
     }
-    Path::new(game_dir).join("ReShade64.dll").is_file()
+    let picked = Path::new(game_dir);
+
+    // ① 与 prepare_opti 同源：normalize 后取真实游戏目录，再看 DLL。
+    if let Some(root) = crate::gamepath::normalize(picked) {
+        return root.join("ReShade64.dll").is_file();
+    }
+    // ② normalize 失败（用户还没选到能识别的游戏目录）：仍按原路径看一次，
+    //    避免「文件确实在用户选的目录里」却被判成没有。
+    picked.join("ReShade64.dll").is_file()
 }
 

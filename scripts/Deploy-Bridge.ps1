@@ -127,6 +127,27 @@ $configValues = [ordered]@{
     'NgxApplicationId'          = '1337'
     'NgxFeatureDirs'            = ''    # 空 = 自动探测含 nvngx_dlss.dll 的目录
     'NgxHdr'                    = '0'    # 0 = 强制 SDR（默认，NGX 收到 IsHDR 会拖影）/ auto 自动探测 / 1 强制 HDR
+    # 2026-11-14: NGX backend reset suppression. 1 = never pass NVSDK_NGX_Parameter_Reset
+    #            (default; keeps DLSS-G frame counter continuous so switching 2D UI does
+    #            not trip eDLSSGStatusFailReflexNotDetectedAtRuntime). 0 = legacy behaviour.
+    'NgxSuppressReset'          = '1'
+    # 2026-11-14: DLSS input direct-connect layer (ported from the dlss-input branch).
+    #            0 = off (default, OptiScaler proxy path, unchanged behaviour).
+    #            1 = dlss / 2 = ffx / 3 = auto. Enable only when testing the direct path.
+    'DlssInputMode'             = '0'
+    # 2026-11-15: dlss-input direct-connect layer defaults (ported from the dlss-input
+    #             branch). These three are its real-machine baselines, NOT code defaults:
+    #             JitterMode=3 (ZeroCentred) / MotionSign=1 (RequireNativeSign) /
+    #             DepthScale=32. Wrong values here produce full-screen ghosting.
+    'DlssInputMotionSign'        = '1'
+    'DlssInputJitterMode'        = '3'
+    'DlssInputDepthScale'        = '32'
+    'DlssInputJitterReduce'      = '0'
+    'DlssInputJitterSource'      = '0'
+    'DlssInputMotionFixup'       = '0'
+    'DlssInputReactiveMask'      = '0'
+    'DlssInputAlphaUpscaling'    = '0'
+    'DlssInputAllowRealNgx'      = '1'
     'NgxRenderPreset'           = '0'   # 0 = 六个 preset 参数都不设（跟随 NGX 自身规则）；5..15 可显式指定
     'NgxSetFrameTimeDelta'      = '1'
     'NgxUseReactiveMask'        = '0'

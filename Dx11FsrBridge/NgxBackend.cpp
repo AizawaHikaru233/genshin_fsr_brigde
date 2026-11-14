@@ -4116,9 +4116,15 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     // A 阶段（2026-11-10）：判定搬进纯函数（零行为变更）。
     // ★ 重构前原文：const int reset_val = (in.reset || inst.first) ? 1 : 0;
     //   现在只把"或"搬走，1/0 的整数化与变量名/类型保持原样。
+    //
+    // 2026-11-14：`suppress` 来自 `NgxSuppressReset`（默认 1）。为真时恒不 reset ——
+    // 详见 NgxParamMap.h 的 ResetInput::suppress 与 NgxParamMap.cpp 的 map_reset 注释：
+    // Reset 在 DLSS-G 在场时会让 Streamline 重置帧计时器，导致 Reflex 帧计数偏离、
+    // 帧生成被判失败并整体重建（进出 2D 界面时必现的卡顿）。
     ngx_param_map::ResetInput ri {};
     ri.frame_reset    = in.reset;
     ri.instance_first = inst.first;
+    ri.suppress       = ffx12::suppress_reset();
     const int reset_val = ngx_param_map::map_reset(ri) ? 1 : 0;
 
     // ---- ngx_in 行（§3.10.1 输入侧；info；闸门 count <= 8 || count % 1024 == 0）----

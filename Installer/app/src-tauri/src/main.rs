@@ -538,54 +538,6 @@ fn on_restore_defaults(app: &AppHandle) {
     );
 }
 
-/// 「移除自签名证书」。
-///
-/// 安装器给 `ReShade64.dll` 签名时会向 `CurrentUser\Root` 写入一个自签名证书
-/// （不签的话反作弊会拦截 OptiScaler 运行期加载它）。那是一个**用户看不见、
-/// 且不随卸载自动消失**的可信根 —— 必须给一个显式的清理入口。
-///
-/// 一并清掉早期版本用过的 `CN=crosire, O=ReShade ...`（那时冒充了 ReShade 作者身份）。
-/// 移除后 ReShade 需要重新签名才能被 OptiScaler 加载；界面给一句说明即可，
-/// 不自动重签（用户可能就是想彻底断掉这条信任）。
-fn on_remove_cert(app: &AppHandle) {
-    match fetch::remove_signing_cert() {
-        Ok(0) => {
-            log::write("[reshade] 移除证书：未找到本项目写入的证书");
-            send(
-                app,
-                json!({
-                    "type": "certRemoved",
-                    "ok": true,
-                    "removed": 0,
-                    "message": "未找到本项目写入的自签名证书（可能已经移除过）",
-                }),
-            );
-        }
-        Ok(n) => {
-            log::write(&format!("[reshade] 移除证书：共移除 {n} 个"));
-            send(
-                app,
-                json!({
-                    "type": "certRemoved",
-                    "ok": true,
-                    "removed": n,
-                    "message": format!(
-                        "已移除 {n} 个自签名证书。下次安装时会重新签一次；\
-                         在此之前 ReShade 需要外部注入才能工作。"
-                    ),
-                }),
-            );
-        }
-        Err(err) => {
-            log::write(&format!("[reshade] 移除证书失败: {err}"));
-            send(
-                app,
-                json!({ "type": "certRemoved", "ok": false, "removed": 0, "message": err }),
-            );
-        }
-    }
-}
-
 fn on_install(app: &AppHandle, msg: &Value) {
     let st = app.state::<AppState>();
     if st.busy.swap(true, Ordering::SeqCst) {
@@ -944,6 +896,34 @@ fn on_frame_gen(app: &AppHandle, msg: &Value) {
     // 非 "off" 一律当 "on"（兼容老界面缓存 / 手改消息，且偏保守：开比关更容易被发现）。
     let value = msg["value"].as_str().unwrap_or("off");
     let on = !value.eq_ignore_ascii_case("off");
+
+    // ★ busy 守卫必须放在**任何写操作之前**。
+    //
+    // 原实现把守卫放在 `framegen::write` 与 `ensure_streamline` 之后，结果是：
+    // 「另一个安装正在进行」时点开关 ⇒ `OptiScaler.ini` 已经改成 `FGOutput=DLSSG`、
+    // 已经 spawn 了一个后台 Streamline 下载，然后才被守卫挡下并 return
+    // ⇒ 留下的正是本 PR 花力气修的那种「开关拨了但配置与注入链不符」的形态。
+    //
+    // 现在先占位：抢不到就直接返回，一个字节都不写。
+    let st = app.state::<AppState>();
+    if st.busy.swap(true, Ordering::SeqCst) {
+        log::write("[install] 帧生成切换跳过：另一个安装正在进行");
+        send(
+            app,
+            json!({ "type": "error", "message": "另一个安装正在进行，请稍后再切换帧生成" }),
+        );
+        post_state(app);
+        return;
+    }
+    // 从这里到函数末尾，任何 return 都必须先释放 busy —— 用一个小 guard 保证。
+    struct BusyGuard<'a>(&'a AppState);
+    impl Drop for BusyGuard<'_> {
+        fn drop(&mut self) {
+            self.0.busy.store(false, Ordering::SeqCst);
+        }
+    }
+    let _busy = BusyGuard(&st);
+
     let s = snapshot(app);
     let state = match framegen::write(&s, on) {
         Ok(state) => state,
@@ -971,23 +951,9 @@ fn on_frame_gen(app: &AppHandle, msg: &Value) {
     let game_dir = PathBuf::from(&s.game_dir);
     if !game_dir.as_os_str().is_empty() {
         if let Some(game_exe) = gamepath::find_game_exe(&game_dir) {
-            let st = app.state::<AppState>();
             st.cancel.store(false, Ordering::SeqCst);
-            // busy 守卫：与进行中的安装互斥（`on_install` / `on_switch_version` 用同一
-            // 模式）。这个 handler 在 UI 线程同步跑 apply，不置位就可能与后台的安装线程
-            // 同时写同一批 ini / fps_config.json。
-            if st.busy.swap(true, Ordering::SeqCst) {
-                log::write("[install] 帧生成切换跳过：另一个安装正在进行");
-                send(
-                    app,
-                    json!({ "type": "error", "message": "另一个安装正在进行，请稍后再切换帧生成" }),
-                );
-                post_state(app);
-                return;
-            }
             let outcome =
                 install::apply(&game_exe, s.fps, &s.selected, &s, &st.cancel, |_| {});
-            st.busy.store(false, Ordering::SeqCst);
             if !outcome.ok {
                 log::write(&format!(
                     "[install] 帧生成切换后重应用失败: {}",
@@ -1466,7 +1432,6 @@ fn bridge(window: WebviewWindow, app: AppHandle, msg: Value) {
         },
         "removeCustomDll" => on_remove_custom_dll(&app, &msg),
         "restoreDefaults" => on_restore_defaults(&app),
-        "removeCert" => on_remove_cert(&app),
         "openLog" => on_open_log(&app, msg["id"].as_str().unwrap_or_default()),
         "bundleLogs" => on_bundle_logs(&app, &msg),
         "fetchComponent" => on_fetch_component(&app, &msg),

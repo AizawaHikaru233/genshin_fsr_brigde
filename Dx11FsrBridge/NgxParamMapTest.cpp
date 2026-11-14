@@ -242,13 +242,10 @@ void test_create_flags()
         CHECK(map_create_flags(off).flags == 0x0u);
     }
 
-    // 历史默认值回归：mv_low_res=true 且其余全关时，结果与 2026-11-13 之前完全相同
-    // （那时 MVLowRes 恒设）。这条钉住"默认行为没变"。
-    {
-        CreateFlagsInput legacy {};
-        legacy.mv_low_res = true;
-        CHECK(map_create_flags(legacy).flags == 0x2u);        // 只剩 MVLowRes
-    }
+    // 2026-11-15：删掉了原来的「mv_low_res=true 其余全关 ⇒ 0x2」回归块。
+    // 它与上面循环里 mask=8 那一组**完全等价**（mask=8 即 mv_low_res 独占），
+    // 删掉后测试仍全绿 —— 说明它没有额外钉住任何东西。真正的保护来自循环里的
+    // 逐位断言：每种组合都核对了 MVLowRes 位与输入一致。
 }
 
 // ===========================================================================

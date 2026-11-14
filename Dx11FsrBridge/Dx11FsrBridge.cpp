@@ -3951,13 +3951,6 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2Mode2OnDemandState", 1, config_path.c_str()) != 0;
     g_config.fsr2_motion_vectors_jittered =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2MotionVectorsJittered", 0, config_path.c_str()) != 0;
-        // 2026-11-13：MVLowRes（"MV 是渲染分辨率的"）开关，默认 1 = 历史行为。
-        // 设为 0 时不再向 NGX 传 MVLowRes 位。动机：本键设 0 后实机拖影明显减轻
-        // （未根除 —— 剩余部分与 NgxHdr、OptiScaler 侧 InitFlags.HDR 有关，不属本仓库）。
-        // 详见 NgxParamMap.cpp。
-        const bool mv_low_res =
-            GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2MotionVectorsLowRes", 1, config_path.c_str()) != 0;
-        ffx12::set_motion_vectors_low_res(mv_low_res);
     g_config.fsr2_positive_motion_vector_scale =
         // 2026-08-25（AA 修复，依据游戏 accumulate 反汇编）：游戏原生重投影 = UV − mv_g
         // （mv_g=+sign·4d² 正向、UV 空间）；FSR2 期望 historyUV = UV + scale·mv_sample。
@@ -4006,6 +3999,27 @@ void load_config()
     g_config.ffx12_projection_hook =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ProjectionHook", 0, config_path.c_str()) != 0;
 #endif
+
+    // ★ 2026-11-15（复审修正）：以下两键**移出** EXPERIMENTAL 宏块。
+    // 原位置在 `DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL` 之内 ——
+    // 那是「FSR2 转译导出」的编译开关，与 NGX 的 MVLowRes / Reset 语义无关；
+    // 关掉该选项时这两个功能键会**静默失效**，属错位。
+    // 它们是**功能键**（消费者会改变行为），发布构建必须无条件读取。
+    //
+    // MVLowRes（"MV 是渲染分辨率的"），默认 1 = 历史行为。设 0 时不再向 NGX
+    // 传该位。动机：本键设 0 后实机拖影明显减轻（未根除 —— 剩余部分与 NgxHdr、
+    // OptiScaler 侧 InitFlags.HDR 有关，不属本仓库）。详见 NgxParamMap.cpp。
+    const bool mv_low_res =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2MotionVectorsLowRes", 1, config_path.c_str()) != 0;
+    ffx12::set_motion_vectors_low_res(mv_low_res);
+    // NGX 后端是否抑制 Reset，默认 1 = 抑制。
+    // Reset 经 NVSDK_NGX_Parameter_Reset 传到 NGX；DLSS-G 在场时 Streamline 会
+    // 把它当"帧计时器重置"，Reflex 与 DLSS-G 帧计数偏离后帧生成被判失败
+    // （eDLSSGStatusFailReflexNotDetectedAtRuntime）并整体重建 ⇒ 2D 界面切换卡顿。
+    // 设 0 恢复旧行为（交棒/空窗超时时真的 reset，清历史但会打断帧生成）。
+    const bool suppress_reset =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxSuppressReset", 1, config_path.c_str()) != 0;
+    ffx12::set_suppress_reset(suppress_reset);
     // 【正式功能】透明队列抖动修复（TransparentJitter，默认 **1 = 修复生效**）。
     // ⚠️ 键名/段位必须与发布 ini 一致：段必须是 `[Dx11FsrBridge]`（放错段读不到，
     // 本项目踩过），且必须在**生产分支**读取（load_config 无条件执行，不受

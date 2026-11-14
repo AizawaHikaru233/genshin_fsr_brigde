@@ -74,9 +74,10 @@ struct CreateFlagsInput
     // 2026-11-13：MVLowRes 由"恒设"改为可配置（见 .cpp 的 map_create_flags 注释）。
     // 由调用方按 Fsr2MotionVectorsLowRes 配置传入；默认 true 保持历史行为。
     //
-    // 注意：本字段是**常量输入**（load_config 一次性读入、进程内不变），
-    // 不是逐帧可变量 —— 因此不需要像 is_hdr / depth_inverted / mv_jittered 那样
-    // 进 NgxBackend 的 flags_input_bits 位图（那张图是给逐帧日志用的）。
+    // 为什么不进 NgxBackend 的 `flags_input_bits` 位图：那张位图是**逐帧可变输入**
+    // 的位集合（`NgxBackend.cpp` 的原话：「新增一个**可变输入**只需占用一个 bit」）。
+    // 本字段是 `load_config` 一次性读入、进程内不变的**常量输入**，不在那张位图的
+    // 语义范围内。若将来改成可逐帧切换，必须同步给位图加一位。
     bool mv_low_res;
 };
 
@@ -163,6 +164,20 @@ struct ResetInput
 {
     bool frame_reset;      // ↔ in.reset
     bool instance_first;   // ↔ inst.first
+    // 2026-11-14：抑制位，由 `NgxSuppressReset`（默认 **1**）驱动。
+    //
+    // 为什么需要：`NVSDK_NGX_Parameter_Reset` 不只「清超分历史」——在 DLSS-G 参与时
+    // 它同时让 Streamline 重置帧计时器 ⇒ Reflex 与 DLSS-G 帧计数偏离 ⇒
+    // `eDLSSGStatusFailReflexNotDetectedAtRuntime` ⇒ OptiScaler 的
+    // `PauseAfterError() -> Deactivate()` 把帧生成整体关掉再重建 ⇒ 可见卡顿。
+    //
+    // 触发场景（实机 2026-11-14）：进/出 2D 界面时 P1 交棒把 `reset_next` 置 1，
+    // 或接管空窗 > 500ms 强制 reset。两者对 FFX 后端都是「清历史」的必需动作，
+    // 对 NGX 却会打断帧生成 —— 这正是「FFX 输入下开不了帧生成、所以从不卡」的由来。
+    //
+    // 默认抑制：NGX 后端不传 Reset。代价是交棒后可能有一两帧历史残留（轻微重影），
+    // 换来帧生成连续、界面切换不卡。需要旧行为时设 `NgxSuppressReset=0`。
+    bool suppress;         // true ⇒ 忽略上面两个输入，恒不 reset
 };
 
 bool map_reset(const ResetInput &in);

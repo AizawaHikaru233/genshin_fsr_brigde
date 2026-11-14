@@ -138,8 +138,24 @@ MvScaleOutput map_mv_scale(const MvScaleInput &in)
 // 重构前（NgxBackend.cpp 的 ngx::dispatch() 第 10 步）：
 //     const int reset_val = (in.reset || inst.first) ? 1 : 0;
 // ★ 逻辑或，**短路语义保留**（两个 bool 无副作用，短路与否结果相同；照抄即可）。
+//
+// 2026-11-14：新增 `in.suppress`（`NgxSuppressReset`，默认 1）。为真时**恒不 reset**。
+//
+// 为什么不 suppress 就不能开帧生成：Reset 经 `NVSDK_NGX_Parameter_Reset` 传到 NGX，
+// 而 DLSS-G 在场时 Streamline 会把它当成「帧计时器重置」⇒ Reflex 与 DLSS-G 帧计数
+// 偏离（实测 `9985 != 10660`）⇒ `eDLSSGStatusFailReflexNotDetectedAtRuntime` ⇒
+// OptiScaler `PauseAfterError() -> Deactivate()` 关闭帧生成并销毁全部 DLSS-G 资源 ⇒
+// 下一帧重建 ⇒ 界面切换时可见卡顿。
+//
+// 交棒瞬间 `reset_next=1`、接管空窗 > 500ms 强制 reset，这两条在进出 2D 界面时
+// 必然命中，所以症状才那么稳定复现。
+//
+// 代价：不 reset 时交棒后可能残留一两帧旧历史（轻微重影）。实测取舍见
+// `docs/OPEN-ISSUES.md` 对应条目。
 bool map_reset(const ResetInput &in)
 {
+    if (in.suppress)
+        return false;
     return in.frame_reset || in.instance_first;
 }
 
