@@ -374,8 +374,9 @@ create_feature ok=1 preset=0 rc=0x1
 **现状**
 
 - `Dx11FsrBridge/Dx11FsrBridge.cpp:3397-3411` 的 `log_focus_block()` 固定输出三行
-  `GPU :` / `SDK :` / `FSR : FSRx.y.z [OK|FAILED]`，取 `g_route_*`（`:594-596`，由
-  `record_adapter_info()` `:15379-15396` 写入）与 `ffx12::matched_version_name()`。
+  `GPU :` / `SDK :` / `FSR : FSRx.y.z [OK|FAILED]`，取路由摘要（`:594-596`，由
+  `record_adapter_info()` 写入）与 `ffx12::matched_version_name()`。
+  （注：本节所引行号是写下时的口径，代码演进后会漂移；需要精确位置时以 `git grep` 为准。）
 - 只有两个调用点，都在 FFX 直连派发上：`:13028`（首次 dispatch 成功）与 `:13305`
   （首次失败，`sdk234_fail_count==1`）。`Ffx12Backend=ngx` 时不走该路径 ⇒ **整块不出现**，
   只有 `ngx_core …` 的零散行（provider / featuredirs / init / create_feature）。
@@ -396,8 +397,8 @@ create_feature ok=1 preset=0 rc=0x1
 
 P1（只报事实，可独立验收）
 
-- 焦点块加 `BACKEND :` 行（`native` / `ngx`；`Ffx12Backend=auto` 时带 `g_backend_auto_note`
-  `:15416` 的 `auto=… vendor=…`），现有 `SDK :` 行改名为 `FFX SDK :` 以区分后端。
+- 焦点块加 `BACKEND :` 行（`native` / `ngx`；`Ffx12Backend=auto` 时带落位摘要
+  落位摘要 `auto=… vendor=…`），现有 `SDK :` 行改名为 `FFX SDK :` 以区分后端。
 - NGX 侧新增焦点块，触发点必须用**一次性闸门**（`create_feature` 每次 key 变化都会重跑，
   `:1884` 不能直接当触发点）：块内 `BACKEND : ngx` + `UPSCALER : NVIDIA DLSS <FileVersion> [OK]`。
 - `ngx::` 增加两个只读 getter：provider kind/path（把 `:1471` 的 `hit.*` 存全局，与现有
@@ -439,7 +440,7 @@ P3（可选）
 **相关代码**
 
 - `Dx11FsrBridge/Dx11FsrBridge.cpp:594-596`、`:3397-3411`、`:9318-9357`、`:13028`、`:13305`、
-  `:15379-15396`、`:15407-15432`
+  `record_adapter_info`、`resolve_backend_auto`（按函数名定位）
 - `Dx11FsrBridge/NgxBackend.cpp:947-976`、`:1104-1106`、`:1422-1472`、`:1884`；`Dx11FsrBridge/NgxBackend.h`
 - `Dx11FsrBridge/Ffx12Backend.cpp:2633-2721`、`:3164`、`:3169-3172`
 
@@ -471,7 +472,7 @@ P3（可选）
 **属实的断言（已核验）**
 
 - `log_focus_block` 的位置与三行内容（`Dx11FsrBridge.cpp:3397-3411`）、两个调用点（`:13028`、`:13305`）、
-  `g_route_*`（`:596` 起）、`record_adapter_info`（`:15379-15396`）。
+  路由摘要（`RouteSnapshot` 快照）、`record_adapter_info`。
 - `unsafe_dx11_on12_backend_selected()`（`:9318-9357`）读的 ini 键 `[Upscalers] Dx11Upscaler`
   与 250 ms 限流缓存。
 - `log_focus_line`（恒 `core` INFO）与 `log_ngx_error`（恒 Error、无计数闸门）的等级差异。
@@ -493,7 +494,7 @@ P3（可选）
 DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此认定「这局在跑 FSR」，方向正好相反。
 
 原因：`ffx12::dispatch()` 在 ngx 模式下同样返回 true（`Ffx12Backend.cpp:2934-2956` 分流后走
-`ngx::dispatch`），所以焦点块的触发条件成立；而块里取的 `g_route_sdk_path`（由
+`ngx::dispatch`），所以焦点块的触发条件成立；而块里取的 SDK 路径（由
 `record_adapter_info` 从 `g_config.ffx12_dll_path` 抄来）与 `matched_version_name()` 在 ngx 下
 从未被赋值 ⇒ 两行都是「默认值」而非「事实」。
 
@@ -501,7 +502,7 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 
 四处改动均已落到工作区，构建与单测通过（证据见节末）：
 
-- 焦点块加 `BACKEND :` 行（`native` / `ngx`；`Ffx12Backend=auto` 时带 `g_backend_auto_note`
+- 焦点块加 `BACKEND :` 行（`native` / `ngx`；`Ffx12Backend=auto` 时带落位摘要
   的 `auto=… vendor=…`），排在 `GPU :` 之后。后端取 `ffx12::backend()` 的真值而非 ini 字面量
   ——`Ffx12Backend=auto` 时 ini 里写的是 `auto`，实际落位由型号决定。
 - `SDK :` → `FFX SDK :`、`FSR :` → `FFX :`；ngx 模式下这两行明确标注 `(unused, backend=ngx)`，
