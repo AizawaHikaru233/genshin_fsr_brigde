@@ -2500,6 +2500,12 @@ static int resolve_create_quality(std::uint32_t render_w, std::uint32_t render_h
 
 // 3.8.3：v1 六档全设同一值（等价于 OptiScaler 的 RenderPresetForAll）。
 // v <= 0 直接 return，六个键一个都不设 —— 语义是「交给 NGX」，不是「默认预设」。
+// ⚠️ 2026-11-14（专项审查：早退是否该跳过副作用）：这里**不需要**像
+//   resolve_backend_auto 那样加 resolved 出参。理由：
+//   · g_params 是进程级单例且从不 Reset()（§3.9.5），所以从 v=12 改成 v=0 时旧键值会残留；
+//   · 但 g_render_preset 只在 load_config 读一次、进程内不变 ⇒ 「运行期改值」不可达；
+//   · 若将来支持热重载，必须改成「v<=0 时显式 Set 回 0」而不是 return，否则会残留。
+//   这里只留说明，不改代码（§一.3：不混入无关改动）。
 static void apply_render_preset(int v)
 {
     if (v <= 0) return;

@@ -53,6 +53,7 @@
 #include <fstream>
 #include <iomanip>
 #include <mutex>
+#include <new> // std::nothrow（RouteSnapshot 发布用：分配失败不能抛异常穿出设备创建 hook）
 #include <optional>
 #include <sstream>
 #include <string>
@@ -597,19 +598,57 @@ std::atomic_bool g_logging_enabled = false;
 // Ffx12Backend 等跨模块引用（timing 独立落盘门控）。
 int g_bridge_log_level = 1;
 // 显卡路由摘要（initialize 早期产生、被 reset_log 清空）——存全局，active 后补打保证可见
-static bool g_route_applied = false; // 路由已应用（防止设备补检重复应用）
-// 路由信息（apply 时保存，焦点框首次成功/失败时输出，保证三行相邻）
-static std::string g_route_gpu_name;
-static std::string g_route_vendor_label;
-static std::string g_route_sdk_path;
+//
+// 2026-11-14（路由摘要跨线程裸读写，可致 use-after-free）：本块原先是 4 个裸
+//   std::string（型号 / vendor 标签 / SDK 路径 / auto 落位摘要）配 2 个裸 bool：
+//   由**设备创建 hook**（record_adapter_info ->
+//   resolve_backend_auto）写入，由 **draw 派发路径**（log_focus_block，两个调用点都在
+//   try_fsr2_translation_draw 内）读取，而两者是否同线程**没有任何代码保证**。
+//   std::string 的读-写竞争不只是"读到旧值"：写入方重新分配缓冲后，读者可能拿到
+//   已释放的旧指针。逐字段加锁也不够 —— 焦点块要把型号与 vendor 打在同一行，
+//   跨字段混合值同样是错的。
+//   ⇒ 改为**不可变快照 + 原子发布**（AGENTS.md §二.4：跨线程共享必须用 std::atomic）：
+//      · 写者一次性构造完整 RouteSnapshot（4 个字段同批可见），再原子发布指针；
+//      · 读者 acquire 一次即拿到整份快照 ⇒ 同一行里的字段必然同源，且不需要任何锁
+//        （§二.5 热路径红线：draw 路径不新增锁 / I/O / 字符串拼接）。
+struct RouteSnapshot
+{
+    std::string gpu_name;
+    std::string vendor_label;
+    std::string sdk_path;
+    std::string backend_auto_note;
+};
+
+// ⚠️ 生命周期：本快照**只发布一次**（进程内），旧快照**不释放**，生命周期等于进程
+//   —— 这样读者拿到指针后物理上不可能遇到 use-after-free，读取处也就不需要回收协议。
+//   若将来**需要重发布**（例如适配器信息要在运行期更新），**必须先改成带回收的方案**
+//   （引用计数 / hazard pointer / RCU 之类）再动手；否则每重发布一次就泄漏一份快照。
+static std::atomic<const RouteSnapshot *> g_route_snapshot { nullptr };
+// 只保护「判重 + 构造 + 发布」这一段。日志与 ffx12::set_backend() 一律放锁外
+// （§二.4：不在持锁期间做 I/O）。
+static std::mutex g_route_publish_mutex;
+// 为什么这两个标志仍是独立原子、而不是塞进快照：
+//   · g_route_applied 必须在**发布之前**就被写入 —— 否则两个线程会各自判重失败、
+//     各发布一份（后发布的覆盖先发布的，先发布的泄漏，焦点框还会抖动）；
+//   · g_backend_auto_resolved 同理：resolve_backend_auto 要在**构造快照之前**落位后端。
+//   两者都只做一次 false->true 翻转，用 exchange/store 让"谁抢到发布权"成为单点事实。
+static std::atomic_bool g_route_applied { false }; // 路由已应用（防止设备补检重复应用）
 // Ffx12Backend=auto（按显卡型号自动落位后端）：
 //   requested —— ini 里写了 auto，等首个非零 vendor 的适配器信息才判；
 //   resolved  —— 已落位。后端是进程级单值，只判一次：后续再看到别的适配器不改后端
 //                （多适配器机器上设备可能不止一个）。
-//   note      —— 落位摘要（"auto=ngx vendor=0x10DE gpu=\"...\""），供状态行追加。
+//   note      —— 落位摘要（"auto=ngx vendor=0x10DE"），**存在 RouteSnapshot 里**
+//                （g_route_snapshot->backend_auto_note），不再有独立全局 —— 它要和
+//                型号/vendor 在同一份快照里发布，否则焦点块可能读到"新 note + 旧型号"。
+// requested 保持裸 bool：写入在 load_config，读取在设备创建 hook。
+// ⚠️ 2026-11-14（审查：注释不实）：原先这里写「此后只读，不存在竞争」，但写点与读点
+//   是否同线程**没有代码保证** —— 那正是本次重构要解决的问题。故这是**形式上的数据竞争**，
+//   与旧代码同形、非本次引入。未改成原子：本值只判一次且写点早于 hook 安装，实测未观察到
+//   问题；但按 §二.4 严格说它不合规，留给后续独立改动（§一.3：不混进本次）。
 static bool g_backend_auto_requested = false;
-static bool g_backend_auto_resolved = false;
-static std::string g_backend_auto_note;
+// 2026-11-14（见上方 RouteSnapshot 注释）：resolved 必须在发布快照**之前**落位，
+// 故不能塞进快照；用原子 + exchange 保证"落位"这件事在并发下只发生一次。
+static std::atomic_bool g_backend_auto_resolved { false };
 
 // OptiScaler 输出定向修复——XeSS/DLSS 的 jitter 需 ≤±0.5（像素/归一化），
 // FSR 输出保持原样（互不干扰）。运行时按 OptiScaler.ini 的 Dx11Upscaler/Dx12Upscaler 判定
@@ -663,7 +702,18 @@ static OptiOutput opti_output_current()
 }
 // 显卡信息记录（**已不做路由**；定义于 initialize 之前，设备创建 hook 先于定义处使用）
 static void record_adapter_info(std::uint32_t vendor, std::uint32_t device_id, const std::wstring &desc);
-static void resolve_backend_auto(std::uint32_t vendor, std::uint32_t device_id, const std::wstring &desc);
+// 2026-11-14（路由摘要改快照发布）：本函数原先把 note 直接写一个裸全局字符串，
+// 而 note 必须与型号/vendor 在同一份 RouteSnapshot 里发布 ⇒ 改成**返回** note，
+// 由调用方（record_adapter_info）一次性构造完整快照。vendor_label 由参数传入：
+// 函数内部不再读任何路由全局，读点只剩"发布"那一处。
+// want_ngx_out：本函数只做**纯计算**，不落位后端、不打日志 —— 那两个副作用由
+// apply_backend_auto_result 在快照**发布之后**执行（理由见该函数的注释）。
+// resolved_out：本次调用**是否真的落位了后端**。调用方必须据此决定要不要执行副作用 ——
+//   本函数有提前返回路径（未写 auto / vendor==0 / 别人先落位），那几种情况下 want_ngx 无意义。
+static std::string resolve_backend_auto(std::uint32_t vendor, std::uint32_t device_id,
+                                        const std::wstring &desc, const std::string &vendor_label,
+                                        bool &want_ngx_out, bool &resolved_out);
+static void apply_backend_auto_result(bool want_ngx, const std::string &note);
 static void route_from_d3d11_device(ID3D11Device *d3d11_device);
 // P1 单实例接管的**生效值**：ini 取值，或后端强制。
 // 为什么 NGX 必须强制（2026-11-13 代码审计）：NGX 的 feature 与资源池是**全局唯一实例**
@@ -3420,21 +3470,28 @@ void log_focus_line(const std::string &line)
 //   原提交信息与文档曾写"native 输出不变"，那是错的。
 static void log_focus_block(const char *state)
 {
+    // 2026-11-14（跨线程读路由摘要）：快照指针 acquire 一次，四个字段都从这一份快照取 ——
+    //   ① 同一行里的"型号 + vendor"必然同源，不会出现跨字段混合值（旧写法逐字段读裸全局）；
+    //   ② 快照不可变且不释放，故读到的指针在整个块内有效，不需要锁、不需要回收协议；
+    //   ③ 这是 draw 路径：只有一次原子读，没有新增 I/O / 拼接 / 计时探针（§二.5）。
+    //   快照未发布（nullptr）时保持原行为：型号与 SDK 打 unknown、note 为空。
+    const RouteSnapshot *const route = g_route_snapshot.load(std::memory_order_acquire);
     const std::string gpu =
-        g_route_gpu_name.empty() ? std::string("unknown") : g_route_gpu_name;
+        (route == nullptr || route->gpu_name.empty()) ? std::string("unknown") : route->gpu_name;
     const std::string sdk =
-        g_route_sdk_path.empty() ? std::string("unknown") : g_route_sdk_path;
+        (route == nullptr || route->sdk_path.empty()) ? std::string("unknown") : route->sdk_path;
+    const std::string vendor_label = route != nullptr ? route->vendor_label : std::string();
     // 后端取 ffx12::backend() 的真值（实现在 Ffx12Backend.cpp 的 set_backend/backend 一对），
     // 不按 ini 字面量判 —— Ffx12Backend=auto 时 ini 里写的是 auto，实际落位由型号决定。
-    // g_backend_auto_note 只在"写了 auto 且已落位"时非空（由 resolve_backend_auto 写入），
+    // backend_auto_note 只在"写了 auto 且已落位"时非空（由 record_adapter_info 随快照发布），
     // 直接附上即为 auto 的决策依据，不再造第二套摘要口径。
     const bool ngx_backend = ffx12::backend() == ffx12::BackendKind::Ngx;
     std::string backend_text = ngx_backend ? "ngx" : "native";
-    if (!g_backend_auto_note.empty())
-        backend_text += "  (" + g_backend_auto_note + ")";
+    if (route != nullptr && !route->backend_auto_note.empty())
+        backend_text += "  (" + route->backend_auto_note + ")";
     log_focus_line("");
     log_focus_line("====================================================");
-    log_focus_line("  GPU : " + gpu + " (vendor=" + g_route_vendor_label + ")");
+    log_focus_line("  GPU : " + gpu + " (vendor=" + vendor_label + ")");
     log_focus_line("  BACKEND : " + backend_text);
     // native：FFX 路径就是当前实现，保持原有三行语义不变。
     // ngx：SDK 路径与 FSR 版本与实际上屏实现无关，必须写 unused —— 保留原值等于继续误导。
@@ -13865,6 +13922,10 @@ bool fsr2_family_skip_gate(ID3D11DeviceContext *context, UINT count, bool indexe
 
 // 把"本帧翻译层是否处理了该 draw"回报给合成族状态机，并输出前若干次诊断。
 // 注：原先只有 draw_indexed 路径写这条日志，draw 路径漏了 → 已统一。
+// ⚠️ 2026-11-14（专项审查：早退是否该跳过记账）：target_draw_info == nullptr 时直接
+//   return、不做 notify_accumulate_result。这是**漏做而非多做**：后果是 skip 许可不武装，
+//   少一次优化机会，不产生错误输出；且 nullptr 本身说明这一帧没有可用的 draw 信息，
+//   此时记账也无从记起。故保持现状，不改代码。
 void note_family_notify(bool handled, const TargetUpscalerDrawInfo *target_draw_info)
 {
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
@@ -15421,21 +15482,78 @@ static bool contains_ci(const std::wstring &hay, const wchar_t *needle)
 // 旧签名还带 device/source 两个参数，函数体里直接 (void) 丢弃——调用方以为在传路由依据。
 static void record_adapter_info(std::uint32_t vendor, std::uint32_t device_id, const std::wstring &desc)
 {
-    if (g_route_applied)
+    if (g_route_applied.load(std::memory_order_acquire))
         return;
     if (vendor == 0)
         return; // 检测失败：留给后续补检（设备创建后）
     char vendor_hex[16] {};
     std::snprintf(vendor_hex, sizeof(vendor_hex), "0x%04X", vendor);
-    g_route_vendor_label = vendor_hex;
-    g_route_gpu_name = narrow(desc.c_str());
-    g_route_sdk_path = narrow(g_config.ffx12_dll_path.c_str());
-    g_route_applied = true;
+    const std::string vendor_label = vendor_hex;
+    const std::string gpu_name = narrow(desc.c_str());
+    const std::string sdk_path = narrow(g_config.ffx12_dll_path.c_str());
     // Ffx12Backend=auto 的落位点：这里刚拿到 vendor / device id / 描述，且本函数由
     // route_from_d3d11_device 在**设备创建 hook 内**调用，早于同一 hook 里
     // swapchain_hook_needed() 的求值（Dx11FsrBridge.cpp:14931 早于 :14937）——
     // 因此落位结果能被交换链钩子的谓词立刻看到。
-    resolve_backend_auto(vendor, device_id, desc);
+    //
+    // 2026-11-14（快照发布顺序）：先落位后端拿到 note，**再**一次性构造完整快照。
+    //   旧顺序是"先写 g_route_* 再让 resolve_backend_auto 补写 note"，那样 note 永远
+    //   赶不上快照发布（发布时 note 还没算出来）。故本函数现在的顺序是：
+    //     ① 抢发布权（g_route_applied 的 exchange **返回 false** 者才继续；返回 true 说明别人先到）
+    //     ② 锁外做全部重活：narrow / snprintf / resolve_backend_auto（内含
+    //        ffx12::set_backend() 与日志）—— 都不持锁
+    //     ③ 锁内只做「判重 + 构造 + 发布」三件事
+    //   g_route_applied 必须先于发布置位：否则两个线程会各自判重失败、各发布一份。
+    //   抢输的线程直接返回（旧行为：第二个适配器不改后端、不覆盖摘要）。
+    if (g_route_applied.exchange(true, std::memory_order_acq_rel))
+        return;
+    bool auto_want_ngx = false;
+    bool auto_resolved = false;
+    const std::string backend_auto_note =
+        resolve_backend_auto(vendor, device_id, desc, vendor_label, auto_want_ngx, auto_resolved);
+    bool published = false;
+    {
+        // 锁内只做「判重 + 构造 + 发布」三件事：不含日志、不含 ffx12::set_backend()
+        // （§二.4：不在持锁期间做 I/O）。
+        // ⚠️ 2026-11-14（专项审查：早退绕过副作用）：**本块内不得 return**。
+        //   原实现在判重命中与分配失败两处直接 return，而副作用（set_backend + 日志）在锁外
+        //   之后才执行 ⇒ 这两条路径会跳过副作用。而 resolve_backend_auto 已经把
+        //   g_backend_auto_resolved 永久置 true 并算出了 want_ngx ⇒ 落位动作再也补不回来，
+        //   后果与刚修的那次回归同型（auto 配置下后端停在 native、DLSS 全程不启用）。
+        //   ⇒ 一律用 published 标志代替 return，把控制流交回给下方统一的副作用出口。
+        std::lock_guard<std::mutex> guard(g_route_publish_mutex);
+        // 判重留在锁内，让"只发布一次"由结构保证：即便将来有人在 g_route_applied 之外
+        // 再开一条发布路径，这里也不会覆盖已发布的快照（覆盖即泄漏，见 RouteSnapshot 注释）。
+        if (g_route_snapshot.load(std::memory_order_relaxed) == nullptr)
+        {
+            RouteSnapshot *const snapshot =
+                new (std::nothrow) RouteSnapshot {gpu_name, vendor_label, sdk_path, backend_auto_note};
+            if (snapshot != nullptr)
+            {
+                g_route_snapshot.store(snapshot, std::memory_order_release);
+                published = true;
+            }
+        }
+        // 分配失败 / 判重命中的降级说明（两条路径的后果都是「摘要缺失」，但**不影响落位**）：
+        //   ① nothrow 分配失败 ⇒ 摘要保持未发布（焦点块打 unknown），超分主链不受影响；
+        //   ② 结构体内 4 个 std::string 的**拷贝构造**仍可能抛 bad_alloc（nothrow 只管分配，
+        //      不管构造）⇒ 异常穿出本函数。分配块本身由运行时代码释放，**不泄漏**，
+        //      但 g_route_applied / g_backend_auto_resolved 已置位 ⇒ 快照永远补不回来。
+        //   两者的暴露面与重构前「给全局 std::string 赋值」完全相同（未加重、也未消除）。
+        //   此处不额外加 try/catch：那属独立健壮性改动，混进本次会让失败无法归因（§一.3）。
+    }
+    // ★ 2026-11-14（审查：发布窗口）：副作用放在**发布之后**且**锁外**。
+    //   顺序不可颠倒：先发布 ⇒ 读者要么看到完整的旧快照、要么看到完整的新快照，
+    //   不会出现「后端已换但摘要还是 nullptr」。锁外 ⇒ 不在持锁期间做 I/O（§二.4）。
+    (void)published;
+    // ★ 2026-11-14（回归修复）：**只有真的落位了才执行副作用**。
+    //   resolve_backend_auto 在「未写 auto」「vendor==0」「别人已落位」三种情况下直接返回，
+    //   此时 auto_want_ngx 是初始的 false —— 无条件 set_backend(false) 会把 ini 里显式写的
+    //   Ffx12Backend=ngx 覆盖成 native（实测：日志里 2 秒内 ngx → native，DLSS 全程未启用）。
+    //   注意：只要 auto_resolved 为真就必须执行，**与 published 无关** —— 落位与摘要发布是
+    //   两件事，摘要缺失（分配失败）不该连带丢掉落位。
+    if (auto_resolved)
+        apply_backend_auto_result(auto_want_ngx, backend_auto_note);
 }
 
 // Ffx12Backend=auto：按显卡型号落位后端（用户口径：RTX -> ngx，非 RTX -> native）。
@@ -15447,37 +15565,73 @@ static void record_adapter_info(std::uint32_t vendor, std::uint32_t device_id, c
 //   · 反过来（预判 native 但机器其实能跑 NGX）只会少一条画质更好的路径，也一样安全。
 //   ⇒ 判错的两个方向都可恢复，故不在配置期引入"探测 NGX 运行时"的重复逻辑
 //     （那会与 ngx::ensure_init 形成两套口径，见 AGENTS.md §五.1 判据单一来源）。
-static void resolve_backend_auto(std::uint32_t vendor, std::uint32_t device_id, const std::wstring &desc)
+// 返回 note（空串 = 本次未落位，或没写 auto）。**不写任何全局**：note 由调用方放进
+// RouteSnapshot 一起发布；vendor_label 由参数传入，本函数内部不读路由全局。
+static std::string resolve_backend_auto(std::uint32_t vendor, std::uint32_t device_id,
+                                        const std::wstring &desc, const std::string &vendor_label,
+                                        bool &want_ngx_out, bool &resolved_out)
 {
-    if (!g_backend_auto_requested || g_backend_auto_resolved || vendor == 0)
-        return;
-    g_backend_auto_resolved = true;
+    // 2026-11-14（回归：DLSS 全程未启用）：本函数有两条**提前返回**路径，而调用方会无条件
+    //   执行副作用（set_backend + 日志）。Ffx12Backend 显式写 ngx 时 g_backend_auto_requested
+    //   为 false ⇒ 这里立即返回、want_ngx_out 保持 false ⇒ 调用方把 ngx 覆盖成 native。
+    //   ⇒ 增加 resolved_out 明确告诉调用方「本次是否真的落位了」，未落位就不得执行副作用。
+    want_ngx_out = false;
+    resolved_out = false;
+    if (!g_backend_auto_requested || vendor == 0)
+        return {};
+    // exchange 而不是"先 load 再 store"：并发下两次调用都可能通过上面的判断，
+    // 只有 exchange 返回 false 的那个才允许落位（后端是进程级单值，只能判一次）。
+    if (g_backend_auto_resolved.exchange(true, std::memory_order_acq_rel))
+        return {};
+    resolved_out = true;
     const bool want_ngx = gpu_pick::supports_dlss(vendor, device_id, desc);
-    // 厂商/型号文字直接复用 record_adapter_info 上面刚写入的 g_route_*（焦点框用的是同一份），
-    // 不再自己 snprintf + narrow 一遍：同一事实两套口径迟早会漂（AGENTS.md §五.2）。
+    // 厂商文字由调用方传入（就是即将写进同一份快照的那一份），不再自己 snprintf + narrow
+    // 一遍：同一事实两套口径迟早会漂（AGENTS.md §五.2）。
     // 摘要里也不再重复打印 GPU 型号 —— 焦点框的 "  GPU : <型号> (vendor=0x…)" 已经打过。
-    g_backend_auto_note = std::string("auto=") + (want_ngx ? "ngx" : "native") +
-        " vendor=" + g_route_vendor_label;
+    const std::string note = std::string("auto=") + (want_ngx ? "ngx" : "native") +
+        " vendor=" + vendor_label;
+    // ★ 2026-11-14（审查：发布窗口）：本函数原先在这里就做 set_backend 与打日志，
+    //   而调用方要等它返回后才发布快照 ⇒ 中间夹着一次文件 I/O（日志落盘），窗口可达毫秒级。
+    //   并发 draw 线程若恰在此刻首次进入 log_focus_block，会读到 nullptr 打出
+    //   "GPU : unknown"，而焦点块是一次性闸门 ⇒ 该进程的摘要永远补不回来。
+    //   ⇒ 改为「纯计算」：这里只返回 note 与 want_ngx，**不做任何副作用**；
+    //     set_backend 与日志由调用方在**发布快照之后**执行（见 record_adapter_info）。
+    //   这样「快照可见」严格先于「后端已切换」，窗口内读者拿到的是旧后端 + 旧摘要，
+    //   两者同源，不会出现"后端已换但摘要还是空的"。
+    want_ngx_out = want_ngx;
+    return note;
+}
+
+// resolve_backend_auto 的副作用半段：落位后端 + 打日志。
+//
+// 2026-11-14（审查：发布窗口）：这两个动作原先是 resolve_backend_auto 的一部分，
+//   而调用方要等它返回才发布快照 ⇒ 「后端已切换」早于「摘要可见」，中间隔着一次日志
+//   文件 I/O。并发 draw 线程若在此窗口首次进入焦点块，会读到 nullptr 打 "GPU : unknown"，
+//   而焦点块是一次性闸门 ⇒ 该进程的摘要永远补不回来（改动前同样窗口下至少型号是对的）。
+//   ⇒ 拆成两段：先构造并发布快照，**再**调本函数。这样窗口内读者看到的是旧后端 + 旧摘要，
+//     两者同源；不会出现「后端已换、摘要还是空」。
+static void apply_backend_auto_result(bool want_ngx, const std::string &note)
+{
 #if defined(DX11FSRBRIDGE_ENABLE_NGX)
     ffx12::set_backend(want_ngx ? ffx12::BackendKind::Ngx : ffx12::BackendKind::Native);
     LOG_INFO(blog::cat::config, std::string(ffx12::backend() == ffx12::BackendKind::Ngx
                                                ? "ngx_core backend=ngx "
                                                : "ngx_core backend=native ") +
-        g_backend_auto_note + single_instance_log_suffix());
+        note + single_instance_log_suffix());
 #else
     // NGX 未编译进本产物：只有"型号判为 RTX"才值得告警（用户写了 auto，本意是让 RTX 走 ngx）。
     if (want_ngx)
         LOG_WARN(blog::cat::config,
-            "ngx_core backend=native config_warn bits=ngx_not_compiled " + g_backend_auto_note);
+            "ngx_core backend=native config_warn bits=ngx_not_compiled " + note);
     else
-        LOG_INFO(blog::cat::config, "ngx_core backend=native " + g_backend_auto_note);
+        LOG_INFO(blog::cat::config, "ngx_core backend=native " + note);
 #endif
 }
 
 // D3D11 设备就绪后的可靠补检（IDXGIDevice::GetAdapter 不受 loader lock 影响）
 static void route_from_d3d11_device(ID3D11Device *d3d11_device)
 {
-    if (g_route_applied || d3d11_device == nullptr)
+    if (g_route_applied.load(std::memory_order_acquire) || d3d11_device == nullptr)
         return;
     IDXGIDevice *dxgi_device = nullptr;
     if (FAILED(d3d11_device->QueryInterface(__uuidof(IDXGIDevice),
@@ -15636,8 +15790,12 @@ void initialize()
         // Ffx12Backend=auto 在这一行必然还是 pending（设备尚未创建 ⇒ 适配器信息未到），
         // 故追加 auto=pending；落位时 resolve_backend_auto() 会再打一条同格式行
         // （ngx_core backend=… auto=… vendor=… gpu="…"）——两条成对出现，可直接当验收判据。
+        // 2026-11-14（见 RouteSnapshot 注释）：resolved 改原子后这里用 acquire 读，
+        // 语义与旧裸 bool 一致 —— 设备还没创建时必然还是 pending。
         const std::string auto_suffix =
-            (g_backend_auto_requested && !g_backend_auto_resolved) ? " auto=pending" : "";
+            (g_backend_auto_requested && !g_backend_auto_resolved.load(std::memory_order_acquire))
+                ? " auto=pending"
+                : "";
 #if defined(DX11FSRBRIDGE_ENABLE_NGX)
         LOG_INFO(blog::cat::config, std::string(ffx12::backend() == ffx12::BackendKind::Ngx
                                                    ? "ngx_core backend=ngx"
