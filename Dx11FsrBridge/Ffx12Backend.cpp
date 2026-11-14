@@ -370,6 +370,8 @@ float g_motion_flip = 1.0f;     // XeSS/DLSS 定向——motion 方向翻转（�
 float g_depth_scale = 1.0f;     // XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
 // b0 常数缓冲（g_motion_cb）与其"已上传值"缓存已搬进 InstanceRes（P2：按实例隔离）。
 bool g_motion_vectors_jittered = false; // 游戏配置：motion 是否已包含投影 jitter
+// 2026-11-13：MVLowRes 开关（默认 true = 历史行为）。语义与动机见 NgxParamMap.cpp。
+bool g_motion_vectors_low_res = true;
 bool g_hdr_input = true;        // 游戏 10-bit HDR 管线（useRealType）
 bool g_auto_exposure = true;    // 自动曝光（OptiScaler 日志 initFlags 实证：AutoExposure=true）
 bool g_non_linear = true;       // 非线性色彩空间（OptiScaler 日志：FsrNonLinearColorSpace=true）
@@ -2352,6 +2354,7 @@ bool finish_all_instances()
 // §3.9A.2 的两个 getter + §3.9A.3(c) 的两个访问器（SDS §3.9A.3(f) 逐字）：
 bool hdr_input() { return g_hdr_input; }
 bool motion_vectors_jittered() { return g_motion_vectors_jittered; }
+bool motion_vectors_low_res() { return g_motion_vectors_low_res; }
 bool depth_inverted() { return g_depth_inverted; }
 
 void set_backend(BackendKind k) { g_backend = k; }
@@ -3258,6 +3261,11 @@ void set_depth_scale(float scale) // XeSS/DLSS 定向——depth 值域归一化
 void set_motion_vectors_jittered(bool jittered)
 {
     g_motion_vectors_jittered = jittered;
+}
+
+void set_motion_vectors_low_res(bool low_res)
+{
+    g_motion_vectors_low_res = low_res;
 }
 
 void set_hdr_input(bool hdr)

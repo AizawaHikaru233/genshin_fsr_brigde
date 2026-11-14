@@ -2,6 +2,7 @@
 
 mod backdrop;
 mod fetch;
+mod framegen;
 mod gamepath;
 mod gpu;
 mod gpu_tables;
@@ -113,6 +114,11 @@ fn post_state(app: &AppHandle) {
                 "value": srinput::effective(&s),
                 "available": srinput::ini_path(&s).is_some(),
             },
+        "frameGen": {
+            // 三态：on / off / auto；没装 OptiScaler 时 available=false（UI 禁用开关）
+            "value": framegen::snapshot(&s).unwrap_or("auto"),
+            "available": framegen::ini_path(&s).is_some(),
+        },
             "modsDir": s.mods_dir,
             "modsDefault": paths::to_display(&paths::payload_dir().join("TextureLoader\\Mods")),
             "textureIni": paths::to_display(&paths::payload_dir().join("TextureLoader\\TextureLoader.ini")),
@@ -282,6 +288,89 @@ fn ensure_dlss(app: &AppHandle, s: &settings::Settings) {
     });
 }
 
+/// 补齐 OptiScaler 的 Streamline 运行时（DLSSG 帧生成依赖它）。
+///
+/// OptiScaler 从**自己组件目录下的 `streamline\`** 加载这几个文件（路径硬编码）：
+/// `sl.interposer.dll` / `sl.common.dll` / `nvngx_dlssg.dll` /
+/// `sl.dlss_g.dll` / `sl.reflex.dll` / `sl.pcl.dll`。
+///
+/// 缺了会报 "Streamline proxy can't find sl.interposer.dll!"，界面上是
+/// "Can't init DLSSG Output / Are you missing the streamline folder?"
+///
+/// 只在**可能用到 DLSSG** 时补：勾了 OptiScaler + 帧生成开着（`FrameGen.FGOutput` 是
+/// `DLSSG`，或 `auto` 且这张卡能跑 DLSS）。不做无条件下载 —— 那个 SDK 包有 263 MB，
+/// 用不上的用户不该为它付流量。
+fn ensure_streamline(app: &AppHandle, s: &settings::Settings) {
+    if !s.selected.iter().any(|id| id == "opti") {
+        return;
+    }
+    // 帧生成没开就不用 DLSSG，也就不需要 Streamline。
+    if !framegen::wants_dlssg(s) {
+        return;
+    }
+    let Some(version) = pkg::resolve("opti", s) else {
+        return;
+    };
+    let dest = version.component_dir.join("streamline");
+    if fetch::streamline_ready(&dest) {
+        return;
+    }
+
+    let app_handle = app.clone();
+    let dest_for_thread = dest.clone();
+    let settings_for_thread = s.clone();
+    std::thread::spawn(move || {
+        let report = |text: &str| {
+            send(
+                &app_handle,
+                json!({
+                    "type": "fetch",
+                    "id": "streamline",
+                    "status": "progress",
+                    "message": text,
+                }),
+            );
+        };
+        let result = fetch::fetch_streamline(&dest_for_thread, &report);
+        match result {
+            Ok(source) => {
+                log::write(&format!(
+                    "[streamline] 已补齐 -> {}（{source}）",
+                    paths::to_display(&dest_for_thread)
+                ));
+                send(
+                    &app_handle,
+                    json!({
+                        "type": "fetch",
+                        "id": "streamline",
+                        "status": "done",
+                        "message": format!("Streamline 运行时已就绪（{source}）"),
+                    }),
+                );
+            }
+            Err(err) => {
+                log::write(&format!("[streamline] 补齐失败: {err}"));
+                // 失败必须让用户看见：帧生成会直接不可用。
+                send(
+                    &app_handle,
+                    json!({
+                        "type": "notice",
+                        "level": "error",
+                        "title": "Streamline 运行时缺失",
+                        "message": format!(
+                            "DLSS 帧生成需要 Streamline 运行时，补齐失败：{err}\n\n可以手动把\
+                             sl.interposer.dll / sl.common.dll / nvngx_dlssg.dll / sl.dlss_g.dll / \
+                             sl.reflex.dll / sl.pcl.dll 放进：\n{}",
+                            paths::to_display(&dest_for_thread)
+                        ),
+                    }),
+                );
+            }
+        }
+        let _ = &settings_for_thread;
+    });
+}
+
 /// 首次装 OptiScaler 且显卡属于「官方 FSR4 要新驱动」的两类平台（RDNA2 独显 / RDNA3.5 核显）：
 /// 提示把 Adrenalin 更新到 26.10.1+。每台机器只弹一次，记在 settings.json 的
 /// `fsr4DriverNoticeShown`，不跟 N 卡的「不再提醒」混在一起。
@@ -378,6 +467,7 @@ fn on_save(app: &AppHandle, msg: &Value) {
 
     // 勾了 OptiScaler + RTX 卡：把 nvngx_dlss.dll 补进组件目录（后台线程，不挡界面）。
     ensure_dlss(app, &settings_now);
+     ensure_streamline(app, &settings_now);
 
     // 先刷新状态（行里的「已安装 / 未选择」跟着变），再发 saved，底栏提示才不会被覆盖。
     post_state(app);
@@ -446,6 +536,54 @@ fn on_restore_defaults(app: &AppHandle) {
         app,
         json!({ "type": "restored", "ok": error.is_empty(), "files": files, "error": error }),
     );
+}
+
+/// 「移除自签名证书」。
+///
+/// 安装器给 `ReShade64.dll` 签名时会向 `CurrentUser\Root` 写入一个自签名证书
+/// （不签的话反作弊会拦截 OptiScaler 运行期加载它）。那是一个**用户看不见、
+/// 且不随卸载自动消失**的可信根 —— 必须给一个显式的清理入口。
+///
+/// 一并清掉早期版本用过的 `CN=crosire, O=ReShade ...`（那时冒充了 ReShade 作者身份）。
+/// 移除后 ReShade 需要重新签名才能被 OptiScaler 加载；界面给一句说明即可，
+/// 不自动重签（用户可能就是想彻底断掉这条信任）。
+fn on_remove_cert(app: &AppHandle) {
+    match fetch::remove_signing_cert() {
+        Ok(0) => {
+            log::write("[reshade] 移除证书：未找到本项目写入的证书");
+            send(
+                app,
+                json!({
+                    "type": "certRemoved",
+                    "ok": true,
+                    "removed": 0,
+                    "message": "未找到本项目写入的自签名证书（可能已经移除过）",
+                }),
+            );
+        }
+        Ok(n) => {
+            log::write(&format!("[reshade] 移除证书：共移除 {n} 个"));
+            send(
+                app,
+                json!({
+                    "type": "certRemoved",
+                    "ok": true,
+                    "removed": n,
+                    "message": format!(
+                        "已移除 {n} 个自签名证书。下次安装时会重新签一次；\
+                         在此之前 ReShade 需要外部注入才能工作。"
+                    ),
+                }),
+            );
+        }
+        Err(err) => {
+            log::write(&format!("[reshade] 移除证书失败: {err}"));
+            send(
+                app,
+                json!({ "type": "certRemoved", "ok": false, "removed": 0, "message": err }),
+            );
+        }
+    }
 }
 
 fn on_install(app: &AppHandle, msg: &Value) {
@@ -555,6 +693,7 @@ fn on_install(app: &AppHandle, msg: &Value) {
         if outcome.ok && !outcome.cancelled {
             ensure_shortcut(&settings_for_thread);
             ensure_dlss(&app_handle, &settings_for_thread);
+             ensure_streamline(&app_handle, &settings_for_thread);
             // 提示放最后：先把「已安装」推给界面，弹窗再来。
             maybe_notice_fsr4_driver(&app_handle, &selected);
         }
@@ -757,6 +896,7 @@ fn on_switch_version(app: &AppHandle, msg: &Value) {
     if error.is_empty() {
         // 换到新版本目录后，那个目录可能还没有 DLSS 运行时。
         ensure_dlss(app, &settings_now);
+         ensure_streamline(app, &settings_now);
     }
 
     post_state(app);
@@ -783,6 +923,7 @@ fn on_sr_input(app: &AppHandle, msg: &Value) {
             log::write(&format!("[bridge] 超分输入类型 -> {value}"));
             post_state(app);
             ensure_dlss(app, &s);
+             ensure_streamline(app, &s);
         }
         Err(err) => {
             log::write(&format!("[bridge] 写 Ffx12Backend 失败: {err}"));
@@ -790,6 +931,79 @@ fn on_sr_input(app: &AppHandle, msg: &Value) {
         }
     }
 }
+
+/// 「帧生成」开关。三态：开（按显卡选 DLSSG / FSRFG）/ 关（NoFG）/ 自动（auto）。
+///
+/// 改 `OptiScaler.ini` 的 `[FrameGen] FGInput` + `FGOutput`，**并重新应用注入链** ——
+/// 因为帧生成状态会改变 ReShade 的加载方式（见 `pkg::reshade_via_opti`）：
+///   · 开 ⇒ ReShade 由 OptiScaler 加载（`LoadReshade=true`），不进 DllList；
+///   · 关 ⇒ ReShade 走外部注入（进 DllList），`LoadReshade=false`。
+/// 不重跑应用的话，用户拨了开关但注入链还是旧的 ⇒ 表现与开关不符。
+fn on_frame_gen(app: &AppHandle, msg: &Value) {
+    // value 只有 "on" / "off" —— 界面 2026-11-14 起不再有 auto 档。
+    // 非 "off" 一律当 "on"（兼容老界面缓存 / 手改消息，且偏保守：开比关更容易被发现）。
+    let value = msg["value"].as_str().unwrap_or("off");
+    let on = !value.eq_ignore_ascii_case("off");
+    let s = snapshot(app);
+    let state = match framegen::write(&s, on) {
+        Ok(state) => state,
+        Err(err) => {
+            log::write(&format!("[install] 写帧生成开关失败: {err}"));
+            send(app, json!({ "type": "error", "message": err }));
+            return;
+        }
+    };
+    log::write(&format!("[install] 帧生成 -> {}", state.as_str()));
+
+    // ★ 2026-11-14：开帧生成后必须补 Streamline 运行时。
+    //
+    // 典型场景：安装时帧生成是关的（默认 `NoFG`）⇒ 那时 `ensure_streamline` 判
+    // 「用不到 DLSSG」而直接返回；用户之后在界面上点开 ⇒ 现在才会写
+    // `FGOutput=DLSSG`，若不在这里补，`payload\...\streamline\` 永远空着 ⇒
+    // DLSSG init 报 "Are you missing the streamline folder?" ⇒ 帧生成起不来。
+    //
+    // 与其它 5 处（on_save / on_install / on_switch_version / on_sr_input / startup heal）
+    // 同一入口函数，判据与下载路径完全复用。
+    ensure_streamline(app, &s);
+
+    // 帧生成状态变了 ⇒ ReShade 加载方式可能跟着变 ⇒ 必须重写注入链。
+    // 游戏还没选目录时跳过（此时也没东西可应用），只更新界面。
+    let game_dir = PathBuf::from(&s.game_dir);
+    if !game_dir.as_os_str().is_empty() {
+        if let Some(game_exe) = gamepath::find_game_exe(&game_dir) {
+            let st = app.state::<AppState>();
+            st.cancel.store(false, Ordering::SeqCst);
+            // busy 守卫：与进行中的安装互斥（`on_install` / `on_switch_version` 用同一
+            // 模式）。这个 handler 在 UI 线程同步跑 apply，不置位就可能与后台的安装线程
+            // 同时写同一批 ini / fps_config.json。
+            if st.busy.swap(true, Ordering::SeqCst) {
+                log::write("[install] 帧生成切换跳过：另一个安装正在进行");
+                send(
+                    app,
+                    json!({ "type": "error", "message": "另一个安装正在进行，请稍后再切换帧生成" }),
+                );
+                post_state(app);
+                return;
+            }
+            let outcome =
+                install::apply(&game_exe, s.fps, &s.selected, &s, &st.cancel, |_| {});
+            st.busy.store(false, Ordering::SeqCst);
+            if !outcome.ok {
+                log::write(&format!(
+                    "[install] 帧生成切换后重应用失败: {}",
+                    outcome.error
+                ));
+                send(
+                    app,
+                    json!({ "type": "error", "message": outcome.error }),
+                );
+            }
+        }
+    }
+
+    post_state(app);
+}
+
 
 /// 解帧工具选项（fps_config.json 里除 GamePath/FPSTarget/DllList/UseHDR 之外的键）。
 fn on_unlocker_config(app: &AppHandle, msg: &Value) {
@@ -1239,6 +1453,7 @@ fn bridge(window: WebviewWindow, app: AppHandle, msg: Value) {
         "switchVersion" => on_switch_version(&app, &msg),
         "unlockerConfig" => on_unlocker_config(&app, &msg),
         "srInput" => on_sr_input(&app, &msg),
+        "frameGen" => on_frame_gen(&app, &msg),
         "modsDir" => on_mods_dir(&app, msg["dir"].as_str().map(str::to_string)),
         "pickMods" => {
             if let Some(dir) = gamepath::pick_folder() {
@@ -1251,6 +1466,7 @@ fn bridge(window: WebviewWindow, app: AppHandle, msg: Value) {
         },
         "removeCustomDll" => on_remove_custom_dll(&app, &msg),
         "restoreDefaults" => on_restore_defaults(&app),
+        "removeCert" => on_remove_cert(&app),
         "openLog" => on_open_log(&app, msg["id"].as_str().unwrap_or_default()),
         "bundleLogs" => on_bundle_logs(&app, &msg),
         "fetchComponent" => on_fetch_component(&app, &msg),
@@ -1442,6 +1658,7 @@ fn main() {
                 // 与路径修正同一批次：N 卡 + 勾了 OptiScaler 时把 DLSS 运行时校验/补齐一次
                 // （缺且补不上会发 dlssError 弹窗）。
                 ensure_dlss(&heal, &s);
+                 ensure_streamline(&heal, &s);
                 // 下载校验只认包内清单：启动时把"用的是哪份清单"记一行，便于排查。
                 match manifest::manifest_path() {
                     Some(path) => log::write(&format!(

@@ -722,6 +722,15 @@ static void route_from_d3d11_device(ID3D11Device *d3d11_device);
 // destroy_instance() + create_instance()；尺寸格式全等 ⇒ 走跨 key 复用，但每帧把
 // g_inst.first 置 true 复位时域（那里的原话：否则两个视图的时域累积互相污染）。
 // 两种都不可能两路同时正常出图 ⇒ 本键对 NGX 后端无效，一律只接管一个实例。
+//
+// 【2026-11-14 复审记录】曾尝试改成只返回 `g_config.ffx12_single_instance`（全量接管），
+// 依据是「进/出角色界面卡顿 2.7 秒」的时间线日志。该改动已撤回，理由：
+//   · 上面的三条限制（g_inst 全局唯一 / 六元组全等才复用 / 复用也要 first=true）
+//     今天仍然成立 ⇒ 两路并发时每帧 destroy+create（~500ms）或每帧 Reset（时域不累积）。
+//   · 原始证据只有 2 条 ngx_inst 记录（1 次 switch + 1 次 reuse），只能证明
+//     「单实例路径下接管权切换 + 原生回退慢」，**不能**证明两路并发 NGX 可行。
+//   · 缺少的关键证据：两路同时 `ngx_out` 的日志。
+// 要改善那 2.7 秒，走已有的 Ffx12SingleInstanceSticky / HoldMs / Pick 压切换频率。
 static bool single_instance_takeover_effective()
 {
     return g_config.ffx12_single_instance || ffx12::backend() == ffx12::BackendKind::Ngx;
@@ -4042,6 +4051,13 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2Mode2OnDemandState", 1, config_path.c_str()) != 0;
     g_config.fsr2_motion_vectors_jittered =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2MotionVectorsJittered", 0, config_path.c_str()) != 0;
+        // 2026-11-13：MVLowRes（"MV 是渲染分辨率的"）开关，默认 1 = 历史行为。
+        // 设为 0 时不再向 NGX 传 MVLowRes 位。动机：本键设 0 后实机拖影明显减轻
+        // （未根除 —— 剩余部分与 NgxHdr、OptiScaler 侧 InitFlags.HDR 有关，不属本仓库）。
+        // 详见 NgxParamMap.cpp。
+        const bool mv_low_res =
+            GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2MotionVectorsLowRes", 1, config_path.c_str()) != 0;
+        ffx12::set_motion_vectors_low_res(mv_low_res);
     g_config.fsr2_positive_motion_vector_scale =
         // 2026-08-25（AA 修复，依据游戏 accumulate 反汇编）：游戏原生重投影 = UV − mv_g
         // （mv_g=+sign·4d² 正向、UV 空间）；FSR2 期望 historyUV = UV + scale·mv_sample。

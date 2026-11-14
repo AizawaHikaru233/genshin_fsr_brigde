@@ -74,7 +74,7 @@ pub fn apply(
 
         let step = match id.as_str() {
             "bridge" => prepare_bridge(settings),
-            "opti" => prepare_opti(settings),
+            "opti" => prepare_opti(settings, game_dir),
             "reshade" => prepare_reshade(game_dir),
             _ => Ok(()),
         };
@@ -332,7 +332,8 @@ fn set_if_changed(
 pub fn prepare_component_ini(id: &str, settings: &Settings) -> Result<(), String> {
     match id {
         "bridge" => prepare_bridge(settings),
-        "opti" => prepare_opti(settings),
+        // 游戏目录取自 settings —— 切版本这条路径上拿不到 `apply()` 里的 game_exe。
+        "opti" => prepare_opti(settings, Path::new(&settings.game_dir)),
         _ => Ok(()),
     }
 }
@@ -358,8 +359,32 @@ fn prepare_bridge(settings: &Settings) -> Result<(), String> {
         .map_err(|e| format!("无法写入 Dx11FsrBridge.ini：{e}"))
 }
 
+
+/// ReShade 的 DLL 在 payload 里的位置（外部注入用的那份）。
+///
+/// 与 `pkg::CATALOG` 里 `id = "reshade"` 的 `dll` 字段必须一致；两边都指向
+/// `payload\ReShade\ReShade64.dll`。走 OptiScaler 加载时会在 `prepare_opti` 里
+/// 把这份**复制**到 OptiScaler 组件目录（见那里的注释：OptiScaler 只在自己那一层找）。
+
+/// 目标文件是否需要（重新）复制：不存在，或大小与源不同。
+///
+/// 用大小而不是哈希：ReShade64.dll 有 5 MB，每次安装都读一遍算 sha256 没必要；
+/// 大小不同足以发现"换了版本"这种真实情况（同版本重复复制是无害的幂等操作，
+/// 但我们也不想每次都覆盖 —— 覆盖会刷新 mtime，让用户误以为文件被动过）。
+fn needs_copy(source: &Path, target: &Path) -> bool {
+    match (fs::metadata(source), fs::metadata(target)) {
+        (Ok(s), Ok(t)) => s.len() != t.len(),
+        (Ok(_), Err(_)) => true,
+        _ => false,
+    }
+}
+
+fn payload_reshade_dll() -> std::path::PathBuf {
+    paths::payload_dir().join("ReShade").join("ReShade64.dll")
+}
+
 /// OptiScaler.ini 的托管键：FSR4 策略按显卡判定，OptiDllPath 按所选版本的布局写。
-fn prepare_opti(settings: &Settings) -> Result<(), String> {
+fn prepare_opti(settings: &Settings, game_dir: &Path) -> Result<(), String> {
     let Some(version) = pkg::resolve("opti", settings) else {
         return Err("payload 里找不到 OptiScaler 的版本目录".into());
     };
@@ -403,11 +428,119 @@ fn prepare_opti(settings: &Settings) -> Result<(), String> {
     write("Log", "SingleFile", "true")?;
     write("Log", "LogAsync", "false")?;
     write("Log", "LogAsyncThreads", "1")?;
-    // 只有一种发布形态：2.4.0 起不再打"非帧生成版"（NonFrameGeneration.edition 已不再打包），
-    // 帧生成交给 OptiScaler 按显卡自己探测，安装器不再写死禁用。
-    write("FrameGen", "Enabled", "auto")?;
-    write("FrameGen", "FGInput", "auto")?;
-    write("FrameGen", "FGOutput", "auto")?;
+    // 只有一种发布形态：2.4.0 起不再打"非帧生成版"（NonFrameGeneration.edition 已不再打包）。
+    //
+    // 2026-11-14：这三个键**只在缺键时补**，不能无条件覆盖。
+    //
+    // ① 不能覆盖的原因（实测 bug）：`on_frame_gen` 写完 `FGInput=Upscaler` + `FGOutput=DLSSG`
+    //    之后，会重跑 `install::apply` 以刷新注入链（ReShade 的加载方式跟随帧生成）；若这里
+    //    无条件写，会把刚设的值打回去 ⇒ 界面开关一拨就弹回，`framegen::is_enabled`
+    //    也永远读不到 true ⇒ ReShade 永远走外部注入。
+    //
+    // ② 缺键补什么：补 **`NoFG`**，不是 `auto`。
+    //    界面 2026-11-14 起只有「开 / 关」两档（没有 auto），而 `framegen::current()`
+    //    把 `auto`/缺键算成「开」—— 若缺键补 `auto`，新装用户会看到开关显示「开」，
+    //    但 `FGOutput=auto` 在非 RTX 卡上可能落到 DLSSG（缺 Streamline 进不去游戏），
+    //    正是这次要去掉的那条路。补 `NoFG` 让「新装 = 关」自洽：用户主动点「开」时
+    //    才按显卡写显式实现（DLSSG / FSRFG）。
+    //
+    //    `Enabled` 仍补 `auto`：它是 OptiScaler 自己的总开关语义（跟随游戏的 DLSS FG 设置），
+    //    与我们的 FGInput/FGOutput 不是一回事，保持原语义不动。
+    if ini::get(&path, "FrameGen", "Enabled").is_none() {
+        write("FrameGen", "Enabled", "auto")?;
+    }
+    for key in ["FGInput", "FGOutput"] {
+        if ini::get(&path, "FrameGen", key).is_none() {
+            write("FrameGen", key, "NoFG")?;
+        }
+    }
+
+    // 2026-11-14：ReShade 的加载方 —— **跟随帧生成开关**。
+    //
+    // 为什么联动而不是独立判断：
+    //   · 开帧生成时，OptiScaler 的 `FGInput=Upscaler` 要求超分与 FG 走同一条呈现路径。
+    //     此时若 ReShade 走外部注入，它会 hook 到 OptiScaler 创建的**隐藏窗口** swapchain
+    //     （`_real`），而真正上屏的是 `_fgSwapChain`（DX12）⇒ effect 生效但 Home 面板永远
+    //     不显示。改成 OptiScaler 加载后两者共享呈现路径，面板正常。
+    //   · 关帧生成时没有这层冲突，外部注入更快（ReShade 在 OptiScaler 之前拿到 swapchain），
+    //     而且不依赖 OptiScaler 的加载顺序。
+    //   · 联动还顺带解决"重复注入"：任一时刻只有一方加载 ReShade。
+    //
+    // ★ 这里用 `reshade_via_opti_wanted`（**意愿**判据），不是 `reshade_via_opti`：
+    //   本函数要先写 `LoadReshade=true`、再复制 DLL；若判据里含「DLL 已在游戏根目录」，
+    //   第一次安装时文件还不存在 ⇒ 返回 false ⇒ 不复制 ⇒ 永远装不上（先有鸡还是先有蛋）。
+    //   DLL 缺失的回退由 `pkg::reshade_via_opti`（注入链那一步）负责。
+    let reshade_via_opti = pkg::reshade_via_opti_wanted(&settings.selected, settings);
+    write("Plugins", "LoadReshade", if reshade_via_opti { "true" } else { "false" })?;
+    log::write(&format!(
+        "[install] ReShade 加载方: {}（帧生成{}）",
+        if reshade_via_opti {
+            "OptiScaler"
+        } else {
+            "外部注入（DllList）"
+        },
+        if reshade_via_opti { "开启" } else { "关闭" }
+    ));
+
+    // 2026-11-14：把 ReShade64.dll 放到 OptiScaler 能找到的位置。
+    //
+    // OptiScaler 的 `Util::ReShadePath()`（OptiScaler/Util.cpp:381）取
+    // `ExePath().parent_path()`，而 `Util::ExePath()`（同文件 366 行）用的是
+    // `GetModuleFileNameW(nullptr, ...)` = **主模块**路径
+    // ⇒ parent_path() 就是**游戏根目录**（`YuanShen.exe` 那一层），不是 OptiScaler.dll 目录。
+    //
+    // 所以走 OptiScaler 加载时，DLL 必须复制到游戏根目录。用复制不用移动/软链：
+    // 软链需要管理员或开发者模式；移动会让「关掉帧生成、改回外部注入」时找不到文件。
+    // 多一份 ~5 MB 副本可以接受，且两个方向切换都是幂等的。
+    if reshade_via_opti {
+        let source = payload_reshade_dll();
+        if source.is_file() {
+            let target = game_dir.join("ReShade64.dll");
+            if needs_copy(&source, &target) {
+                fs::copy(&source, &target)
+                    .map_err(|e| format!("无法把 ReShade64.dll 复制到游戏根目录：{e}"))?;
+                log::write(&format!(
+                    "[install] 已把 ReShade64.dll 复制到游戏根目录 {}",
+                    target.display()
+                ));
+            }
+        } else {
+            // 文件还没有（用户还没下载 ReShade）：不算错误，只记一笔。
+            // 下次 install 时若已下载会自动补上。
+            log::write("[install] ReShade64.dll 尚未下载，跳过复制到游戏根目录");
+        }
+    } else {
+        // 关帧生成：`LoadReshade` 上面已写回 false（走外部注入）。
+        //
+        // 游戏根目录那份 ReShade64.dll 要**移除** —— 否则 OptiScaler 一旦因为别的路径走到
+        // `LoadReshade`（用户手改 ini / 以后默认值变化）就会加载它，而外部注入又会注入一次
+        // ⇒ 重复注入。移除是安全的：payload\ReShade\ 里的原件保留，重新开帧生成会再复制回去。
+        //
+        // 只在"确定是我们的副本"时才删：比对大小与 payload 里的一致才动手，避免误删用户
+        // 自己放的其它版本 ReShade。
+        let source = payload_reshade_dll();
+        let target = game_dir.join("ReShade64.dll");
+        if source.is_file() && target.is_file() {
+            let same = match (fs::metadata(&source), fs::metadata(&target)) {
+                (Ok(s), Ok(t)) => s.len() == t.len(),
+                _ => false,
+            };
+            if same {
+                if let Err(err) = fs::remove_file(&target) {
+                    // 删不掉（游戏正在跑 / 权限）不算致命：只记一笔，下次会再试。
+                    log::write(&format!(
+                        "[install] 无法移除游戏根目录的 ReShade64.dll（{err}），下次再试"
+                    ));
+                } else {
+                    log::write(&format!(
+                        "[install] 已移除游戏根目录的 ReShade64.dll（改回外部注入）{}",
+                        target.display()
+                    ));
+                }
+            }
+        }
+    }
+
 
     log::write(&format!(
         "OptiScaler 版本 {} · {} · OptiDllPath={}",

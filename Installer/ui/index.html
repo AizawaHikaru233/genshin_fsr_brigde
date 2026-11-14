@@ -556,6 +556,24 @@
         </div>
 
         <!-- 安装内容 -->
+
+        <!-- 帧生成：只镜像 OptiScaler.ini 的 [FrameGen] FGInput + FGOutput，选完立刻写回 -->
+        <div class="row intro" style="animation-delay:140ms">
+          <div class="ico">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 12h4l3-8 4 16 3-8h4"/>
+            </svg>
+          </div>
+          <div style="min-width:0">
+            <div class="rlabel">帧生成</div>
+            <div class="rvalue srnote">在超分之后插入补间帧提升流畅度；需要 OptiScaler。开启时按显卡自动选 DLSSG（NVIDIA RTX）或 FSRFG（其余）。开启时 ReShade 改由 OptiScaler 加载（否则设置面板不可见），关闭时改回外部注入</div>
+          </div>
+          <div class="seg" id="fgseg" role="group" aria-label="帧生成">
+            <span class="segthumb"></span>
+            <button type="button" data-v="on" aria-pressed="false">开</button>
+            <button type="button" data-v="off" aria-pressed="false">关</button>
+          </div>
+        </div>
         <div class="row headrow intro" style="animation-delay:160ms">
           <div class="ico">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
@@ -793,6 +811,18 @@
           <div class="row">
             <div class="ico">
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3.4l7 2.6v5.2c0 4-2.9 7.6-7 8.8-4.1-1.2-7-4.8-7-8.8V6l7-2.6Z"/><path d="M9.2 12.2l2 2 3.6-3.8"/>
+              </svg>
+            </div>
+            <div>
+              <div class="rlabel">移除自签名证书</div>
+              <div class="rvalue">签名 ReShade64.dll 时，安装器会向「当前用户」的受信任根写入一个自签名证书（否则反作弊会拦截 OptiScaler 加载它）。移除后需重新安装才能再次签名</div>
+            </div>
+            <button class="ghost" id="btn-remove-cert">移除…</button>
+          </div>
+          <div class="row">
+            <div class="ico">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M10.2 6.6H6.4A2.4 2.4 0 0 0 4 9v8.6A2.4 2.4 0 0 0 6.4 20h8.6a2.4 2.4 0 0 0 2.4-2.4v-3.8"/><path d="M13.4 4h6.6v6.6"/><path d="M20 4l-7.4 7.4"/>
               </svg>
             </div>
@@ -1026,6 +1056,8 @@
     shortcutOn: true,    // 安装时创建桌面快捷方式
     srInput: 'auto',     // 超分输入类型：auto | native | ngx（= Dx11FsrBridge.ini 的 Ffx12Backend）
     srAvailable: false,  // 桥装好了、那份 ini 在，才允许改
+    frameGen: 'off',     // 帧生成：on | off（2026-11-14 起不再有 auto，具体实现在后端按显卡选）
+    frameGenAvailable: false,  // 装了 OptiScaler、那份 ini 在，才允许改
     unlockerDir: '',     // 解帧工具目录（payload\FpsUnlocker）
     shortcutName: '',    // 快捷方式文件名（跟随界面语言）
     modsDefault: ''     // 默认 Mods 目录（payload\TextureLoader\Mods）
@@ -1761,6 +1793,31 @@
   }
 
   // 装完之后改帧率：底部结论行跟着变，别让两处数字打架。
+
+  // ── 帧生成 ──
+  // 两态：on / off（值见 post_state 的 frameGen.value）。
+  // 2026-11-14 起没有 auto：开的时候由后端按显卡写 DLSSG（NVIDIA RTX）或 FSRFG（其余），
+  // 避免 A 卡 / 非 RTX 的 N 卡被 auto 判到 DLSSG 后因缺 Streamline 进不去游戏。
+  // 与「超分输入类型」同一套模式：只负责显示与点击，真实值由后端读回。
+  var fgSeg = $("#fgseg");
+  function syncFrameGen(){
+    if (!fgSeg) return;
+    [].forEach.call(fgSeg.querySelectorAll("button"), function(b){
+      b.setAttribute("aria-pressed", b.dataset.v === state.frameGen ? "true" : "false");
+      b.disabled = !state.frameGenAvailable;
+    });
+    syncSegThumb(fgSeg, true);
+  }
+  if (fgSeg){
+    [].forEach.call(fgSeg.querySelectorAll("button"), function(b){
+      b.addEventListener("click", function(){
+        if (b.disabled || b.getAttribute("aria-pressed") === "true") return;
+        state.frameGen = b.dataset.v;
+        syncFrameGen();
+        host.send({type:"frameGen", value: b.dataset.v});
+      });
+    });
+  }
   function refreshDoneEnv(){
     if (state.phase !== 'done') return;
     env.className = 'env';
@@ -2224,6 +2281,32 @@
     env.innerHTML = '<b>正在恢复默认设置…</b>';
     host.send({type:'restoreDefaults'});
   });
+  /* ── 移除自签名证书（同一套"两次点击确认"，因为这会断掉 ReShade 的签名） ── */
+  var btnRemoveCert = $('#btn-remove-cert'), certArmed = false, certTimer = 0;
+  function disarmCert(){
+    certArmed = false;
+    clearTimeout(certTimer);
+    if (btnRemoveCert){
+      btnRemoveCert.textContent = '移除…';
+      btnRemoveCert.classList.remove('danger');
+    }
+  }
+  if (btnRemoveCert){
+    btnRemoveCert.addEventListener('click', function(){
+      if (state.phase === 'installing') return;
+      if (!certArmed){
+        certArmed = true;
+        btnRemoveCert.textContent = '确认移除';
+        btnRemoveCert.classList.add('danger');
+        certTimer = setTimeout(disarmCert, 4000);
+        return;
+      }
+      disarmCert();
+      env.className = 'env';
+      env.innerHTML = '<b>正在移除自签名证书…</b>';
+      host.send({type:'removeCert'});
+    });
+  }
   /* ── 桌面快捷方式 + 与其他启动器联动 ── */
   var swShortcut = $('#sw-shortcut');
   var unlockerDirEl = $('#unlockerdir');
@@ -2684,8 +2767,11 @@ $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); }
       applyAppearance();
       state.srInput = (msg.srInput && msg.srInput.value) || 'auto';
       state.srAvailable = !!(msg.srInput && msg.srInput.available);
+      state.frameGen = (msg.frameGen && msg.frameGen.value) || '';
+      state.frameGenAvailable = !!(msg.frameGen && msg.frameGen.available);
       syncFpsUI();
       syncSrInput();
+      syncFrameGen();
       buildRows();
       updateSummary();
       updateMain();
@@ -2828,6 +2914,15 @@ $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); }
         env.className = 'env bad';
         env.innerHTML = '<b>' + (msg.error || '恢复失败') + '</b>';
       }
+    }
+    else if (msg.type === 'certRemoved'){
+      // 移除自签名证书的结果。0 个也当成功（本来就没有），只说"未找到"。
+      env.className = msg.ok ? 'env' : 'env bad';
+      var removed = msg.removed || 0;
+      env.innerHTML = msg.ok
+        ? '<b>' + (removed > 0 ? '已移除 ' + removed + ' 个自签名证书' : '没有找到需要移除的证书') + '</b>'
+          + '<span class="sep">·</span>' + (msg.message || '')
+        : '<b>' + (msg.message || '移除失败') + '</b>';
     }
     else if (msg.type === 'logs'){
       if (msg.cancelled) {

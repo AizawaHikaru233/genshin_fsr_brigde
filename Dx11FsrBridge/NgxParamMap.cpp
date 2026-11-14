@@ -31,7 +31,19 @@ CreateFlagsOutput map_create_flags(const CreateFlagsInput &in)
     CreateFlagsOutput out {};
     out.flags = 0;
     if (in.is_hdr)            out.flags |= kFlagIsHdr;
-                              out.flags |= kFlagMvLowRes;   // 1<<1，恒设（与重构前那行逐字对应）
+    // 2026-11-13：MVLowRes 改为按 `in.mv_low_res` 决定（**不再恒设**）。
+    //
+    // 历史：这里曾是恒设一行（"与重构前逐字对应"）。
+    //
+    // 该位语义：告诉 DLSS「运动矢量是**渲染分辨率**的、需要内部放大到显示分辨率」。
+    // 若游戏实际给的是显示分辨率 MV 却置了这位，DLSS 会按错误比例缩放 MV
+    // ⇒ 运动补偿错位 ⇒ 全屏拖影（与本项目早期「若游戏给的是像素单位会出现全屏拖影」
+    // 那条记录同源）。
+    //
+    // 改为可配置的依据：本键设 0 后实机拖影明显减轻（未完全根除 —— 剩余部分与
+    // `NgxHdr`、OptiScaler 侧 `[InitFlags] HDR` 有关，不在本仓库范围）。
+    // 默认仍由调用方传 true（保持历史行为），需要 A/B 时用 Fsr2MotionVectorsLowRes=0。
+    if (in.mv_low_res)        out.flags |= kFlagMvLowRes;
     if (in.mv_jittered)       out.flags |= kFlagMvJittered;
     if (in.depth_inverted)    out.flags |= kFlagDepthInverted;
     return out;

@@ -11,7 +11,7 @@
 //      然后对同一组输入比较**输出的 IEEE 位模式**（std::bit_cast，不是 epsilon）。
 //      ⇒ 如果被测函数抄错一个符号、一个 0.5、一个乘法顺序，位模式立刻不同。
 //   ② **契约断言**：把与实机症状直接相关的不变量单独钉住
-//      （MVLowRes 恒设 / mode 5 恒 0 / mode 2 原样 / reset 四组合 / 守卫 >= 语义）。
+//      （MVLowRes 跟输入 / mode 5 恒 0 / mode 2 原样 / reset 四组合 / 守卫 >= 语义）。
 //
 // ★ 为什么 oracle 必须"另抄一份"而不是调用 map_*：
 //   调用被测函数当 oracle 是同义反复 —— 两边同时错就永远绿。
@@ -23,18 +23,20 @@
 // ============================================================================
 // 与任务书表述不一致的两处（**如实记录，不迁就**）
 // ============================================================================
-// (1) 任务书写「map_create_flags：4 个布尔输入的 16 种组合」。但任务书自己给出的
+// (1) 任务书写「map_create_flags：4 个布尔输入的 16 种组合」，而最初给出的
 //     CreateFlagsInput 只有 **3 个** bool（is_hdr / depth_inverted / mv_jittered）
-//     ⇒ 组合数是 2^3 = **8**。第 4 个"输入"是 MVLowRes，而它是**常量 1**、不是输入。
-//     本测试覆盖全部 8 种组合，并对每一种都断言 MVLowRes 位存在（= 把 4 个位全钉死）。
-//     若要真做 16 组合，得给结构体加第 4 个字段 —— 那是改接口，超出本次重构范围。
+//     ⇒ 那时组合数是 2^3 = **8**，第 4 个"输入"MVLowRes 是**常量 1**。
+//
+//     2026-11-13：MVLowRes 改成可配置（Fsr2MotionVectorsLowRes），结构体随之加了
+//     第 4 个字段 `mv_low_res` ⇒ **现在真的是 2^4 = 16 组合**，与任务书的措辞一致。
+//     本测试同步改成 16 组合，并保留一条「mv_low_res=true 且其余全关 ⇒ 0x2」回归，
+//     钉住"默认值与改动前相同"。
 //
 // (2) 任务书要求「验证 mode 3 的输出范围是 [-0.5, 0.5)」。**该命题在字面意义上不成立**：
 //     mode 3 是 -(n*W) + 0.5。若 n 是裸的 [0,1) 相位（例如 n=0.5、W=2556），
 //     输出是 -1277.5 —— 远离 [-0.5, 0.5)。
 //     它只在 **n = halton/W** 这个语义下才落在范围里（实机取证：游戏字段存的是
-//     halton/renderW，见 build-t6verify/_ref-dlss-input 的 DlssInput.h 注释），
-//     且此时输出是 **(-0.5, +0.5]**（左开右闭），不是 [-0.5, 0.5)。
+//     halton/renderW），且此时输出是 **(-0.5, +0.5]**（左开右闭），不是 [-0.5, 0.5)。
 //     ⇒ 本测试断言的是**真实成立的那个命题**，并额外断言"裸相位下确实超界"，
 //       把这条边界写进代码，防止后人按任务书的措辞去"修"公式。
 
@@ -93,12 +95,15 @@ using namespace ngx_param_map;
 // ===========================================================================
 
 // 来源：NgxBackend.cpp:1415-1421（build_create_flags 的决策部分）。
-// 注意 :1417 那行 MVLowRes 前面**没有 if**（缩进只是排版）⇒ 无条件执行。
-std::uint32_t oracle_create_flags(bool is_hdr, bool depth_inverted, bool mv_jittered)
+// 2026-11-13：MVLowRes 由「恒设」改为由第 4 个输入 mv_low_res 决定
+// （见 NgxParamMap.cpp 的 map_create_flags 注释）。oracle 同步改成同一个口径 ——
+// 两个实现都从输入取值，才不会「改了一边忘了另一边」。
+std::uint32_t oracle_create_flags(bool is_hdr, bool depth_inverted, bool mv_jittered,
+                                  bool mv_low_res)
 {
     std::uint32_t flags = 0;
     if (is_hdr)             flags |= (1u << 0);   // IsHDR
-                            flags |= (1u << 1);   // MVLowRes，恒设
+    if (mv_low_res)         flags |= (1u << 1);   // MVLowRes（2026-11-13 起条件化）
     if (mv_jittered)        flags |= (1u << 2);   // MVJittered
     if (depth_inverted)     flags |= (1u << 3);   // DepthInverted
     return flags;
@@ -194,25 +199,28 @@ float halton(int i, int b)
 // ===========================================================================
 void test_create_flags()
 {
-    std::printf("[1] map_create_flags: 2^3 combinations vs oracle + MVLowRes constant\n");
+    // 2026-11-13：组合数从 2^3 变 2^4 —— MVLowRes 不再是常量，成了第 4 个输入。
+    std::printf("[1] map_create_flags: 2^4 combinations vs oracle (MVLowRes now an input)\n");
 
-    for (int mask = 0; mask < 8; ++mask)
+    for (int mask = 0; mask < 16; ++mask)
     {
         CreateFlagsInput in {};
         in.is_hdr         = (mask & 1) != 0;
         in.depth_inverted = (mask & 2) != 0;
         in.mv_jittered    = (mask & 4) != 0;
+        in.mv_low_res     = (mask & 8) != 0;
 
         const CreateFlagsOutput out = map_create_flags(in);
-        const std::uint32_t want = oracle_create_flags(in.is_hdr, in.depth_inverted, in.mv_jittered);
+        const std::uint32_t want =
+            oracle_create_flags(in.is_hdr, in.depth_inverted, in.mv_jittered, in.mv_low_res);
         CHECK(out.flags == want);
 
         // 4 个位逐位对账（不是只看整体值 —— 整体错位时逐位能指出是哪一位）。
         CHECK(((out.flags & kFlagIsHdr) != 0) == in.is_hdr);
         CHECK(((out.flags & kFlagDepthInverted) != 0) == in.depth_inverted);
         CHECK(((out.flags & kFlagMvJittered) != 0) == in.mv_jittered);
-        // ★ 恒设位：与其余三个输入**无关**，8 种组合都必须为 1。
-        CHECK((out.flags & kFlagMvLowRes) != 0);
+        // ★ 2026-11-13 起跟输入走，不再恒 1。
+        CHECK(((out.flags & kFlagMvLowRes) != 0) == in.mv_low_res);
 
         // 不得出现任何未声明的位（1<<4 / 1<<5 DoSharpening / 1<<6 / 1<<7 / 1<<8 一律不设）。
         CHECK((out.flags & ~(kFlagIsHdr | kFlagMvLowRes | kFlagMvJittered | kFlagDepthInverted)) == 0);
@@ -227,11 +235,19 @@ void test_create_flags()
     // 全开 / 全关的两个具体值（便于人眼核对）。
     {
         CreateFlagsInput on {};
-        on.is_hdr = true; on.depth_inverted = true; on.mv_jittered = true;
+        on.is_hdr = true; on.depth_inverted = true; on.mv_jittered = true; on.mv_low_res = true;
         CHECK(map_create_flags(on).flags == 0xFu);            // 1|2|4|8
         CreateFlagsInput off {};
-        off.is_hdr = false; off.depth_inverted = false; off.mv_jittered = false;
-        CHECK(map_create_flags(off).flags == 0x2u);           // 只剩 MVLowRes
+        // 全关：一个字位都不设（含 MVLowRes —— 它不再是"永远在"的那一位）。
+        CHECK(map_create_flags(off).flags == 0x0u);
+    }
+
+    // 历史默认值回归：mv_low_res=true 且其余全关时，结果与 2026-11-13 之前完全相同
+    // （那时 MVLowRes 恒设）。这条钉住"默认行为没变"。
+    {
+        CreateFlagsInput legacy {};
+        legacy.mv_low_res = true;
+        CHECK(map_create_flags(legacy).flags == 0x2u);        // 只剩 MVLowRes
     }
 }
 

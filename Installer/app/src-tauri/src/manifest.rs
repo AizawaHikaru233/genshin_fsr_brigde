@@ -52,12 +52,26 @@ pub fn load() -> Option<Manifest> {
             continue;
         }
         match std::fs::read_to_string(&path) {
-            Ok(text) => match serde_json::from_str::<Manifest>(&text) {
-                Ok(manifest) => return Some(manifest),
-                Err(err) => {
-                    crate::log::write(&format!("[verify] 清单解析失败 {}: {err}", path.display()))
+            Ok(text) => {
+                // 2026-11-14：清单可能带 UTF-8 BOM。
+                //
+                // 上游生成脚本用 PowerShell 的 `Out-File -Encoding UTF8` / `Set-Content
+                // -Encoding UTF8` 写这份清单，两者都会写 BOM（EF BB BF）。而
+                // `serde_json::from_str` **不接受**前导 BOM，会在第 1 行第 1 列报
+                // "expected value"；调用方又把解析失败当成「清单缺失」
+                // ⇒ 用户看到"包里缺少 upstream-versions.json，无法校验下载内容"，
+                // ReShade / DLSS 全都下不了，而文件其实就在 exe 旁边。
+                //
+                // 实测（2026-11-14）：发布包 2.5.0 的 upstream-versions.json 确实以
+                // EF BB BF 开头。这里剥掉再解析，不依赖上游改生成脚本。
+                let trimmed = text.trim_start_matches('\u{feff}');
+                match serde_json::from_str::<Manifest>(trimmed) {
+                    Ok(manifest) => return Some(manifest),
+                    Err(err) => {
+                        crate::log::write(&format!("[verify] 清单解析失败 {}: {err}", path.display()))
+                    }
                 }
-            },
+            }
             Err(err) => {
                 crate::log::write(&format!("[verify] 清单读取失败 {}: {err}", path.display()))
             }

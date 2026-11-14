@@ -384,9 +384,23 @@ fn normalize(path: &Path) -> String {
 }
 
 /// DllList 里的绝对路径是否包含该组件。
+///
+/// **ReShade 是双路径组件（2026-11-14）**：它在帧生成开着时**故意不进 DllList**，
+/// 改为由 OptiScaler 加载（见 [`reshade_via_opti`]）。因此判"是否已安装"必须看两条路：
+///
+/// | 帧生成 | 判据 |
+/// |---|---|
+/// | 开 | `OptiScaler.ini` 的 `[Plugins] LoadReshade=true` **且** 游戏根目录有 `ReShade64.dll` |
+/// | 关 | DllList 里含 `payload\ReShade\ReShade64.dll`（原有逻辑） |
+///
+/// 不这么判的话，界面会把"已由 OptiScaler 正确加载"的 ReShade 显示成「未写入」，
+/// 用户以为没装上，反复点保存也改不掉（因为它本来就不该进 DllList）。
 pub fn is_enabled(dlls: &[String], id: &str, settings: &Settings) -> bool {
     if id == "fpsun" {
         return dll_path_of(id, settings).is_file();
+    }
+    if id == "reshade" && reshade_via_opti(&settings.selected, settings) {
+        return reshade_loaded_by_opti(settings);
     }
     let target = normalize(&dll_path_of(id, settings));
     !target.is_empty()
@@ -395,11 +409,54 @@ pub fn is_enabled(dlls: &[String], id: &str, settings: &Settings) -> bool {
             .any(|entry| normalize(Path::new(entry)) == target)
 }
 
-/// 注入顺序固定：ReShade64 → Dx11FsrBridge → OptiScaler → AntiPlayerMosaic → TextureLoader
+/// OptiScaler 那条路上 ReShade 是否真的就位：`LoadReshade=true` **且** 游戏根目录有 DLL。
+///
+/// 两个条件缺一不可 —— 只写了 ini 但文件没复制过去，游戏里起不来；
+/// 只有文件但 `LoadReshade=false`，没人加载它。
+fn reshade_loaded_by_opti(settings: &Settings) -> bool {
+    let game_dir = settings.game_dir.trim();
+    if game_dir.is_empty() {
+        return false;
+    }
+    let dll_present = Path::new(game_dir).join("ReShade64.dll").is_file();
+    if !dll_present {
+        return false;
+    }
+    // LoadReshade 读自已安装那份 OptiScaler.ini；没装 OptiScaler 时 ini_path() 返回 None。
+    match crate::framegen::ini_path(settings) {
+        Some(path) => crate::ini::get(&path, "Plugins", "LoadReshade")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+/// 注入顺序固定：Dx11FsrBridge → OptiScaler → AntiPlayerMosaic → TextureLoader
 /// 用户自定义注入的 DLL 一律追加在这些之后。
+///
+/// **ReShade 的特殊处理（2026-11-14）**：判据见 [`reshade_via_opti`] ——
+/// 装 OptiScaler **且帧生成开着**时，ReShade 交给 OptiScaler 加载、不进 DllList。
+///
+/// 为什么：
+///   · 开帧生成时，外部注入的 ReShade64.dll 排在注入链**第一个**，它 hook 到的是
+///     OptiScaler 创建的**隐藏窗口** swapchain（`_real`）。DX11 的 ReShade 把 overlay
+///     画在那个隐藏窗口上，而真正上屏的是 `_fgSwapChain`（DX12）
+///     ⇒ **effect 生效但设置面板永远不可见**。
+///   · 由 OptiScaler 加载时，ReShade 与 OptiScaler 共享同一条呈现路径，面板正常。
+///   · 关帧生成时没有这层冲突，外部注入更快，也不依赖 OptiScaler 的加载顺序。
+///
+/// 没装 OptiScaler 时仍然外部注入（否则根本没人加载它）。
 pub fn dll_list(selected: &[String], settings: &Settings) -> Vec<PathBuf> {
-    const ORDER: &[&str] = &["reshade", "bridge", "opti", "mosaic", "texture"];
-    let mut list: Vec<PathBuf> = ORDER
+    // 帧生成开着 + 装了 OptiScaler ⇒ ReShade 交给 OptiScaler，不进注入链（也避免重复注入）
+    let reshade_by_opti = reshade_via_opti(selected, settings);
+
+    let order: &[&str] = if reshade_by_opti {
+        &["bridge", "opti", "mosaic", "texture"]
+    } else {
+        &["reshade", "bridge", "opti", "mosaic", "texture"]
+    };
+
+    let mut list: Vec<PathBuf> = order
         .iter()
         .filter(|id| selected.iter().any(|s| s == *id))
         .map(|id| dll_path_of(id, settings))
@@ -420,5 +477,57 @@ pub fn dll_list(selected: &[String], settings: &Settings) -> Vec<PathBuf> {
         list.push(path);
     }
     list
+}
+
+/// ReShade 是否应当由 OptiScaler 加载 —— **意愿判据**（不看 DLL 到底在不在）。
+///
+/// 判据：装了 OptiScaler + 勾了 ReShade + **帧生成开着**。
+///
+/// 为什么把帧生成算进来：见 [`dll_list`] 的注释 —— 开帧生成时外部注入的 ReShade 会把
+/// overlay 画到隐藏窗口 swapchain 上，面板永远不可见；关帧生成时外部注入没问题且更快。
+///
+/// ★ 为什么这一层**不查 DLL 是否存在**：
+///   `install::prepare_opti` 要先写 `LoadReshade=true`，然后才把 DLL 复制到游戏根目录。
+///   若这里也查文件，第一次安装时文件还不存在 ⇒ 返回 false ⇒ 不复制 ⇒ 永远装不上
+///   （先有鸡还是先有蛋）。
+///
+///   「文件到底在不在」由 [`reshade_via_opti`] 在**决策注入链**时查（那时复制已经做过）。
+///   两层的分工：
+///     · `reshade_via_opti_wanted`  —— 决定「要不要复制 + 写 LoadReshade=true」
+///     · `reshade_via_opti`        —— 决定「ReShade 该不该走 OptiScaler 这条路」，
+///                                    文件不在时自动落回外部注入
+pub fn reshade_via_opti_wanted(selected: &[String], settings: &Settings) -> bool {
+    let has_opti = selected.iter().any(|s| s == "opti");
+    let has_reshade = selected.iter().any(|s| s == "reshade");
+    has_opti && has_reshade && crate::framegen::is_enabled(settings)
+}
+
+/// ReShade 是否**实际**由 OptiScaler 加载（意愿 + DLL 确实就位）。
+///
+/// 用于决定注入链（[`dll_list`]）与界面状态（[`is_enabled`]）。
+///
+/// 为什么还要查「DLL 在不在游戏根目录」：这是**签名/复制失败后的真实回退路径**。
+/// `install::prepare_opti` 只在 payload 里那份 `ReShade64.dll` 存在时才复制过去；
+/// 复制不成功（用户没下载 ReShade）时游戏根目录就空着 —— 而 OptiScaler 的
+/// `Util::ReShadePath()` 正是从那里找它。若这里仍返回 true，会出现
+/// 「`LoadReshade=true` 但 DLL 不在」⇒ OptiScaler 加载失败，且 `LoadReshade=true`
+/// 还把 DllList 里的外部注入挤掉了 ⇒ 用户既没有 ReShade 也没有面板。
+/// 加上这一条后那种情况自动落回外部注入，与文案里说的
+/// 「失败不阻断，只是要走外部注入路径」一致。
+///
+/// ★ 帧生成状态用 `framegen::is_enabled`（读 `OptiScaler.ini` 的 `[FrameGen]`）。
+///   返回 false（没装 / 读不到 / 关着）时按关闭处理：宁可走外部注入
+///   （此时没有 FG 冲突），也不要在状态未知时把 ReShade 藏起来。
+pub fn reshade_via_opti(selected: &[String], settings: &Settings) -> bool {
+    reshade_via_opti_wanted(selected, settings) && reshade_dll_in_game_dir(settings)
+}
+
+/// 游戏根目录是否已有 `ReShade64.dll`（OptiScaler 的 `Util::ReShadePath()` 从那里找）。
+fn reshade_dll_in_game_dir(settings: &Settings) -> bool {
+    let game_dir = settings.game_dir.trim();
+    if game_dir.is_empty() {
+        return false;
+    }
+    Path::new(game_dir).join("ReShade64.dll").is_file()
 }
 
