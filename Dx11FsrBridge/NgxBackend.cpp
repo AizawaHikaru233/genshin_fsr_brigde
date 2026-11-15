@@ -1006,9 +1006,9 @@ const char *provider_mode_name(int mode)
 // ============================================================================
 
 // ngx_in / ngx_out 的采样周期：1021（< 1024 的最大素数）。
-// 与 8/16/24/32/64/128 全部互质 ⇒ 采样点相对抖动相位不会锁死；相邻采样帧相隔 1021，
-// 与 phaseCount=32 的排列周期是 lcm(1021,32)=32672 帧 —— 远长于一次游玩，
-// 等效于沿相位轴均匀采样。
+// 与 8/16/24/32/64/128 全部互质 ⇒ 采样点相对抖动相位不会锁死：第 n 个采样点的相位是
+// (n × 1021) mod phaseCount，1021 mod 32 = 29 且 gcd(29,32) = 1 ⇒ 随 n 逐一遍历 32 个相位
+// （完整排列周期 lcm(1021,32) = 32672 帧；未实测单局时长，此处只作数量级参考）。
 // ★ 改这个数之前先确认它仍是素数，且与本机 phaseCount 互质（见上方注释）。
 constexpr std::uint64_t kNgxJitterSamplePeriod = 1021u;
 
@@ -1470,7 +1470,7 @@ static bool bind_entries_from(HMODULE module, std::string *missing)
     //   ★ 必须传 module 句柄，不能用 nullptr —— GetModuleFileNameW(nullptr, …) 取到的是
     //     **宿主 exe**（self_module_dir() 上方已记录同一教训），那会把"谁在超分"答成游戏本体。
     //   ★ 为什么放在这个成功出口、而不是三个调用点各记一次：三个调用点是同一条回退链
-    //     （注册表 → 已装载模块 → 裸名装载），只有走到这里才代表 10 个导出**齐全**；
+    //     （注册表 → 裸名装载 → 枚举已装载模块），只有走到这里才代表 10 个导出**齐全**；
     //     放在这里天然满足"后写覆盖前写"⇒ 全局里永远是**最后成功绑定**的那个模块，
     //     也就是 hit 最终采纳的 provider。在调用点记则会把中途失败的候选也写进去。
     wchar_t entry_path[MAX_PATH] {};
@@ -1843,9 +1843,10 @@ static bool ensure_init(ID3D11Device *dev)
     //   为什么并进本行而不是另起一行：这一行已经是"初始化成功"的唯一快照，排查时需要
     //   「运行时版本 + 来源 + provider + 入口模块」同时在场才够一次定位；拆成两行会让
     //   只抓 error 级的用户拿到半截事实。
-    //   为什么**不做成配置开关**：本行每次进程只走一次（g_inited 短路），不在每帧/每 draw
-    //   路径上（§二.5 热路径红线不适用），代价只是一次 GetModuleFileNameW；而它要解决的
-    //   是一个已经发生过的真实误判（OptiScaler 场景下 provider 行指向 DriverStore 那份）。
+    //   为什么**不做成配置开关**：本行只在**初始化成功**时打印，含 shutdown_all() 清掉
+    //   g_inited 之后的设备重建（设备更换 / 设备丢失两条路径），不在每帧/每 draw 路径上
+    //   （§二.5 热路径红线不适用），代价只是一次 GetModuleFileNameW；而它要解决的是一个
+    //   已经发生过的真实误判（OptiScaler 场景下 provider 行指向 DriverStore 那份）。
     //   做成开关只会让需要它的那一次恰好是关着的 —— 诊断默认常开、且不影响任何行为分支。
     //   ★ 与 provider= 的差别：provider= 说"从哪条路找来的"，entry= 说"最终绑的是哪个文件"。
     log_ngx_error(L"ngx_core init ok=1 available=1 rc=0x%X dlss=%s source=%s provider=%s entry=%s",
