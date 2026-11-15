@@ -384,11 +384,19 @@ bool g_available = false;   // SuperSampling 可用
 //   放在 g_inited / g_available 旁边（同为进程级事实），与 active() / available() 那组查询
 //   同级，不另起一段、也不在别处再造第二份口径（AGENTS.md §五.2）。
 // ★ 只存 kind，不存 ProviderHit 的 module / path：module 句柄按 §6-13 惯例不持有，
-//   而 path 已经打在紧邻的 "provider resolved=… module=…" 行上；再存一份**没有读取点**的
+//   而 hit.path 已经打在紧邻的 "provider resolved=… module=…" 行上；再存一份**没有读取点**的
 //   副本只会变成死状态（本仓库对"加了字段却没人读"的历史事故有明确记录）。
 // ★ 形态纪律不变：它**不是** atomic —— 写方（ensure_init）与读方（日志）都在
 //   ffx12::dispatch() 持 g_mutex 的调用栈内，与 g_inited / g_available 的前提完全相同。
 const wchar_t *g_provider_kind = L"unknown";   // 指向字符串字面量（静态存储期），无需持有
+// 2026-11-15（谁在提供 CreateFeature 入口）：**入口模块**的完整路径。
+// 为什么在"不存 path"之上又加这一份：两者不是同一个事实。hit.path 是**装载来源**
+//   （注册表里 FullPath\_nvngx.dll，常见是 DriverStore 那份），而这一个是**真正被
+//   GetProcAddress 绑上 10 个 NVSDK_NGX_D3D11_* 入口的那个已装载模块**。装了 OptiScaler
+//   之后它劫持 LoadLibraryW 返回自己的 HMODULE ⇒ 两者指向不同文件，只看 provider 行会把
+//   "这局谁在超分"判断反。它**有读取点**（init 行的 entry= 字段），不是死状态。
+// ★ 写方/读方同上（都只在 ensure_init 的调用栈内）；值只在初始化时算一次，非热路径。
+std::wstring g_entry_module_path;
 // DLSS 运行时版本（"310.9.16" = FileVersion 前三段）；"?" = 未取到。
 // 只在首次初始化成功时读一次（g_dlss_version_read 锁存）—— 读文件版本要打开文件，
 // 绝不能落在每帧/每 draw 路径上（§二.5 热路径红线）。
@@ -1458,6 +1466,19 @@ static bool bind_entries_from(HMODULE module, std::string *missing)
     }
     if (missing != nullptr)
         missing->clear();
+    // 2026-11-15：把**入口模块**的完整路径记到全局（供 init 行的 entry= 字段）。
+    //   ★ 必须传 module 句柄，不能用 nullptr —— GetModuleFileNameW(nullptr, …) 取到的是
+    //     **宿主 exe**（self_module_dir() 上方已记录同一教训），那会把"谁在超分"答成游戏本体。
+    //   ★ 为什么放在这个成功出口、而不是三个调用点各记一次：三个调用点是同一条回退链
+    //     （注册表 → 已装载模块 → 裸名装载），只有走到这里才代表 10 个导出**齐全**；
+    //     放在这里天然满足"后写覆盖前写"⇒ 全局里永远是**最后成功绑定**的那个模块，
+    //     也就是 hit 最终采纳的 provider。在调用点记则会把中途失败的候选也写进去。
+    wchar_t entry_path[MAX_PATH] {};
+    const DWORD entry_n = GetModuleFileNameW(module, entry_path, MAX_PATH);
+    // 取不到（0 或截断）时清空，让 init 行打 entry=(unknown)，不留下上一次的旧值。
+    g_entry_module_path.clear();
+    if (entry_n != 0 && entry_n < MAX_PATH)
+        g_entry_module_path.assign(entry_path, entry_path + entry_n);
     return true;
 }
 
@@ -1817,11 +1838,22 @@ static bool ensure_init(ID3D11Device *dev)
             g_dlss_version_read = true;
         }
     }
-    log_ngx_error(L"ngx_core init ok=1 available=1 rc=0x%X dlss=%s source=%s provider=%s",
+    // 2026-11-15（谁在提供 CreateFeature 入口）：补 entry= 字段，即真正被绑上 10 个
+    //   NVSDK_NGX_D3D11_* 导出的**已装载模块**的完整路径。
+    //   为什么并进本行而不是另起一行：这一行已经是"初始化成功"的唯一快照，排查时需要
+    //   「运行时版本 + 来源 + provider + 入口模块」同时在场才够一次定位；拆成两行会让
+    //   只抓 error 级的用户拿到半截事实。
+    //   为什么**不做成配置开关**：本行每次进程只走一次（g_inited 短路），不在每帧/每 draw
+    //   路径上（§二.5 热路径红线不适用），代价只是一次 GetModuleFileNameW；而它要解决的
+    //   是一个已经发生过的真实误判（OptiScaler 场景下 provider 行指向 DriverStore 那份）。
+    //   做成开关只会让需要它的那一次恰好是关着的 —— 诊断默认常开、且不影响任何行为分支。
+    //   ★ 与 provider= 的差别：provider= 说"从哪条路找来的"，entry= 说"最终绑的是哪个文件"。
+    log_ngx_error(L"ngx_core init ok=1 available=1 rc=0x%X dlss=%s source=%s provider=%s entry=%s",
                   static_cast<unsigned>(NVSDK_NGX_Result_Success),
                   g_dlss_version.empty() ? L"?" : g_dlss_version.c_str(),
                   g_dlss_source.empty() ? L"none" : g_dlss_source.c_str(),
-                  g_provider_kind);
+                  g_provider_kind,
+                  g_entry_module_path.empty() ? L"(unknown)" : g_entry_module_path.c_str());
 
     // ---- 第 10b 步（2026-11-13，OPEN-ISSUES §4）：为选档准备**独立的**查询参数对象 ----
     // 为什么放在这里、而不是第一次选档时懒建：
