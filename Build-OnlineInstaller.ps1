@@ -469,14 +469,9 @@ function Prepare-FpsStage {
     }
     Copy-Item -LiteralPath $bridgeDll -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.dll') -Force
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.ini') -Force
-    # Bridge 的编译期依赖里有一份专有许可：NVIDIA NGX SDK 头（third_party\ngx\）。
-    # 许可要求随分发对象一并提供许可文本（NVIDIA RTX SDKs License §2.c），故放进模块目录；
-    # 与 TextureLoader\licenses\ 同一惯例 —— 外部许可不上移到包根 license\。
-    $ngxLicense = Join-Path $root 'Dx11FsrBridge\third_party\ngx\NVIDIA-SDK-LICENSE.txt'
-    if (-not (Test-Path -LiteralPath $ngxLicense -PathType Leaf)) {
-        throw "缺少 NVIDIA NGX SDK 许可文本: $ngxLicense（third_party\ngx 目录不完整，先跑 tools\Fetch-NgxHeaders.ps1）"
-    }
-    Copy-Item -LiteralPath $ngxLicense -Destination (Join-Path $stagePayloadBridge 'NVIDIA-NGX-SDK-LICENSE.txt') -Force
+    # 2026-11-15：NVIDIA NGX SDK 头（third_party\ngx\）已随 NGX 代理后端移除 ——
+    # 直连层（DlssInput）自己声明最小 NVSDK_NGX ABI，不再 vendor 专有头，
+    # 故这里不再需要复制 NVIDIA-SDK-LICENSE.txt。
     Copy-Item -LiteralPath $antiDll -Destination (Join-Path $stagePayloadAnti 'AntiPlayerMosaic.dll') -Force
     # TextureLoader（纹理/Mod 加载器）：DLL + ini + DirectStorage 运行时 + 空 Mods 目录。
     # 许可文件收进模块目录内 licenses/ 子文件夹（自身 GPL-3.0 许可/溯源 +
@@ -610,7 +605,6 @@ function Build-FpsPackage {
         ) + $installerFiles + @(
             'license\OptiScaler-LICENSE.txt', 'license\FPSUnlocker-LICENSE.txt', 'license\ReShade-LICENSE.txt',
             'payload\Bridge\Dx11FsrBridge.dll', 'payload\Bridge\Dx11FsrBridge.ini',
-            'payload\Bridge\NVIDIA-NGX-SDK-LICENSE.txt',
             'payload\AntiPlayerMosaic\AntiPlayerMosaic.dll',
             'payload\TextureLoader\TextureLoader.dll', 'payload\TextureLoader\TextureLoader.ini',
             'payload\TextureLoader\dstorage.dll', 'payload\TextureLoader\dstoragecore.dll',
@@ -720,14 +714,7 @@ try {
     New-Item -ItemType Directory -Path $bridge, $opti, $amd, $nvidia, $reshade, $textureLoader, $defaults -Force | Out-Null
     Copy-Item -LiteralPath $bridgeDll -Destination (Join-Path $bridge 'Dx11FsrBridge.dll') -Force
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $bridge 'Dx11FsrBridge.ini') -Force
-    # NVIDIA RTX SDKs License §2.c：分发对象须随附许可文本（NGX SDK 头是桥的编译期依赖）。
-    # 与 FPS 包同一规则；此前只加进了 FPS 包的 required 列表与复制流程，商城包漏了复制，
-    # 于是 2.5.0 首次打包在 Assert-RequiredFiles 处失败（缺 payload\Bridge\NVIDIA-NGX-SDK-LICENSE.txt）。
-    $ngxLicense = Join-Path $root 'Dx11FsrBridge\third_party\ngx\NVIDIA-SDK-LICENSE.txt'
-    if (-not (Test-Path -LiteralPath $ngxLicense -PathType Leaf)) {
-        throw "缺少 NVIDIA NGX SDK 许可文本: $ngxLicense（third_party\ngx 目录不完整，先跑 tools\Fetch-NgxHeaders.ps1）"
-    }
-    Copy-Item -LiteralPath $ngxLicense -Destination (Join-Path $bridge 'NVIDIA-NGX-SDK-LICENSE.txt') -Force
+    # 2026-11-15：同上 —— NGX SDK 头已移除，商城包也不再需要这份许可文本。
     Copy-DirectoryContents -Source $optiRuntime -Destination $opti
     # 临时方案：同上，芙芙包里的 OptiScaler 也换成 AMD 官方 FFX 运行时。
     Copy-Item -LiteralPath $ffxDll -Destination (Join-Path $opti 'amd_fidelityfx_upscaler_dx12.dll') -Force
@@ -786,7 +773,6 @@ try {
         'FSR-Bridge-Plugin.dll', 'config.ini', 'Feedback.txt', 'Package-Version.txt',
         'license\OptiScaler-LICENSE.txt', 'license\FPSUnlocker-LICENSE.txt', 'license\ReShade-LICENSE.txt',
         'payload\Bridge\Dx11FsrBridge.dll', 'payload\Bridge\Dx11FsrBridge.ini',
-        'payload\Bridge\NVIDIA-NGX-SDK-LICENSE.txt',
         'payload\OptiScaler\OptiScaler.dll', 'payload\OptiScaler\amd_fidelityfx_dx12.dll',
         'payload\OptiScaler\amd_fidelityfx_upscaler_dx12.dll', 'payload\OptiScaler\libxell.dll',
         'payload\OptiScaler\libxess.dll', 'payload\OptiScaler\libxess_dx11.dll',

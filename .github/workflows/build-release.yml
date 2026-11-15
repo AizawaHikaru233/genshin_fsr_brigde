@@ -113,8 +113,16 @@ jobs:
           $uni = [Text.Encoding]::Unicode.GetString($bytes)
           # 2026-11-15：桥已改用 DLSS 直连层（DlssInput），NGX 代理后端的键全部移除。
           # 这里检查直连层的特征串 —— 它们缺失说明构建漏了 DlssInput.cpp。
-          foreach ($needle in @('DlssInputJitterMode', 'DlssInputDepthScale', 'DlssInputModule')) {
-              if (-not $uni.Contains($needle)) {
+          # 2026-11-15（审查 N19）：断言串必须**只在 DlssInput.cpp 里出现** ——
+          # 原清单的三个键全部只在 Dx11FsrBridge.cpp 的 load_config 里（L"..." 字面量），
+          # 漏编 DlssInput.cpp 也照样绿。改用只在该 TU 出现的 ASCII 串。
+          # 编码：这些是 std::string 字面量 ⇒ ASCII，必须用 Latin1 而非 Unicode。
+          $ascii = [Text.Encoding]::GetEncoding(28591).GetString($bytes)
+          foreach ($needle in @('no_dlss_runtime_and_no_optiscaler', 'optiscaler_required_but_absent',
+                                       'real_ngx_disallowed', 'ngx_exports_incomplete')) {
+              if (-not $ascii.Contains($needle)) {
+                  throw "DLSS direct-connect string '$needle' missing from the packaged bridge - DlssInput.cpp probably not compiled in"
+              }
               throw "DLSS direct-connect string '$needle' missing from the packaged bridge - DlssInput.cpp probably not compiled in"
               }
           }

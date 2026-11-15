@@ -353,6 +353,26 @@ target_include_directories(NgxParamMapTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
 enable_testing()
 add_test(NAME NgxParamMapTest COMMAND NgxParamMapTest)
 
+# ---- DLSS 直连层的纯映射层单测（2026-11-15，审查 M6 补）----
+#
+# `DlssInputTest.cpp` 覆盖 DlssInput.h/.cpp 的**纯计算部分**：
+#   jitter 六模式 + 相位折返 / MV 符号四档 / CreateFlags 位模式 / perf_quality 六档 /
+#   reset 优先级 / masks 组合 / subrect 校验 / route_output 全分支 / build_frame 兜底 /
+#   自生成 Halton。
+#
+# ⚠️ 它**不覆盖**驱动层（Feature::create/evaluate/destroy、Runtime::initialize/
+#   ensure_feature/shutdown）—— 那些要假 NGX vtable，属后续工作。
+#
+# 零依赖：不碰 D3D、不碰 NGX、不链 Detours，任何平台都能跑。
+add_executable(DlssInputTest
+    DlssInputTest.cpp
+    DlssInput.cpp
+)
+fsrbridge_configure_test(DlssInputTest)
+target_include_directories(DlssInputTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+enable_testing()
+add_test(NAME DlssInputTest COMMAND DlssInputTest)
+
 if(DX11FSRBRIDGE_BUILD_TESTS)
     # il2cpp callsite hook：观察/跳过/还原模式 + per-instance 隔离 + 相机 hook。
     # 需链 Il2CppCallSiteHook.cpp。**此测试已实测通过**。

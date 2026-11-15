@@ -387,6 +387,8 @@ struct Config
     // 1=auto / 2=force（强制走直连层）
     int dlss_input_mode = 1;   // 1=auto（默认）/ 2=force dlss；0 与其它值等价于 auto
     std::wstring dlss_input_module = L"nvngx.dll";
+    // 含 nvngx_dlss.dll 的目录（分号分隔）。空 = 按候选顺序自动探测，见 ensure_initialized。
+    std::wstring dlss_input_feature_dirs;
     bool dlss_input_allow_real_ngx = true;
     std::uint32_t dlss_input_jitter_reduce = 0;
     std::uint32_t dlss_input_motion_fixup = 0;
@@ -623,7 +625,6 @@ int g_bridge_log_level = 1;
 // 2026-11-14（路由摘要跨线程裸读写，可致 use-after-free）：本块原先是 4 个裸
 //   std::string（型号 / vendor 标签 / SDK 路径 / auto 落位摘要）配 2 个裸 bool：
 //   由**设备创建 hook**（record_adapter_info ->
-//   resolve_backend_auto）写入，由 **draw 派发路径**（log_focus_block，两个调用点都在
 //   try_fsr2_translation_draw 内）读取，而两者是否同线程**没有任何代码保证**。
 //   std::string 的读-写竞争不只是"读到旧值"：写入方重新分配缓冲后，读者可能拿到
 //   已释放的旧指针。逐字段加锁也不够 —— 焦点块要把型号与 vendor 打在同一行，
@@ -651,7 +652,6 @@ static std::mutex g_route_publish_mutex;
 // 为什么这两个标志仍是独立原子、而不是塞进快照：
 //   · g_route_applied 必须在**发布之前**就被写入 —— 否则两个线程会各自判重失败、
 //     各发布一份（后发布的覆盖先发布的，先发布的泄漏，焦点框还会抖动）；
-//   · g_backend_auto_resolved 同理：resolve_backend_auto 要在**构造快照之前**落位后端。
 //   两者都只做一次 false->true 翻转，用 exchange/store 让"谁抢到发布权"成为单点事实。
 static std::atomic_bool g_route_applied { false }; // 路由已应用（防止设备补检重复应用）
 // Ffx12Backend=auto（按显卡型号自动落位后端）：
@@ -666,10 +666,8 @@ static std::atomic_bool g_route_applied { false }; // 路由已应用（防止�
 //   是否同线程**没有代码保证** —— 那正是本次重构要解决的问题。故这是**形式上的数据竞争**，
 //   与旧代码同形、非本次引入。未改成原子：本值只判一次且写点早于 hook 安装，实测未观察到
 //   问题；但按 §二.4 严格说它不合规，留给后续独立改动（§一.3：不混进本次）。
-static bool g_backend_auto_requested = false;
 // 2026-11-14（见上方 RouteSnapshot 注释）：resolved 必须在发布快照**之前**落位，
 // 故不能塞进快照；用原子 + exchange 保证"落位"这件事在并发下只发生一次。
-static std::atomic_bool g_backend_auto_resolved { false };
 
 // OptiScaler 输出定向修复——XeSS/DLSS 的 jitter 需 ≤±0.5（像素/归一化），
 // FSR 输出保持原样（互不干扰）。运行时按 OptiScaler.ini 的 Dx11Upscaler/Dx12Upscaler 判定
@@ -728,13 +726,8 @@ static void record_adapter_info(std::uint32_t vendor, std::uint32_t device_id, c
 // 由调用方（record_adapter_info）一次性构造完整快照。vendor_label 由参数传入：
 // 函数内部不再读任何路由全局，读点只剩"发布"那一处。
 // want_ngx_out：本函数只做**纯计算**，不落位后端、不打日志 —— 那两个副作用由
-// apply_backend_auto_result 在快照**发布之后**执行（理由见该函数的注释）。
 // resolved_out：本次调用**是否真的落位了后端**。调用方必须据此决定要不要执行副作用 ——
 //   本函数有提前返回路径（未写 auto / vendor==0 / 别人先落位），那几种情况下 want_ngx 无意义。
-static std::string resolve_backend_auto(std::uint32_t vendor, std::uint32_t device_id,
-                                        const std::wstring &desc, const std::string &vendor_label,
-                                        bool &want_ngx_out, bool &resolved_out);
-static void apply_backend_auto_result(bool want_ngx, const std::string &note);
 static void route_from_d3d11_device(ID3D11Device *d3d11_device);
 // P1 单实例接管的**生效值**：ini 取值，或后端强制。
 // 为什么 NGX 必须强制（2026-11-13 代码审计）：NGX 的 feature 与资源池是**全局唯一实例**
@@ -4348,6 +4341,12 @@ void load_config()
     g_config.dlss_input_module = [](const std::filesystem::path &cp) -> std::wstring {
         wchar_t buf[64] {};
         GetPrivateProfileStringW(L"Dx11FsrBridge", L"DlssInputModule", L"nvngx.dll", buf,
+                                 static_cast<DWORD>(std::size(buf)), cp.c_str());
+        return buf;
+    }(config_path);
+    g_config.dlss_input_feature_dirs = [](const std::filesystem::path &cp) -> std::wstring {
+        wchar_t buf[2048] {};
+        GetPrivateProfileStringW(L"Dx11FsrBridge", L"DlssInputFeatureDirs", L"", buf,
                                  static_cast<DWORD>(std::size(buf)), cp.c_str());
         return buf;
     }(config_path);
@@ -10757,25 +10756,53 @@ void probe_native_params_once(
 //   显卡厂商、OptiScaler 是否在场、ngx 模块是否存在，都是**进程/环境**事实
 //   （需要 DXGI 适配器枚举、模块枚举），而 DlssInput.cpp 刻意零平台依赖以便单测。
 //   纯决策函数 `dlss_input::route_output` 仍在那边，这里只负责"喂输入"。
+// 适配器 vendor id：由 record_adapter_info（设备创建 hook 内）写入，
+// 由 dlss_gate 的路由判据读取。必须是**文件级** —— 定义在 dlss_gate
+// 命名空间里的话，外层的 record_adapter_info 看不到它（2026-11-15 修）。
+static std::atomic<std::uint32_t> g_route_vendor_id { 0u };
+// 路由结果缓存：-1=未决定 / 0=ffx / 1=dlss。只决定一次（显卡不会中途变）。
+// ⚠️ 必须是文件级：`try_fsr2_translation_draw` 在 dlss_gate 之外写它（M1 的失败回退）。
+std::atomic<int> g_path { -1 };
+// DLSS 直连层的运行时与互斥：ensure_feature 会重建 feature，必须串行。
+// ⚠️ 必须是文件级 —— final_shutdown（atexit 路径）在 dlss_gate 之外调 shutdown()。
+dlss_input::Runtime g_runtime;
+std::mutex g_runtime_mutex;
+
 namespace dlss_gate
 {
 // 适配器 vendor（从 dlss-input 分支移植）。由 record_adapter_info 写入；
 // 路由判据用它决定「能否走 DLSS 直连」，避免在渲染线程重新枚举 DXGI。
-static std::atomic<std::uint32_t> g_route_vendor_id { 0u };
-std::atomic<int> g_path { -1 }; // -1=未决定 0=ffx 1=dlss；只决定一次（显卡不会中途变）
+// g_route_vendor_id 已移到文件级（见 record_adapter_info 上方）：record_adapter_info
+// 在全局作用域写它，dlss_gate 内的路由判据读它，两边必须看到同一个对象。
+// g_path 已移到文件级（见 dlss_gate 命名空间之前）：dispatch 失败回退时
+// 在 `try_fsr2_translation_draw`（外层作用域）里要写它。
 std::atomic_bool g_init_attempted { false };
 std::atomic_bool g_init_ok { false };
 std::atomic_uint32_t g_eval_failures { 0 };
 std::atomic_uint64_t g_eval_total { 0 };
-dlss_input::Runtime g_runtime;
-std::mutex g_runtime_mutex; // ensure_feature 会重建 feature，必须串行
+// g_runtime / g_runtime_mutex 已移到文件级（见 dlss_gate 之前）：final_shutdown
+// 在 dlss_gate 之外调 g_runtime.shutdown()。
 
 dlss_input::Vendor vendor_from_current_device()
 {
     // 复用桥已有的适配器信息（record_adapter_info 在设备创建钩子里已经拿到 vendor）。
     // 这里刻意不重新枚举 DXGI：`try_fsr2_translation_draw` 在渲染线程上，
     // CreateDXGIFactory 会带来可观的首次开销。
-    return dlss_input::Vendor::Unknown;
+    // 2026-11-15（审查 B3）：原来这里是空实现（恒 Unknown），而注释声称「复用
+    // record_adapter_info 拿到的 vendor」—— 实际那个函数从不写 g_route_vendor_id，
+    // 于是 auto 分支的 vendor 维度恒假，直连层在「只装桥」时从代码上不可达。
+    // 现在两边都接通：record_adapter_info 负责写，这里负责读（只读一个 atomic，
+    // 仍然不枚举 DXGI）。
+    const std::uint32_t id = g_route_vendor_id.load(std::memory_order_relaxed);
+    if (id == 0)
+        return dlss_input::Vendor::Unknown;   // 设备还没建好
+    switch (id)
+    {
+    case 0x10DE: return dlss_input::Vendor::Nvidia;
+    case 0x1002: return dlss_input::Vendor::Amd;
+    case 0x8086: return dlss_input::Vendor::Intel;
+    default:     return dlss_input::Vendor::Unknown;
+    }
 }
 
 int resolve_path()
@@ -10785,6 +10812,8 @@ int resolve_path()
         return cached;
 
     dlss_input::RouteInput in {};
+    // 2026-11-15（审查 B3）：vendor 改走 vendor_from_current_device（它读 g_route_vendor_id）；
+    // allow_real_ngx 一并传进去，否则 auto 在「只装桥」时永远回 FFX。
     const std::uint32_t vendor_id = g_route_vendor_id.load(std::memory_order_relaxed);
     in.vendor = vendor_id == 0x10DE ? dlss_input::Vendor::Nvidia
         : vendor_id == 0x1002      ? dlss_input::Vendor::Amd
@@ -10796,6 +10825,11 @@ int resolve_path()
     // 所以这里除了已加载的名字，还要把各候选名都问一遍；真正的判定交给
     // `ensure_initialized` 的 LoadLibraryW（失败会 fail-open 回 ffx）。
     in.dlss_runtime_present = false;
+    // 2026-11-15：不装 OptiScaler 时 `nvngx.dll` 只在 NVIDIA 的 DriverStore 里，
+    // 而那个目录不在标准 DLL 搜索顺序里 ⇒ 上面的 GetModuleHandleW 全部落空。
+    // 这里补一个「DriverStore 里有没有」的判断，让 auto 有机会落到直连路径；
+    // 真正的加载（含失败 fail-open）仍由 Runtime::initialize 的候选循环负责。
+    bool driverstore_has_nvngx = false;
     for (const wchar_t *name : { g_config.dlss_input_module.c_str(), L"nvngx.dll",
                                  L"_nvngx.dll", L"nvngx_dlss.dll" })
     {
@@ -10804,6 +10838,29 @@ int resolve_path()
             in.dlss_runtime_present = true;
             break;
         }
+    }
+    if (!in.dlss_runtime_present)
+    {
+        // 只查一次：路由决策每次进程只做一遍（g_path 会缓存），代价可忽略。
+        wchar_t sys_dir[MAX_PATH] {};
+        const UINT n = GetSystemDirectoryW(sys_dir, static_cast<UINT>(std::size(sys_dir)));
+        if (n != 0 && n < std::size(sys_dir))
+        {
+            const std::wstring pattern = std::wstring(sys_dir) +
+                L"\\DriverStore\\FileRepository\\nv_dispi.inf_amd64_*\\nvngx.dll";
+            WIN32_FIND_DATAW fd {};
+            HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE)
+            {
+                driverstore_has_nvngx = true;
+                FindClose(h);
+            }
+        }
+        // 语义说明：这里把「DriverStore 里有」也当成 runtime 可用。
+        // 它不等于「一定加载成功」—— 真正的失败由 Runtime::initialize 的
+        // LoadLibraryW 回答，那条路径会 fail-open 回 ffx（不崩、不黑屏）。
+        if (driverstore_has_nvngx)
+            in.dlss_runtime_present = true;
     }
     // 2026-11-15：**不再把 `DlssInput=0` 当成「强制 FFX」**。
     //
@@ -10814,6 +10871,7 @@ int resolve_path()
     // 现在的语义：1 = auto / 2 = force dlss；其它值一律当 auto（保守：
     // 「不认识的配置值」不该让桥去抢超分）。`DlssInput=0` 因此等价于 auto。
     in.user_preference = g_config.dlss_input_mode == 2 ? 1 : -1;
+    in.allow_real_ngx = g_config.dlss_input_allow_real_ngx;
 
     const dlss_input::RouteOutput out = dlss_input::route_output(in);
     const int path = out.path == dlss_input::OutputPath::DlssInput ? 1 : 0;
@@ -10879,6 +10937,89 @@ bool ensure_initialized(ID3D11Device *device, ID3D11DeviceContext *context)
     dlss_input::RuntimeConfig rc {};
     rc.module_hint = g_config.dlss_input_module;
     rc.allow_real_ngx = g_config.dlss_input_allow_real_ngx;
+    // ---- 探测含 nvngx_dlss.dll 的目录（PathListInfo 用）----
+    //
+    // 2026-11-15：不装 OptiScaler 时**必须**给 NGX 一份目录列表，否则 CreateFeature
+    // 返回 0xBAD0000B（实机确认）。候选顺序：
+    //   ① ini 的 DlssInputFeatureDirs（分号分隔，用户显式指定优先）
+    //   ② 已加载 nvngx_dlss.dll 的目录（游戏或别的注入器已经拉起过）
+    //   ③ 桥自身所在目录（安装器把 nvngx_dlss.dll 放在这里）
+    //
+    // 为什么不信 DriverStore：那里只有加载器 nvngx.dll（488 KB），
+    // **没有** nvngx_dlss.dll（58 MB 的特征库要随包分发）。
+    auto add_dir_if_has_dll = [](std::vector<std::wstring> &dirs, const std::wstring &dir) {
+        if (dir.empty())
+            return;
+        // 去掉末尾分隔符（NGX 期望整洁路径）
+        std::wstring d = dir;
+        while (!d.empty() && (d.back() == L'\\' || d.back() == L'/'))
+            d.pop_back();
+        if (d.empty())
+            return;
+        const std::wstring probe = d + L"\\nvngx_dlss.dll";
+        const DWORD attr = GetFileAttributesW(probe.c_str());
+        if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            return;
+        for (const std::wstring &existing : dirs)
+        {
+            if (_wcsicmp(existing.c_str(), d.c_str()) == 0)
+                return;   // 去重（大小写不敏感，Windows 路径语义）
+        }
+        dirs.push_back(d);
+    };
+
+    // ② 已加载的特征库
+    if (HMODULE m = GetModuleHandleW(L"nvngx_dlss.dll"))
+    {
+        wchar_t buf[MAX_PATH] {};
+        if (GetModuleFileNameW(m, buf, static_cast<DWORD>(std::size(buf))) != 0)
+        {
+            const std::wstring full(buf);
+            const std::size_t slash = full.find_last_of(L"\\/");
+            if (slash != std::wstring::npos)
+                add_dir_if_has_dll(rc.feature_dirs, full.substr(0, slash));
+        }
+    }
+    // ③ 桥自身目录
+    {
+        wchar_t buf[MAX_PATH] {};
+        // 取本 DLL 自身的句柄：GetModuleHandleExW 用 FROM_ADDRESS 反查，
+        // 不需要额外保存 hInstance（DllMain 里那个值在其它 TU）。
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&add_dir_if_has_dll), &self);
+        if (self != nullptr && GetModuleFileNameW(self, buf, static_cast<DWORD>(std::size(buf))) != 0)
+        {
+            const std::wstring full(buf);
+            const std::size_t slash = full.find_last_of(L"\\/");
+            if (slash != std::wstring::npos)
+                add_dir_if_has_dll(rc.feature_dirs, full.substr(0, slash));
+        }
+    }
+
+    // ① ini 显式指定的目录（最高优先级，最后插入到最前面）
+    if (!g_config.dlss_input_feature_dirs.empty())
+    {
+        std::vector<std::wstring> explicit_dirs;
+        std::size_t pos = 0;
+        const std::wstring &all = g_config.dlss_input_feature_dirs;
+        while (pos <= all.size())
+        {
+            const std::size_t sep = all.find(L';', pos);
+            const std::size_t end = (sep == std::wstring::npos) ? all.size() : sep;
+            if (end > pos)
+                add_dir_if_has_dll(explicit_dirs, all.substr(pos, end - pos));
+            if (sep == std::wstring::npos)
+                break;
+            pos = sep + 1;
+        }
+        if (!explicit_dirs.empty())
+        {
+            explicit_dirs.insert(explicit_dirs.end(), rc.feature_dirs.begin(), rc.feature_dirs.end());
+            rc.feature_dirs.swap(explicit_dirs);
+        }
+    }
 
     unsigned long crash_code = 0;
     const bool ok = init_ngx_guarded(g_runtime, rc, device, context, &crash_code);
@@ -11674,19 +11815,39 @@ bool dispatch(ID3D11DeviceContext *context, const ffx12::FrameInput &in,
     //   要让 history = uv - mv_g，必须 s = **+1**。
     //   此前用 -1 等于把方向又翻一次，历史朝反方向采样 ⇒ 一动就大面积拖影。
     //
-    // 默认值取自 ini 的 `DlssInputMotionSign`（模板默认 1）。
+    // ── 运动矢量符号：**单一来源** = `DlssInputMotionSign`（0/1/2/3）──
+    //
+    // 2026-11-15（审查 M5）：原先这里是「`DlssInputMotionFixup` 定一次，随后
+    //   `DlssInputMotionSign == 1` 与 `== 3` 各再覆盖一次」——三个来源互相打架。
+    //   随包默认 MotionSign=1、MotionFixup=0 ⇒ 用户设的 UseNegativeScale 被静默
+    //   覆盖成 RequireNativeSign，而下面那行注释还写着"默认值取自 DlssInputMotionSign"。
+    //
+    //   现在 Fixup 键**只作为 Sign=0 时的细分档**，不再反向覆盖 Sign 的决定：
+    //
+    //     Sign=0（默认）→ UseNegativeScale，除非 Fixup=1 则 RequireNativeSign
+    //     Sign=1        → RequireNativeSign（强制正 scale，A/B 用）
+    //     Sign=2        → 关闭 MV（scale=0，决定性诊断档）
+    //     Sign=3        → RequireNativeSign + 喂原始纹理（复刻 FFX 输入路径）
+    //
+    // 纹理符号单独记：解码始终按 FSR2 取负（见 DlssInput.h 与 Ffx12Backend.cpp），
+    // 只有 Sign=3 会在下面的 motion_ready 处把原始纹理传下去。
     spec.motion_sign = dlss_input::MotionTextureSign::Fsr2Negated;
-    spec.motion_fixup = g_config.dlss_input_motion_fixup == 1
-        ? dlss_input::MotionFixup::RequireNativeSign
-        : dlss_input::MotionFixup::UseNegativeScale;
-    // A/B 覆盖（排障用，见 ini 的 DlssInputMotionSign）：
-    //   1 = 强制正 scale（与推导相反，用于验证"方向反了"这一假说）
-    //   2 = 彻底关闭 MV（scale=0），决定性诊断档
-    //   3 = **原始纹理 + 正 scale**（完全复刻 FFX/FSR2 输入路径的 MV 组合）
-    if (g_config.dlss_input_motion_sign == 1)
+    switch (g_config.dlss_input_motion_sign)
+    {
+    case 1:
+    case 3:
         spec.motion_fixup = dlss_input::MotionFixup::RequireNativeSign;
-    if (g_config.dlss_input_motion_sign == 3)
-        spec.motion_fixup = dlss_input::MotionFixup::RequireNativeSign;
+        break;
+    case 2:
+        // 关闭 MV 时 fixup 无意义；给默认值即可（motion_disabled 会让调用方跳过 Set）
+        spec.motion_fixup = dlss_input::MotionFixup::UseNegativeScale;
+        break;
+    default:
+        spec.motion_fixup = g_config.dlss_input_motion_fixup == 1
+            ? dlss_input::MotionFixup::RequireNativeSign
+            : dlss_input::MotionFixup::UseNegativeScale;
+        break;
+    }
     spec.motion_disabled = (g_config.dlss_input_motion_sign == 2);
     // 实机观察（2026-11-09）：设 2（关闭 MV）会让**大部分画面变灰**。
     // 这是该档位的**预期行为**，不是新缺陷：MV scale=0 时 DLSS 认为所有像素
@@ -14104,13 +14265,19 @@ bool try_fsr2_translation_draw(
                         /*first_frame=*/ st->last_gen == 0,
                         /*ms_since_last=*/ st->last_dispatch_tick != 0
                             ? GetTickCount64() - st->last_dispatch_tick : 0);
-                    // 失败 ⇒ 永久退回 ffx（避免每帧在两条链路上抖动）。
+                    // 失败 ⇒ 真的永久退回 ffx。
+                    //
+                    // ⚠️ 2026-11-15（审查 M1）：原实现只打了一条 "(permanent for this process)"
+                    //   的日志，**既不 g_path.store(0) 也不改走 ffx12::dispatch** —— 那个 else
+                    //   分支只在 use_dlss_input == false 时进。结果是每帧重试、每帧失败、
+                    //   每帧无超分，而日志说"已永久退回"。现在真的落盘 g_path=0。
                     if (!dispatch_ok)
                     {
+                        g_path.store(0, std::memory_order_relaxed);
                         static std::atomic_bool dlss_fallback_logged { false };
                         if (!dlss_fallback_logged.exchange(true, std::memory_order_relaxed))
                             LOG_WARN(blog::cat::upscale,
-                                "dlss_input_fallback_to_ffx (permanent for this process)");
+                                "dlss_input_fallback_to_ffx (g_path=0, permanent for this process)");
                     }
                 }
                 else
@@ -15887,11 +16054,12 @@ bool swapchain_control_hook_needed()
 
 bool swapchain_color_hook_needed()
 {
-    // T-8：ngx 后端需要读 swapchain 的 color space 来判定 IsHDR 标志。
-    // 发布构建下 k_color_diagnostics_enabled / spoof / force 三者恒假，
-    // 若不在此加条件，set_color_space1 hook 永不安装 ⇒ ngx 的 auto 探测退化为
-    // 仅按输入纹理格式推导（不可靠：本机存在 10-bit SDR 会话）。
-    // 注：这个谓词不依赖任何后端概念 —— 直连层与纯 FFX 都成立。
+    // 2026-11-15：原判据是「NGX 代理后端在场」（`ffx12::backend() == BackendKind::Ngx`），
+    // 但那个概念已随 NgxBackend.cpp 移除。直连层读 swapchain 的 color space 是为了
+    // 判定 DLSS 的 IsHDR 标志，纯 FFX 构型下这三个 hook 是纯透传。
+    //
+    // 判据改为「直连层开着」：与原来「只对 NGX 后端装」的覆盖面等价。
+    if (g_config.dlss_input_mode != 0)
         return true;
     return k_color_diagnostics_enabled || hdr_swapchain_spoof_active() || hdr_swapchain_force_active();
 }
@@ -16523,6 +16691,9 @@ static void record_adapter_info(std::uint32_t vendor, std::uint32_t device_id, c
         return;
     if (vendor == 0)
         return; // 检测失败：留给后续补检（设备创建后）
+    // 2026-11-15（审查 B3）：把 vendor 存下来供 dlss_gate 的路由判据用。
+    // 必须在下面的 g_route_applied 抢权**之前**写：抢输的线程也要能看到。
+    g_route_vendor_id.store(vendor, std::memory_order_relaxed);
     char vendor_hex[16] {};
     std::snprintf(vendor_hex, sizeof(vendor_hex), "0x%04X", vendor);
     const std::string vendor_label = vendor_hex;
@@ -16544,10 +16715,6 @@ static void record_adapter_info(std::uint32_t vendor, std::uint32_t device_id, c
     //   抢输的线程直接返回（旧行为：第二个适配器不改后端、不覆盖摘要）。
     if (g_route_applied.exchange(true, std::memory_order_acq_rel))
         return;
-    bool auto_want_ngx = false;
-    bool auto_resolved = false;
-    const std::string backend_auto_note =
-        resolve_backend_auto(vendor, device_id, desc, vendor_label, auto_want_ngx, auto_resolved);
     bool published = false;
     {
         // 锁内只做「判重 + 构造 + 发布」三件事：不含日志、不含 ffx12::set_backend()
@@ -16564,7 +16731,9 @@ static void record_adapter_info(std::uint32_t vendor, std::uint32_t device_id, c
         if (g_route_snapshot.load(std::memory_order_relaxed) == nullptr)
         {
             RouteSnapshot *const snapshot =
-                new (std::nothrow) RouteSnapshot {gpu_name, vendor_label, sdk_path, backend_auto_note};
+                // 2026-11-15（审查 B4）：`backend_auto_note` 随 auto 链一起删除，
+                // 这里传空串 —— 摘要的 auto= 后缀已无来源（后端选择的概念不存在了）。
+                new (std::nothrow) RouteSnapshot {gpu_name, vendor_label, sdk_path, std::string {}};
             if (snapshot != nullptr)
             {
                 g_route_snapshot.store(snapshot, std::memory_order_release);
@@ -16589,74 +16758,21 @@ static void record_adapter_info(std::uint32_t vendor, std::uint32_t device_id, c
     //   Ffx12Backend=ngx 覆盖成 native（实测：日志里 2 秒内 ngx → native，DLSS 全程未启用）。
     //   注意：只要 auto_resolved 为真就必须执行，**与 published 无关** —— 落位与摘要发布是
     //   两件事，摘要缺失（分配失败）不该连带丢掉落位。
-    if (auto_resolved)
-        apply_backend_auto_result(auto_want_ngx, backend_auto_note);
+    // 2026-11-15（审查 B4）：副作用出口已删除（resolve_backend_auto 不存在了）。
 }
 
-// Ffx12Backend=auto：按显卡型号落位后端（用户口径：RTX -> ngx，非 RTX -> native）。
+// 2026-11-15（审查 B4）：`resolve_backend_auto` / `apply_backend_auto_result` /
+// `g_backend_auto_requested` / `g_backend_auto_resolved` 整条 auto 链已删除。
 //
-// 为什么判据只看型号、不看 NGX 运行时是否就绪：
-//   · 判据的唯一来源是适配器（这里），而 NGX 可用性要等设备创建后才能问（ensure_init）；
-//   · 预判为 ngx 但 NGX 初始化失败时，dispatch 逐帧 fail-open 交回游戏原生路径
-//     （Ffx12Backend.cpp:2956 -> Dx11FsrBridge.cpp:13254），最坏只是没超分，不会崩、不会黑屏；
-//   · 反过来（预判 native 但机器其实能跑 NGX）只会少一条画质更好的路径，也一样安全。
-//   ⇒ 判错的两个方向都可恢复，故不在配置期引入"探测 NGX 运行时"的重复逻辑
-//     （那会与 ngx::ensure_init 形成两套口径，见 AGENTS.md §五.1 判据单一来源）。
-// 返回 note（空串 = 本次未落位，或没写 auto）。**不写任何全局**：note 由调用方放进
-// RouteSnapshot 一起发布；vendor_label 由参数传入，本函数内部不读路由全局。
-static std::string resolve_backend_auto(std::uint32_t vendor, std::uint32_t device_id,
-                                        const std::wstring &desc, const std::string &vendor_label,
-                                        bool &want_ngx_out, bool &resolved_out)
-{
-    // 2026-11-14（回归：DLSS 全程未启用）：本函数有两条**提前返回**路径，而调用方会无条件
-    //   执行副作用（set_backend + 日志）。Ffx12Backend 显式写 ngx 时 g_backend_auto_requested
-    //   为 false ⇒ 这里立即返回、want_ngx_out 保持 false ⇒ 调用方把 ngx 覆盖成 native。
-    //   ⇒ 增加 resolved_out 明确告诉调用方「本次是否真的落位了」，未落位就不得执行副作用。
-    want_ngx_out = false;
-    resolved_out = false;
-    if (!g_backend_auto_requested || vendor == 0)
-        return {};
-    // exchange 而不是"先 load 再 store"：并发下两次调用都可能通过上面的判断，
-    // 只有 exchange 返回 false 的那个才允许落位（后端是进程级单值，只能判一次）。
-    if (g_backend_auto_resolved.exchange(true, std::memory_order_acq_rel))
-        return {};
-    resolved_out = true;
-    const bool want_ngx = gpu_pick::supports_dlss(vendor, device_id, desc);
-    // 厂商文字由调用方传入（就是即将写进同一份快照的那一份），不再自己 snprintf + narrow
-    // 一遍：同一事实两套口径迟早会漂（AGENTS.md §五.2）。
-    // 摘要里也不再重复打印 GPU 型号 —— 焦点框的 "  GPU : <型号> (vendor=0x…)" 已经打过。
-    const std::string note = std::string("auto=") + (want_ngx ? "ngx" : "native") +
-        " vendor=" + vendor_label;
-    // ★ 2026-11-14（审查：发布窗口）：本函数原先在这里就做 set_backend 与打日志，
-    //   而调用方要等它返回后才发布快照 ⇒ 中间夹着一次文件 I/O（日志落盘），窗口可达毫秒级。
-    //   并发 draw 线程若恰在此刻首次进入 log_focus_block，会读到 nullptr 打出
-    //   "GPU : unknown"，而焦点块是一次性闸门 ⇒ 该进程的摘要永远补不回来。
-    //   ⇒ 改为「纯计算」：这里只返回 note 与 want_ngx，**不做任何副作用**；
-    //     set_backend 与日志由调用方在**发布快照之后**执行（见 record_adapter_info）。
-    //   这样「快照可见」严格先于「后端已切换」，窗口内读者拿到的是旧后端 + 旧摘要，
-    //   两者同源，不会出现"后端已换但摘要还是空的"。
-    want_ngx_out = want_ngx;
-    return note;
-}
-
-// resolve_backend_auto 的副作用半段：落位后端 + 打日志。
+// 为什么删而不是修：这条链的唯一目的是「按显卡型号在 native / ngx 之间落位后端」，
+// 而后端选择这个概念已随 NgxBackend.cpp 移除 —— 现在走哪条超分路径由 `DlssInput`
+// 的 dlss_gate 决定（它自己读 vendor，见 vendor_from_current_device）。
 //
-// 2026-11-14（审查：发布窗口）：这两个动作原先是 resolve_backend_auto 的一部分，
-//   而调用方要等它返回才发布快照 ⇒ 「后端已切换」早于「摘要可见」，中间隔着一次日志
-//   文件 I/O。并发 draw 线程若在此窗口首次进入焦点块，会读到 nullptr 打 "GPU : unknown"，
-//   而焦点块是一次性闸门 ⇒ 该进程的摘要永远补不回来（改动前同样窗口下至少型号是对的）。
-//   ⇒ 拆成两段：先构造并发布快照，**再**调本函数。这样窗口内读者看到的是旧后端 + 旧摘要，
-//     两者同源；不会出现「后端已换、摘要还是空」。
-static void apply_backend_auto_result(bool want_ngx, const std::string &note)
-{
-    // NGX 未编译进本产物：只有"型号判为 RTX"才值得告警（用户写了 auto，本意是让 RTX 走 ngx）。
-    if (want_ngx)
-        LOG_WARN(blog::cat::config,
-            "ngx_core backend=native config_warn bits=ngx_not_compiled " + note);
-    else
-        LOG_INFO(blog::cat::config, "ngx_core backend=native " + note);
-}
-
+// 删除前的实际状态：`g_backend_auto_requested` 在本侧**没有任何赋值点**
+// （main 侧那两处随 NGX 配置段一起被删了），于是 resolve_backend_auto 首行就 return、
+// apply_backend_auto_result 恒不调用、auto_suffix 恒空
+// ⇒ 一边打 "ngx_core backend=native"、另一边焦点块打 "BACKEND : ngx"，
+// 同一份启动日志里两行说相反的话。
 // D3D11 设备就绪后的可靠补检（IDXGIDevice::GetAdapter 不受 loader lock 影响）
 static void route_from_d3d11_device(ID3D11Device *d3d11_device)
 {
@@ -16821,10 +16937,9 @@ void initialize()
         // （ngx_core backend=… auto=… vendor=… gpu="…"）——两条成对出现，可直接当验收判据。
         // 2026-11-14（见 RouteSnapshot 注释）：resolved 改原子后这里用 acquire 读，
         // 语义与旧裸 bool 一致 —— 设备还没创建时必然还是 pending。
-        const std::string auto_suffix =
-            (g_backend_auto_requested && !g_backend_auto_resolved.load(std::memory_order_acquire))
-                ? " auto=pending"
-                : "";
+        // 2026-11-15（审查 B4）：auto 链已删，auto=pending 后缀无来源（恒空）。
+        // 保留变量名是为了让下面那行 LOG_INFO 的 diff 最小。
+        const std::string auto_suffix;
         LOG_INFO(blog::cat::config, "ngx_core backend=native" + auto_suffix);
     }
 
@@ -17074,6 +17189,16 @@ void final_shutdown()
 {
     std::call_once(g_final_shutdown_once, []()
         {
+            // 2026-11-15（审查 M4）：`Runtime::shutdown()` 原先是**零调用**的死代码
+            // —— feature 句柄、参数表、加载的 NGX 模块都活到进程结束。
+            //   放在这里而不是 DLL_PROCESS_DETACH：DETACH 在 loader lock 下，
+            //   而 shutdown 会调 COM 释放（可能触发驱动侧等待），违反该分支
+            //   "不得阻塞式取锁"的既有约束（见 DETACH 分支的 2026-09-20 记录）。
+            //   atexit 路径不在 loader lock 下，适合做真正的资源回收。
+            {
+                std::lock_guard lock(g_runtime_mutex);
+                g_runtime.shutdown();
+            }
             blog::shutdown();
         });
 }

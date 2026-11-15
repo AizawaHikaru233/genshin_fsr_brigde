@@ -49,6 +49,63 @@ std::string narrow_ascii(const std::wstring &wide)
         out.push_back(c >= 0x20 && c < 0x7F ? static_cast<char>(c) : '?');
     return out;
 }
+#if defined(_WIN32)
+// ---------------------------------------------------------------------------
+// find_nvngx_in_driverstore — 从 NVIDIA 的 DriverStore 目录里找 nvngx.dll
+// ---------------------------------------------------------------------------
+//
+// 为什么需要这个：`nvngx.dll` **不在** System32，也不随游戏分发，而是由 NVIDIA
+// 驱动装在 `<SystemRoot>\System32\DriverStore\FileRepository\nv_dispi.inf_amd64_<hash>\`。
+// 那个目录**不在标准 DLL 搜索顺序里** ⇒ 不装 OptiScaler 时
+// `LoadLibraryW("nvngx.dll")` 必然失败，直连层永远起不来（2026-11-15 实测确认：
+// 全盘只有 DriverStore 那一份，488,816 B）。
+//
+// 实现取舍：
+//   · 用 FindFirstFileW 遍历 `nv_dispi.inf_amd64_*`，取**目录名最大**的那一个
+//     （harness 后部是驱动包的递增标识，字典序最大 ≈ 最新）。不追求绝对正确 ——
+//     真实的版本比对要看 INF 内容，代价与本函数的收益不成比例。
+//   · 只返回**路径**，加载交给调用方现有的候选循环（已含 OptiScaler 拦截逻辑）。
+//   · 找不到返回空串，调用方继续试下一个候选。
+//   · 本函数**不报错、不打日志**：它只是给候选列表补一项。
+std::wstring find_nvngx_in_driverstore()
+{
+    wchar_t sys_dir[MAX_PATH] {};
+    const UINT n = GetSystemDirectoryW(sys_dir, static_cast<UINT>(std::size(sys_dir)));
+    if (n == 0 || n >= std::size(sys_dir))
+        return {};
+
+    std::wstring pattern = std::wstring(sys_dir) +
+        L"\\DriverStore\\FileRepository\\nv_dispi.inf_amd64_*";
+
+    WIN32_FIND_DATAW fd {};
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return {};
+
+    std::wstring best_dir;
+    do
+    {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+            continue;
+        // 取字典序最大者（见上方取舍说明）
+        if (best_dir.empty() || fd.cFileName > best_dir)
+            best_dir = fd.cFileName;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+
+    if (best_dir.empty())
+        return {};
+
+    const std::wstring candidate = std::wstring(sys_dir) +
+        L"\\DriverStore\\FileRepository\\" + best_dir + L"\\nvngx.dll";
+    // 只确认存在性；加载由调用方做（它还要处理 OptiScaler 拦截等情况）
+    const DWORD attr = GetFileAttributesW(candidate.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        return {};
+    return candidate;
+}
+#endif // _WIN32
+
 
 // ---------------------------------------------------------------------------
 // 1.1 jitter
@@ -605,15 +662,24 @@ RouteOutput route_output(const RouteInput &in)
     }
 
     // auto：
-    //   ① 已经加载了 NGX ⇒ 直接用。
-    //   ② OptiScaler 在场 ⇒ 它的 LdrLoadDll 钩子会把 nvngx.dll 换成自己，值得一试。
-    //   ③ 都不满足 ⇒ 保持现状（绝不因为"是 N 卡"就盲目切换）。
+    //   ① 已经加载了 NGX ⇒ 直接用（N 卡或 OptiScaler 在场时）。
+    //   ② 没加载但允许用原生 NGX 且是 N 卡 ⇒ 值得一试：`LoadLibraryW` 由
+    //      `Runtime::initialize` 负责，失败会 fail-open 回 ffx 并留下原因。
+    //      ★ 2026-11-15（审查 B3）：这一步是**必需**的 —— 游戏本体不加载
+    //        nvngx.dll，只看 ① 会让 auto 在「只装桥」时永远回 FFX，
+    //        使 DlssInput 直连层从代码上不可达（PR #16 的原始缺陷）。
+    //   ③ OptiScaler 在场 ⇒ 它的 LdrLoadDll 钩子会把 nvngx.dll 换成自己。
+    //   ④ 都不满足 ⇒ 保持现状（绝不因为"是 N 卡"就盲目切）。
     if (in.dlss_runtime_present)
     {
         if (in.vendor == Vendor::Nvidia || in.optiscaler_present)
             return { OutputPath::DlssInput, "ngx_runtime_present" };
+        // 非 N 卡且无 OptiScaler：模块在场也没法用（DLSS 只在 N 卡上跑）
         return { OutputPath::FfxNative, "ngx_present_but_vendor_not_nvidia" };
     }
+
+    if (in.allow_real_ngx && in.vendor == Vendor::Nvidia)
+        return { OutputPath::DlssInput, "nvidia_rtx_will_try_load" };
 
     if (in.optiscaler_present)
         return { OutputPath::DlssInput, "optiscaler_present_will_serve_ngx" };
@@ -956,6 +1022,13 @@ bool Runtime::initialize(const RuntimeConfig &config, ID3D11Device *device,
         candidates.emplace_back(L"nvngx.dll");
     candidates.emplace_back(L"_nvngx.dll");
     candidates.emplace_back(L"nvngx_dlss.dll");
+    // 5. NVIDIA DriverStore 里的绝对路径 —— 不装 OptiScaler 时唯一能找到 nvngx 的地方。
+    //    见 find_nvngx_in_driverstore 的说明。空串表示没找到，直接跳过。
+    {
+        const std::wstring ds = find_nvngx_in_driverstore();
+        if (!ds.empty())
+            candidates.push_back(ds);
+    }
 
     std::string tried;
     for (const std::wstring &name : candidates)
@@ -1005,17 +1078,42 @@ bool Runtime::initialize(const RuntimeConfig &config, ID3D11Device *device,
     //    与 Init 的 (…, device, **InFeatureInfo**, **InSDKVersion**) 相反。
     //    写反会把 0x15 当指针 → 0xC0000005 READ 0x15（实机炸过一次）。
     constexpr std::uint32_t kSdkVersion = 0x0000015;
+
+    // ---- 构造 FeatureCommonInfo（含 PathListInfo）----
+    //
+    // ⚠️ 这里**必须**给出真实的目录列表：传 nullptr 时 NGX 会返回 0xBAD0000B，
+    //    而且不会有任何日志（NGX 的日志回调要 LoggingInfo 才启用）。
+    //    2026-11-15 实机确认：只装桥时 feature 永远建不起来，原因就是这里传了 nullptr。
+    //
+    // 目录来源优先级（见 RuntimeConfig::feature_dirs）：
+    //   ① ini 的 DlssInputFeatureDirs（分号分隔，用户显式指定）
+    //   ② 已加载的 nvngx_dlss.dll 所在目录（若游戏/OptiScaler 已经拉起来过）
+    //   ③ 桥模块自身所在目录
+    std::vector<const wchar_t *> path_ptrs;
+    for (const std::wstring &dir : config.feature_dirs)
+    {
+        if (!dir.empty())
+            path_ptrs.push_back(dir.c_str());
+    }
+    NgxFeatureCommonInfo fc {};
+    fc.PathListInfo.Path   = path_ptrs.empty() ? nullptr : path_ptrs.data();
+    fc.PathListInfo.Length = static_cast<unsigned int>(path_ptrs.size());
+    fc.InternalData        = nullptr;
+    fc.LoggingInfo.LoggingCallback         = nullptr;
+    fc.LoggingInfo.MinimumLoggingLevel     = 0;
+    fc.LoggingInfo.DisableOtherLoggingSinks = false;
+
     std::uint32_t rc = 0;
     if (api_.init_project_id != nullptr)
     {
         rc = api_.init_project_id(config.project_id.c_str(), config.engine_type,
                                   config.engine_version.c_str(), L".", device,
-                                  kSdkVersion, static_cast<const void *>(nullptr));
+                                  kSdkVersion, static_cast<const void *>(&fc));
     }
     else if (api_.init != nullptr)
     {
         // Init 顺序相反：InFeatureInfo 在 InSDKVersion 之前。
-        rc = api_.init(0x1337ull, L".", device, static_cast<const void *>(nullptr), kSdkVersion);
+        rc = api_.init(0x1337ull, L".", device, static_cast<const void *>(&fc), kSdkVersion);
     }
     if (rc != 1u)
     {
@@ -1025,6 +1123,7 @@ bool Runtime::initialize(const RuntimeConfig &config, ID3D11Device *device,
         return false;
     }
     device_inited_ = true;
+    device_ = device;   // 供 shutdown1(device) 用
 
     NvngxParameter *params = nullptr;
     if (api_.get_capability_parameters != nullptr)
@@ -1036,6 +1135,15 @@ bool Runtime::initialize(const RuntimeConfig &config, ID3D11Device *device,
         char buf[96] {};
         std::snprintf(buf, sizeof(buf), "ngx_params_failed(0x%08X)", static_cast<unsigned>(rc));
         error_ = buf;
+        // 2026-11-15（审查 M3）：NGX 已经 Init 成功了，这条失败路径原先既不清
+        //   device_inited_ 也不 Shutdown ⇒ NGX 永久停在"已 Init、无参数表、
+        //   不重试、也不会 Shutdown"的状态（调用方随即 g_path=0 且 g_init_attempted
+        //   已 latch，这条路径**再也走不到**）。补上对称的资源回收。
+        if (device_inited_ && api_.shutdown != nullptr)
+        {
+            api_.shutdown();
+            device_inited_ = false;
+        }
         return false;
     }
     params_ = params;
@@ -1074,10 +1182,26 @@ bool Runtime::ensure_feature(const Feature::Desc &desc, ID3D11DeviceContext *con
 
 void Runtime::shutdown()
 {
+    // 2026-11-15（审查 M4）：原实现有三处不完整，逐条修：
+    //   ① 用无参 `PFN_Shutdown`，而 `PFN_Shutdown1(ID3D11Device*)` 解析了却从不使用
+    //      —— 后者是 NGX 推荐的按设备卸载，能避免同进程多设备时的误伤；
+    //   ② 从不调 `destroy_parameters` ⇒ 参数表泄漏；
+    //   ③ 从不 `FreeLibrary` ⇒ 模块引用计数不归零。
     feature_.destroy(api_);
-    if (device_inited_ && api_.shutdown != nullptr)
-        api_.shutdown();
-    device_inited_ = false;
+    if (params_ != nullptr && api_.destroy_parameters != nullptr)
+    {
+        api_.destroy_parameters(params_);
+        params_ = nullptr;
+    }
+    if (device_inited_)
+    {
+        // 优先 Shutdown1(device)：它按设备卸载，比全局 Shutdown 精确。
+        if (api_.shutdown1 != nullptr && device_ != nullptr)
+            api_.shutdown1(device_);
+        else if (api_.shutdown != nullptr)
+            api_.shutdown();
+        device_inited_ = false;
+    }
     ready_ = false;
     params_ = nullptr;
 }
