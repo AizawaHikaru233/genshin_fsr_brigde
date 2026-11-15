@@ -17192,13 +17192,29 @@ void final_shutdown()
             // 2026-11-15（审查 M4）：`Runtime::shutdown()` 原先是**零调用**的死代码
             // —— feature 句柄、参数表、加载的 NGX 模块都活到进程结束。
             //   放在这里而不是 DLL_PROCESS_DETACH：DETACH 在 loader lock 下，
-            //   而 shutdown 会调 COM 释放（可能触发驱动侧等待），违反该分支
-            //   "不得阻塞式取锁"的既有约束（见 DETACH 分支的 2026-09-20 记录）。
-            //   atexit 路径不在 loader lock 下，适合做真正的资源回收。
-            {
-                std::lock_guard lock(g_runtime_mutex);
-                g_runtime.shutdown();
-            }
+            //   而 shutdown 会调 COM 释放（可能触发驱动侧等待）。
+            //
+            // ⚠️⚠️ 2026-11-15（**实机回归：进程残留**）：上面那段推理只对了一半。
+            //   放到 atexit 仍然会卡 —— 而且症状比 FFX 那次更糟：
+            //   游戏窗口关了、主进程却挂在退出路径上不退（用户报的就是这个）。
+            //
+            //   为什么：`NVSDK_NGX_D3D11_Shutdown1` 是**第三方代码**，与 FFX 的
+            //   `ffxDestroyContext` 同型 —— 在「设备已移除 / 驱动已开始卸载」的状态下
+            //   它内部会等一个永远不会完成的 GPU 侧清理。上一段那 12 行注释
+            //   （`[SHUTDOWN] ffx12_shutdown begin` 之后再无 `ctxs_destroyed`）
+            //   记录的正是同一个坑，我又踩了一次。
+            //
+            //   ⇒ **退出路径不做任何第三方运行时的释放**（FFX 与 NGX 同规则）。
+            //   代价：feature 句柄 / 参数表 / 模块引用计数在进程退出时都不归零 ——
+            //   但进程正在退出，这些由 OS 无条件回收，**没有任何功能损失**。
+            //   反过来，为了这点收益把整个进程钉死在退出路径上，不可接受。
+            //
+            //   `Runtime::shutdown()` 仍然保留（并已按 M4 补全：destroy_parameters +
+            //   shutdown1(device)）—— 它现在只在**进程内可控的场景**下被调用：
+            //   目前没有这样的场景，但将来若要支持「运行中切换 DLSS ↔ FFX」，
+            //   那才是它的正确用途（那时设备还活着，不会阻塞）。
+            //
+            //   本函数只做日志器收尾（幂等）。
             blog::shutdown();
         });
 }
