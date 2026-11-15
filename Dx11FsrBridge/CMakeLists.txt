@@ -72,11 +72,10 @@ option(DX11FSRBRIDGE_BUILD_TESTS "Build the SDK-free unit tests (il2cpp callsite
 option(DX11FSRBRIDGE_DIAGNOSTICS
     "Compile diagnostics/probes (PerfProbe, Fsr2InputDump, *Probe*, Trace*, Dump*) - keep OFF for release" OFF)
 
-# ---- D3D11 NGX（DLSS 超分）后端开关 ----
-# NGX 头已随仓库分发（`third_party/ngx/`，许可与来源见该目录 `NOTICE.md`）⇒ 全新检出默认
-# 就能编出 NGX 构型，与发布包一致。仍保留「头缺失 ⇒ 自动降级为 OFF，只打一行 STATUS、
-# 不 FATAL」这条兜底：显式删掉头文件或裁剪仓库时，其余部分必须仍能构建。
-option(DX11FSRBRIDGE_ENABLE_NGX "Build the D3D11 NGX (DLSS) backend" ON)
+# ---- D3D11 NGX（DLSS 超分）头 ----
+# 2026-11-15：`third_party/ngx/` 已随 `NgxBackend.cpp` 一并移除 —— 直连层
+# （`DlssInput.h`）自己声明最小 NVSDK_NGX ABI，不需要 vendor NVIDIA 头。
+
 
 set(DX11FSRBRIDGE_DIAGNOSTICS_ON ${DX11FSRBRIDGE_DIAGNOSTICS})
 if(NOT DX11FSRBRIDGE_DIAGNOSTICS_ON AND CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -146,22 +145,11 @@ if(DX11FSRBRIDGE_DIAGNOSTICS_ON)
     target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_ENABLE_DIAGNOSTICS=1)
 endif()
 
-# NGX 后端接线（SDS §5.1）。★ 三行缺一不可：只写 include 目录与宏、不写 target_sources
-# ⇒ `NgxBackend.cpp` 永不进编译单元 ⇒ ngx 的 13 个符号未定义 ⇒ **LNK2019**（本 target 无 GLOB）。
-if(DX11FSRBRIDGE_ENABLE_NGX)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx/nvsdk_ngx_defs.h")
-        target_sources(Dx11FsrBridge PRIVATE NgxBackend.cpp)
-        target_include_directories(Dx11FsrBridge PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx")
-        target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_ENABLE_NGX=1)
-        message(STATUS "Dx11FsrBridge: NGX 后端参与编译（DX11FSRBRIDGE_ENABLE_NGX=1）")
-    else()
-        message(STATUS "NGX headers not found (Dx11FsrBridge/third_party/ngx/nvsdk_ngx_defs.h); "
-                       "building without the NGX backend. Restore them with "
-                       "tools/Fetch-NgxHeaders.ps1 if this checkout is incomplete.")
-        set(DX11FSRBRIDGE_ENABLE_NGX OFF)
-    endif()
-endif()
+# DLSS 直连层（2026-11-15）：`DlssInput.cpp` 无条件进编译单元。
+# 它自己声明最小 NVSDK_NGX ABI（不 vendor NVIDIA 头），因此不需要 third_party/ngx，
+# 也不需要 DX11FSRBRIDGE_ENABLE_NGX 宏 —— 原 `NgxBackend.cpp` 那套 OptiScaler 代理已移除。
+target_sources(Dx11FsrBridge PRIVATE DlssInput.cpp)
+
 
 # 旧方案已彻底移除：Fsr2TranslationLayer（旧翻译层）与 Dx11On12Swapchain（On12 引导）
 # 不再编译进 DLL；OptiScaler 以新 ffx12 链路为基底接入。
@@ -238,7 +226,8 @@ target_link_libraries(Dx11FsrBridge PRIVATE
     # 用于探测显示器真实 HDR 状态。这三个函数在 user32.lib。
     user32
     # 2026-11-14：GetFileVersionInfoSizeW / GetFileVersionInfoW / VerQueryValueW ——
-    # NgxBackend.cpp 用它读 nvngx_dlss.dll 的 FileVersion（"ngx_core init ok=1 … dlss=" 行）。
+    # 2026-11-15：原消费者 NgxBackend.cpp 已移除；直连层读取模块信息仍走同一组 API，
+    # 故 version.lib 保留。
     # ★ 为什么直接链 version.lib，而不是 GetModuleHandleW("version.dll") + GetProcAddress：
     #   ① 少一条运行期失败路径：GetProcAddress 拿不到就得在日志里加一种新的失败形态，
     #      而它在本机上永远不会发生（§一.6：不引入测不到的分支）；
@@ -349,8 +338,9 @@ endfunction()
 # ---- NGX 参数映射纯函数层单测（2026-11-10，A 阶段）----
 #
 # `NgxParamMap.h/.cpp` 是**零 D3D / 零 NGX / 零全局**的纯计算层 ⇒ 本 target
-# **不需要任何开关**：不需要 FFX SDK 头、不需要 NGX 头（`DX11FSRBRIDGE_ENABLE_NGX=OFF`
-# 照样构建）、不需要 GPU、不需要游戏、不链 Detours。
+# **不需要任何开关**：不需要 FFX SDK 头、不需要 NGX 头
+# （直连层自己声明最小 ABI，不 vendor NVIDIA 头）
+# 照样构建、不需要 GPU、不需要游戏、不链 Detours。
 # 它把重构前**只能实机验证**的五处公式（CreateFlags / jitter 六模式 / MV scale /
 # reset / reactive 尺寸守卫）用**位模式**钉住：测试里的 oracle 是重构前原代码
 # **另抄一份**，断言用 `std::bit_cast` 比位（不是 epsilon）。
@@ -451,12 +441,8 @@ if(DX11FSRBRIDGE_BUILD_BACKEND_TEST)
     #
     #    保持本开关默认 OFF，避免让"已知失败的测试"混进 CI 绿灯。
     # 2026-11-09（PR #12 审查次要项 6）：**本 test 只覆盖 native 路径**。
-    #   不定义 DX11FSRBRIDGE_ENABLE_NGX ⇒ Ffx12Backend.cpp 里的 ngx:: 分支
-    #   （#if defined(DX11FSRBRIDGE_ENABLE_NGX) 内）不参与编译 ⇒ 测试不覆盖 NGX 路径。
-    #   理由：本 test 在隔离 harness 下已知运行崩溃（见上方 message），扩展其覆盖面
-    #   没有价值；NGX 路径的编译覆盖由 .github/workflows/compile-check.yml 的
-    #   build-ngx-on job 覆盖；但该 job 已配置、从未在 GitHub 上运行过，
-    #   因此编译覆盖目前是 NOT VERIFIED。
+    #   2026-11-15：`ngx::` 分支已随 NgxBackend.cpp 移除，本注释原来的「不覆盖 NGX 路径」
+    #   说明已失效 —— 现在 Ffx12Backend.cpp 只有 FFX 一条路径。
     add_executable(Ffx12BackendTest
         Ffx12BackendTest.cpp
         Ffx12Backend.cpp

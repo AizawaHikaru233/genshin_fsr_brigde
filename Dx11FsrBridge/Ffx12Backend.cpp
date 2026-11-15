@@ -1,6 +1,5 @@
 #include "Ffx12Backend.h"
 #include "Ffx12ShaderSource.h"   // 两份 HLSL 正文（T-1 迁出；native 与 ngx 共用）
-#include "NgxBackend.h"          // ngx::dispatch / ngx::should_release_all（T-6 分流点）
 #include "PerfProbe.h"
 
 #include <Windows.h>
@@ -376,7 +375,6 @@ bool g_non_linear = true;       // 非线性色彩空间（OptiScaler 日志：F
 bool g_use_pq_chain = false;    // PQ 链开关（2026-08-24 定案：游戏原生直喂 PQ 值 + HDR|NON_LINEAR|AUTO_EXPOSURE
                                 // 标志（initFlags 0x129），不做 PqToLinear/LinearToPq；本开关保留旧链作对照）
 // 后端选择（SDS §3.9A.3(b)）：由桥的 ini 读取点（Ffx12Backend 键）经 set_backend() 设置。
-BackendKind g_backend = BackendKind::Native;   // 初值 Native = 改造前行为（REQ-04）
 
 
 // 读取 D3D12 info queue 消息（诊断；正式版不编译）
@@ -2354,8 +2352,6 @@ bool hdr_input() { return g_hdr_input; }
 bool motion_vectors_jittered() { return g_motion_vectors_jittered; }
 bool depth_inverted() { return g_depth_inverted; }
 
-void set_backend(BackendKind k) { g_backend = k; }
-BackendKind backend() { return g_backend; }
 
 // 进程退出标志的对外入口（g_process_exiting 在匿名命名空间内，此处仅转发）。
 // 由桥的 DllMain(DLL_PROCESS_DETACH, lpReserved != nullptr) 调用。
@@ -2921,41 +2917,6 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
     // 拿到锁后再判一次：等锁期间 shutdown() 可能已经开始。
     if (g_shutting_down.load(std::memory_order_acquire))
         return false;
-#if defined(DX11FSRBRIDGE_ENABLE_NGX)
-    // ★ T-6 分流点（SDS §3.3.2）：ngx 模式下 D3D12 / FFX 完全不初始化。
-    //   位置硬约束：必须在二次 shutdown 判之后、t_dispatch_start 之前。
-    //   绝不能插在上方 if 的条件行与它唯一的 return false 之间——那样会被吞成 body，
-    //   编译零警告但所有 dispatch 恒返回 false（本项目第 4 类 BLOCKER 的典型形态）。
-    //
-    // g_backend 与 BackendKind 都是 ffx12 的符号，且本块就贴在 ffx12::dispatch() 体内，
-    // 与 g_backend 的存储（同一 TU 的匿名命名空间，Ffx12Backend.cpp:379）处于同一作用域
-    // ⇒ 可直接裸写。若哪天这段被挪到别的 TU，必须改写成
-    //   ffx12::backend() == ffx12::BackendKind::Ngx
-    if (g_backend == BackendKind::Ngx)
-    {
-        // ★ 复刻 native 路径下游（本函数内、分流点之后）的两道判空。不能靠共用：分流后
-        //   native 的判空不可达，而这里的失败形态是 return false（fail-open），不是崩溃。
-        //   B-1：四个尺寸任一为 0 ⇒ CopyResource / CreateTexture2D 都不接受。
-        if (game_context == nullptr || input.color == nullptr || input.depth == nullptr ||
-            input.motion == nullptr || input.output_target == nullptr)
-            return false;
-        if (input.render_w == 0 || input.render_h == 0 ||
-            input.display_w == 0 || input.display_h == 0)
-            return false;
-
-        // ★ 这里只有这一行。初始化在 ngx::dispatch 内部完成（懒初始化）。
-        //   不得在此调 ngx::init —— 公开 init() 已在计划第十稿取消。
-        const bool ok = ngx::dispatch(input, game_context, instance_key);
-
-        // 统计口径：不是与 native 完全同口径，而是「计数一致、rc 只记最终值」。
-        // native 路径在下方两行写这两个全局；ngx 模式下那两行不可达，故本分支自己写一次。
-        // kFfxDispatchOk 不存在（全仓库只有 kFfxDispatchNotReached，Ffx12Backend.cpp:316）。
-        // 成功用 0（与 FFX_API_RETURN_OK 同值），失败沿用既有哨兵。
-        g_dispatch_counter.fetch_add(1, std::memory_order_relaxed);
-        g_last_ffx_dispatch_rc.store(ok ? 0 : kFfxDispatchNotReached, std::memory_order_relaxed);
-        return ok;
-    }
-#endif
     const std::uint64_t t_dispatch_start = qpc_us();
     g_dispatch_counter.fetch_add(1, std::memory_order_relaxed);
     g_last_ffx_dispatch_rc.store(kFfxDispatchNotReached, std::memory_order_relaxed);

@@ -117,20 +117,26 @@ $configValues = [ordered]@{
     'Fsr2Il2CppHook'            = '1'   # 代码内建缺省是 0 ⇒ 删行会让桥接失效
     'Ffx12ReuseSameGeneration'  = '0'   # 开启会产生残像
     'Ffx12FeatureFallback'      = '1'
-    # ---- 7. NGX(DLSS) 后端 / NGX backend（后端由 Ffx12Backend=auto 按显卡型号选）----
+    # ---- 7. DLSS 直连层 / DLSS direct-connect layer（超分路径由 DlssInput 决定）----
     # 默认值逐键与 Dx11FsrBridge.package.ini 的 [Dx11FsrBridge] 段、以及代码内建缺省一致
-    # （load_config 的 NGX 键解析段）。改这里必须四处同步改（load_config + 本脚本 + package.ini + 提交信息）。
-    # ⚠️ Ffx12Backend **故意不在本表里**：见文件顶部"三个故意不写的例外"。
-    'NgxApplicationId'          = '1337'
-    'NgxFeatureDirs'            = ''    # 空 = 自动探测含 nvngx_dlss.dll 的目录
-    'NgxHdr'                    = '0'    # 0 = 强制 SDR（默认，NGX 收到 IsHDR 会拖影）/ auto 自动探测 / 1 强制 HDR
-    'NgxRenderPreset'           = '0'   # 0 = 六个 preset 参数都不设（跟随 NGX 自身规则）；5..15 可显式指定
-    'NgxSetFrameTimeDelta'      = '1'
-    'NgxUseReactiveMask'        = '0'
-    'NgxLogLevel'               = '1'   # 0=全关 1=error（默认，取证行已可见）2=info 3=debug
-    'NgxPassthrough'            = '0'
-    'NgxProvider'               = 'auto' # NGX 实现来源：auto（默认）/ nvidia / external（非 N 卡经 OptiScaler）
-    'NgxCrossKeyReuse'          = '1'   # 1 = key 变化但尺寸/格式全等时复用实例（消除角色界面切换 ~500ms 卡顿）；0 = 每次切换都销毁重建
+    # （load_config 的 DlssInput 键解析段）。改这里必须四处同步改（load_config + 本脚本 + package.ini + 提交信息）。
+    #
+    # 1=auto（默认）/ 2=force 走 DLSS 直连。**没有 0=off 这一档** —— 原先把 0 当
+    # 「强制 FFX」会让桥自己跑 FFX 超分，与 OptiScaler 的 Dx11Upscaler=dlss 冲突 ⇒ 卡死。
+    # 直连层由桥自己持一份 NGX feature，不经 OptiScaler 代理。
+    'DlssInput'                 = '1'   # 1=auto（默认）/ 2=force；0 等价于 auto（无 off 档）
+    'DlssInputModule'           = 'nvngx.dll'
+    'DlssInputAllowRealNgx'     = '1'
+    'DlssInputJitterMode'       = '3'   # 3 = ZeroCentred（实机基线，配错会全屏拖影）
+    'DlssInputMotionSign'       = '1'   # 1 = 正 scale（实机基线）
+    'DlssInputDepthScale'       = '32'  # 逆深度 [0,0.03] x32 -> [0,0.96]
+    'DlssInputJitterSource'     = '0'
+    'DlssInputJitterReduce'     = '0'
+    'DlssInputMotionFixup'      = '0'
+    'DlssInputReactiveMask'     = '0'
+    'DlssInputAlphaUpscaling'   = '0'
+    'DlssInputJitterProbe'      = '0'
+    'DlssInputMvProbe'          = '0'
     # ---- 日志（[Log] 段）/ Logging ----
     # 必须在这里写：Add-LogSection 只在**没有** [Log] 段时才补整段，
     # 而已部署的 ini 都已有 [Log] 段 → 段内的新键永远不会被补上（实测 queue_capacity 缺失）。
