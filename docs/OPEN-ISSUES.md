@@ -5,7 +5,7 @@
 > **改动历史不在这里**：某段代码为什么是现在这样，用 `git log` / `git blame` 查。
 > 条目关闭后直接删除；要留结论就移入文末「已解决」，并注明解决它的提交。
 
-最后更新：2026-11-13
+最后更新：2026-11-15
 
 ---
 
@@ -90,7 +90,9 @@ DLL 大小 660,480 B 未变。
 
 **四、未纳入 2026-11-14 清理范围**
 
-`SDS §x.x` 的 27 处引用**刻意未动**。那份设计文档（`docs/SDS_NgxBackend.md`，3,253 行）存在于归档分支
+`SDS §x.x` 的引用**刻意未动**（写下时为 27 处，口径 `git grep -o 'SDS §' -- 'Dx11FsrBridge/*'`；
+`c37d3a5` 补就地图例后又新增 2 处，故该数字会随图例增长，核对时以命令结果为准）。
+那份设计文档（`docs/SDS_NgxBackend.md`，3,253 行）存在于归档分支
 `archive/feat-ngx-backend-20261110`，由 `c3bd66a` 引入、从未删除，文档内定义了代码里全部编号体系：
 `S-n` 变更编号、`E0`–`E3` 证据等级、`M2`–`M4` 里程碑、`T-n` 任务编号、`D-n` 审核发现。
 
@@ -99,6 +101,11 @@ DLL 大小 660,480 B 未变。
 
 另注：`B1xx` 编号（约 230 处）在 `Dx11FsrBridge.cpp` 文件头有就地图例
 （「本项目历次变更批次的编号，每个编号的实质内容即紧随其后的注释段落」），符合就地定义要求，同样不应清理。
+
+**状态（2026-11-15）**：本节所列的注释清理已完成（`git grep -E 'AGENTS(\.md)? §(8|15|16)' -- Dx11FsrBridge`
+为 0 命中；`SDS` / `T-n` / `E0`–`E3` / `D-n` 已在 `NgxBackend.cpp` 文件头补就地图例）。
+上文的文档归属问题已定案：**该设计文档不入库**（`docs/` 仅白名单放行 `docs/OPEN-ISSUES.md`，见 `.gitignore`），
+故「就地补图例」是 `SDS` 编号的永久解法，不再考虑把该文档并入主分支。
 
 ---
 
@@ -167,7 +174,6 @@ Dx11wDx12SC::Present
 "known issue ... Will be eventually fixed"，此后 5 个月无修复。
 
 **为何不修**：阻塞发生在 OptiScaler 自身的 DLL 卸载路径，桥无法介入。
-完整证据链见本地留痕 `VERDICT_game_exit_hang_20261112.md`（不随仓库分发）。
 
 ## 4. DLSS 选档的**实机验收**尚未完成（机制已实现）
 
@@ -508,7 +514,7 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 - `SDK :` → `FFX SDK :`、`FSR :` → `FFX :`；ngx 模式下这两行明确标注 `(unused, backend=ngx)`，
   不再把未使用的 AMD SDK 与 `FSR?` 当成「这局在用什么」。
   注意 `BACKEND :` 行**无条件打印**、两个改名对 native 同样生效，故 native 下也从三行变四行。
-- `ngx_core init ok=1` 行追加 `dlss=<版本>`、`source=<来源>` 与 `provider=<kind>`：
+- `ngx_core init ok=1` 行追加 `dlss=<版本>`、`source=<来源>`、`provider=<kind>` 与 `entry=<路径>`：
   `ProviderHit` 的 `kind` 提升为全局供该行读取；`source` 取 `loaded` / `file` / `none`，
   用来区分「本进程已装载的模块」与「特征目录里的候选文件」—— 两条路可能给出同一版本号，只看数值无法区分。
   DLSS 版本取**已加载模块**的 FileVersion（`GetModuleHandleW` +
@@ -518,6 +524,11 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
   ⚠️ 该修复在**本会话内不可观测** —— 这段代码在 `g_inited = true` 之后，而 `ensure_init` 首行是
   `if (g_inited) return g_available`，一旦成功就再不会走到这里；退避窗口只用于**失败**的 init。
   真正会重读的只有 `shutdown_all()` 之后重建的情形。
+  `entry=<路径>` 是**真正被绑上 10 个 `NVSDK_NGX_D3D11_*` 导出的已装载模块**的完整路径，
+  与 `provider=<kind>`（从哪条路找来的）是两个不同事实：装 OptiScaler 时 `provider=` 常指向
+  DriverStore 那份 `_nvngx.dll`，而真正提供 `CreateFeature` 入口的是 `OptiScaler.dll`
+  —— 它劫持 `LoadLibraryW` 并返回自身 HMODULE。取不到打 `entry=(unknown)`。
+  该值只在导出绑定成功的唯一出口写一次，故恒等于最终采纳的那个模块（中途失败的候选不写）。
 - `Dx11FsrBridge/CMakeLists.txt` 链 `version` 库。用直接链接而非 `GetProcAddress`：
   少一条运行期失败路径，且依赖在加载期就暴露，不必等第一次读版本时才发现
   （与 `FufuGraphicsPlugin/CMakeLists.txt` 同写法）。
