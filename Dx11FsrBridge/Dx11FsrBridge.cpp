@@ -12168,7 +12168,8 @@ bool dispatch(ID3D11DeviceContext *context, const ffx12::FrameInput &in,
     if (!ok)
     {
         const std::uint32_t f = g_eval_failures.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (f <= 8 || f % 256 == 0)
+        // 同一共振问题（256 = 32×8，与 8 帧相位同相）⇒ 改 257。
+        if (f <= 8 || f % 257 == 0)
         {
             LOG_WARN(blog::cat::upscale,
                 "dlss_input_eval_failed count=" + std::to_string(f) +
@@ -12212,7 +12213,16 @@ bool dispatch(ID3D11DeviceContext *context, const ffx12::FrameInput &in,
     }
     const std::uint64_t cadence_until = jitter_cadence_until.load(std::memory_order_relaxed);
     const bool cadence_active = jitter_cadence_on && cadence_until != 0 && n <= cadence_until;
-    if (n <= 8 || n % 600 == 0 || cadence_active)
+    // 2026-11-16（审查三轮）：周期从 600 改为 **601**。
+    //
+    // 600 / 8 = 75 是整数，而游戏的抖动相位是 **8 帧周期**（标准 Halton(2) 前 8 项，
+    // 之后截断回开头 —— 见 DLSS_INPUT.md §11）。⇒ 每 600 帧采样一次，采样点恒落在
+    // **同一个相位**上，日志里的 jitter_px 看起来像冻结了，而它其实每帧都在变。
+    //
+    // 601 是质数、601 mod 8 = 1 ⇒ 相邻两次采样错开一个相位，遍历整个 8 帧周期。
+    // 上游 `3ab1dc0` 用 1021 解决同一问题（也是质数）；本分支选 601 而不用 1021，
+    // 是因为这条日志带十几个字段、比上游那条重，周期太稀不利于排障。
+    if (n <= 8 || n % 601 == 0 || cadence_active)
     {
         // `render_calls` 是本帧累计的 il2cpp `FFX_FSR2::Render` 调用次数。
         // 它是判定"抖动为什么不动"的**唯一**分水岭：
