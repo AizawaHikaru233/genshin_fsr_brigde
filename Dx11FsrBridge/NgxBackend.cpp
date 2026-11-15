@@ -979,21 +979,42 @@ const char *provider_mode_name(int mode)
 
 // ============================================================================
 // §3.10.1 的三个日志闸门（T-5）
-// ★ 三者的阈值**各不相同**，且都是 SDS 明文写死的，不要合并成一个函数 ——
-//   合并会让"某条线的闸门调了、另一条忘了调"这种事故在下一次改动时重现。
+// ★ 三者的阈值**各不相同**，不要合并成一个函数 —— 合并会让"某条线的闸门调了、
+//   另一条忘了调"这种事故在下一次改动时重现。
 // ★ 三种形态的来源：
-//   ngx_in / ngx_out  → §3.10.1 表「闸门」列：count <= 8 || count % 1024 == 0
+//   ngx_in / ngx_out  → 计数闸门（周期**故意偏离** SDS §3.10.1 的 1024，理由见下）
 //   ngx_core eval 成功 → §3.10.1 表：每 1024 帧
 //   ngx_core eval 失败 → §3.10.1 表：每次（前 8 次全打，之后每 256 次一次）
+// ★ ngx_in / ngx_out **不再用 1024**：1024 与 FSR2 的抖动相位周期整倍共振。
+//   相位周期 phaseCount = 8 × (显示/渲染)²；1920×1080 渲染 + 3840×2160 显示 ⇒ 比值 2
+//   ⇒ phaseCount = 32，而 1024 = 32 × 32 ⇒ 每个采样点对 32 取模都相同 ⇒ 采样点永远
+//   落在同一相位。实机取证：gen=1024 与 gen=2048 的 jitter 都是 -0.468750,0.043210
+//   （反解 mode3 的 px = 0.5 - halton(n,2) 得 n=31）；gen=3072..20480 的 18 条全是
+//   0.031250,0.376543（n=30，期间换过实例，帧计数偏移一帧）。
+//   代价不是画面错，而是**判据错**：用 grep 'ngx_in jitter' 判断「jitter 还在不在动」
+//   会得出「冻结了」的错误结论（AGENTS.md §五.1：观测源必须反映事实源头）。
+//   故改用与常见 phaseCount（8/16/24/32/64/128）互质的奇素数周期
+//   kNgxJitterSamplePeriod，让采样点沿相位轴铺开；日志量与原来基本持平（1021 ≈ 1024）。
 // ============================================================================
 
-// 前 8 帧全打 + 之后每 1024 帧一次（ngx_in / ngx_out 共用，§3.10.1）。
-static bool log_gate_win8_every1024(std::uint64_t count)
+// ngx_in / ngx_out 的采样周期：1021（< 1024 的最大素数）。
+// 与 8/16/24/32/64/128 全部互质 ⇒ 采样点相对抖动相位不会锁死；相邻采样帧相隔 1021，
+// 与 phaseCount=32 的排列周期是 lcm(1021,32)=32672 帧 —— 远长于一次游玩，
+// 等效于沿相位轴均匀采样。
+// ★ 改这个数之前先确认它仍是素数，且与本机 phaseCount 互质（见上方注释）。
+constexpr std::uint64_t kNgxJitterSamplePeriod = 1021u;
+
+// 前 8 帧全打 + 之后每 kNgxJitterSamplePeriod 帧一次（ngx_in / ngx_out 共用）。
+static bool log_gate_win8_jitter(std::uint64_t count)
 {
-    return count <= 8u || (count % 1024u) == 0u;
+    return count <= 8u || (count % kNgxJitterSamplePeriod) == 0u;
 }
 
 // 每 1024 帧一次（ngx_core eval 成功行，§3.10.1）。
+// ★ 这里**继续用 1024**，不跟着 ngx_in / ngx_out 改成 kNgxJitterSamplePeriod：
+//   eval 成功行打的是 eval_us / eval_fail_total 这类**与抖动相位无关**的量，
+//   不存在「采样点与相位锁死」的问题；它也不是判断 jitter 的依据来源。
+//   保留 1024 是为了让口径继续与 SDS §3.10.1 对得上，少一处无谓偏离。
 static bool log_gate_every1024(std::uint64_t count)
 {
     return (count % 1024u) == 0u;
@@ -4281,10 +4302,12 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     ri.instance_first = inst.first;
     const int reset_val = ngx_param_map::map_reset(ri) ? 1 : 0;
 
-    // ---- ngx_in 行（§3.10.1 输入侧；info；闸门 count <= 8 || count % 1024 == 0）----
+    // ---- ngx_in 行（§3.10.1 输入侧；info；闸门 count <= 8 || count % kNgxJitterSamplePeriod）----
     // ★ fmt 的三个值取自**实际输入纹理的 GetDesc()**，不得凭空构造。
     // ★ 本行是**逐帧**行，绝不与一次性快照的 ngx_core 混用（§3.10.2 末尾的硬约束）。
-    if (log_gate_win8_every1024(frame_count))
+    // ★ 采样周期用 kNgxJitterSamplePeriod 而非 1024：1024 与抖动相位周期整倍共振，
+    //   会让「jitter 在不在动」这个判断永远看到同一个相位（见闸门定义处的实机数字）。
+    if (log_gate_win8_jitter(frame_count))
     {
         D3D11_TEXTURE2D_DESC ddesc {}, mdesc {};
         in.depth->GetDesc(&ddesc);
@@ -4422,14 +4445,15 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     const std::uint64_t copy_us = qpc_us() - copy_t0;
 
     // ngx_out 行（§3.10.1 输出侧；逐帧 = **debug**；失败才用 error）
-    if (log_gate_win8_every1024(frame_count))
+    // 采样周期同 ngx_in（kNgxJitterSamplePeriod），不复用 1024 闸门。
+    if (log_gate_win8_jitter(frame_count))
     {
         log_ngx_core(blog::Level::Debug, L"ngx_out copy out=%dx%d fmt=%d copy_us=%.1f",
                      static_cast<int>(inst.dw), static_cast<int>(inst.dh),
                      static_cast<int>(odesc.Format), static_cast<double>(copy_us));
     }
 
-    // ngx_core eval 成功行（**info**；每 1024 帧一次）
+    // ngx_core eval 成功行（**info**；每 1024 帧一次，与抖动相位无关，故不跟随 kNgxJitterSamplePeriod）
     if (log_gate_every1024(frame_count))
     {
         log_ngx_core(blog::Level::Info,
