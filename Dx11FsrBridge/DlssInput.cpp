@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cctype>   // tolower（impl 判据按文件名比对时需要）
 #include <limits>
 
 #if defined(_WIN32)
@@ -660,29 +661,40 @@ RouteOutput route_output(const RouteInput &in)
             return { OutputPath::DlssInput, "user_forced_dlss_optiscaler_will_serve" };
         return { OutputPath::DlssInput, "user_forced_dlss_try_load" };
     }
+    // auto —— 2026-11-16（审查二轮）重写：原顺序让 `allow_real_ngx` 不可达。
+    //
+    // 原问题：`if (in.dlss_runtime_present)`（= 674 行）排在
+    // `if (in.allow_real_ngx && vendor == Nvidia)`（= 682 行）之前，而
+    // `Dx11FsrBridge.cpp` 的 DriverStore 探测会把「驱动目录里有 nvngx.dll」也算作
+    // `dlss_runtime_present` ⇒ **装了 N 卡驱动的机器上它恒为真** ⇒ 682 行永远走不到
+    // ⇒ `DlssInputAllowRealNgx` 取 0 还是 1 都不改变路由。
+    //
+    // 新顺序按「先看用户许不许，再看能不能」排：
+    //   ① OptiScaler 在场 ⇒ 一定走它（用户的显式选择优先于一切）
+    //   ② OptiScaler 不在 + 用户禁了原生 NGX ⇒ 回 FFX（这才是 allow_real_ngx=0 的语义）
+    //   ③ 运行时可解析（已加载 or DriverStore 命中）且是 N 卡 ⇒ 直连
+    //   ④ 允许原生 NGX 且是 N 卡 ⇒ 值得一试（LoadLibraryW 由 initialize 负责）
+    //   ⑤ 都不满足 ⇒ FFX
+    if (in.optiscaler_present)
+        return { OutputPath::DlssInput, "optiscaler_present_will_serve_ngx" };
 
-    // auto：
-    //   ① 已经加载了 NGX ⇒ 直接用（N 卡或 OptiScaler 在场时）。
-    //   ② 没加载但允许用原生 NGX 且是 N 卡 ⇒ 值得一试：`LoadLibraryW` 由
-    //      `Runtime::initialize` 负责，失败会 fail-open 回 ffx 并留下原因。
-    //      ★ 2026-11-15（审查 B3）：这一步是**必需**的 —— 游戏本体不加载
-    //        nvngx.dll，只看 ① 会让 auto 在「只装桥」时永远回 FFX，
-    //        使 DlssInput 直连层从代码上不可达（PR #16 的原始缺陷）。
-    //   ③ OptiScaler 在场 ⇒ 它的 LdrLoadDll 钩子会把 nvngx.dll 换成自己。
-    //   ④ 都不满足 ⇒ 保持现状（绝不因为"是 N 卡"就盲目切）。
+    if (!in.allow_real_ngx)
+    {
+        // 到这里说明 optiscaler 不在场、用户又禁了原生 NGX ⇒ 没有可用的 DLSS 实现。
+        // 这正是 `DlssInputAllowRealNgx=0` 该有的效果（旧实现在这里被判据顺序吃掉了）。
+        return { OutputPath::FfxNative, "real_ngx_disallowed_and_no_optiscaler" };
+    }
+
     if (in.dlss_runtime_present)
     {
-        if (in.vendor == Vendor::Nvidia || in.optiscaler_present)
+        if (in.vendor == Vendor::Nvidia)
             return { OutputPath::DlssInput, "ngx_runtime_present" };
-        // 非 N 卡且无 OptiScaler：模块在场也没法用（DLSS 只在 N 卡上跑）
+        // 非 N 卡：模块在场也跑不了 DLSS（它只在 N 卡上工作）
         return { OutputPath::FfxNative, "ngx_present_but_vendor_not_nvidia" };
     }
 
-    if (in.allow_real_ngx && in.vendor == Vendor::Nvidia)
+    if (in.vendor == Vendor::Nvidia)
         return { OutputPath::DlssInput, "nvidia_rtx_will_try_load" };
-
-    if (in.optiscaler_present)
-        return { OutputPath::DlssInput, "optiscaler_present_will_serve_ngx" };
 
     return { OutputPath::FfxNative, "no_dlss_runtime_and_no_optiscaler" };
 }
@@ -818,11 +830,37 @@ ResolveReport NgxApi::resolve(void *module)
     get_feature_requirements =
         reinterpret_cast<PFN_GetRequirements>(get("NVSDK_NGX_D3D11_GetFeatureRequirements"));
 
-    // 区分实现来源：OptiScaler 会导出 OptiScaler 专有符号。
-    if (get("OptiScaler") != nullptr || get("NVSDK_NGX_D3D12_EvaluateFeature") != nullptr)
-        report.impl = "optiscaler";
-    else if (get_capability_parameters != nullptr)
-        report.impl = "nvidia-ngx";
+    // 区分实现来源 —— **看模块的真实文件名**，不看导出符号。
+    //
+    // ⚠️⚠️ 2026-11-16（审查二轮更正）：原判据是
+    //     get("OptiScaler") != nullptr || get("NVSDK_NGX_D3D12_EvaluateFeature") != nullptr
+    //   **两条都不成立**，实测证据：
+    //     · `OptiScaler.dll` 的 967 个导出里**没有**名为 `OptiScaler` 的符号
+    //       （它导出的是 D3D11CreateDevice / NVSDK_NGX_* / 大量 nucleus 转发），
+    //       所以第一个条件永远为假；
+    //     · `NVSDK_NGX_D3D12_EvaluateFeature` 是**所有** NGX 实现都有的符号 ——
+    //       驱动自带的两个都导出它（`nvngx.dll` 序号 29、`_nvngx.dll` 序号 36，
+    //       用 dumpbin /EXPORTS 在 DriverStore 上逐个验过）⇒ 第二个条件恒为真。
+    //   ⇒ 只要模块不是 OptiScaler，这一行也恒判 `optiscaler`，与是否装了 OptiScaler 无关。
+    //
+    //   后果不止日志身份：`require_optiscaler` 与 `allow_real_ngx` 两道门
+    //   都以这个字符串为判据 ⇒ 两道门都被绕过。
+    //
+    // 新判据：**看模块的真实文件名**（`module_name` 由上方 GetModuleFileNameW 得到，
+    // 已剥成纯文件名）。OptiScaler 一定从它自己的文件加载，文件名含 "optiscaler"；
+    // 驱动自带的叫 `nvngx.dll` / `_nvngx.dll`。
+    //   文件名是**事实**，导出符号只是**能力** —— 用事实判身份。
+    {
+        std::string lower = report.module_name;
+        for (char &ch : lower)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (lower.find("optiscaler") != std::string::npos)
+            report.impl = "optiscaler";
+        else if (get_capability_parameters != nullptr)
+            report.impl = "nvidia-ngx";
+        else
+            report.impl = "unknown";
+    }
 
     std::string missing;
     auto need = [&missing](const void *p, const char *name) {

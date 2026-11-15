@@ -528,17 +528,23 @@ void test_route()
     CHECK(r.path == OutputPath::DlssInput);
     CHECK(std::string(r.reason) == "nvidia_rtx_will_try_load");
 
-    // 关掉 allow_real_ngx ⇒ 不允许盲试，回 FFX
+    // 关掉 allow_real_ngx ⇒ 不允许盲试，回 FFX。
+    // 2026-11-16（审查二轮）：reason 改成专属的 "real_ngx_disallowed_and_no_optiscaler" ——
+    //   原来它与"什么都没有"共用同一个 reason，无法在日志里区分这两种情况。
     in.allow_real_ngx = false;
     r = route_output(in);
     CHECK(r.path == OutputPath::FfxNative);
-    CHECK(std::string(r.reason) == "no_dlss_runtime_and_no_optiscaler");
+    CHECK(std::string(r.reason) == "real_ngx_disallowed_and_no_optiscaler");
 
-    // OptiScaler 在场时，即使 allow_real_ngx=false 也值得试（它的 LdrLoadDll 钩子会接管）
+    // OptiScaler 在场时，即使 allow_real_ngx=false 也走它（LdrLoadDll 钩子会接管）。
+    // 2026-11-16：新顺序把它排在 allow_real_ngx 之前 —— 用户的显式选择优先于全局开关。
     in.optiscaler_present = true;
     r = route_output(in);
     CHECK(std::string(r.reason) == "optiscaler_present_will_serve_ngx");
 
+    // 已加载 NGX：先把 OptiScaler 摘掉再看 —— 否则会先命中最上面那个 optiscaler 分支。
+    in.optiscaler_present = false;
+    in.allow_real_ngx = true;
     in.dlss_runtime_present = true;
     CHECK(std::string(route_output(in).reason) == "ngx_runtime_present");
 

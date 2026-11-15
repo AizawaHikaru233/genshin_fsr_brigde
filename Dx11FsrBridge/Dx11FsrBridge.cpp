@@ -16183,13 +16183,22 @@ bool swapchain_control_hook_needed()
 
 bool swapchain_color_hook_needed()
 {
-    // 2026-11-15：原判据是「NGX 代理后端在场」（`ffx12::backend() == BackendKind::Ngx`），
-    // 但那个概念已随 NgxBackend.cpp 移除。直连层读 swapchain 的 color space 是为了
-    // 判定 DLSS 的 IsHDR 标志，纯 FFX 构型下这三个 hook 是纯透传。
+    // 2026-11-16（审查二轮更正）：**这不是后端条件，是「直连层是否可能启用」的条件。**
     //
-    // 判据改为「直连层开着」：与原来「只对 NGX 后端装」的覆盖面等价。
-    // 2026-11-16（审查 F2）：同 3504 处 —— `DlssInput` 无「0=关」这一档，
-    // 0 与未知值都按 auto 处理 ⇒ 判据写 `1 || 2`，不写 `!= 0`。
+    // 审查指出：`DlssInput` 的默认值在四处都是 1，而 `Build-DlssBridge.ps1` 的
+    // `[ValidateSet(1, 2)]` 也不允许 0 ⇒ 本判据在**所有受支持配置下恒真**，
+    // 与原先那个孤儿 `return true;` 的实际效果相同。
+    //
+    // 这一点是**有意的**，但要写明白其语义：
+    //   直连层默认开启（`DlssInput=1` auto），而它读 swapchain 的 color space 是为了
+    //   判定 DLSS 的 `IsHDR` 标志。auto 的最终落位要等设备创建后才知道
+    //   （`dlss_gate::resolve_path`），而**本谓词在 `swapchain_hook_needed()` 里
+    //   被求值的时机早于那个判定** ⇒ 只能按「可能启用」装，不能按「已确定启用」装。
+    //   装错的代价是三个纯透传 hook（`hooked_check_color_space_support` /
+    //   `hooked_set_color_space1` 在 spoof 关时都 `return physical_hr`），无行为影响。
+    //
+    // 若将来要「只在确定走 DLSS 时装」，需要一个能在设备创建前取到真值的输入 ——
+    // 目前没有（`resolve_path` 依赖适配器信息）。届时改这里，别改 DlssInput 的默认值。
     if (g_config.dlss_input_mode == 1 || g_config.dlss_input_mode == 2)
         return true;
     return k_color_diagnostics_enabled || hdr_swapchain_spoof_active() || hdr_swapchain_force_active();
