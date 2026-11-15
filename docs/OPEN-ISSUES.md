@@ -174,7 +174,6 @@ Dx11wDx12SC::Present
 "known issue ... Will be eventually fixed"，此后 5 个月无修复。
 
 **为何不修**：阻塞发生在 OptiScaler 自身的 DLL 卸载路径，桥无法介入。
-完整证据链见本地留痕 `VERDICT_game_exit_hang_20261112.md`（不随仓库分发）。
 
 ## 4. DLSS 选档的**实机验收**尚未完成（机制已实现）
 
