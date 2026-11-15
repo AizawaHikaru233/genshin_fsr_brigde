@@ -598,12 +598,36 @@ int main()
     expect(skipped_count() >= 6, "skipped_count >= 6");
     expect(accumulate_replaced_count() >= 4, "accumulate_replaced_count >= 4");
 
+    // ---- 9b. 【本轮新增 · 审查第二轮建议 5】"解除许可的回报真的发生过"必须可测 ----
+    //   缺陷原状（验证缺口）：create_feature 白名单失败分支里**真的调了**
+    //   notify_accumulate_result(false, …)，但此前唯一证据是上面第 4 步那条
+    //   "notify(false) 之后不跳"的断言 —— 它证明的是**状态机语义**。
+    //   把 NgxBackend.cpp 里那行调用**整行删掉**，本文件与 DLL 都照常编译链接、
+    //   本测试也照常 ALL PASS（本轮实测：删掉后 cmake --build 仍 0 error，
+    //   Fsr2FamilyTakeoverTest 仍 ALL PASS）⇒ 那个修复点没有任何自动化证据。
+    //   ⇒ 新增 accumulate_cleared_count()：只在 notify_accumulate_result(false, …) 里 +1。
+    //     下面三条断言把它钉住：① true **不**递增（否则"清锁"与"武装"两个相反事实
+    //     共用一个计数器，读数无法区分是哪一种发生了）；② false 恰好 +1；③ 再 +1（累计）。
+    {
+        const std::uint64_t cleared_before_true = accumulate_cleared_count();
+        notify_accumulate_result(true, T0 + 1100);
+        expect(accumulate_cleared_count() == cleared_before_true,
+               "cleared_count: notify(true) must NOT increment it");
+        notify_accumulate_result(false, T0 + 1110);
+        expect(accumulate_cleared_count() == cleared_before_true + 1,
+               "cleared_count: notify(false) increments by exactly 1");
+        notify_accumulate_result(false, T0 + 1120);
+        expect(accumulate_cleared_count() == cleared_before_true + 2,
+               "cleared_count: second notify(false) -> +2 (cumulative, not sticky)");
+    }
+
     if (g_failures == 0)
     {
-        std::printf("Fsr2FamilyTakeoverTest: ALL PASS (skipped=%llu replaced=%llu leave=%llu)\n",
+        std::printf("Fsr2FamilyTakeoverTest: ALL PASS (skipped=%llu replaced=%llu leave=%llu cleared=%llu)\n",
             static_cast<unsigned long long>(skipped_count()),
             static_cast<unsigned long long>(accumulate_replaced_count()),
-            static_cast<unsigned long long>(takeover_leave_count()));
+            static_cast<unsigned long long>(takeover_leave_count()),
+            static_cast<unsigned long long>(accumulate_cleared_count()));
         return 0;
     }
     std::printf("Fsr2FamilyTakeoverTest: %d FAILURE(S)\n", g_failures);

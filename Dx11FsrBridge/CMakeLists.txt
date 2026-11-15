@@ -44,7 +44,7 @@ option(DX11FSRBRIDGE_BUILD_FAMILY_TEST "Build the Fsr2FamilyTakeover state-machi
 #   - `Ffx12Test` / `Ffx12AccumTest` —— `#include "ffx_api.h"` / `"ffx_upscale.h"`，
 #     需 FFX SDK 头 staging（本文件的 FFX_API_STAGE_ROOT 流程），且运行需真实 SDK DLL
 #   - `Ffx12DescTest`               —— 纯 D3D12 计算着色器验证，运行需 GPU
-#   - `GpuRouteTest`                —— 已在文件内标注 OBSOLETE
+#   - 历史参考表（GPU id → 架构）已删除：其被测函数在生产代码中已不存在，见提交历史
 # 这些留待需要时按 FFX SDK staging 接入；先保证"能无外部依赖编译"的两个进 CI。
 option(DX11FSRBRIDGE_BUILD_TESTS "Build the SDK-free unit tests (il2cpp callsite, ffx12 backend)" OFF)
 
@@ -71,6 +71,11 @@ option(DX11FSRBRIDGE_BUILD_TESTS "Build the SDK-free unit tests (il2cpp callsite
 #    `-DDX11FSRBRIDGE_DIAGNOSTICS=ON`。
 option(DX11FSRBRIDGE_DIAGNOSTICS
     "Compile diagnostics/probes (PerfProbe, Fsr2InputDump, *Probe*, Trace*, Dump*) - keep OFF for release" OFF)
+
+# ---- D3D11 NGX（DLSS 超分）头 ----
+# 2026-11-15：`third_party/ngx/` 已随 `NgxBackend.cpp` 一并移除 —— 直连层
+# （`DlssInput.h`）自己声明最小 NVSDK_NGX ABI，不需要 vendor NVIDIA 头。
+
 
 set(DX11FSRBRIDGE_DIAGNOSTICS_ON ${DX11FSRBRIDGE_DIAGNOSTICS})
 if(NOT DX11FSRBRIDGE_DIAGNOSTICS_ON AND CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -123,7 +128,7 @@ add_library(Dx11FsrBridge SHARED
     Il2CppCallSiteHook.cpp
     TransparentJitterHook.cpp
     Ffx12Backend.cpp
-    DlssInput.cpp
+    NgxParamMap.cpp
 )
 
 # ⚠️ `Fsr2InputDump.cpp`（抓帧诊断）**只在诊断构建里**进源列表：
@@ -139,6 +144,12 @@ endif()
 if(DX11FSRBRIDGE_DIAGNOSTICS_ON)
     target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_ENABLE_DIAGNOSTICS=1)
 endif()
+
+# DLSS 直连层（2026-11-15）：`DlssInput.cpp` 无条件进编译单元。
+# 它自己声明最小 NVSDK_NGX ABI（不 vendor NVIDIA 头），因此不需要 third_party/ngx，
+# 也不需要 DX11FSRBRIDGE_ENABLE_NGX 宏 —— 原 `NgxBackend.cpp` 那套 OptiScaler 代理已移除。
+target_sources(Dx11FsrBridge PRIVATE DlssInput.cpp)
+
 
 # 旧方案已彻底移除：Fsr2TranslationLayer（旧翻译层）与 Dx11On12Swapchain（On12 引导）
 # 不再编译进 DLL；OptiScaler 以新 ffx12 链路为基底接入。
@@ -211,10 +222,48 @@ target_link_libraries(Dx11FsrBridge PRIVATE
     d3d12
     d3dcompiler
     dxgi
+    # T-10：DisplayConfigGetDeviceInfo / QueryDisplayConfig（Windows 显示配置 API）
+    # 用于探测显示器真实 HDR 状态。这三个函数在 user32.lib。
+    user32
+    # 2026-11-14：GetFileVersionInfoSizeW / GetFileVersionInfoW / VerQueryValueW ——
+    # 2026-11-15：原消费者 NgxBackend.cpp 已移除；直连层读取模块信息仍走同一组 API，
+    # 故 version.lib 保留。
+    # ★ 为什么直接链 version.lib，而不是 GetModuleHandleW("version.dll") + GetProcAddress：
+    #   ① 少一条运行期失败路径：GetProcAddress 拿不到就得在日志里加一种新的失败形态，
+    #      而它在本机上永远不会发生（§一.6：不引入测不到的分支）；
+    #   ② 静态 import 表让依赖在加载期就暴露，而不是等到第一次读版本时才发现。
+    # ⚠️ 关于风险面，如实记录（2026-11-14 实测更正）：
+    #   version.dll **不是** KnownDLL（本机 Windows 10.0.26300 实测 HKLM\SYSTEM\
+    #   CurrentControlSet\Control\Session Manager\KnownDLLs 共 38 项，其中没有 VERSION；
+    #   换 Windows 版本数量会变，故注明环境）。因此这条 import 走的是
+    #   标准 DLL 搜索顺序 —— **游戏 exe 所在目录优先于 System32**。若该目录被放了一个
+    #   同名 version.dll，加载的就是它。
+    #   补充两点常被说错的事实（2026-11-14 用 PE 导入表与 KnownDLLs 实测核对）：
+    #   · SafeDllSearchMode 只影响"当前目录"的位置，**exe 目录恒在 System32 之前**；
+    #     而**本 DLL 自身所在目录不会被搜索**（DLL 搜索不使用"本模块目录"）。
+    #   · 不能拿 user32 当同类：user32 **是** KnownDLL，根本不走搜索顺序；
+    #     d3d11 / dxgi 也不在本 DLL 的导入表里（d3d11 是运行期 LoadLibrary）。
+    #   真正同类的例子是导入表里那些非 KnownDLL 项：MSVCP140 / VCRUNTIME140 /
+    #   D3DCOMPILER_47 / d3d12 —— 它们同样按搜索顺序解析。
+    #   代价只是一条静态 import 表项（三个函数），与 FufuGraphicsPlugin 的 target_link_libraries
+    #   里链 version 的写法一致（那边是读自身 .rc 的版本资源，同一个库、同一种取舍）。
+    version
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/detours/detours.lib"
 )
 
 if(DX11FSRBRIDGE_BUILD_FAMILY_TEST)
+    # ⚠️ 配对开关检查（2026-11-13 补）：只开 BUILD_FAMILY_TEST、不开 DIAGNOSTICS 时，
+    #   下面第 10 / 11 / 13 节的被测符号全在 `#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)`
+    #   里 ⇒ 会得到一片 `C2065: 未声明的标识符`，而根因只是一个宏没开，极易被误判成
+    #   「源码编不过」（本仓库已发生过一次：有人据此判定该测试「从 HEAD 起就编译不过」，
+    #   实际是配置缺开关）。这里提前拦下，避免再去读那一屏编译错误。
+    if(NOT DX11FSRBRIDGE_DIAGNOSTICS_ON)
+        message(WARNING
+            "DX11FSRBRIDGE_BUILD_FAMILY_TEST=ON 但 DX11FSRBRIDGE_DIAGNOSTICS=OFF："
+            "Fsr2FamilyTakeoverTest 的第 10/11/13 节被测符号由 DX11FSRBRIDGE_ENABLE_DIAGNOSTICS 门控，"
+            "本配置下必然出现一片 C2065。请成对开启："
+            "-DDX11FSRBRIDGE_BUILD_FAMILY_TEST=ON -DDX11FSRBRIDGE_DIAGNOSTICS=ON")
+    endif()
     add_executable(Fsr2FamilyTakeoverTest
         Fsr2FamilyTakeoverTest.cpp
         Fsr2FamilyTakeover.cpp
@@ -253,34 +302,76 @@ endif()
 #      残留的**失效实例指针**会污染下一次 `install()`（已修）。
 #   ⚠️ `Ffx12BackendTest` —— 可编译，但**运行仍崩溃**（见下），故单独开关。
 #   ❌ `Ffx12Test` / `Ffx12AccumTest` —— `#include "ffx_api.h"` 等，需 FFX SDK 头
-#      staging；`Ffx12DescTest` 另需 GPU；`GpuRouteTest` 已在文件内标注 OBSOLETE。
+#      staging；`Ffx12DescTest` 另需 GPU。
 option(DX11FSRBRIDGE_BUILD_TESTS "Build the runnable SDK-free unit tests (il2cpp callsite)" OFF)
 option(DX11FSRBRIDGE_BUILD_BACKEND_TEST
     "Build Ffx12BackendTest (KNOWN ISSUE: crashes in ffxCreateContext under the isolated test harness)"
     OFF)
 
-if(DX11FSRBRIDGE_BUILD_TESTS OR DX11FSRBRIDGE_BUILD_BACKEND_TEST)
-    # 共用设置函数：把主 target 用到的宏与警告级别统一施加到测试 target
-    function(fsrbridge_configure_test target)
-        target_compile_features(${target} PRIVATE cxx_std_20)
-        if(MSVC)
-            target_compile_options(${target} PRIVATE /utf-8 /W3)
-        endif()
-        target_compile_definitions(${target} PRIVATE
-            WIN32_LEAN_AND_MEAN
-            NOMINMAX
-            UNICODE
-            _UNICODE
-        )
-        # ⚠️ 测试 target 必须与主 target **用同一个诊断开关**：
-        # 否则要么诊断 test 在没有诊断实现的构建里编译失败（PerfProbeTest /
-        # Fsr2InputDumpTest），要么 `Il2CppCallSiteHookTest` /
-        # `TransparentJitterHookTest` 与 DLL 走不同的 `PerfProbe.h` 分支。
-        if(DX11FSRBRIDGE_DIAGNOSTICS_ON)
-            target_compile_definitions(${target} PRIVATE DX11FSRBRIDGE_ENABLE_DIAGNOSTICS=1)
-        endif()
-    endfunction()
-endif()
+# 共用设置函数：把主 target 用到的宏与警告级别统一施加到测试 target
+#
+# ★ 2026-11-10（A 阶段）：本函数原先包在
+#   `if(DX11FSRBRIDGE_BUILD_TESTS OR DX11FSRBRIDGE_BUILD_BACKEND_TEST)` 块内，
+#   现移到块外。原因：`NgxParamMapTest` 是**零依赖**的纯映射层单测，必须在
+#   **默认构建**（两个开关都 OFF）下就能编译 —— 若函数仍在块内，那个 target
+#   在默认配置下根本不存在。测试 target 不进 DLL 源列表 ⇒ 对产物零影响。
+function(fsrbridge_configure_test target)
+    target_compile_features(${target} PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /utf-8 /W3)
+    endif()
+    target_compile_definitions(${target} PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        UNICODE
+        _UNICODE
+    )
+    # ⚠️ 测试 target 必须与主 target **用同一个诊断开关**：
+    # 否则要么诊断 test 在没有诊断实现的构建里编译失败（PerfProbeTest /
+    # Fsr2InputDumpTest），要么 `Il2CppCallSiteHookTest` /
+    # `TransparentJitterHookTest` 与 DLL 走不同的 `PerfProbe.h` 分支。
+    if(DX11FSRBRIDGE_DIAGNOSTICS_ON)
+        target_compile_definitions(${target} PRIVATE DX11FSRBRIDGE_ENABLE_DIAGNOSTICS=1)
+    endif()
+endfunction()
+
+# ---- NGX 参数映射纯函数层单测（2026-11-10，A 阶段）----
+#
+# `NgxParamMap.h/.cpp` 是**零 D3D / 零 NGX / 零全局**的纯计算层 ⇒ 本 target
+# **不需要任何开关**：不需要 FFX SDK 头、不需要 NGX 头
+# （直连层自己声明最小 ABI，不 vendor NVIDIA 头）
+# 照样构建、不需要 GPU、不需要游戏、不链 Detours。
+# 它把重构前**只能实机验证**的五处公式（CreateFlags / jitter 六模式 / MV scale /
+# reset / reactive 尺寸守卫）用**位模式**钉住：测试里的 oracle 是重构前原代码
+# **另抄一份**，断言用 `std::bit_cast` 比位（不是 epsilon）。
+add_executable(NgxParamMapTest
+    NgxParamMapTest.cpp
+    NgxParamMap.cpp
+)
+fsrbridge_configure_test(NgxParamMapTest)
+target_include_directories(NgxParamMapTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+enable_testing()
+add_test(NAME NgxParamMapTest COMMAND NgxParamMapTest)
+
+# ---- DLSS 直连层的纯映射层单测（2026-11-15，审查 M6 补）----
+#
+# `DlssInputTest.cpp` 覆盖 DlssInput.h/.cpp 的**纯计算部分**：
+#   jitter 六模式 + 相位折返 / MV 符号四档 / CreateFlags 位模式 / perf_quality 六档 /
+#   reset 优先级 / masks 组合 / subrect 校验 / route_output 全分支 / build_frame 兜底 /
+#   自生成 Halton。
+#
+# ⚠️ 它**不覆盖**驱动层（Feature::create/evaluate/destroy、Runtime::initialize/
+#   ensure_feature/shutdown）—— 那些要假 NGX vtable，属后续工作。
+#
+# 零依赖：不碰 D3D、不碰 NGX、不链 Detours，任何平台都能跑。
+add_executable(DlssInputTest
+    DlssInputTest.cpp
+    DlssInput.cpp
+)
+fsrbridge_configure_test(DlssInputTest)
+target_include_directories(DlssInputTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+enable_testing()
+add_test(NAME DlssInputTest COMMAND DlssInputTest)
 
 if(DX11FSRBRIDGE_BUILD_TESTS)
     # il2cpp callsite hook：观察/跳过/还原模式 + per-instance 隔离 + 相机 hook。
@@ -305,23 +396,19 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     target_include_directories(TransparentJitterHookTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME TransparentJitterHookTest COMMAND TransparentJitterHookTest)
 
-    # DLSS 输入契约的纯映射层单测：jitter（wrap vs clamp 的多样性差异、cb0 一帧相位补偿）、
-    # motion（FSR2 纹理 → NGX 的符号抵消）、create flags（PQ 码值不得标成 IsHDR）、
-    # perf quality（UltraQuality 被 OptiScaler 改写时的规避）、reset 优先级、
-    # mask（transparency 无槽位时必须承认丢失）、subrect 越界、输出路由。
-    #
-    # ⚠️ 本 target **不需要 GPU、不需要游戏、不需要 nvngx.dll、不链接 Detours**：
-    #   `DlssInput.cpp` 的驱动层用 `#if defined(_WIN32)` 与前置声明隔离，
-    #   纯映射层零依赖 ⇒ 这是唯一能在 CI/无 N 卡的机器上钉住"N 卡语义"的测试。
-    add_executable(DlssInputTest
-        DlssInputTest.cpp
-        DlssInput.cpp
+    # Ffx12Backend=auto 的型号判据（GpuBackendPick.h，纯 header，零依赖）：
+    # RTX -> ngx；GTX / MX / 非 NVIDIA -> native；名字认不出关键字时按 device id 兜底
+    # （只认 Ampere / Ada / Blackwell，Turing 与 GTX 16 同段故不兜底）。
+    # 不需要游戏、不需要 GPU、不链接任何库。
+    add_executable(GpuBackendPickTest
+        GpuBackendPickTest.cpp
     )
-    fsrbridge_configure_test(DlssInputTest)
-    target_include_directories(DlssInputTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(NAME DlssInputTest COMMAND DlssInputTest)
+    fsrbridge_configure_test(GpuBackendPickTest)
+    target_include_directories(GpuBackendPickTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME GpuBackendPickTest COMMAND GpuBackendPickTest)
 
-    # ---- 以下两个 test target 是**诊断专用**，随诊断开关一起排除 ----    #
+    # ---- 以下两个 test target 是**诊断专用**，随诊断开关一起排除 ----
+    #
     # ⚠️ 必须一起排除，否则发布构建会挂：`PerfProbeTest` 要测 `perf_probe::read_*` /
     # `reset_for_test` / 直方图；`Fsr2InputDumpTest` 要链 `Fsr2InputDump.cpp`——
     # 两者在发布构建里**根本不存在**（诊断核心被 `#if` 排除、诊断 .cpp 不在源列表里）。
@@ -373,6 +460,9 @@ if(DX11FSRBRIDGE_BUILD_BACKEND_TEST)
     #    已加 fail-open 的 try/catch（见 Ffx12Backend.cpp）。
     #
     #    保持本开关默认 OFF，避免让"已知失败的测试"混进 CI 绿灯。
+    # 2026-11-09（PR #12 审查次要项 6）：**本 test 只覆盖 native 路径**。
+    #   2026-11-15：`ngx::` 分支已随 NgxBackend.cpp 移除，本注释原来的「不覆盖 NGX 路径」
+    #   说明已失效 —— 现在 Ffx12Backend.cpp 只有 FFX 一条路径。
     add_executable(Ffx12BackendTest
         Ffx12BackendTest.cpp
         Ffx12Backend.cpp

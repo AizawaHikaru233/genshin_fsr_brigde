@@ -1,4 +1,4 @@
-# Build-DlssBridge.ps1 - build Dx11FsrBridge.dll with a portable MSVC toolchain.
+﻿# Build-DlssBridge.ps1 - build Dx11FsrBridge.dll with a portable MSVC toolchain.
 #
 # WHY THIS SCRIPT EXISTS
 #   The bridge has 19 __try blocks that probe game memory and patch the IAT.
@@ -31,10 +31,11 @@ param(
     # Explicit toolchain root; overrides $WorkspaceRoot when non-empty.
     [string] $ToolchainRoot = "",
     [switch] $Clean,
-    # Value written to DlssInput in the generated ini. 0=off 1=auto 2=force.
-    # Default 2 so a test build is actually testable without hand-editing an ini
-    # that the installer will overwrite anyway.
-    [ValidateSet(0, 1, 2)][int] $DlssInputMode = 2,
+    # Value written to DlssInput in the generated ini. 1=auto 2=force.
+    # ⚠️ 没有 0=off 这一档：桥侧把 0 与任何未知值都按 auto 处理 —— 原先把 0 当
+    #   「强制 FFX」会让桥自己跑 FFX 超分，与 OptiScaler 的 Dx11Upscaler=dlss 冲突。
+    # 默认 1=auto：与 package.ini / Deploy-Bridge.ps1 / load_config 四处一致。
+    [ValidateSet(1, 2)][int] $DlssInputMode = 1,
     # Emit DlssInputMvProbe=1 in the generated ini (MV readback diagnostic).
     [switch] $MvProbe,
     # Build WITH diagnostics (Fsr2InputDump etc.). Release builds exclude them.
@@ -189,6 +190,7 @@ $cppSources = @(
     "TransparentJitterHook.cpp"
     "Ffx12Backend.cpp"
     "DlssInput.cpp"
+    "NgxParamMap.cpp"   # 纯计算层：FFX 路径与直连层共用（map_jitter / map_mv_scale）
 )
 
 $defines = @(

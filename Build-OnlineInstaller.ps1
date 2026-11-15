@@ -469,6 +469,9 @@ function Prepare-FpsStage {
     }
     Copy-Item -LiteralPath $bridgeDll -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.dll') -Force
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $stagePayloadBridge 'Dx11FsrBridge.ini') -Force
+    # 2026-11-15：NVIDIA NGX SDK 头（third_party\ngx\）已随 NGX 代理后端移除 ——
+    # 直连层（DlssInput）自己声明最小 NVSDK_NGX ABI，不再 vendor 专有头，
+    # 故这里不再需要复制 NVIDIA-SDK-LICENSE.txt。
     Copy-Item -LiteralPath $antiDll -Destination (Join-Path $stagePayloadAnti 'AntiPlayerMosaic.dll') -Force
     # TextureLoader（纹理/Mod 加载器）：DLL + ini + DirectStorage 运行时 + 空 Mods 目录。
     # 许可文件收进模块目录内 licenses/ 子文件夹（自身 GPL-3.0 许可/溯源 +
@@ -711,6 +714,7 @@ try {
     New-Item -ItemType Directory -Path $bridge, $opti, $amd, $nvidia, $reshade, $textureLoader, $defaults -Force | Out-Null
     Copy-Item -LiteralPath $bridgeDll -Destination (Join-Path $bridge 'Dx11FsrBridge.dll') -Force
     Copy-Item -LiteralPath $bridgePackageConfig -Destination (Join-Path $bridge 'Dx11FsrBridge.ini') -Force
+    # 2026-11-15：同上 —— NGX SDK 头已移除，商城包也不再需要这份许可文本。
     Copy-DirectoryContents -Source $optiRuntime -Destination $opti
     # 临时方案：同上，芙芙包里的 OptiScaler 也换成 AMD 官方 FFX 运行时。
     Copy-Item -LiteralPath $ffxDll -Destination (Join-Path $opti 'amd_fidelityfx_upscaler_dx12.dll') -Force

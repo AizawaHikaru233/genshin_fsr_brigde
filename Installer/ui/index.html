@@ -73,6 +73,9 @@
   .rvalue{font-size:13px;color:var(--ink2);margin-top:3px;letter-spacing:0}
   .rvalue.mono{font-family:var(--mono);font-size:12px;letter-spacing:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .rvalue.dim{color:var(--ink2)}
+  /* 超分输入类型的备注：一句话说明「接口 ≠ 选择」，允许折两行 */
+  .srnote{max-width:34em;line-height:1.35}
+  .srnote.dim{color:var(--ink2)}
   .ghost{font-size:13px;color:var(--ink);background:#F1F1F4;border:0;border-radius:8px;padding:6px 12px;transition:background .15s,transform .12s var(--ease),box-shadow .2s,color .15s}
   .ghost:hover{background:#E8E8EC}
   .ghost:active{transform:scale(.97)}
@@ -252,6 +255,11 @@
   .sfixed{font-size:12.5px;color:var(--ink2);font-variant-numeric:tabular-nums;white-space:nowrap}
   .sfixed b{font-weight:600;color:var(--ink)}
   .slabel{font-size:12.5px;color:var(--ink2);white-space:nowrap}
+  /* 高帧防检测：开关独占一行，说明与风险提示各占一行（文字比其它行宽） */
+  .srow.cloak{flex-direction:column;align-items:stretch;gap:5px}
+  .cloakhead{display:flex;align-items:center;gap:10px}
+  .cloakdesc{font-size:12px;color:var(--ink2);line-height:1.5}
+  .cloakwarn{font-size:12px;color:var(--red);line-height:1.5}
   .scard-note{padding:0 18px 12px;font-size:12px;color:var(--ink2);line-height:1.5}
   .lnklist{padding:2px 18px 12px}
   .lnkrow{display:flex;align-items:center;gap:10px;padding:7px 0}
@@ -526,9 +534,28 @@
             <input class="fpsinput" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" maxlength="4" placeholder="自定义" aria-label="自定义帧率上限">
           </div>
         </div>
-  
+
+        <!-- 超分输入类型：只镜像 Dx11FsrBridge.ini 的 DlssInput，选完立刻写回那份 ini -->
+        <div class="row intro" style="animation-delay:120ms">
+          <div class="ico">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="4" y="4" width="16" height="16" rx="3"/><rect x="9" y="9" width="6" height="6" rx="1"/>
+              <path d="M9 2.6v1.4M15 2.6v1.4M9 20v1.4M15 20v1.4M2.6 9H4M2.6 15H4M20 9h1.4M20 15h1.4"/>
+            </svg>
+          </div>
+          <div style="min-width:0">
+            <div class="rlabel">超分输入类型</div>
+            <div class="rvalue srnote">这是超分输入接口，不是超分选择。Auto 能拿到 NGX 就走 DLSS 直连，否则退回 FFX</div>
+          </div>
+          <div class="seg" id="srseg" role="group" aria-label="超分输入类型">
+            <span class="segthumb"></span>
+            <button type="button" data-v="1" aria-pressed="true">Auto</button>
+            <button type="button" data-v="2" aria-pressed="false">强制 DLSS</button>
+          </div>
+        </div>
+
         <!-- 安装内容 -->
-        <div class="row headrow intro" style="animation-delay:120ms">
+        <div class="row headrow intro" style="animation-delay:160ms">
           <div class="ico">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 3.6 20 8v8l-8 4.4L4 16V8Z"/><path d="M12 12.1 20 8M12 12.1V20.4M12 12.1 4 8"/>
@@ -996,6 +1023,8 @@
     uiLang: 'system',    // 界面语言：system | zh | en
     theme: 'system',     // 明暗主题：system | light | dark
     shortcutOn: true,    // 安装时创建桌面快捷方式
+  srInput: '1',          // 超分输入类型：1=auto | 2=force（= Dx11FsrBridge.ini 的 DlssInput）
+    srAvailable: false,  // 桥装好了、那份 ini 在，才允许改
     unlockerDir: '',     // 解帧工具目录（payload\FpsUnlocker）
     shortcutName: '',    // 快捷方式文件名（跟随界面语言）
     modsDefault: ''     // 默认 Mods 目录（payload\TextureLoader\Mods）
@@ -1442,6 +1471,27 @@
     miscRow.group.appendChild(hdr);
     box.appendChild(miscRow);
 
+    // 高帧防检测：和上面的开关走同一条通道（fps_config.json 的 FpsClamp 键）
+    var cloakRow = document.createElement('div');
+    cloakRow.className = 'srow cloak';
+    var cloakHead = document.createElement('div');
+    cloakHead.className = 'cloakhead';
+    ui.cloakWrap = swItem(cloakHead, 'cloak', '高帧防检测', cfg.cloak !== false, false, function(){
+      var patch = {};
+      patch.cloak = !state.unlocker.cloak;
+      patchUnlocker(patch);
+    });
+    var cloakDesc = document.createElement('div');
+    cloakDesc.className = 'cloakdesc';
+    cloakDesc.textContent = '向游戏上报 60/45/30，避免解锁帧率被判为非法工具；不影响实际帧数';
+    var cloakWarn = document.createElement('div');
+    cloakWarn.className = 'cloakwarn';
+    cloakWarn.textContent = '此项会修改游戏代码，若游戏更新后失效或出现异常请关闭';
+    cloakRow.appendChild(cloakHead);
+    cloakRow.appendChild(cloakDesc);
+    cloakRow.appendChild(cloakWarn);
+    box.appendChild(cloakRow);
+
     var note = document.createElement('div');
     note.className = 'scard-note';
     note.id = 'unlockernote';
@@ -1478,6 +1528,12 @@
       sw.disabled = locked;
       wrap.classList.toggle('dim', locked);
     });
+
+    // 防检测开关写 fps_config.json，禁用条件与其它解帧工具选项保持一致
+    var cloakSw = ui.cloakWrap.querySelector('.sw');
+    cloakSw.setAttribute('aria-checked', cfg.cloak !== false ? 'true' : 'false');
+    cloakSw.disabled = locked;
+    ui.cloakWrap.classList.toggle('dim', locked);
 
     ui.mon.disabled = locked;
     if (document.activeElement !== ui.mon) ui.mon.value = String(cfg.monitor);
@@ -1632,6 +1688,7 @@
 
   function placeAllThumbs(){
     fpsControls.forEach(function(c){ placeThumb(c, false); });
+    if (srSeg) syncSegThumb(srSeg, false);
   }
 
   function syncFpsUI(){
@@ -1677,6 +1734,30 @@
   }
 
   [].forEach.call(document.querySelectorAll('[data-fpsctl]'), function(el){ createFpsControl(el); });
+
+  // ── 超分输入类型 ──
+  // 值由后端读回（post_state 的 srInput），这里只负责显示与点击。
+  // ⚠️ 没有「0 = 关闭」这一档：桥侧 0 会走 FFX 并与 OptiScaler 的 Dx11Upscaler 冲突。
+  var srSeg = $('#srseg');
+  function syncSrInput(){
+    if (!srSeg) return;
+    [].forEach.call(srSeg.querySelectorAll('button'), function(b){
+      b.setAttribute('aria-pressed', b.dataset.v === state.srInput ? 'true' : 'false');
+      b.disabled = !state.srAvailable;
+    });
+    syncSegThumb(srSeg, true);
+  }
+  if (srSeg){
+    [].forEach.call(srSeg.querySelectorAll('button'), function(b){
+      b.addEventListener('click', function(){
+        // 与 seg() 同一套判定：看当前 aria-pressed，不看建节点时的旧值
+        if (b.disabled || b.getAttribute('aria-pressed') === 'true') return;
+        state.srInput = b.dataset.v;
+        syncSrInput();
+        host.send({type:'srInput', value: b.dataset.v});
+      });
+    });
+  }
 
   // 装完之后改帧率：底部结论行跟着变，别让两处数字打架。
   function refreshDoneEnv(){
@@ -2600,7 +2681,10 @@ $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); }
       state.opacity = (typeof msg.opacity === 'number') ? msg.opacity : 80;
       syncMaximized();
       applyAppearance();
+    state.srInput = (msg.srInput && msg.srInput.value) || '1';
+      state.srAvailable = !!(msg.srInput && msg.srInput.available);
       syncFpsUI();
+      syncSrInput();
       buildRows();
       updateSummary();
       updateMain();
@@ -2795,6 +2879,8 @@ $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); }
     '已配置':'Configured', '未配置':'Not configured',
     '游戏目录':'Game folder', '正在查找原神安装位置…':'Locating Genshin…', '更换…':'Change…',
     '帧率上限':'Frame rate cap', '安装内容':'Injection list', '保存':'Save',
+    '超分输入类型':'Super resolution input',
+    '这是超分输入接口，不是超分选择，Auto 为 N 卡使用 NVNGX，A 卡使用 FFX 更稳定':'This picks the super resolution input interface, not the upscaler. Auto uses NVNGX on NVIDIA and FFX on AMD, which is more stable.',
     '启动游戏':'Launch game', '游戏运行中':'Game running',
     '先选一个游戏目录，再来这里启动。':'Pick the game folder first, then launch from here.',
     '解帧工具正在运行，关掉游戏后它会自己退出。':'The unlocker is running; it exits when the game closes.',
@@ -2868,6 +2954,9 @@ $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); }
     '改完立刻生效，下次启动游戏时应用。':'Changes apply immediately and take effect next launch.',
     '完成一次安装（写入注入链）后就能在这里调整。':'Finish one install (writes the injection chain) to edit these.',
     '已保存到 fps_config.json':'Saved to fps_config.json', '保存失败':'Save failed',
+    '高帧防检测':'Frame Rate Detection Prevention',
+    '向游戏上报 60/45/30，避免解锁帧率被判为非法工具；不影响实际帧数':'Reports 60/45/30 to the game so the unlocked frame rate is not flagged; the real frame rate is unaffected.',
+    '此项会修改游戏代码，若游戏更新后失效或出现异常请关闭':'This modifies game code; turn it off if it stops working after a game update or anything looks wrong.',
     '窗口模式':'Window mode', '窗口化':'Windowed', '无边框':'Borderless', '全屏':'Fullscreen', '独占全屏':'Exclusive fullscreen',
     '分辨率':'Resolution', '跟随游戏':'Follow game', '自定义':'Custom',
     '启动':'Startup', '即开游戏':'Auto-launch game', '随游戏退出':'Exit with game', '启动最小化':'Start minimized',

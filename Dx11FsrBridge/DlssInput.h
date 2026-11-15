@@ -420,6 +420,11 @@ struct RouteInput
     bool optiscaler_present = false;
     bool dlss_runtime_present = false; // nvngx.dll 可解析到 NVSDK_NGX_D3D11_*
     int user_preference = -1;          // ini：-1=auto / 0=ffx / 1=dlss
+    // 2026-11-15（审查 B3）：auto 分支是否允许直接用 NVIDIA 原生 NGX。
+    // 接通前 auto 只看 `dlss_runtime_present`（= 模块**已加载**），而无 OptiScaler
+    // 时游戏根本不加载 nvngx.dll ⇒ auto 恒回 FFX，直连层从代码上不可达。
+    // 接上这个字段后，auto 在 N 卡且 allow_real_ngx 时会尝试 LoadLibraryW。
+    bool allow_real_ngx = true;
 };
 
 struct RouteOutput
@@ -677,6 +682,41 @@ class Feature
     std::string error_;
 };
 
+// ---------------------------------------------------------------------------
+// NVSDK_NGX_FeatureCommonInfo 的最小声明（只到我们需要的字段）
+// ---------------------------------------------------------------------------
+//
+// 为什么需要它：`Init` / `Init_ProjectID` 的某个参数就是这个结构的指针。传 nullptr
+// 时 NGX **不会**用默认路径去找 DLSS 特征库 —— 它会返回 0xBAD0000B
+// （= NVSDK_NGX_Result_FAIL_NotSupported 家族的 PathListInfo 类错误），
+// CreateFeature 永远建不起来。2026-11-15 实机确认过这条：只装桥（无 OptiScaler）时
+//   dlss_input_init_ok impl=nvidia-ngx path=...DriverStore...\nvngx.dll
+//   dlss_input_feature_failed error=create_feature_failed(0xBAD0000B)
+//
+// 结构布局依据 NVIDIA SDK 的 nvsdk_ngx_defs.h（本仓库不再 vendor 该头，故就地声明）。
+// ⚠️ 字段顺序与类型必须与 SDK 完全一致 —— NGX 是按偏移读的，顺序错一个字段就会
+//    把指针当整数读。这里只声明**前缀**（PathListInfo + InternalData），
+//    LoggingInfo 及其后置字段保持不声明 ⇒ 调用方用零填充的聚合体传入即可。
+struct NgxPathListInfo
+{
+    const wchar_t **Path;    // 目录列表（宽字符绝对路径，不含末尾分隔符）
+    unsigned int Length;     // 条目数
+};
+
+struct NgxLoggingInfo
+{
+    void *LoggingCallback;              // NGX_LoggingCallback；nullptr = 不回调
+    int MinimumLoggingLevel;            // NVSDK_NGX_LOGGING_LEVEL_*
+    bool DisableOtherLoggingSinks;      // 保持 false：让 NGX 自己的 nvngx.log 也继续写
+};
+
+struct NgxFeatureCommonInfo
+{
+    NgxPathListInfo PathListInfo;
+    void *InternalData;
+    NgxLoggingInfo LoggingInfo;
+};
+
 // 模块名/路径的窄字符化（诊断日志用；无法转换的字符降为 '?'，绝不抛异常）。
 std::string narrow_ascii(const std::wstring &wide);
 
@@ -692,6 +732,13 @@ struct RuntimeConfig
     std::string project_id = "genshin-fsr-bridge-dlss";
     int engine_type = 3; // NVSDK_NGX_EngineType_Custom
     std::string engine_version = "1.0.0";
+    // 含 nvngx_dlss.dll 的目录（PathListInfo）。空 = 由调用方按候选顺序探测：
+    //   ① ini 的 DlssInputFeatureDirs（分号分隔，用户显式指定）
+    //   ② 已加载 nvngx_dlss.dll 的目录（游戏/OptiScaler 拉起过时才有）
+    //   ③ 桥自身所在目录（安装器把 nvngx_dlss.dll 拷到这里）
+    //
+    // ⚠️ 这个列表**不能为空**：传 nullptr 时 NGX 返回 0xBAD0000B，feature 建不起来。
+    std::vector<std::wstring> feature_dirs;
 };
 
 class Runtime
@@ -719,6 +766,9 @@ class Runtime
     Feature feature_ {};
     bool ready_ = false;
     bool device_inited_ = false;
+    // 2026-11-15（审查 M4）：保存设备指针供 shutdown1(device) 用。
+    // 不 AddRef：设备由游戏持有，生命周期覆盖本运行时（见 shutdown 的调用时机）。
+    ID3D11Device *device_ = nullptr;
     std::string error_;
     Feature::Desc current_ {};
 };

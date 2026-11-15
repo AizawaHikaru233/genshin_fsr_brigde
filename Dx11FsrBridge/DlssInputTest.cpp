@@ -520,10 +520,21 @@ void test_route()
     in.vendor = Vendor::Nvidia;
     in.dlss_runtime_present = false;
     in.optiscaler_present = false;
+    // 2026-11-15（审查 B3）：allow_real_ngx 接通后，N 卡 + 无 OptiScaler + 未加载 NGX
+    //   会走 "nvidia_rtx_will_try_load"（让 LoadLibraryW 去试），而不是直接回 FFX。
+    //   关闭 allow_real_ngx 才回到旧的 "no_dlss_runtime_and_no_optiscaler"。
+    in.allow_real_ngx = true;
+    r = route_output(in);
+    CHECK(r.path == OutputPath::DlssInput);
+    CHECK(std::string(r.reason) == "nvidia_rtx_will_try_load");
+
+    // 关掉 allow_real_ngx ⇒ 不允许盲试，回 FFX
+    in.allow_real_ngx = false;
     r = route_output(in);
     CHECK(r.path == OutputPath::FfxNative);
     CHECK(std::string(r.reason) == "no_dlss_runtime_and_no_optiscaler");
 
+    // OptiScaler 在场时，即使 allow_real_ngx=false 也值得试（它的 LdrLoadDll 钩子会接管）
     in.optiscaler_present = true;
     r = route_output(in);
     CHECK(std::string(r.reason) == "optiscaler_present_will_serve_ngx");

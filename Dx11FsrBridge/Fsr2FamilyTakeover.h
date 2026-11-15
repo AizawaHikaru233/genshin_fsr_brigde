@@ -53,6 +53,26 @@ void notify_takeover_leave();
 // 交棒释放次数（诊断/验收：应随交棒事件增长，而不是恒 0）
 std::uint64_t takeover_leave_count();
 
+// 「累积 pass 未被替换」的回报次数（`notify_accumulate_result(false, …)` 的成功调用次数）。
+//
+// ★ 2026-11-13（独立审查第二轮 · 建议 5）新增。存在理由（验证缺口）：
+//   `create_feature` 的白名单失败分支里**真的调了** `notify_accumulate_result(false, …)`，
+//   而此前唯一的证据是 `Fsr2FamilyTakeoverTest.cpp:52` 那条断言 —— 它证明的是**状态机语义**
+//   （false 之后 should_skip_pre 必须放手），**不证明调用发生过**。删掉那一行调用，
+//   单测照样全绿（实测：删掉后 DLL 仍能编译链接，见本地留痕）。
+//   ⇒ 用一个进程级计数把"调用发生过"变成可观测事实：读 `skipped_count()` 的前后差即可核对
+//     （该差值在 false 之后必为 0，true 之后必 >0 ⇒ 两者共同构成"调用发生过"的证据）。
+//
+// 为什么做成**计数**而不是审查建议的"一次性计数字段 + 日志"：
+//   ① 不新增热路径计算 —— 计数只在 `replaced_ok == false` 时 +1，且本函数**本来**就在
+//      写一个 atomic（g_accumulate_replaced.store）；这里多一次 relaxed fetch_add，
+//      量级与既有写入同阶、且不在每 draw 的成功路径上（AGENTS.md §二.5）。
+//   ② 不需要在 NgxBackend.cpp 里加状态字段，也不需要在 dispatch 的热路径上读它
+//      （审查建议的方案要在失败分支里读 skipped_count() 再打日志，反而多一次 atomic 读）。
+//   ③ 计数可以**离线**由既有单测断言（`Fsr2FamilyTakeoverTest` 已实时导入该头文件），
+//      不需要实机 —— 这正是本建议要的"不需要实机也能验证调用发生"。
+std::uint64_t accumulate_cleared_count();
+
 // ---------------------------------------------------------------------------
 // P1 单实例接管：修复②的**唯一判定点**（纯函数 ⇒ 可离线单测）。
 //
@@ -65,7 +85,7 @@ std::uint64_t takeover_leave_count();
 // 单测（Fsr2FamilyTakeoverTest）逐条钉住这两条 ⇒ 回归不可能再次悄悄发生。
 struct TokenOnlyClaimFacts
 {
-    bool single_instance_takeover = false;  // Ffx12SingleInstance=1（P1 生效）
+    bool single_instance_takeover = false;  // 单实例接管**生效**（Ffx12SingleInstance=1 或 NGX 后端强制）
     bool second_instance_present = false;   // 当前确有多个**活跃**实例（非粘性，见下）
     // ⚠️ 实机回归（2026-09-28）：`second_instance_present` 早先被实现为**粘性**（"本进程出现过
     // 第二个实例"）。状态槽只增不减、场景/视图切换也不回收 ⇒ 一次为真终生为真 ⇒ 单视图场景下

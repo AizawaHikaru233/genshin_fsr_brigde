@@ -1,9 +1,4 @@
 #include <Windows.h>
-// `_ReturnAddress()`（HDR swapchain 冒充那三处钩子用它取调用方地址）声明在
-// <intrin.h> 里。此前本文件从未包含它，只是靠 <Windows.h> 在 MSVC 上的**隐式**
-// 传递包含侥幸编译通过 —— 换成任何严格一点的工具链（或 Windows SDK 调整头顺序）
-// 就会 C3861。显式包含，不依赖传递。
-#include <intrin.h>
 #include <TlHelp32.h>
 #include <d3d11.h>
 #include <d3d11_3.h>
@@ -20,7 +15,13 @@
 #include "Il2CppCallSiteHook.h"
 #include "TransparentJitterHook.h"
 #include "Ffx12Backend.h"
-#include "DlssInput.h"
+#include "DlssInput.h"   // DLSS 输入直连层（替代 NgxBackend / NgxParamMap）：
+                       // 桥自己以 DLSS 客户端身份持一份 NGX feature，
+                       // 走 NVSDK_NGX_Parameter 契约，不再经 OptiScaler 翻译。
+// 纯计算层（与后端无关）：jitter 换算 / MV scale / reset 判定 / 尺寸守卫。
+// FFX 路径与 DLSS 直连层**共用**这两层 —— 它们不碰 D3D、不碰 NGX，可离线单测。
+#include "NgxParamMap.h"
+#include "GpuBackendPick.h"   // Ffx12Backend=auto 的型号判据（纯 header，零依赖）
 #include "Fsr2InputDump.h"
 #include "BridgeLogger.h"
 #include "PerfProbe.h"
@@ -28,6 +29,14 @@
 //
 // 【本文件中的 `B1xx` 编号】= 本项目历次变更批次的编号（`B103`…`B109`）；
 //   每个编号的实质内容即紧随其后的注释段落。
+//
+// 【本文件中的 `E0`–`E3` 标记】= 该条结论的**证据强度**，用于区分「实测过」与「推断」：
+//   `E0` = 读源码 / API 语义 / 头文件推断，**未实测**；
+//   `E1` = 用独立探针或最小复现实测过（可复现）；
+//   `E2` = 在真实游戏会话里实测过（日志 / 画面可查）；
+//   `E3` = 由外部确证（上游源码 / 官方文档 / 驱动行为）。
+//   ⚠️ 同一个标记在不同注释里的强弱不可比 —— 判断可信度看它旁边写没写具体证据，
+//   不要只看等级字母。
 
 #include <algorithm>
 #include <array>
@@ -43,6 +52,7 @@
 #include <fstream>
 #include <iomanip>
 #include <mutex>
+#include <new> // std::nothrow（RouteSnapshot 发布用：分配失败不能抛异常穿出设备创建 hook）
 #include <optional>
 #include <sstream>
 #include <string>
@@ -281,14 +291,20 @@ struct Config
     bool ffx12 = false;
     std::wstring ffx12_dll_path;
     bool ffx12_fail_closed = false; // 禁止回退原生（测试/故障显式暴露）
-    // 【正式功能】P1 单实例接管（默认**开**）：多个 FSR2 上下文并存时只接管**一个**实例，
-    // 其余实例**放行游戏原生上采样**（返回 false，让游戏的累积 draw 照常执行；返回 true
-    // 会吞掉那一路的累积 pass ⇒ 画面冻住）。
-    // 为什么需要：FFX12 的 GPU 互操作共享层是**全局单份**（共享纹理/fence/单槽 pending/
-    // 尺寸池），只支持一条流水线；而现场实测有两个长期并存的 FSR2 上下文（各有一份
-    // ffxContext、历史各归各的）⇒ 两路交替复用同一份共享资源，交付帧混进另一视角的角色。
-    // P1 不隔离共享层（那是 P2），只消除"并存"：只要任一时刻只有一路走桥，就不会混帧。
-    bool ffx12_single_instance = true;
+    // 【正式功能】P1 单实例接管（默认**关** = 全量接管）：置 1 时多个 FSR2 上下文并存
+    // 只接管**一个**实例，其余实例**放行游戏原生上采样**（返回 false，让游戏的累积 draw
+    // 照常执行；返回 true 会吞掉那一路的累积 pass ⇒ 画面冻住）。
+    // 历史（为什么默认不开）：引入时（2026-09-28）FFX12 的 GPU 互操作共享层是**全局单份**
+    // （共享纹理/fence/单槽 pending/尺寸池），只支持一条流水线；现场实测有两个长期并存的
+    // FSR2 上下文（各有一份 ffxContext、历史各归各的）⇒ 两路交替复用同一份共享资源，交付帧
+    // 混进另一视角的角色，故先用 P1 消除"并存"。同日 f9e52b3 起该共享层改为**按实例独占**
+    // （纹理/UAV/SRV/尺寸池/context/挂起槽全部按 instance_key 隔离，只剩 fence 是全局），
+    // 68ed170（2026-10-02）遂把缺省改为 0 全量接管，实测左右 1:1 分屏两路各自 100% 接管
+    // （0 拒绝 / 0 吞掉 / 无覆盖层 / 无冻结）。2026-11-10 合并 NGX 后端时被改回 1（回归，
+    // 提交说明所谓"与发布 ini 对齐"不成立——改动前两处本来都是 0），2026-11-13 恢复 0。
+    // ⚠️ NGX 后端例外：它的 feature/资源池是真全局单实例 ⇒ 无视本键，一律按 1 处理
+    //   （见 single_instance_takeover_effective()）。
+    bool ffx12_single_instance = false;
     // 接管哪一个（默认 0 = 自动）：0 = render 面积大者优先、面积相同取**最早出现**；
     // 1 = 强制最早出现；2 = 强制最新出现（与 1 互补：改一行 ini 即可换成"另一路"验证）。
     std::uint32_t ffx12_single_instance_pick = 0;
@@ -341,47 +357,11 @@ struct Config
     bool ffx12_reuse_same_generation = true;
     bool ffx12_output_mark = false;     // 输出标记（诊断：验证画面来源是否 ffx12）
     float ffx12_fov_scale = 1.0f;       // FOV 缩放（AA 重投影验证：1.0=45°）
-    bool ffx12_jitter_delay = true;   // 2026-08-25 FSR4 实测：游戏双缓冲预录滞后一帧 → 用上一帧 jitter（jdelay=1）
+    // 2026-11-10 实机复测推翻 2026-08-25 的结论：本版本游戏**不再**滞后一帧。
+    // 设 1（用上一帧 jitter）会让整个画面变模糊，且不解决 K 预设拖影；设 0 才与 FFX 持平。
+    // 四处统一为 0：结构体默认 / load_config fallback / package.ini / Deploy-Bridge.ps1。
+    bool ffx12_jitter_delay = false;
     bool ffx12_force_reset = false;   // 诊断：每帧强制 FSR2 reset（与正常对比：相同=历史零贡献/单帧重建）
-    // ---- DLSS 输入路径（DlssInput.h / DLSS_INPUT.md）----
-    // mode：0=off（默认，全部走现有 ffx12 链路）1=auto（N 卡 + 能解析到 NGX 才切）
-    //       2=force（不管显卡，能解析到就切 —— 用于 A 卡 + OptiScaler 的 A/B）
-    int dlss_input_mode = 0;
-    std::uint32_t dlss_input_jitter_reduce = 0;
-    // 抖动符号约定（独立于 Ffx12JitterMode，见 jitter_mode_from_config 的说明）。
-    // 0=+n*W-0.5  1=+n*W  2=raw  3=-n*W+0.5（默认）4=-n*W  5=zero
-    std::uint32_t dlss_input_jitter_mode = 3;
-    // reactive mask 开关（motion.b 合成）。0=关（默认基线）1=开。
-    // 适用场景：低对比区域（白衣/白丝 vs 灰白地面）转动视角出拖影 ——
-    // DLSS 靠颜色差异判断历史可信度，低对比时误判 ⇒ 需显式告知"此处不可信"。
-    std::uint32_t dlss_input_reactive_mask = 0;
-    // AlphaUpscaling（NGX 1<<7）A/B 开关。默认 0=关。
-    // NVIDIA 官方头只有枚举、无语义说明，因此不作为默认行为，只供实机验证：
-    // 三渲二角色的描边/头发边缘是 alpha 混合，若 DLSS 当作不透明几何累积历史
-    // 就会在时域里抖动。开=1 若消除抖动则可考虑设默认，若变差则永久关闭。
-    std::uint32_t dlss_input_alpha_upscaling = 0;
-    // jitter 来源：0=游戏字段（默认，保持现状）1=自生成 Halton（推进且不重复）。
-    // 实测游戏字段在稳态下冻结（83 帧仅 14 个唯一相位），自生成可让 DLSS 真正收敛。
-    std::uint32_t dlss_input_jitter_source = 0;
-    std::uint32_t dlss_input_motion_fixup = 0;  // 0=负 scale 1=要求原生符号纹理
-    // 运动矢量符号 A/B 开关（排障用）：0=负 scale（默认）1=正 scale 2=关闭 MV。
-    // 2 是**决定性诊断档**：若关闭后运动模糊消失，问题 100% 在 MV 链路；
-    // 若仍在，则与 MV 无关（mask/depth/jitter 方向）。
-    // 运动矢量 scale 符号：**1 = 正 scale 是正确值**（2026-11-10 实机确认）。
-    // 0=负(错误旧默认) 1=正(正确) 2=关闭MV(诊断) 3=原始纹理+正scale(诊断)
-    std::uint32_t dlss_input_motion_sign = 1;
-    // MV 数值探针（低频）：每 600 帧读回一次解码后的 MV 均值。
-    // 默认关（AGENTS.md §二.5：诊断默认关；每帧探针会吃掉帧数）。
-    bool dlss_input_mv_probe = false;
-    // jitter 来源探针：强制读 cb0 并对比 render 字段，判定谁在逐帧变化。
-    // 默认关；见 DlssInputJitterProbe。
-    bool dlss_input_jitter_probe = false;
-    // 深度值域归一化倍数。游戏逆深度实际约 [0, 0.03]，DLSS 期望 [0,1]
-    // ⇒ 需要约 32~33 倍放大。不归一化会导致前后景不可分 → 运动拖影
-    // （Ffx12Backend.cpp:456-457 对 FFX 路径已记录同一结论）。
-    float dlss_input_depth_scale = 32.0f;
-    std::wstring dlss_input_module = L"nvngx.dll";
-    bool dlss_input_allow_real_ngx = true;
     // 原生 D3D11 纯 GPU 传输（自建 D3D12 + NT 共享句柄 + D3D11.4 fence）。
     // 默认开：GpuInteropProbe 已在本机字节级验证；不劫持游戏设备为 On12（进场前冻结根因）。
     bool ffx12_gpu_interop = true;
@@ -397,6 +377,30 @@ struct Config
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     std::uint32_t similarity_report_interval_ms = 2000;
 #endif
+    // ---- DLSS 输入直连层（DlssInput.h）----
+    //
+    // 架构：桥**自己**以 DLSS 客户端身份调 NGX（`NVSDK_NGX_Parameter` 契约），
+    // 不再把 FSR2 语义交给 OptiScaler 翻译。feature 由桥持有
+    // ⇒ 游戏释放它自己的 feature 时不会连带重建整条链。
+    //
+    // 0=off（默认，走原来的 ffx12::dispatch，行为与改造前一致）
+    // 1=auto / 2=force（强制走直连层）
+    int dlss_input_mode = 1;   // 1=auto（默认）/ 2=force dlss；0 与其它值等价于 auto
+    std::wstring dlss_input_module = L"nvngx.dll";
+    // 含 nvngx_dlss.dll 的目录（分号分隔）。空 = 按候选顺序自动探测，见 ensure_initialized。
+    std::wstring dlss_input_feature_dirs;
+    bool dlss_input_allow_real_ngx = true;
+    std::uint32_t dlss_input_jitter_reduce = 0;
+    std::uint32_t dlss_input_motion_fixup = 0;
+    std::uint32_t dlss_input_jitter_mode = 3;
+    std::uint32_t dlss_input_reactive_mask = 0;
+    std::uint32_t dlss_input_alpha_upscaling = 0;
+    std::uint32_t dlss_input_jitter_source = 0;
+    std::uint32_t dlss_input_motion_sign = 1;
+    bool dlss_input_mv_probe = false;
+    bool dlss_input_jitter_probe = false;
+    float dlss_input_depth_scale = 32.0f;
+
     std::wstring run_label;
 };
 
@@ -617,16 +621,53 @@ std::atomic_bool g_logging_enabled = false;
 // Ffx12Backend 等跨模块引用（timing 独立落盘门控）。
 int g_bridge_log_level = 1;
 // 显卡路由摘要（initialize 早期产生、被 reset_log 清空）——存全局，active 后补打保证可见
-static bool g_route_applied = false; // 路由已应用（防止设备补检重复应用）
-// 路由信息（apply 时保存，焦点框首次成功/失败时输出，保证三行相邻）
-static std::string g_route_gpu_name;
-static std::string g_route_vendor_label;
-// 适配器 vendor id（0x10DE=NVIDIA / 0x1002=AMD / 0x8086=Intel）。
-// 存在的理由：DLSS 输入路由（见 dlss_gate::resolve_path）必须按厂商决策，
-// 而 `g_route_vendor_label` 是 "0x10DE" 这样的**字符串**，解析它去判断厂商既慢又脆。
-// 这里保存原始数值，只在 record_adapter_info 里写一次。
-static std::atomic<std::uint32_t> g_route_vendor_id { 0u };
-static std::string g_route_sdk_path;
+//
+// 2026-11-14（路由摘要跨线程裸读写，可致 use-after-free）：本块原先是 4 个裸
+//   std::string（型号 / vendor 标签 / SDK 路径 / auto 落位摘要）配 2 个裸 bool：
+//   由**设备创建 hook**（record_adapter_info ->
+//   try_fsr2_translation_draw 内）读取，而两者是否同线程**没有任何代码保证**。
+//   std::string 的读-写竞争不只是"读到旧值"：写入方重新分配缓冲后，读者可能拿到
+//   已释放的旧指针。逐字段加锁也不够 —— 焦点块要把型号与 vendor 打在同一行，
+//   跨字段混合值同样是错的。
+//   ⇒ 改为**不可变快照 + 原子发布**（AGENTS.md §二.4：跨线程共享必须用 std::atomic）：
+//      · 写者一次性构造完整 RouteSnapshot（4 个字段同批可见），再原子发布指针；
+//      · 读者 acquire 一次即拿到整份快照 ⇒ 同一行里的字段必然同源，且不需要任何锁
+//        （§二.5 热路径红线：draw 路径不新增锁 / I/O / 字符串拼接）。
+struct RouteSnapshot
+{
+    std::string gpu_name;
+    std::string vendor_label;
+    std::string sdk_path;
+    std::string backend_auto_note;
+};
+
+// ⚠️ 生命周期：本快照**只发布一次**（进程内），旧快照**不释放**，生命周期等于进程
+//   —— 这样读者拿到指针后物理上不可能遇到 use-after-free，读取处也就不需要回收协议。
+//   若将来**需要重发布**（例如适配器信息要在运行期更新），**必须先改成带回收的方案**
+//   （引用计数 / hazard pointer / RCU 之类）再动手；否则每重发布一次就泄漏一份快照。
+static std::atomic<const RouteSnapshot *> g_route_snapshot { nullptr };
+// 只保护「判重 + 构造 + 发布」这一段。日志与 ffx12::set_backend() 一律放锁外
+// （§二.4：不在持锁期间做 I/O）。
+static std::mutex g_route_publish_mutex;
+// 为什么这两个标志仍是独立原子、而不是塞进快照：
+//   · g_route_applied 必须在**发布之前**就被写入 —— 否则两个线程会各自判重失败、
+//     各发布一份（后发布的覆盖先发布的，先发布的泄漏，焦点框还会抖动）；
+//   两者都只做一次 false->true 翻转，用 exchange/store 让"谁抢到发布权"成为单点事实。
+static std::atomic_bool g_route_applied { false }; // 路由已应用（防止设备补检重复应用）
+// Ffx12Backend=auto（按显卡型号自动落位后端）：
+//   requested —— ini 里写了 auto，等首个非零 vendor 的适配器信息才判；
+//   resolved  —— 已落位。后端是进程级单值，只判一次：后续再看到别的适配器不改后端
+//                （多适配器机器上设备可能不止一个）。
+//   note      —— 落位摘要（"auto=ngx vendor=0x10DE"），**存在 RouteSnapshot 里**
+//                （g_route_snapshot->backend_auto_note），不再有独立全局 —— 它要和
+//                型号/vendor 在同一份快照里发布，否则焦点块可能读到"新 note + 旧型号"。
+// requested 保持裸 bool：写入在 load_config，读取在设备创建 hook。
+// ⚠️ 2026-11-14（审查：注释不实）：原先这里写「此后只读，不存在竞争」，但写点与读点
+//   是否同线程**没有代码保证** —— 那正是本次重构要解决的问题。故这是**形式上的数据竞争**，
+//   与旧代码同形、非本次引入。未改成原子：本值只判一次且写点早于 hook 安装，实测未观察到
+//   问题；但按 §二.4 严格说它不合规，留给后续独立改动（§一.3：不混进本次）。
+// 2026-11-14（见上方 RouteSnapshot 注释）：resolved 必须在发布快照**之前**落位，
+// 故不能塞进快照；用原子 + exchange 保证"落位"这件事在并发下只发生一次。
 
 // OptiScaler 输出定向修复——XeSS/DLSS 的 jitter 需 ≤±0.5（像素/归一化），
 // FSR 输出保持原样（互不干扰）。运行时按 OptiScaler.ini 的 Dx11Upscaler/Dx12Upscaler 判定
@@ -679,8 +720,35 @@ static OptiOutput opti_output_current()
     return g_opti_output.load(std::memory_order_relaxed);
 }
 // 显卡信息记录（**已不做路由**；定义于 initialize 之前，设备创建 hook 先于定义处使用）
-static void record_adapter_info(std::uint32_t vendor, const std::wstring &desc);
+static void record_adapter_info(std::uint32_t vendor, std::uint32_t device_id, const std::wstring &desc);
+// 2026-11-14（路由摘要改快照发布）：本函数原先把 note 直接写一个裸全局字符串，
+// 而 note 必须与型号/vendor 在同一份 RouteSnapshot 里发布 ⇒ 改成**返回** note，
+// 由调用方（record_adapter_info）一次性构造完整快照。vendor_label 由参数传入：
+// 函数内部不再读任何路由全局，读点只剩"发布"那一处。
+// want_ngx_out：本函数只做**纯计算**，不落位后端、不打日志 —— 那两个副作用由
+// resolved_out：本次调用**是否真的落位了后端**。调用方必须据此决定要不要执行副作用 ——
+//   本函数有提前返回路径（未写 auto / vendor==0 / 别人先落位），那几种情况下 want_ngx 无意义。
 static void route_from_d3d11_device(ID3D11Device *d3d11_device);
+// P1 单实例接管的**生效值**：ini 取值，或后端强制。
+// 为什么 NGX 必须强制（2026-11-13 代码审计）：NGX 的 feature 与资源池是**全局唯一实例**
+// （NgxBackend.cpp 的 `NgxInstance g_inst`，v8 起不再是 map + LRU），只支持一条流水线。
+// 全量接管 + 两路视图交替派发时：尺寸/格式不同 ⇒ 每次 instance_key 变化都
+// destroy_instance() + create_instance()；尺寸格式全等 ⇒ 走跨 key 复用，但每帧把
+// g_inst.first 置 true 复位时域（那里的原话：否则两个视图的时域累积互相污染）。
+// 两种都不可能两路同时正常出图 ⇒ 本键对 NGX 后端无效，一律只接管一个实例。
+static bool single_instance_takeover_effective()
+{
+    // 2026-11-15：不再对任何后端强制单实例。原 NGX 代理需要单实例（`NgxInstance g_inst`
+    // 全局唯一），直连层由桥自己持有 feature、不需要这条约束。
+    return g_config.ffx12_single_instance;
+}
+
+// 后端选择行（`ngx_core backend=…`）的单实例状态后缀：只在「ini 写 0 却被强制」时出现，
+// 让日志里的**配置值**与**生效值**能分开读（AGENTS.md §五.6 日志口径自洽）。
+static std::string single_instance_log_suffix()
+{
+    return "";   // 生效值恒等于配置值，无「被强制」状态需要标注
+}
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 std::mutex g_ps_trace_mutex;
 std::ofstream g_ps_trace_stream;
@@ -3396,20 +3464,64 @@ void log_focus_line(const std::string &line)
     blog::write(blog::Level::Info, blog::cat::core, line);
 }
 
-// 接管信息焦点框——显卡型号 / SDK 路径 / FSR 实际版本 相邻输出，
+// 接管信息焦点框——显卡型号 / 后端 / FFX SDK 路径 / FFX 实际版本 相邻输出，
 // 空行 + 分隔线制造明显焦点区域（排版参考：[ffx] Upscaler Version 风格）。
+//
+// 2026-11-14（焦点块在 ngx 模式下撒谎）：本块只描述 FFX 直连路径，但它的两个调用点
+//   （try_fsr2_translation_draw 里"首次派发成功"与"首次失败"两处，用行号会随本文件增删
+//   漂移，故只写位置）在 **ngx 模式同样可达** —— ffx12::dispatch() 在 ngx 分支里把结果
+//   透传给 ngx::dispatch() 后照样返回 true。实测 backend=ngx 的会话打出：
+//     GPU : NVIDIA GeForce RTX 4070 SUPER (vendor=0x10DE)
+//     SDK : ...\payload\AMD\amd_fidelityfx_upscaler_dx12.dll
+//     FSR : FSR?  [OK]
+//   而同一份日志的 ngx_core provider resolved=nvidia_registry 说明真正上屏的是 DLSS。
+//   这不是"缺信息"，是**主动误导**：排查者会顺着 AMD SDK 路径查下去。
+//   ⇒ ① 先加 BACKEND 行回答"谁在超分"；② ngx 模式下 FFX 两行明确标 unused，
+//      不再让"AMD 的 SDK + 未知版本 FSR + [OK]"冒充当前实现。
+// ⚠️ 2026-11-14（审查：说法与事实不符，更正）：本改动**对 native 模式也有影响** ——
+//   BACKEND 行是**无条件**打印的（不只在 ngx 分支），且 SDK :→FFX SDK :、FSR :→FFX :
+//   两个改名同样作用于 native。所以 native 下的块从 3 行变 4 行、两行改了名。
+//   原提交信息与文档曾写"native 输出不变"，那是错的。
 static void log_focus_block(const char *state)
 {
+    // 2026-11-14（跨线程读路由摘要）：快照指针 acquire 一次，四个字段都从这一份快照取 ——
+    //   ① 同一行里的"型号 + vendor"必然同源，不会出现跨字段混合值（旧写法逐字段读裸全局）；
+    //   ② 快照不可变且不释放，故读到的指针在整个块内有效，不需要锁、不需要回收协议；
+    //   ③ 这是 draw 路径：只有一次原子读，没有新增 I/O / 拼接 / 计时探针（§二.5）。
+    //   快照未发布（nullptr）时保持原行为：型号与 SDK 打 unknown、note 为空。
+    const RouteSnapshot *const route = g_route_snapshot.load(std::memory_order_acquire);
     const std::string gpu =
-        g_route_gpu_name.empty() ? std::string("unknown") : g_route_gpu_name;
+        (route == nullptr || route->gpu_name.empty()) ? std::string("unknown") : route->gpu_name;
     const std::string sdk =
-        g_route_sdk_path.empty() ? std::string("unknown") : g_route_sdk_path;
+        (route == nullptr || route->sdk_path.empty()) ? std::string("unknown") : route->sdk_path;
+    const std::string vendor_label = route != nullptr ? route->vendor_label : std::string();
+    // 后端取 ffx12::backend() 的真值（实现在 Ffx12Backend.cpp 的 set_backend/backend 一对），
+    // 不按 ini 字面量判 —— Ffx12Backend=auto 时 ini 里写的是 auto，实际落位由型号决定。
+    // backend_auto_note 只在"写了 auto 且已落位"时非空（由 record_adapter_info 随快照发布），
+    // 直接附上即为 auto 的决策依据，不再造第二套摘要口径。
+    // 2026-11-15：后端名改由直连层真值决定（原先看 ffx12::backend()，那个概念已移除）。
+    // Ffx12Backend 键不再存在；超分路径由 DlssInput 决定（见日志 dlss_input_first_dispatch）。
+    const bool ngx_backend = (g_config.dlss_input_mode != 0);
+    std::string backend_text = ngx_backend ? "ngx" : "native";
+    if (route != nullptr && !route->backend_auto_note.empty())
+        backend_text += "  (" + route->backend_auto_note + ")";
     log_focus_line("");
     log_focus_line("====================================================");
-    log_focus_line("  GPU : " + gpu + " (vendor=" + g_route_vendor_label + ")");
-    log_focus_line("  SDK : " + sdk);
-    log_focus_line("  FSR : FSR" + std::string(ffx12::matched_version_name()) +
-                   "  [" + state + "]");
+    log_focus_line("  GPU : " + gpu + " (vendor=" + vendor_label + ")");
+    log_focus_line("  BACKEND : " + backend_text);
+    // native：FFX 路径就是当前实现，保持原有三行语义不变。
+    // ngx：SDK 路径与 FSR 版本与实际上屏实现无关，必须写 unused —— 保留原值等于继续误导。
+    if (ngx_backend)
+    {
+        log_focus_line("  FFX SDK : (unused, backend=ngx)");
+        log_focus_line("  FFX : (unused, backend=ngx)");
+    }
+    else
+    {
+        log_focus_line("  FFX SDK : " + sdk);
+        log_focus_line("  FFX : FSR" + std::string(ffx12::matched_version_name()) +
+                       "  [" + state + "]");
+    }
     log_focus_line("====================================================");
     log_focus_line("");
 }
@@ -4144,11 +4256,23 @@ void load_config()
     ffx12::set_async_upscale(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12AsyncUpscale", 1, config_path.c_str()) != 0);
     ffx12::set_hdr_input(g_config.ffx12_hdr_input);
+    // 2026-11-15：原 `#if DX11FSRBRIDGE_ENABLE_NGX` 包裹的十一个 NGX 配置键
+    // （Ffx12Backend / NgxApplicationId / NgxFeatureDirs / NgxHdr / NgxRenderPreset /
+    //  NgxSetFrameTimeDelta / NgxUseReactiveMask / NgxLogLevel / NgxPassthrough /
+    //  NgxProvider / NgxCrossKeyReuse）已随 `NgxBackend.*` 一并移除。
+    //
+    // 原因：超分路径改由 `DlssInput` 决定（桥直接调 NGX），这些键原本都是
+    // 「怎么喂 OptiScaler 代理」的旋钮，代理层不存在后它们没有消费者。
+    // 对应的新配置见 `DlssInput*` 系列（默认值见 Dx11FsrBridge.package.ini）。
+
     ffx12::set_auto_exposure(g_config.ffx12_auto_exposure);
     ffx12::set_non_linear(g_config.ffx12_non_linear);
     ffx12::set_velocity_factor(g_config.ffx12_velocity_factor);
-    // 【正式功能】P1 单实例接管（默认开）——段必须是 `[Dx11FsrBridge]`。
+    // 【正式功能】P1 单实例接管（默认**关** = 全量接管）——段必须是 `[Dx11FsrBridge]`。
     // 它读在诊断守卫之外：这是**功能键**（消费者改变行为），发布构建必须保留。
+    // 缺省 0 必须与发布模板一致（Dx11FsrBridge.package.ini）：FFX 后端的共享层已按实例隔离
+    // （f9e52b3），全量接管才是分屏场景的正确值；NGX 后端无视本键、一律按 1 处理
+    // （见 single_instance_takeover_effective()）。
     g_config.ffx12_single_instance =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12SingleInstance", 0, config_path.c_str()) != 0;
     g_config.ffx12_single_instance_pick = std::clamp<std::uint32_t>(
@@ -4168,84 +4292,66 @@ void load_config()
         60000u);
     g_config.ffx12_single_instance_strict =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12SingleInstanceStrictMatch", 0, config_path.c_str()) != 0;
+    // 后端侧同开关：池重建 / context 重建留痕（默认关；见 Ffx12Backend.h 的说明）
+    ffx12::set_instance_diag(g_config.ffx12_single_instance_diag);
 
-    // ---- DLSS 输入路径（DlssInput.h）----
-    // 与上面各键**并列**而不是替换：DLSS 输入只是把"喂给谁"换成 NVSDK_NGX，
-    // 输入抓取（draw 识别 / il2cpp token / 资源槽位）全部复用现有链路。
+    // ---- DLSS 输入直连层配置（DlssInput.h）----
     //
-    // ⚠️ `DlssInput` 的默认值是 **0（关）**，理由：
-    //   切到 NGX 输入意味着**换掉了所有已经调好的语义**（jitter 符号、MV 符号、
-    //   色彩空间、auto-exposure）。在 N 卡实机验证前默认打开 = 让 A 卡用户也承担
-    //   "被当 N 卡处理"的风险。要开就显式开，并看日志里的 `dlss_input_route` 一行。
+    // 注意 DlssInput 默认 0（关）：切到 NGX 输入意味着换掉所有已调好的语义
+    //   （jitter 符号 / MV 符号 / 色彩空间 / auto-exposure）。要开就显式开。
     g_config.dlss_input_mode = static_cast<int>(GetPrivateProfileIntW(
-        L"Dx11FsrBridge", L"DlssInput", 0, config_path.c_str())); // 0=off 1=auto 2=force
+        L"Dx11FsrBridge", L"DlssInput", 1, config_path.c_str())); // 1=auto（默认）/ 2=force
     g_config.dlss_input_jitter_reduce = std::clamp<std::uint32_t>(
         static_cast<std::uint32_t>(GetPrivateProfileIntW(
             L"Dx11FsrBridge", L"DlssInputJitterReduce", 0, config_path.c_str())),
-        0u,
-        2u); // 0=wrap（默认，保多样性）1=clamp（复刻旧行为）2=none（诊断）
+        0u, 2u);
     g_config.dlss_input_motion_fixup = std::clamp<std::uint32_t>(
         static_cast<std::uint32_t>(GetPrivateProfileIntW(
             L"Dx11FsrBridge", L"DlssInputMotionFixup", 0, config_path.c_str())),
-        0u,
-        1u); // 0=负 scale 抵消（默认）1=要求解码纹理改为原生符号
-    // 抖动符号约定：独立键，默认 3（与实机基线一致）。
+        0u, 1u);
     g_config.dlss_input_jitter_mode = std::clamp<std::uint32_t>(
         static_cast<std::uint32_t>(GetPrivateProfileIntW(
             L"Dx11FsrBridge", L"DlssInputJitterMode", 3, config_path.c_str())),
-        0u,
-        5u);
-    // reactive mask 开关（默认 0=关，保持已验证基线）。
+        0u, 5u);
     g_config.dlss_input_reactive_mask = std::clamp<std::uint32_t>(
         static_cast<std::uint32_t>(GetPrivateProfileIntW(
             L"Dx11FsrBridge", L"DlssInputReactiveMask", 0, config_path.c_str())),
-        0u,
-        1u);
-    // AlphaUpscaling A/B 开关（默认 0=关）。
+        0u, 1u);
     g_config.dlss_input_alpha_upscaling = std::clamp<std::uint32_t>(
         static_cast<std::uint32_t>(GetPrivateProfileIntW(
             L"Dx11FsrBridge", L"DlssInputAlphaUpscaling", 0, config_path.c_str())),
-        0u,
-        1u);
-    // jitter 来源选择（0=游戏字段 1=自生成 Halton）。
-    // 实测：游戏字段稳态下只有 14/83 个唯一相位（冻结在极小范围），
-    // 自生成 Halton 单调推进，可让 DLSS 时域累积真正收敛。
+        0u, 1u);
     g_config.dlss_input_jitter_source = std::clamp<std::uint32_t>(
         static_cast<std::uint32_t>(GetPrivateProfileIntW(
             L"Dx11FsrBridge", L"DlssInputJitterSource", 0, config_path.c_str())),
-        0u,
-        1u);
+        0u, 1u);
     g_config.dlss_input_motion_sign = std::clamp<std::uint32_t>(
         static_cast<std::uint32_t>(GetPrivateProfileIntW(
             L"Dx11FsrBridge", L"DlssInputMotionSign", 1, config_path.c_str())),
-        0u,
-        3u); // 0=负 scale（默认）1=正 scale 2=关闭 MV 3=原始纹理+正scale（复刻FFX）
-    // MV 数值探针：默认关。开启后每 600 帧读回一次，用于判定解码后的 MV
-    // 在静态/运动时的数值是否合理（此前对 MV 的结论全是推导，已被否决两次）。
+        0u, 3u);
     g_config.dlss_input_mv_probe =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"DlssInputMvProbe", 0, config_path.c_str()) != 0;
-    // jitter 来源探针（诊断，默认关）。
     g_config.dlss_input_jitter_probe =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"DlssInputJitterProbe", 0, config_path.c_str()) != 0;
-    // 深度归一化倍数（整数读入后转 float，避免依赖 ini 浮点解析）。
-    // 默认 32：游戏逆深度 [0,~0.03] ⇒ 32 倍后覆盖 [0,~0.96]，落在 DLSS 期望的 [0,1]。
+    // 深度归一化：游戏逆深度 [0,~0.03] -> 32 倍后覆盖 [0,~0.96]，落在 DLSS 期望的 [0,1]。
     g_config.dlss_input_depth_scale = static_cast<float>(std::clamp<std::uint32_t>(
         static_cast<std::uint32_t>(GetPrivateProfileIntW(
             L"Dx11FsrBridge", L"DlssInputDepthScale", 32, config_path.c_str())),
-        1u,
-        256u));
-    g_config.dlss_input_module = [] (const std::filesystem::path &config_path) -> std::wstring {
+        1u, 256u));
+    g_config.dlss_input_module = [](const std::filesystem::path &cp) -> std::wstring {
         wchar_t buf[64] {};
         GetPrivateProfileStringW(L"Dx11FsrBridge", L"DlssInputModule", L"nvngx.dll", buf,
-                                 static_cast<DWORD>(std::size(buf)), config_path.c_str());
+                                 static_cast<DWORD>(std::size(buf)), cp.c_str());
         return buf;
     }(config_path);
-    // 没有 OptiScaler 时能否直接用 NVIDIA 原生 NGX 出 DLSS（= N 卡直出，不经 OptiScaler）。
+    g_config.dlss_input_feature_dirs = [](const std::filesystem::path &cp) -> std::wstring {
+        wchar_t buf[2048] {};
+        GetPrivateProfileStringW(L"Dx11FsrBridge", L"DlssInputFeatureDirs", L"", buf,
+                                 static_cast<DWORD>(std::size(buf)), cp.c_str());
+        return buf;
+    }(config_path);
     g_config.dlss_input_allow_real_ngx =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"DlssInputAllowRealNgx", 1, config_path.c_str()) != 0;
-
-    // 后端侧同开关：池重建 / context 重建留痕（默认关；见 Ffx12Backend.h 的说明）
-    ffx12::set_instance_diag(g_config.ffx12_single_instance_diag);
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     ffx12::set_dump_frames(static_cast<std::uint32_t>(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DumpFrames", 0, config_path.c_str())));
@@ -7396,8 +7502,78 @@ bool hdr_swapchain_force_active()
 
 bool is_hdr10_color_space(DXGI_COLOR_SPACE_TYPE color_space)
 {
-    return color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
-        color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020;
+    // PQ（G2084）本身即 HDR 传输函数，无条件成立。
+    if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+        color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020)
+        return true;
+
+    // G10（scRGB）需要额外条件：**假定**必须配合 FP16 后缓冲，才按 HDR 处理。
+    //   ★ 2026-11-09（PR #12 审查 A-3）：不能无条件把 G10 判成 HDR。
+    //     DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709（值 1）**正是 Windows 在
+    //     「自动管理颜色」(ACM) 开启但显示器为 SDR 时对 SDR 交换链使用的标准值**
+    //     ⇒ 无条件判 HDR 会把 SDR 内容喂成 IsHDR=1，违反本仓库既有裁决
+    //     「宁可判 SDR 也不误报 HDR」（package.ini 的 NgxHdr 段 / NgxBackend.cpp 的
+    //     resolve_is_hdr 上方「M3 修复」段，搜「回退层保守化」；
+    //     **按内容定位，不写绝对行号** —— 行号随改动漂移，写了必然过期）。
+    //
+    //   ★★ 「SDR 不会是 FP16」是**假设**，不是定理，不得当确定前提用。
+    //      本仓库自己就有反例（就地引用）：
+    //        · NgxBackend.cpp 的 srv_typed_format（搜「SDR 半浮点」）明文写这三种是
+    //          「本机/目标平台真会出现的 **SDR** 半浮点与广色域格式」，其中
+    //            case DXGI_FORMAT_R16G16B16A16_UNORM:   // 11
+    //            case DXGI_FORMAT_R16G16B16A16_SNORM:   // 13
+    //          ⇒ **SDR 会话可以是 16-bit 半浮点**，故「SDR 不会是 FP16」为假。
+    //        · 真正撑住本判据的是**取值范围**，不是位深：真 scRGB HDR 需要用 >1.0
+    //          表示超出 SDR 白点的亮度，只有 FLOAT(10) 有这个扩展范围；UNORM(11) 钳在
+    //          [0,1]、SNORM(13) 钳在 [-1,1]，装不下超白点 ⇒ 它们即便 16-bit 也只能是 SDR。
+    //          判据因此**刻意**只收 FLOAT(10) / TYPELESS(9)（可被当作 FLOAT 建视图），
+    //          不收 UNORM(11)/SNORM(13)。
+    //        · 证据等级：**E0**（读本仓库源码 + Windows SDK 头 dxgiformat.h:22-26/:37）。
+    //          未做过「UNORM/SNORM 后缓冲 + G10 色空间」的实机组合实测 ⇒ 本判据是
+    //          **未经 E2 证实的假设**，不是已验证结论。
+    //        · 因此本判据只提供**充分性**（命中即判 HDR），不提供必要性（未命中不排除 HDR）。
+    //
+    //   ★★ **对本项目唯一目标程序，本分支实质不可达**。
+    //      实机日志（2026-11-09 实机运行；SDR/HDR 各两份独立会话，逐字一致）：
+    //        HDR 会话：ngx_hdr_decision is_hdr=1 src=swapchain mode=0 sw_known=1
+    //                  sw_hdr=1 sw_fmt=24 color_fmt=23 depth_inv=1 flags=0xB
+    //        SDR 会话：ngx_hdr_decision is_hdr=0 src=swapchain_format mode=0 sw_known=0
+    //                  sw_hdr=0 sw_fmt=29 color_fmt=27 depth_inv=1 flags=0xA
+    //      出处（归档日志，可直接逐字 grep 复核）：
+    //        HDR = build-t6verify/t8-run1.log:460、build-t6verify/perf-latest.log:460
+    //        SDR = build-t6verify/t8-sdr.log:457 与 :553、
+    //              build-t6verify/perf-sdr.log:463 与 :552
+    //      ★ 与 VERIFY_T8 的关系（勿再误判为「照 schema 补全」）：
+    //        docs/agent/evidence/VERIFY_T8_NGXHDR_AUTODETECT.md 的帧率表只摘了 9 个字段
+    //        中的 5 个（is_hdr / src / sw_fmt / color_fmt / flags），未列
+    //        mode / sw_known / sw_hdr / depth_inv。那是**摘录省略**，不是字段不存在；
+    //        以原始日志为准，两处**不矛盾**。本注释是逐字引用，未按 schema 补全。
+    //      sw_fmt=24 = DXGI_FORMAT_R10G10B10A2_UNORM（dxgiformat.h:37），
+    //      sw_fmt=29 = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB（dxgiformat.h:42）；
+    //      而本分支要求 R16G16B16A16_FLOAT(10) / TYPELESS(9)（dxgiformat.h:22-23）。
+    //      ⇒ 目标游戏后缓冲只有 8-bit(29) 与 10-bit(24) 两种形态，**均非 FP16**
+    //        ⇒ 本分支恒为 false，是**死分支**。
+    //      ⇒ 净效果 = **撤销 C 项（G10 支持），G10 一律判 SDR**；
+    //        而不是「scRGB 已可判 HDR」。维护者不得据此认为该通路已可用。
+    //      ⇒ 旁证（E2 日志 + E0 代码推理）：同一日志里 sw_hdr=1 与 sw_fmt=24 并存
+    //        ⇒ 命中者只可能是上方 PQ(G2084) 分支（G10 分支在非 FP16 格式下恒 false；
+    //        唯一例外是 SetColorSpace1 那一刻后缓冲恰为 16F，而全部实机日志中
+    //        从未出现过 10/9）。即目标游戏的 HDR 走 PQ，不走 G10。
+    //      ⇒ 只有「16F 后缓冲 + G10 色空间」的程序才会走到 true（目标游戏不在其列）。
+    //      ⇒ 逃生舱：NgxHdr=1 强制 HDR（见 package.ini 的 NgxHdr 说明）。
+    //
+    //   ⇒ 判据 = G10 色空间 **且** 后缓冲格式为 R16G16B16A16_FLOAT(_TYPELESS)。
+    //   ★ G10 在 dxgicommon.h 的 DXGI_COLOR_SPACE_TYPE 里只有一个成员：
+    //     DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 = 1（即 scRGB，线性、P709 基色）。
+    //     没有 STUDIO_G10，**也没有 G10_NONE_P2020 这个成员** —— 臆造它会让 MSVC 报
+    //     C2065（2026-11-10 修复：合并后的 main 因此在 NGX ON 构型下编译失败）。
+    if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709)
+    {
+        // NGX 关闭时无法读取后缓冲格式 ⇒ 保守判 SDR（不误报）。
+        return false;
+    }
+
+    return false;
 }
 
 HRESULT STDMETHODCALLTYPE hooked_check_color_space_support(
@@ -7435,7 +7611,13 @@ HRESULT STDMETHODCALLTYPE hooked_set_color_space1(
     DXGI_COLOR_SPACE_TYPE color_space)
 {
     void *const caller = _ReturnAddress();
-    const bool spoof = hdr_swapchain_spoof_active() && is_hdr10_color_space(color_space);
+    // 原实现在本调用点对 is_hdr10_color_space(color_space) **求值两次**
+    //   （① spoof 判据、② ngx::set_swapchain_hdr 的实参）。该函数内部读
+    //   ngx::swapchain_format()（atomic），两次求值之间可能被写方翻转
+    //   ⇒「放行/拦截的判定」与「告诉 NGX 的状态」可能不是同一个结论。
+    //   改为**一次求值、两处复用**：spoof 与 NGX 侧看到同一结果。
+    const bool hdr10 = is_hdr10_color_space(color_space);
+    const bool spoof = hdr_swapchain_spoof_active() && hdr10;
     const DXGI_COLOR_SPACE_TYPE physical_color_space = spoof
         ? DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
         : color_space;
@@ -7474,32 +7656,35 @@ HRESULT STDMETHODCALLTYPE hooked_set_hdr_metadata(
             ? g_original_set_hdr_metadata(swapchain, type, size, metadata)
             : DXGI_ERROR_INVALID_CALL);
 
-    std::ostringstream message;
-    message << "dxgi_hdr_metadata swapchain=" << hex64(reinterpret_cast<std::uintptr_t>(swapchain))
-        << " caller=" << module_path_from_address(caller)
-        << " type=" << static_cast<unsigned>(type) << "/" << hdr_metadata_type_name(type)
-        << " size=" << size
-        << " physical_hr=" << hex64(static_cast<std::uint32_t>(physical_hr))
-        << " spoof=" << (spoof ? 1 : 0);
-    if (type == DXGI_HDR_METADATA_TYPE_HDR10 && metadata != nullptr && size >= sizeof(DXGI_HDR_METADATA_HDR10))
-    {
-        const auto &hdr10 = *static_cast<const DXGI_HDR_METADATA_HDR10 *>(metadata);
-        message << " red=" << hdr10.RedPrimary[0] << "," << hdr10.RedPrimary[1]
-            << " green=" << hdr10.GreenPrimary[0] << "," << hdr10.GreenPrimary[1]
-            << " blue=" << hdr10.BluePrimary[0] << "," << hdr10.BluePrimary[1]
-            << " white=" << hdr10.WhitePoint[0] << "," << hdr10.WhitePoint[1]
-            << " max_mastering=" << hdr10.MaxMasteringLuminance
-            << " min_mastering=" << hdr10.MinMasteringLuminance
-            << " max_cll=" << hdr10.MaxContentLightLevel
-            << " max_fall=" << hdr10.MaxFrameAverageLightLevel;
-    }
 #if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
     const bool should_log = true;
 #else
     const bool should_log = spoof;
 #endif
+    // 发布构建下 should_log 恒为假：拼串整体下沉进 if，避免每帧白做格式化与模块扫描
     if (should_log)
+    {
+        std::ostringstream message;
+        message << "dxgi_hdr_metadata swapchain=" << hex64(reinterpret_cast<std::uintptr_t>(swapchain))
+            << " caller=" << module_path_from_address(caller)
+            << " type=" << static_cast<unsigned>(type) << "/" << hdr_metadata_type_name(type)
+            << " size=" << size
+            << " physical_hr=" << hex64(static_cast<std::uint32_t>(physical_hr))
+            << " spoof=" << (spoof ? 1 : 0);
+        if (type == DXGI_HDR_METADATA_TYPE_HDR10 && metadata != nullptr && size >= sizeof(DXGI_HDR_METADATA_HDR10))
+        {
+            const auto &hdr10 = *static_cast<const DXGI_HDR_METADATA_HDR10 *>(metadata);
+            message << " red=" << hdr10.RedPrimary[0] << "," << hdr10.RedPrimary[1]
+                << " green=" << hdr10.GreenPrimary[0] << "," << hdr10.GreenPrimary[1]
+                << " blue=" << hdr10.BluePrimary[0] << "," << hdr10.BluePrimary[1]
+                << " white=" << hdr10.WhitePoint[0] << "," << hdr10.WhitePoint[1]
+                << " max_mastering=" << hdr10.MaxMasteringLuminance
+                << " min_mastering=" << hdr10.MinMasteringLuminance
+                << " max_cll=" << hdr10.MaxContentLightLevel
+                << " max_fall=" << hdr10.MaxFrameAverageLightLevel;
+        }
         LOG_INFO(blog::cat::hdr, message.str());
+    }
     return spoof ? S_OK : physical_hr;
 }
 
@@ -10255,6 +10440,310 @@ static std::size_t read_game_floats_seh(std::uint64_t ptr, float *out, std::size
     }
 }
 
+// sdk234 未接管原因的低频诊断（2026-09-19：从 try_fsr2_translation_draw
+// 内抽出，该函数原约 1800 行）。
+//
+// **只读**：不修改任何状态机状态，只写自己的静态节流计数器 —— 因此可安全抽出，
+// 不会影响 dispatch/gate 语义。
+// 双入口第二次进入（同代次、刚派发过）不算异常，过滤掉。
+void log_sdk234_skip_reason(
+    const void *inst_state,
+    std::uint64_t match_inst,
+    std::uint64_t draw_out_ptr,
+    std::uint64_t sdk234_now,
+    std::uint64_t last_dispatch_tick,
+    std::uint32_t render_width,
+    std::uint32_t render_height)
+{
+    static std::atomic_uint64_t sdk234_skip_count { 0 };
+    static std::atomic_uint64_t sdk234_skip_next { 1 };
+    const bool second_entry_like =
+        inst_state != nullptr && last_dispatch_tick != 0 &&
+        sdk234_now - last_dispatch_tick <= 50;
+    if (second_entry_like)
+        return;
+
+    const std::uint64_t sc = sdk234_skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (sc != 1 && sc != sdk234_skip_next.load(std::memory_order_relaxed))
+        return;
+
+    sdk234_skip_next.store(sc * 8 + 1, std::memory_order_relaxed);
+    const std::string reason = match_inst == 0 ? "NO_TOKEN" : "GATE_STALE";
+    const std::uint64_t ago_ms =
+        inst_state != nullptr && last_dispatch_tick != 0 ? sdk234_now - last_dispatch_tick : 0;
+    // 已知实例代次/帧状态：判断"实例 Render 未被捕获"（:g 远离 glob）还是
+    // "代次在推进但 bridge 门控异常"（:g 接近 glob 却仍 gate_stale）。
+    std::string insts_state;
+    {
+        std::uint64_t insts[8] {};
+        std::size_t inst_n = 0;
+        il2cpp_callsite::known_instances(insts, 8, inst_n);
+        for (std::size_t i = 0; i < inst_n; ++i)
+        {
+            il2cpp_callsite::CapturedParams ip {};
+            std::uint64_t ig = 0;
+            il2cpp_callsite::last_params_for(insts[i], ip, ig);
+            if (i > 0)
+                insts_state += ",";
+            insts_state += hex64(insts[i] & 0xFFFFFFFFull) +
+                ":g" + std::to_string(ig) +
+                ":f" + std::to_string(ip.frame_index);
+        }
+    }
+    LOG_DEBUG(blog::cat::upscale, "ffx12_skip count=" + std::to_string(sc) +
+        " rc=" + reason +
+        " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
+        " out=" + hex64(draw_out_ptr) +
+        " sdk234_out=" + hex64(g_sdk234_output_ptr) +
+        " ago_ms=" + std::to_string(ago_ms) +
+        " render=" + std::to_string(render_width) + "x" +
+        std::to_string(render_height) +
+        " glob=" + std::to_string(il2cpp_callsite::params_generation()) +
+        " insts=" + insts_state);
+}
+
+// 一次性原生参数探测（诊断用，Ffx12Probe=1 时启用；正式版不编译）。
+//
+// 2026-09-19：从 try_fsr2_translation_draw 内抽出（该函数原约 1800 行）。
+// **纯诊断**：已逐项核实对 g_sdk234_output_ptr / g_sdk234_output_tick / st-> / g_config.
+// 的写入均为 **0 处** —— 只写自己的静态节流计数器与 dump 文件，不影响 dispatch 语义。
+// 整个函数体在 !RELEASE_RUNTIME 下才编译，故对发布版是**编译期无操作**。
+//
+// 外部依赖仅 5 个：context、call_params，以及 color/depth/motion 三张纹理（用于记录格式）。
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+void probe_native_params_once(
+    ID3D11DeviceContext *context,
+    const il2cpp_callsite::CapturedParams &call_params,
+    ID3D11Texture2D *color_tex,
+    ID3D11Texture2D *depth_tex,
+    ID3D11Texture2D *motion_tex)
+{
+    if (g_config.ffx12_probe)
+    {
+    static std::atomic_uint32_t sdk234_probe_round { 0 };
+    static std::atomic_bool sdk234_cb0_done { false };
+    const std::uint32_t probe_round = sdk234_probe_round.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool probe_full = probe_round == 1;
+    const bool probe_cb0 = !sdk234_cb0_done.load(std::memory_order_relaxed) && probe_round <= 32;
+    if (probe_full || probe_cb0)
+    {
+        std::string probe;
+        if (probe_full)
+            probe = "ffx12_probe";
+        else
+            probe = "ffx12_probe_cb0";
+        if (probe_full)
+        {
+            ID3D11PixelShader *ps = nullptr;
+            context->PSGetShader(&ps, nullptr, nullptr);
+            if (ps)
+            {
+                const ShaderInfo si = lookup_pixel_shader_info(ps);
+                probe += " ps_hash=" + hex64(si.hash);
+                ps->Release();
+            }
+            ID3D11ShaderResourceView *psrvs[8] = {};
+            context->PSGetShaderResources(0, 8, psrvs);
+            for (int i = 0; i < 8; ++i)
+            {
+                if (!psrvs[i])
+                    continue;
+                ID3D11Resource *res = nullptr;
+                psrvs[i]->GetResource(&res);
+                if (res)
+                {
+                    ID3D11Texture2D *tex = nullptr;
+                    if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D),
+                                                      reinterpret_cast<void **>(&tex))))
+                    {
+                        D3D11_TEXTURE2D_DESC td {};
+                        tex->GetDesc(&td);
+                        probe += " s" + std::to_string(i) + "=" + std::to_string(td.Format) + "x" +
+                            std::to_string(td.Width) + "x" + std::to_string(td.Height);
+                        tex->Release();
+                    }
+                    res->Release();
+                }
+                psrvs[i]->Release();
+            }
+            ID3D11RenderTargetView *prtvs[4] = {};
+            ID3D11DepthStencilView *pdsv = nullptr;
+            context->OMGetRenderTargets(4, prtvs, &pdsv);
+            for (int i = 0; i < 4; ++i)
+            {
+                if (!prtvs[i])
+                    continue;
+                ID3D11Resource *res = nullptr;
+                prtvs[i]->GetResource(&res);
+                if (res)
+                {
+                    ID3D11Texture2D *tex = nullptr;
+                    if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D),
+                                                      reinterpret_cast<void **>(&tex))))
+                    {
+                        D3D11_TEXTURE2D_DESC td {};
+                        tex->GetDesc(&td);
+                        probe += " r" + std::to_string(i) + "=" + std::to_string(td.Format) + "x" +
+                            std::to_string(td.Width) + "x" + std::to_string(td.Height);
+                        tex->Release();
+                    }
+                    res->Release();
+                }
+                prtvs[i]->Release();
+            }
+            if (pdsv)
+                pdsv->Release();
+        }
+        std::uint8_t cb0[512] {};
+        std::size_t cb0_size = 0;
+        {
+            ID3D11Buffer *bound_cb = nullptr;
+            context->PSGetConstantBuffers(0, 1, &bound_cb);
+            if (bound_cb)
+            {
+                const std::uint64_t cb_key = reinterpret_cast<std::uint64_t>(bound_cb);
+                g_trace_ps_cb0_key.store(cb_key, std::memory_order_relaxed);
+                const auto snap_it = g_buffer_snapshots.find(cb_key);
+                if (snap_it != g_buffer_snapshots.end())
+                {
+                    cb0_size = snap_it->second.size();
+                    std::memcpy(cb0, snap_it->second.data(),
+                                cb0_size < sizeof(cb0) ? cb0_size : sizeof(cb0));
+                }
+                bound_cb->Release();
+            }
+        }
+        probe += " cb0_size=" + std::to_string(cb0_size);
+        if (cb0_size > 0)
+        {
+            sdk234_cb0_done.store(true, std::memory_order_relaxed);
+            probe += " cb0=";
+            const std::size_t floats = cb0_size / 4;
+            for (std::size_t i = 0; i < floats; ++i)
+            {
+                probe += std::to_string(reinterpret_cast<const float *>(cb0)[i]);
+                if (i + 1 < floats)
+                    probe += ",";
+            }
+        }
+        LOG_INFO(blog::cat::probe, probe);
+    }
+    // ---- 输入内容采样（前 3 轮 + 每 64 轮；motion 3×3 网格 + mvmax） ----
+    if (probe_round <= 3 || probe_round % 64 == 0)
+    {
+        std::string samples = "ffx12_samples round=" + std::to_string(probe_round);
+        append_tex_samples(samples, "color", color_tex, context);
+        append_tex_samples(samples, "depth", depth_tex, context);
+        append_tex_samples(samples, "motion", motion_tex, context, true, true);
+        bool last_reset = false;
+        std::uint64_t ctx_recreates = 0;
+        ffx12::debug_state(last_reset, ctx_recreates);
+        samples += " reset=" + std::to_string(last_reset ? 1 : 0) +
+            " recreates=" + std::to_string(ctx_recreates);
+        LOG_INFO(blog::cat::upscale, samples);
+    }
+    // ---- cb0 逐帧跟踪（前 32 轮）：jitter/frame/instance 与 cb0 tail 的对应 ----
+    if (probe_round <= 32)
+    {
+        std::string track = "ffx12_cb0_track round=" + std::to_string(probe_round) +
+            " inst=" + hex64(call_params.instance & 0xFFFFFFFFull) +
+            " frame=" + std::to_string(call_params.frame_index) +
+            " jit_norm=" + std::to_string(call_params.jitter_x) + "," +
+            std::to_string(call_params.jitter_y);
+        ID3D11Buffer *bound_cb = nullptr;
+        context->PSGetConstantBuffers(0, 1, &bound_cb);
+        if (bound_cb)
+        {
+            const std::uint64_t cb_key = reinterpret_cast<std::uint64_t>(bound_cb);
+            g_trace_ps_cb0_key.store(cb_key, std::memory_order_relaxed);
+            const auto snap_it = g_buffer_snapshots.find(cb_key);
+            if (snap_it != g_buffer_snapshots.end() && snap_it->second.size() >= 464)
+            {
+                const float *f = reinterpret_cast<const float *>(snap_it->second.data());
+                track += " cb0_96_115=";
+                for (int i = 96; i < 116; ++i)
+                {
+                    track += std::to_string(f[i]);
+                    if (i < 115)
+                        track += ",";
+                }
+            }
+            else
+            {
+                track += " cb0_snap_missing";
+            }
+            bound_cb->Release();
+        }
+        LOG_INFO(blog::cat::upscale, track);
+    }
+    // ---- 一次性实例/上下文内存 dump（前 2 轮；找原生 near/far/fov/exposure 等参数） ----
+    if (probe_round <= 2)
+    {
+        std::string mem = "ffx12_mem_dump round=" + std::to_string(probe_round);
+        append_mem_dump(mem, "inst", call_params.instance, 32);
+        append_mem_u64(mem, "inst_ptr", call_params.instance, 32);
+        append_mem_dump(mem, "ctx", call_params.context, 16);
+        append_mem_u64(mem, "ctx_ptr", call_params.context, 32);
+        LOG_INFO(blog::cat::probe, mem);
+        // 原生参数全量转储（日志截断放不下；第 1 轮写文件，供离线分析 fov/near/far）：
+        // 实例前 8KB + 上下文前 4KB + cb0 全量（496B）
+        if (probe_round == 1)
+        {
+            FILE *f = nullptr;
+            if (fopen_s(&f, "sdk234_native_dump.bin", "wb") == 0 && f)
+            {
+                if (call_params.instance)
+                    fwrite(reinterpret_cast<const void *>(call_params.instance), 1, 8192, f);
+                if (call_params.context)
+                    fwrite(reinterpret_cast<const void *>(call_params.context), 1, 4096, f);
+                // cb0 全量（含实例字段的 render/display/jitter 段）：快照钩子可能缺失，
+                // 用 staging 直读兜底（CopyResource + Map）
+                {
+                    ID3D11Buffer *bound_cb = nullptr;
+                    context->PSGetConstantBuffers(0, 1, &bound_cb);
+                    if (bound_cb)
+                    {
+                        D3D11_BUFFER_DESC bd {};
+                        bound_cb->GetDesc(&bd);
+                        const UINT cb_size = bd.ByteWidth > 4096 ? 4096 : bd.ByteWidth;
+                        D3D11_BUFFER_DESC sd {};
+                        sd.ByteWidth = cb_size;
+                        sd.Usage = D3D11_USAGE_STAGING;
+                        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                        ID3D11Buffer *staging_cb = nullptr;
+                        ID3D11Device *dev = nullptr;
+                        context->GetDevice(&dev);
+                        if (dev &&
+                            SUCCEEDED(dev->CreateBuffer(&sd, nullptr, &staging_cb)) &&
+                            staging_cb != nullptr)
+                        {
+                            context->CopyResource(staging_cb, bound_cb);
+                            context->Flush();
+                            D3D11_MAPPED_SUBRESOURCE m {};
+                            if (SUCCEEDED(context->Map(staging_cb, 0,
+                                                       D3D11_MAP_READ, 0, &m)) &&
+                                m.pData)
+                            {
+                                fwrite(m.pData, 1, cb_size, f);
+                                context->Unmap(staging_cb, 0);
+                            }
+                            staging_cb->Release();
+                        }
+                        if (dev)
+                            dev->Release();
+                        bound_cb->Release();
+                    }
+                }
+                fclose(f);
+                LOG_DEBUG(blog::cat::upscale, "ffx12_native_dump written=sdk234_native_dump.bin");
+            }
+        }
+    }
+    } // if (g_config.ffx12_probe)
+}
+#endif // !DX11FSRBRIDGE_RELEASE_RUNTIME
+
+
 // ===========================================================================
 // DLSS 输入路由（DlssInput.h / DLSS_INPUT.md）
 // ===========================================================================
@@ -10267,22 +10756,53 @@ static std::size_t read_game_floats_seh(std::uint64_t ptr, float *out, std::size
 //   显卡厂商、OptiScaler 是否在场、ngx 模块是否存在，都是**进程/环境**事实
 //   （需要 DXGI 适配器枚举、模块枚举），而 DlssInput.cpp 刻意零平台依赖以便单测。
 //   纯决策函数 `dlss_input::route_output` 仍在那边，这里只负责"喂输入"。
+// 适配器 vendor id：由 record_adapter_info（设备创建 hook 内）写入，
+// 由 dlss_gate 的路由判据读取。必须是**文件级** —— 定义在 dlss_gate
+// 命名空间里的话，外层的 record_adapter_info 看不到它（2026-11-15 修）。
+static std::atomic<std::uint32_t> g_route_vendor_id { 0u };
+// 路由结果缓存：-1=未决定 / 0=ffx / 1=dlss。只决定一次（显卡不会中途变）。
+// ⚠️ 必须是文件级：`try_fsr2_translation_draw` 在 dlss_gate 之外写它（M1 的失败回退）。
+std::atomic<int> g_path { -1 };
+// DLSS 直连层的运行时与互斥：ensure_feature 会重建 feature，必须串行。
+// ⚠️ 必须是文件级 —— final_shutdown（atexit 路径）在 dlss_gate 之外调 shutdown()。
+dlss_input::Runtime g_runtime;
+std::mutex g_runtime_mutex;
+
 namespace dlss_gate
 {
-std::atomic<int> g_path { -1 }; // -1=未决定 0=ffx 1=dlss；只决定一次（显卡不会中途变）
+// 适配器 vendor（从 dlss-input 分支移植）。由 record_adapter_info 写入；
+// 路由判据用它决定「能否走 DLSS 直连」，避免在渲染线程重新枚举 DXGI。
+// g_route_vendor_id 已移到文件级（见 record_adapter_info 上方）：record_adapter_info
+// 在全局作用域写它，dlss_gate 内的路由判据读它，两边必须看到同一个对象。
+// g_path 已移到文件级（见 dlss_gate 命名空间之前）：dispatch 失败回退时
+// 在 `try_fsr2_translation_draw`（外层作用域）里要写它。
 std::atomic_bool g_init_attempted { false };
 std::atomic_bool g_init_ok { false };
 std::atomic_uint32_t g_eval_failures { 0 };
 std::atomic_uint64_t g_eval_total { 0 };
-dlss_input::Runtime g_runtime;
-std::mutex g_runtime_mutex; // ensure_feature 会重建 feature，必须串行
+// g_runtime / g_runtime_mutex 已移到文件级（见 dlss_gate 之前）：final_shutdown
+// 在 dlss_gate 之外调 g_runtime.shutdown()。
 
 dlss_input::Vendor vendor_from_current_device()
 {
     // 复用桥已有的适配器信息（record_adapter_info 在设备创建钩子里已经拿到 vendor）。
     // 这里刻意不重新枚举 DXGI：`try_fsr2_translation_draw` 在渲染线程上，
     // CreateDXGIFactory 会带来可观的首次开销。
-    return dlss_input::Vendor::Unknown;
+    // 2026-11-15（审查 B3）：原来这里是空实现（恒 Unknown），而注释声称「复用
+    // record_adapter_info 拿到的 vendor」—— 实际那个函数从不写 g_route_vendor_id，
+    // 于是 auto 分支的 vendor 维度恒假，直连层在「只装桥」时从代码上不可达。
+    // 现在两边都接通：record_adapter_info 负责写，这里负责读（只读一个 atomic，
+    // 仍然不枚举 DXGI）。
+    const std::uint32_t id = g_route_vendor_id.load(std::memory_order_relaxed);
+    if (id == 0)
+        return dlss_input::Vendor::Unknown;   // 设备还没建好
+    switch (id)
+    {
+    case 0x10DE: return dlss_input::Vendor::Nvidia;
+    case 0x1002: return dlss_input::Vendor::Amd;
+    case 0x8086: return dlss_input::Vendor::Intel;
+    default:     return dlss_input::Vendor::Unknown;
+    }
 }
 
 int resolve_path()
@@ -10292,6 +10812,8 @@ int resolve_path()
         return cached;
 
     dlss_input::RouteInput in {};
+    // 2026-11-15（审查 B3）：vendor 改走 vendor_from_current_device（它读 g_route_vendor_id）；
+    // allow_real_ngx 一并传进去，否则 auto 在「只装桥」时永远回 FFX。
     const std::uint32_t vendor_id = g_route_vendor_id.load(std::memory_order_relaxed);
     in.vendor = vendor_id == 0x10DE ? dlss_input::Vendor::Nvidia
         : vendor_id == 0x1002      ? dlss_input::Vendor::Amd
@@ -10303,6 +10825,11 @@ int resolve_path()
     // 所以这里除了已加载的名字，还要把各候选名都问一遍；真正的判定交给
     // `ensure_initialized` 的 LoadLibraryW（失败会 fail-open 回 ffx）。
     in.dlss_runtime_present = false;
+    // 2026-11-15：不装 OptiScaler 时 `nvngx.dll` 只在 NVIDIA 的 DriverStore 里，
+    // 而那个目录不在标准 DLL 搜索顺序里 ⇒ 上面的 GetModuleHandleW 全部落空。
+    // 这里补一个「DriverStore 里有没有」的判断，让 auto 有机会落到直连路径；
+    // 真正的加载（含失败 fail-open）仍由 Runtime::initialize 的候选循环负责。
+    bool driverstore_has_nvngx = false;
     for (const wchar_t *name : { g_config.dlss_input_module.c_str(), L"nvngx.dll",
                                  L"_nvngx.dll", L"nvngx_dlss.dll" })
     {
@@ -10312,10 +10839,39 @@ int resolve_path()
             break;
         }
     }
-    in.user_preference = g_config.dlss_input_mode == 2 ? 1 : (g_config.dlss_input_mode == 0 ? 0 : -1);
-    // mode==1（auto）时把 preference 还原成 auto，避免被强制
-    if (g_config.dlss_input_mode == 1)
-        in.user_preference = -1;
+    if (!in.dlss_runtime_present)
+    {
+        // 只查一次：路由决策每次进程只做一遍（g_path 会缓存），代价可忽略。
+        wchar_t sys_dir[MAX_PATH] {};
+        const UINT n = GetSystemDirectoryW(sys_dir, static_cast<UINT>(std::size(sys_dir)));
+        if (n != 0 && n < std::size(sys_dir))
+        {
+            const std::wstring pattern = std::wstring(sys_dir) +
+                L"\\DriverStore\\FileRepository\\nv_dispi.inf_amd64_*\\nvngx.dll";
+            WIN32_FIND_DATAW fd {};
+            HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE)
+            {
+                driverstore_has_nvngx = true;
+                FindClose(h);
+            }
+        }
+        // 语义说明：这里把「DriverStore 里有」也当成 runtime 可用。
+        // 它不等于「一定加载成功」—— 真正的失败由 Runtime::initialize 的
+        // LoadLibraryW 回答，那条路径会 fail-open 回 ffx（不崩、不黑屏）。
+        if (driverstore_has_nvngx)
+            in.dlss_runtime_present = true;
+    }
+    // 2026-11-15：**不再把 `DlssInput=0` 当成「强制 FFX」**。
+    //
+    // 原映射 `mode==0 ⇒ user_preference=0` 会被 `route_output` 解释成
+    // `user_forced_ffx`，于是桥自己跑 FFX 超分 —— 而 OptiScaler 侧还开着
+    // `Dx11Upscaler=dlss`，两套超分同时接管同一条 draw ⇒ 实机卡死（07:27:51 复现）。
+    //
+    // 现在的语义：1 = auto / 2 = force dlss；其它值一律当 auto（保守：
+    // 「不认识的配置值」不该让桥去抢超分）。`DlssInput=0` 因此等价于 auto。
+    in.user_preference = g_config.dlss_input_mode == 2 ? 1 : -1;
+    in.allow_real_ngx = g_config.dlss_input_allow_real_ngx;
 
     const dlss_input::RouteOutput out = dlss_input::route_output(in);
     const int path = out.path == dlss_input::OutputPath::DlssInput ? 1 : 0;
@@ -10381,6 +10937,89 @@ bool ensure_initialized(ID3D11Device *device, ID3D11DeviceContext *context)
     dlss_input::RuntimeConfig rc {};
     rc.module_hint = g_config.dlss_input_module;
     rc.allow_real_ngx = g_config.dlss_input_allow_real_ngx;
+    // ---- 探测含 nvngx_dlss.dll 的目录（PathListInfo 用）----
+    //
+    // 2026-11-15：不装 OptiScaler 时**必须**给 NGX 一份目录列表，否则 CreateFeature
+    // 返回 0xBAD0000B（实机确认）。候选顺序：
+    //   ① ini 的 DlssInputFeatureDirs（分号分隔，用户显式指定优先）
+    //   ② 已加载 nvngx_dlss.dll 的目录（游戏或别的注入器已经拉起过）
+    //   ③ 桥自身所在目录（安装器把 nvngx_dlss.dll 放在这里）
+    //
+    // 为什么不信 DriverStore：那里只有加载器 nvngx.dll（488 KB），
+    // **没有** nvngx_dlss.dll（58 MB 的特征库要随包分发）。
+    auto add_dir_if_has_dll = [](std::vector<std::wstring> &dirs, const std::wstring &dir) {
+        if (dir.empty())
+            return;
+        // 去掉末尾分隔符（NGX 期望整洁路径）
+        std::wstring d = dir;
+        while (!d.empty() && (d.back() == L'\\' || d.back() == L'/'))
+            d.pop_back();
+        if (d.empty())
+            return;
+        const std::wstring probe = d + L"\\nvngx_dlss.dll";
+        const DWORD attr = GetFileAttributesW(probe.c_str());
+        if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            return;
+        for (const std::wstring &existing : dirs)
+        {
+            if (_wcsicmp(existing.c_str(), d.c_str()) == 0)
+                return;   // 去重（大小写不敏感，Windows 路径语义）
+        }
+        dirs.push_back(d);
+    };
+
+    // ② 已加载的特征库
+    if (HMODULE m = GetModuleHandleW(L"nvngx_dlss.dll"))
+    {
+        wchar_t buf[MAX_PATH] {};
+        if (GetModuleFileNameW(m, buf, static_cast<DWORD>(std::size(buf))) != 0)
+        {
+            const std::wstring full(buf);
+            const std::size_t slash = full.find_last_of(L"\\/");
+            if (slash != std::wstring::npos)
+                add_dir_if_has_dll(rc.feature_dirs, full.substr(0, slash));
+        }
+    }
+    // ③ 桥自身目录
+    {
+        wchar_t buf[MAX_PATH] {};
+        // 取本 DLL 自身的句柄：GetModuleHandleExW 用 FROM_ADDRESS 反查，
+        // 不需要额外保存 hInstance（DllMain 里那个值在其它 TU）。
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&add_dir_if_has_dll), &self);
+        if (self != nullptr && GetModuleFileNameW(self, buf, static_cast<DWORD>(std::size(buf))) != 0)
+        {
+            const std::wstring full(buf);
+            const std::size_t slash = full.find_last_of(L"\\/");
+            if (slash != std::wstring::npos)
+                add_dir_if_has_dll(rc.feature_dirs, full.substr(0, slash));
+        }
+    }
+
+    // ① ini 显式指定的目录（最高优先级，最后插入到最前面）
+    if (!g_config.dlss_input_feature_dirs.empty())
+    {
+        std::vector<std::wstring> explicit_dirs;
+        std::size_t pos = 0;
+        const std::wstring &all = g_config.dlss_input_feature_dirs;
+        while (pos <= all.size())
+        {
+            const std::size_t sep = all.find(L';', pos);
+            const std::size_t end = (sep == std::wstring::npos) ? all.size() : sep;
+            if (end > pos)
+                add_dir_if_has_dll(explicit_dirs, all.substr(pos, end - pos));
+            if (sep == std::wstring::npos)
+                break;
+            pos = sep + 1;
+        }
+        if (!explicit_dirs.empty())
+        {
+            explicit_dirs.insert(explicit_dirs.end(), rc.feature_dirs.begin(), rc.feature_dirs.end());
+            rc.feature_dirs.swap(explicit_dirs);
+        }
+    }
 
     unsigned long crash_code = 0;
     const bool ok = init_ngx_guarded(g_runtime, rc, device, context, &crash_code);
@@ -11176,19 +11815,39 @@ bool dispatch(ID3D11DeviceContext *context, const ffx12::FrameInput &in,
     //   要让 history = uv - mv_g，必须 s = **+1**。
     //   此前用 -1 等于把方向又翻一次，历史朝反方向采样 ⇒ 一动就大面积拖影。
     //
-    // 默认值取自 ini 的 `DlssInputMotionSign`（模板默认 1）。
+    // ── 运动矢量符号：**单一来源** = `DlssInputMotionSign`（0/1/2/3）──
+    //
+    // 2026-11-15（审查 M5）：原先这里是「`DlssInputMotionFixup` 定一次，随后
+    //   `DlssInputMotionSign == 1` 与 `== 3` 各再覆盖一次」——三个来源互相打架。
+    //   随包默认 MotionSign=1、MotionFixup=0 ⇒ 用户设的 UseNegativeScale 被静默
+    //   覆盖成 RequireNativeSign，而下面那行注释还写着"默认值取自 DlssInputMotionSign"。
+    //
+    //   现在 Fixup 键**只作为 Sign=0 时的细分档**，不再反向覆盖 Sign 的决定：
+    //
+    //     Sign=0（默认）→ UseNegativeScale，除非 Fixup=1 则 RequireNativeSign
+    //     Sign=1        → RequireNativeSign（强制正 scale，A/B 用）
+    //     Sign=2        → 关闭 MV（scale=0，决定性诊断档）
+    //     Sign=3        → RequireNativeSign + 喂原始纹理（复刻 FFX 输入路径）
+    //
+    // 纹理符号单独记：解码始终按 FSR2 取负（见 DlssInput.h 与 Ffx12Backend.cpp），
+    // 只有 Sign=3 会在下面的 motion_ready 处把原始纹理传下去。
     spec.motion_sign = dlss_input::MotionTextureSign::Fsr2Negated;
-    spec.motion_fixup = g_config.dlss_input_motion_fixup == 1
-        ? dlss_input::MotionFixup::RequireNativeSign
-        : dlss_input::MotionFixup::UseNegativeScale;
-    // A/B 覆盖（排障用，见 ini 的 DlssInputMotionSign）：
-    //   1 = 强制正 scale（与推导相反，用于验证"方向反了"这一假说）
-    //   2 = 彻底关闭 MV（scale=0），决定性诊断档
-    //   3 = **原始纹理 + 正 scale**（完全复刻 FFX/FSR2 输入路径的 MV 组合）
-    if (g_config.dlss_input_motion_sign == 1)
+    switch (g_config.dlss_input_motion_sign)
+    {
+    case 1:
+    case 3:
         spec.motion_fixup = dlss_input::MotionFixup::RequireNativeSign;
-    if (g_config.dlss_input_motion_sign == 3)
-        spec.motion_fixup = dlss_input::MotionFixup::RequireNativeSign;
+        break;
+    case 2:
+        // 关闭 MV 时 fixup 无意义；给默认值即可（motion_disabled 会让调用方跳过 Set）
+        spec.motion_fixup = dlss_input::MotionFixup::UseNegativeScale;
+        break;
+    default:
+        spec.motion_fixup = g_config.dlss_input_motion_fixup == 1
+            ? dlss_input::MotionFixup::RequireNativeSign
+            : dlss_input::MotionFixup::UseNegativeScale;
+        break;
+    }
     spec.motion_disabled = (g_config.dlss_input_motion_sign == 2);
     // 实机观察（2026-11-09）：设 2（关闭 MV）会让**大部分画面变灰**。
     // 这是该档位的**预期行为**，不是新缺陷：MV scale=0 时 DLSS 认为所有像素
@@ -11451,308 +12110,6 @@ bool dispatch(ID3D11DeviceContext *context, const ffx12::FrameInput &in,
     return true;
 }
 } // namespace dlss_gate
-
-// sdk234 未接管原因的低频诊断（2026-09-19：从 try_fsr2_translation_draw
-// 内抽出，该函数原约 1800 行）。
-// **只读**：不修改任何状态机状态，只写自己的静态节流计数器 —— 因此可安全抽出，
-// 不会影响 dispatch/gate 语义。
-// 双入口第二次进入（同代次、刚派发过）不算异常，过滤掉。
-void log_sdk234_skip_reason(
-    const void *inst_state,
-    std::uint64_t match_inst,
-    std::uint64_t draw_out_ptr,
-    std::uint64_t sdk234_now,
-    std::uint64_t last_dispatch_tick,
-    std::uint32_t render_width,
-    std::uint32_t render_height)
-{
-    static std::atomic_uint64_t sdk234_skip_count { 0 };
-    static std::atomic_uint64_t sdk234_skip_next { 1 };
-    const bool second_entry_like =
-        inst_state != nullptr && last_dispatch_tick != 0 &&
-        sdk234_now - last_dispatch_tick <= 50;
-    if (second_entry_like)
-        return;
-
-    const std::uint64_t sc = sdk234_skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (sc != 1 && sc != sdk234_skip_next.load(std::memory_order_relaxed))
-        return;
-
-    sdk234_skip_next.store(sc * 8 + 1, std::memory_order_relaxed);
-    const std::string reason = match_inst == 0 ? "NO_TOKEN" : "GATE_STALE";
-    const std::uint64_t ago_ms =
-        inst_state != nullptr && last_dispatch_tick != 0 ? sdk234_now - last_dispatch_tick : 0;
-    // 已知实例代次/帧状态：判断"实例 Render 未被捕获"（:g 远离 glob）还是
-    // "代次在推进但 bridge 门控异常"（:g 接近 glob 却仍 gate_stale）。
-    std::string insts_state;
-    {
-        std::uint64_t insts[8] {};
-        std::size_t inst_n = 0;
-        il2cpp_callsite::known_instances(insts, 8, inst_n);
-        for (std::size_t i = 0; i < inst_n; ++i)
-        {
-            il2cpp_callsite::CapturedParams ip {};
-            std::uint64_t ig = 0;
-            il2cpp_callsite::last_params_for(insts[i], ip, ig);
-            if (i > 0)
-                insts_state += ",";
-            insts_state += hex64(insts[i] & 0xFFFFFFFFull) +
-                ":g" + std::to_string(ig) +
-                ":f" + std::to_string(ip.frame_index);
-        }
-    }
-    LOG_DEBUG(blog::cat::upscale, "ffx12_skip count=" + std::to_string(sc) +
-        " rc=" + reason +
-        " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
-        " out=" + hex64(draw_out_ptr) +
-        " sdk234_out=" + hex64(g_sdk234_output_ptr) +
-        " ago_ms=" + std::to_string(ago_ms) +
-        " render=" + std::to_string(render_width) + "x" +
-        std::to_string(render_height) +
-        " glob=" + std::to_string(il2cpp_callsite::params_generation()) +
-        " insts=" + insts_state);
-}
-
-// 一次性原生参数探测（诊断用，Ffx12Probe=1 时启用；正式版不编译）。
-//
-// 2026-09-19：从 try_fsr2_translation_draw 内抽出（该函数原约 1800 行）。
-// **纯诊断**：已逐项核实对 g_sdk234_output_ptr / g_sdk234_output_tick / st-> / g_config.
-// 的写入均为 **0 处** —— 只写自己的静态节流计数器与 dump 文件，不影响 dispatch 语义。
-// 整个函数体在 !RELEASE_RUNTIME 下才编译，故对发布版是**编译期无操作**。
-//
-// 外部依赖仅 5 个：context、call_params，以及 color/depth/motion 三张纹理（用于记录格式）。
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-void probe_native_params_once(
-    ID3D11DeviceContext *context,
-    const il2cpp_callsite::CapturedParams &call_params,
-    ID3D11Texture2D *color_tex,
-    ID3D11Texture2D *depth_tex,
-    ID3D11Texture2D *motion_tex)
-{
-    if (g_config.ffx12_probe)
-    {
-    static std::atomic_uint32_t sdk234_probe_round { 0 };
-    static std::atomic_bool sdk234_cb0_done { false };
-    const std::uint32_t probe_round = sdk234_probe_round.fetch_add(1, std::memory_order_relaxed) + 1;
-    const bool probe_full = probe_round == 1;
-    const bool probe_cb0 = !sdk234_cb0_done.load(std::memory_order_relaxed) && probe_round <= 32;
-    if (probe_full || probe_cb0)
-    {
-        std::string probe;
-        if (probe_full)
-            probe = "ffx12_probe";
-        else
-            probe = "ffx12_probe_cb0";
-        if (probe_full)
-        {
-            ID3D11PixelShader *ps = nullptr;
-            context->PSGetShader(&ps, nullptr, nullptr);
-            if (ps)
-            {
-                const ShaderInfo si = lookup_pixel_shader_info(ps);
-                probe += " ps_hash=" + hex64(si.hash);
-                ps->Release();
-            }
-            ID3D11ShaderResourceView *psrvs[8] = {};
-            context->PSGetShaderResources(0, 8, psrvs);
-            for (int i = 0; i < 8; ++i)
-            {
-                if (!psrvs[i])
-                    continue;
-                ID3D11Resource *res = nullptr;
-                psrvs[i]->GetResource(&res);
-                if (res)
-                {
-                    ID3D11Texture2D *tex = nullptr;
-                    if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D),
-                                                      reinterpret_cast<void **>(&tex))))
-                    {
-                        D3D11_TEXTURE2D_DESC td {};
-                        tex->GetDesc(&td);
-                        probe += " s" + std::to_string(i) + "=" + std::to_string(td.Format) + "x" +
-                            std::to_string(td.Width) + "x" + std::to_string(td.Height);
-                        tex->Release();
-                    }
-                    res->Release();
-                }
-                psrvs[i]->Release();
-            }
-            ID3D11RenderTargetView *prtvs[4] = {};
-            ID3D11DepthStencilView *pdsv = nullptr;
-            context->OMGetRenderTargets(4, prtvs, &pdsv);
-            for (int i = 0; i < 4; ++i)
-            {
-                if (!prtvs[i])
-                    continue;
-                ID3D11Resource *res = nullptr;
-                prtvs[i]->GetResource(&res);
-                if (res)
-                {
-                    ID3D11Texture2D *tex = nullptr;
-                    if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D),
-                                                      reinterpret_cast<void **>(&tex))))
-                    {
-                        D3D11_TEXTURE2D_DESC td {};
-                        tex->GetDesc(&td);
-                        probe += " r" + std::to_string(i) + "=" + std::to_string(td.Format) + "x" +
-                            std::to_string(td.Width) + "x" + std::to_string(td.Height);
-                        tex->Release();
-                    }
-                    res->Release();
-                }
-                prtvs[i]->Release();
-            }
-            if (pdsv)
-                pdsv->Release();
-        }
-        std::uint8_t cb0[512] {};
-        std::size_t cb0_size = 0;
-        {
-            ID3D11Buffer *bound_cb = nullptr;
-            context->PSGetConstantBuffers(0, 1, &bound_cb);
-            if (bound_cb)
-            {
-                const std::uint64_t cb_key = reinterpret_cast<std::uint64_t>(bound_cb);
-                g_trace_ps_cb0_key.store(cb_key, std::memory_order_relaxed);
-                const auto snap_it = g_buffer_snapshots.find(cb_key);
-                if (snap_it != g_buffer_snapshots.end())
-                {
-                    cb0_size = snap_it->second.size();
-                    std::memcpy(cb0, snap_it->second.data(),
-                                cb0_size < sizeof(cb0) ? cb0_size : sizeof(cb0));
-                }
-                bound_cb->Release();
-            }
-        }
-        probe += " cb0_size=" + std::to_string(cb0_size);
-        if (cb0_size > 0)
-        {
-            sdk234_cb0_done.store(true, std::memory_order_relaxed);
-            probe += " cb0=";
-            const std::size_t floats = cb0_size / 4;
-            for (std::size_t i = 0; i < floats; ++i)
-            {
-                probe += std::to_string(reinterpret_cast<const float *>(cb0)[i]);
-                if (i + 1 < floats)
-                    probe += ",";
-            }
-        }
-        LOG_INFO(blog::cat::probe, probe);
-    }
-    // ---- 输入内容采样（前 3 轮 + 每 64 轮；motion 3×3 网格 + mvmax） ----
-    if (probe_round <= 3 || probe_round % 64 == 0)
-    {
-        std::string samples = "ffx12_samples round=" + std::to_string(probe_round);
-        append_tex_samples(samples, "color", color_tex, context);
-        append_tex_samples(samples, "depth", depth_tex, context);
-        append_tex_samples(samples, "motion", motion_tex, context, true, true);
-        bool last_reset = false;
-        std::uint64_t ctx_recreates = 0;
-        ffx12::debug_state(last_reset, ctx_recreates);
-        samples += " reset=" + std::to_string(last_reset ? 1 : 0) +
-            " recreates=" + std::to_string(ctx_recreates);
-        LOG_INFO(blog::cat::upscale, samples);
-    }
-    // ---- cb0 逐帧跟踪（前 32 轮）：jitter/frame/instance 与 cb0 tail 的对应 ----
-    if (probe_round <= 32)
-    {
-        std::string track = "ffx12_cb0_track round=" + std::to_string(probe_round) +
-            " inst=" + hex64(call_params.instance & 0xFFFFFFFFull) +
-            " frame=" + std::to_string(call_params.frame_index) +
-            " jit_norm=" + std::to_string(call_params.jitter_x) + "," +
-            std::to_string(call_params.jitter_y);
-        ID3D11Buffer *bound_cb = nullptr;
-        context->PSGetConstantBuffers(0, 1, &bound_cb);
-        if (bound_cb)
-        {
-            const std::uint64_t cb_key = reinterpret_cast<std::uint64_t>(bound_cb);
-            g_trace_ps_cb0_key.store(cb_key, std::memory_order_relaxed);
-            const auto snap_it = g_buffer_snapshots.find(cb_key);
-            if (snap_it != g_buffer_snapshots.end() && snap_it->second.size() >= 464)
-            {
-                const float *f = reinterpret_cast<const float *>(snap_it->second.data());
-                track += " cb0_96_115=";
-                for (int i = 96; i < 116; ++i)
-                {
-                    track += std::to_string(f[i]);
-                    if (i < 115)
-                        track += ",";
-                }
-            }
-            else
-            {
-                track += " cb0_snap_missing";
-            }
-            bound_cb->Release();
-        }
-        LOG_INFO(blog::cat::upscale, track);
-    }
-    // ---- 一次性实例/上下文内存 dump（前 2 轮；找原生 near/far/fov/exposure 等参数） ----
-    if (probe_round <= 2)
-    {
-        std::string mem = "ffx12_mem_dump round=" + std::to_string(probe_round);
-        append_mem_dump(mem, "inst", call_params.instance, 32);
-        append_mem_u64(mem, "inst_ptr", call_params.instance, 32);
-        append_mem_dump(mem, "ctx", call_params.context, 16);
-        append_mem_u64(mem, "ctx_ptr", call_params.context, 32);
-        LOG_INFO(blog::cat::probe, mem);
-        // 原生参数全量转储（日志截断放不下；第 1 轮写文件，供离线分析 fov/near/far）：
-        // 实例前 8KB + 上下文前 4KB + cb0 全量（496B）
-        if (probe_round == 1)
-        {
-            FILE *f = nullptr;
-            if (fopen_s(&f, "sdk234_native_dump.bin", "wb") == 0 && f)
-            {
-                if (call_params.instance)
-                    fwrite(reinterpret_cast<const void *>(call_params.instance), 1, 8192, f);
-                if (call_params.context)
-                    fwrite(reinterpret_cast<const void *>(call_params.context), 1, 4096, f);
-                // cb0 全量（含实例字段的 render/display/jitter 段）：快照钩子可能缺失，
-                // 用 staging 直读兜底（CopyResource + Map）
-                {
-                    ID3D11Buffer *bound_cb = nullptr;
-                    context->PSGetConstantBuffers(0, 1, &bound_cb);
-                    if (bound_cb)
-                    {
-                        D3D11_BUFFER_DESC bd {};
-                        bound_cb->GetDesc(&bd);
-                        const UINT cb_size = bd.ByteWidth > 4096 ? 4096 : bd.ByteWidth;
-                        D3D11_BUFFER_DESC sd {};
-                        sd.ByteWidth = cb_size;
-                        sd.Usage = D3D11_USAGE_STAGING;
-                        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                        ID3D11Buffer *staging_cb = nullptr;
-                        ID3D11Device *dev = nullptr;
-                        context->GetDevice(&dev);
-                        if (dev &&
-                            SUCCEEDED(dev->CreateBuffer(&sd, nullptr, &staging_cb)) &&
-                            staging_cb != nullptr)
-                        {
-                            context->CopyResource(staging_cb, bound_cb);
-                            context->Flush();
-                            D3D11_MAPPED_SUBRESOURCE m {};
-                            if (SUCCEEDED(context->Map(staging_cb, 0,
-                                                       D3D11_MAP_READ, 0, &m)) &&
-                                m.pData)
-                            {
-                                fwrite(m.pData, 1, cb_size, f);
-                                context->Unmap(staging_cb, 0);
-                            }
-                            staging_cb->Release();
-                        }
-                        if (dev)
-                            dev->Release();
-                        bound_cb->Release();
-                    }
-                }
-                fclose(f);
-                LOG_DEBUG(blog::cat::upscale, "ffx12_native_dump written=sdk234_native_dump.bin");
-            }
-        }
-    }
-    } // if (g_config.ffx12_probe)
-}
-#endif // !DX11FSRBRIDGE_RELEASE_RUNTIME
 
 template <typename DrawCall>
 bool try_fsr2_translation_draw(
@@ -12503,7 +12860,7 @@ bool try_fsr2_translation_draw(
         // 判据（全序 ⇒ 天然粘滞，不逐帧漂移）：① render 面积大者优先；② 面积相同取
         // **最早出现**的实例。候选只在"最近 k_p1_live_ms 内仍被匹配到"的实例间产生，
         // 已退场的实例不会长期占着接管权。理由见交付说明，Ffx12SingleInstancePick 可覆盖。
-        if (g_config.ffx12_single_instance && st != nullptr)
+        if (single_instance_takeover_effective() && st != nullptr)
         {
             constexpr std::uint64_t k_p1_live_ms = 200;
             const std::uint64_t p1_now = GetTickCount64();
@@ -12800,7 +13157,7 @@ bool try_fsr2_translation_draw(
         //   · 它的 FSR2 历史已过期，先用原生跑几百毫秒，避免"立刻重新接管 + reset"的跳变。
         // 说明：非接管实例本来就由上面的 passthrough 分支先放行，所以本窗口实际只在
         // "老接管者马上又被裁决回来"（flap）时才起作用 —— 那正是最需要兜底的情形。
-        if (g_config.ffx12_single_instance && st != nullptr && match_inst != 0 &&
+        if (single_instance_takeover_effective() && st != nullptr && match_inst != 0 &&
             st->native_until_tick != 0 && GetTickCount64() < st->native_until_tick)
         {
             const bool nw_consumed =
@@ -12858,7 +13215,7 @@ bool try_fsr2_translation_draw(
             // ⚠️ 放行前提必须是"**当前**确有另一个活跃实例"（非粘性）。见 g_sdk234_multi_instance
             // 的判据注释：用"历史上出现过第二个实例"会让这条放行在单视图场景长期生效 ⇒ 本桥的
             // 超分被大面积让给游戏原生（实机回归的直接机制之一）。
-            const bool release_now = g_config.ffx12_single_instance &&
+            const bool release_now = single_instance_takeover_effective() &&
                 g_sdk234_multi_instance.load(std::memory_order_relaxed) != 0 &&
                 p1_other_instance_live(match_inst);
             if (release_now)
@@ -13039,7 +13396,7 @@ bool try_fsr2_translation_draw(
             !output_belongs_to_instance && st->acc_in_color != 0 &&
             st->acc_in_color == claim_color_ptr;
         fsr2_family_takeover::TokenOnlyClaimFacts p2_facts {};
-        p2_facts.single_instance_takeover = g_config.ffx12_single_instance;
+        p2_facts.single_instance_takeover = single_instance_takeover_effective();
         // ⚠️ 必须用"**当前**确有另一个活跃实例"（非粘性），而不是"历史上出现过第二个实例"。
         // 实机回归（2026-09-28）：粘性版本 + `token_cands` 把幽灵实例也计入 ⇒ 接管者**每一个**
         // 累积 draw 都被拒（`ffx12_ambiguous_bootstrap` 涨到 5376，而另一路 :g 已冻住 54 秒）
@@ -13116,7 +13473,7 @@ bool try_fsr2_translation_draw(
         //   bootstrap 被拒 ⇒ 归属建立不起来 ⇒ 超分停止"的死锁（实机见过一次）。
         //   ⇒ 只用于 A/B 取证，不要长期打开；真要长期用它，请先看日志里
         //   `ffx12_strict_skip` 与 `ffx12_result` 是否同时在增长。
-        if (g_config.ffx12_single_instance_strict && g_config.ffx12_single_instance &&
+        if (g_config.ffx12_single_instance_strict && single_instance_takeover_effective() &&
             st != nullptr && match_inst != 0 && match_path == 2 && !output_belongs_to_instance &&
             match_inst == sdk234_take_cur && call_gen != 0)
         {
@@ -13419,22 +13776,11 @@ bool try_fsr2_translation_draw(
                 sdk_in.reset = g_config.ffx12_force_reset || st->reset_next;
                 sdk_in.use_reactive_mask = g_config.fsr2_use_reactive_mask;
                 sdk_in.use_transparency_mask = g_config.fsr2_use_transparency_mask;
-                // 锐化 —— **桥不参与，交给 OptiScaler 的 RCAS 后处理**（2026-11-10）。
-                //
-                // 实机证据链：
-                //   1) NGX 已废弃内置锐化：`nvsdk_ngx_defs.h:296` 的 `DoSharpening`
-                //      明确标注 "Sharpness is not supported"。
-                //   2) 用户在 OptiScaler 打开锐化后，游戏**正常运行但画面全黑**。
-                //      机制：废弃的 `DoSharpening` 位被传给 DLSS v310.7 ⇒ 未定义路径
-                //      ⇒ 输出无内容（不是崩溃，是管道跑通但画面空）。
-                //   3) OptiScaler 在 `DLSSFeature.cpp:14-22`（ProcessEvaluateParams）
-                //      里会覆盖 `Sharpness` 键：OverrideSharpness 且无 RCAS → 用它的值；
-                //      RCAS 启用 → 强制 0。⇒ 桥传什么都不会直接灌给 DLSS。
-                //
-                // 因此：桥恒不启用锐化；用户通过 OptiScaler 的
-                // `OverrideSharpness` / `Sharpness` / `[CAS] Enabled` 调整。
-                sdk_in.enable_sharpening = false;
-                sdk_in.sharpness = 0.0f;
+                // RCAS 锐化：此前 `Fsr2SharpnessPercent` 只被读取、**从不使用**（与
+                // mv_decode / transparency / 硬编码 flags 同类的"配置存在但从未接线"死键）。
+                // 默认 0 ⇒ enable_sharpening=false，行为与现状一致；设 >0 才真正打开。
+                sdk_in.enable_sharpening = g_config.fsr2_sharpness_percent > 0;
+                sdk_in.sharpness = static_cast<float>(g_config.fsr2_sharpness_percent) / 100.0f;
                 // 接管空窗检测（2026-08-24 实证）：UI 全屏/场景切换由另一实例或原生接管，
                 // 距上次 dispatch 超 500ms（= 其他路径接管期）→ 恢复时强制 FSR2 reset，清历史残留。
                 {
@@ -13488,13 +13834,7 @@ bool try_fsr2_translation_draw(
                 //   槽1 = cb0[27].zw、槽2 = cb0[26].zw（其他着色器变体可能在此）
                 // 选变化槽：避免某视图槽位冻结导致 jitter 冻结 → 无 AA（第 16 轮 0x25FCE520 实证）。
                 // 都不变 = 该视图无相机抖动 → 无 AA 可累积（游戏原生同此）。
-                // 闸门：只有 render 字段"无效"时才回退 cb0。
-                // 但实机证据（2026-11-09）：该字段**在 [0,1) 内一直"有效"，却在稳态下
-                // 每 600~1200 帧才更新一次**（n=600..6600 恒为 0.000342,0.000386，
-                // 而 render_calls 与帧号 1:1）。
-                // ⇒ "有效"不等于"逐帧变化"。诊断开关 DlssInputJitterProbe=1 时，
-                // 无论闸门如何都额外读一次 cb0 并对比，用来判定 cb0 是否才是逐帧真值。
-                if (!render_jitter_valid || g_config.dlss_input_jitter_probe)
+                if (!render_jitter_valid)
                 {
                     ID3D11Buffer *bound_cb = nullptr;
                     context->PSGetConstantBuffers(0, 1, &bound_cb);
@@ -13588,29 +13928,6 @@ bool try_fsr2_translation_draw(
                                             }
                                         }
                                         const int pick = st->jit_locked ? st->jit_slot : 0;
-                                        // 探针：对比 cb0 与 render 字段，判定谁在逐帧变化。
-                                        // 只在 DlssInputJitterProbe=1 时打印，低频（前 8 次 + 每 300 次）。
-                                        if (g_config.dlss_input_jitter_probe)
-                                        {
-                                            static std::atomic_uint64_t jprobe_count { 0 };
-                                            const std::uint64_t jpc =
-                                                jprobe_count.fetch_add(1, std::memory_order_relaxed) + 1;
-                                            if (jpc <= 8 || jpc % 300 == 0)
-                                            {
-                                                LOG_INFO(blog::cat::upscale,
-                                                    "dlss_jitter_probe n=" + std::to_string(jpc) +
-                                                    " render=(" + std::to_string(call_params.jitter_x) + "," +
-                                                    std::to_string(call_params.jitter_y) + ")" +
-                                                    " cb0=(" + (ok[0] ? std::to_string(cb[0][0]) : std::string("--")) +
-                                                    "," + (ok[0] ? std::to_string(cb[0][1]) : std::string("--")) + ")" +
-                                                    " cb27=(" + (ok[1] ? std::to_string(cb[1][0]) : std::string("--")) +
-                                                    "," + (ok[1] ? std::to_string(cb[1][1]) : std::string("--")) + ")" +
-                                                    " cb26=(" + (ok[2] ? std::to_string(cb[2][0]) : std::string("--")) +
-                                                    "," + (ok[2] ? std::to_string(cb[2][1]) : std::string("--")) + ")" +
-                                                    " locked_slot=" + std::to_string(st->jit_slot) +
-                                                    " (which one changes per frame?)");
-                                            }
-                                        }
                                         if (ok[pick])
                                         {
                                             jit_src_x = cb[pick][0];
@@ -13643,39 +13960,35 @@ bool try_fsr2_translation_draw(
                         bound_cb->Release();
                     }
                 }
-                const float use_jx = g_config.ffx12_jitter_delay ? st->prev_jx : jit_src_x;
-                const float use_jy = g_config.ffx12_jitter_delay ? st->prev_jy : jit_src_y;
-                switch (g_config.ffx12_jitter_mode)
+                // ---- A 阶段（2026-11-10）：模式换算搬进纯函数 NgxParamMap.cpp ----
+                // ★ 逐位等价：六种模式的公式与重构前 switch **逐字相同**（含 mode 2 的
+                //   "原样"语义、mode 5 的恒 0、以及 default 兜住一切非法值）。
+                //   对照 oracle（重构前 switch 另抄一份）在 NgxParamMapTest.cpp 第 [2][3][4] 节。
+                // ★ 传进去的 norm 是 jit_src_x（= 旧代码 use_jx 的来源），delay 由纯函数内部选；
+                //   旧代码的 use_jx/use_jy 三元表达式因此整条搬进了 map_jitter。
+                // ★ 单次读取模式：旧代码 switch 只读一次 g_config.ffx12_jitter_mode，
+                //   本段也必须只读一次；分两次读（填 ji.mode 一次 + !=2 判据一次）会在
+                //   配置热重载场景下出现“填模式”与“是否回写”读到不同值的窗口。
+                const std::uint32_t jit_mode = g_config.ffx12_jitter_mode;
+                ngx_param_map::JitterInput ji {};
+                ji.norm_x = jit_src_x;
+                ji.norm_y = jit_src_y;
+                ji.render_w = sdk_in.render_w;
+                ji.render_h = sdk_in.render_h;
+                ji.mode = jit_mode;
+                ji.delay_one_frame = g_config.ffx12_jitter_delay;
+                ji.prev_norm_x = st->prev_jx;
+                ji.prev_norm_y = st->prev_jy;
+                const ngx_param_map::JitterOutput jit_out = ngx_param_map::map_jitter(ji);
+                // ★★ mode 2 必须**不回写**：旧代码 case 2 是 `break;`，sdk_in.jitter_x/y
+                //   保留 switch **之前**的赋值（:12437 = call_params.jitter_x/y）。
+                //   纯函数在 mode 2 返回的是 jit_src_x，与 call_params 在 cb0 回退路径上
+                //   可能不同 ⇒ 这里显式跳过赋值，才与重构前逐位一致。
+                if (jit_mode != 2)
                 {
-                    case 1: // +norm×render（无 −0.5）
-                        sdk_in.jitter_x = use_jx * static_cast<float>(sdk_in.render_w);
-                        sdk_in.jitter_y = use_jy * static_cast<float>(sdk_in.render_h);
-                        break;
-                    case 2: // 原样归一化（≈0，等效关 jitter）
-                        break;
-                    case 3: // −norm×render + 0.5（模式 0 的 X/Y 翻转，翻译层 Fsr2JitterMode=3 风格）
-                        sdk_in.jitter_x = -(use_jx * static_cast<float>(sdk_in.render_w)) + 0.5f;
-                        sdk_in.jitter_y = -(use_jy * static_cast<float>(sdk_in.render_h)) + 0.5f;
-                        break;
-                    case 4: // −norm×render（游戏反汇编约定：采样 = pixel − jitter；默认）
-                        sdk_in.jitter_x = -(use_jx * static_cast<float>(sdk_in.render_w));
-                        sdk_in.jitter_y = -(use_jy * static_cast<float>(sdk_in.render_h));
-                        break;
-                    case 5: // 零 jitter（诊断）
-                        sdk_in.jitter_x = 0.0f;
-                        sdk_in.jitter_y = 0.0f;
-                        break;
-                    default: // 0: +norm×render − 0.5（旧默认，A/B 保留）
-                        sdk_in.jitter_x = use_jx * static_cast<float>(sdk_in.render_w) - 0.5f;
-                        sdk_in.jitter_y = use_jy * static_cast<float>(sdk_in.render_h) - 0.5f;
-                        break;
+                    sdk_in.jitter_x = jit_out.px;
+                    sdk_in.jitter_y = jit_out.py;
                 }
-                // ⚠️ 必须在**覆盖 prev_jx 之前**存下"上一帧"的相位。
-                // 此前 DLSS 分支在 13708 行读 st->prev_jx，而这一行在 13450 已经
-                // 把它更新成本帧值 ⇒ 读到的是当前帧，`Ffx12JitterDelay` 的补偿
-                // 在 DLSS 路径上完全失效（实机症状：运动中系统性拖影）。
-                const float prev_frame_jx = st->prev_jx;
-                const float prev_frame_jy = st->prev_jy;
                 st->prev_jx = jit_src_x;
                 st->prev_jy = jit_src_y;
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
@@ -13724,12 +14037,19 @@ bool try_fsr2_translation_draw(
                 // motion scale：FSR2 约定 = ±render 尺寸，符号 = 游戏原生运动方向约定。
                 // 2026-08-25 依据游戏 accumulate 反汇编（history_uv = UV − mv_g, mv_g=正向）：
                 // FSR2 需要反向运动 → 本桥 −sign 解码已反向 → scale 必须 +renderSize（Fsr2MotionVectorScaleMode=1）。
-                const float mv_sign = g_config.fsr2_positive_motion_vector_scale ? 1.0f : -1.0f;
-                // motionScale：FSR2/DLSS/XeSS 均按 render 尺寸（输入分辨率像素；display 尺寸已试无变化）。
-                sdk_in.motion_scale_x = mv_sign * static_cast<float>(sdk_in.render_w) *
-                                        g_config.ffx12_motion_scale;
-                sdk_in.motion_scale_y = mv_sign * static_cast<float>(sdk_in.render_h) *
-                                        g_config.ffx12_motion_scale;
+                // ---- A 阶段（2026-11-10）：MV scale 搬进纯函数 NgxParamMap.cpp ----
+                // ★ 逐位等价：mv_sign 与 (sign*W)*scale 的左结合顺序**逐字保留**。
+                //   对照 oracle（重构前两行另抄一份）在 NgxParamMapTest.cpp 第 [6] 节。
+                // ★ motionScale 口径不变：FSR2/DLSS/XeSS 均按 render 尺寸
+                //   （输入分辨率像素；display 尺寸已试无变化）。
+                ngx_param_map::MvScaleInput mi {};
+                mi.positive_scale = g_config.fsr2_positive_motion_vector_scale;
+                mi.motion_scale = g_config.ffx12_motion_scale;
+                mi.render_w = sdk_in.render_w;
+                mi.render_h = sdk_in.render_h;
+                const ngx_param_map::MvScaleOutput mv_out = ngx_param_map::map_mv_scale(mi);
+                sdk_in.motion_scale_x = mv_out.x;
+                sdk_in.motion_scale_y = mv_out.y;
                 // 相机参数：先用 OptiScaler 路径已验证值（原生值待 PRE cb0 探测）。
                 // FovScale 配置：AA 重投影依赖 FOV，缩放可快速验证 FOV 是否为 AA 失效元凶。
                 sdk_in.camera_near = g_config.ffx12_camera_near;
@@ -13923,18 +14243,21 @@ bool try_fsr2_translation_draw(
                     st->dbg_depth = d_ptr;
                 }
 
-                // ---- 输出路由：ffx-api（现状）还是 NVSDK_NGX（DLSS 输入）----
+                // ---- 输出路由：ffx-api（纯 FFX）还是 NVSDK_NGX（DLSS 直连）----
                 //
-                // 两者是**互斥**的后端：同一帧只喂一条链路（同时喂会让两份历史互相污染，
-                // 而且两边的 reset/尺寸重建节奏不同）。`dispatch_ok` 统一承载成功与否，
-                // 失败 ⇒ 由下面原有的 fail-open 分支放行游戏原生 draw（不黑屏）。
+                // 2026-11-15（从 dlss-input 分支移植）：两者是**互斥**的后端，同一帧只喂一条链路。
+                //
+                // 谁持有 feature：直连层由桥自己持有（`dlss_input::Runtime` 里的 `feature_`），
+                // 不像 OptiScaler 代理那样由外部持有 ⇒ 游戏释放它自己的 feature 时不影响本桥那份。
+                //
+                // 默认 `DlssInput=0` ⇒ 永远走 ffx12::dispatch，行为与改造前完全一致。
                 bool dispatch_ok = false;
                 const bool use_dlss_input = dlss_gate::resolve_path() == 1;
                 if (use_dlss_input)
                 {
                     // 与 ffx 路径共用同一份抓取结果；额外需要"游戏归一化 jitter"，
                     // 它来自 il2cpp token（call_params.jitter_x/y 就是归一化相位）。
-                    const float prev_norm[2] { prev_frame_jx, prev_frame_jy };
+                    const float prev_norm[2] { st->prev_jx, st->prev_jy };
                     dispatch_ok = dlss_gate::dispatch(
                         context, sdk_in,
                         sdk_in.display_w, sdk_in.display_h,
@@ -13942,13 +14265,19 @@ bool try_fsr2_translation_draw(
                         /*first_frame=*/ st->last_gen == 0,
                         /*ms_since_last=*/ st->last_dispatch_tick != 0
                             ? GetTickCount64() - st->last_dispatch_tick : 0);
-                    // 失败 ⇒ 永久退回 ffx（避免每帧在两条链路上抖动）。
+                    // 失败 ⇒ 真的永久退回 ffx。
+                    //
+                    // ⚠️ 2026-11-15（审查 M1）：原实现只打了一条 "(permanent for this process)"
+                    //   的日志，**既不 g_path.store(0) 也不改走 ffx12::dispatch** —— 那个 else
+                    //   分支只在 use_dlss_input == false 时进。结果是每帧重试、每帧失败、
+                    //   每帧无超分，而日志说"已永久退回"。现在真的落盘 g_path=0。
                     if (!dispatch_ok)
                     {
+                        g_path.store(0, std::memory_order_relaxed);
                         static std::atomic_bool dlss_fallback_logged { false };
                         if (!dlss_fallback_logged.exchange(true, std::memory_order_relaxed))
                             LOG_WARN(blog::cat::upscale,
-                                "dlss_input_fallback_to_ffx (permanent for this process)");
+                                "dlss_input_fallback_to_ffx (g_path=0, permanent for this process)");
                     }
                 }
                 else
@@ -14699,7 +15028,7 @@ bool fsr2_family_should_skip_draw(ID3D11DeviceContext *context)
     // 至于"老实例掉出活性窗后互锁松开、它的预处理 pass 又被跳过"这个自锁风险：交棒时已对
     // 它做了逐实例处置（notify_takeover_leave + 纯原生窗口），原生路径是被显式交还的，
     // 不依赖本标记兜底 ⇒ 不会复发。
-    if (g_config.ffx12_single_instance &&
+    if (single_instance_takeover_effective() &&
         g_sdk234_multi_instance.load(std::memory_order_relaxed) != 0)
         return false;
     // cached_ps 由缓存持有引用：D3D11 对象地址在释放后可能被复用，不持引用就会
@@ -14812,6 +15141,10 @@ bool fsr2_family_skip_gate(ID3D11DeviceContext *context, UINT count, bool indexe
 
 // 把"本帧翻译层是否处理了该 draw"回报给合成族状态机，并输出前若干次诊断。
 // 注：原先只有 draw_indexed 路径写这条日志，draw 路径漏了 → 已统一。
+// ⚠️ 2026-11-14（专项审查：早退是否该跳过记账）：target_draw_info == nullptr 时直接
+//   return、不做 notify_accumulate_result。这是**漏做而非多做**：后果是 skip 许可不武装，
+//   少一次优化机会，不产生错误输出；且 nullptr 本身说明这一帧没有可用的 draw 信息，
+//   此时记账也无从记起。故保持现状，不改代码。
 void note_family_notify(bool handled, const TargetUpscalerDrawInfo *target_draw_info)
 {
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
@@ -15695,11 +16028,39 @@ bool swapchain_present_hook_needed()
 
 bool swapchain_control_hook_needed()
 {
-    return dlssg_dxgi_workaround_active() || hdr_swapchain_force_active();
+    // ★ 把 Ngx 后端并入本谓词 —— 这是修既有刷新块的
+    //   **可达性**，不是新功能。原实现把「ResizeBuffers 成功后重读后缓冲格式」
+    //   （hooked_resize_buffers 内、ngx::set_swapchain_format 那一段）当成缺口已修，
+    //   但本谓词当时只有 dlssg 与 HdrSwapchainForce 两项，而 HdrSwapchainForce 在
+    //   发布构型恒假（见 hdr_swapchain_force_active）⇒ 在「NGX 后端 + 默认发布 ini
+    //   + 未启用 dlssg 帧生成」构型下 resize_buffers 槽不会被 patch，那段刷新块
+    //   不执行（静默：无日志、无报错）。
+    // ★ 为什么 NGX 需要它：ngx 的 G10 判据（is_hdr10_color_space）依赖后缓冲格式
+    //   的实时性。游戏在 SDR↔HDR / 全屏 / 分辨率切换时会重建交换链并可能改变
+    //   BufferDesc.Format；只在 install_swapchain_hooks 里读一次，ngx 侧就会一直
+    //   用安装时刻的旧格式。
+    // 注：这个谓词不依赖任何后端概念 —— 直连层与纯 FFX 都成立。
+    // ★ 副作用（改这里前必读）：本谓词 = should_hook_general_swapchain_controls，
+    //   除 resize_buffers 外还会 patch set/get_fullscreen_state 与 resize_target
+    //   三个槽（见 install_swapchain_hooks）。三者在 Ngx 构型且 dlssg 未启用时均为
+    //   纯透传；只有 dlssg_dxgi_workaround_active() 为真时才短路，而那种情形
+    //   本谓词本来就返回真、钩子本来就装 —— 即三个槽的行为与本次改动前一致。
+    // 2026-11-15：原第三项是 `ffx12::backend() == BackendKind::Ngx`（NGX 代理需要）。
+    // 直连层同样需要后缓冲格式的实时性（depth/motion 提取时要读描述），故改为
+    // 「直连层开着」这个等价条件。
+    return dlssg_dxgi_workaround_active() || hdr_swapchain_force_active() ||
+        g_config.dlss_input_mode != 0;
 }
 
 bool swapchain_color_hook_needed()
 {
+    // 2026-11-15：原判据是「NGX 代理后端在场」（`ffx12::backend() == BackendKind::Ngx`），
+    // 但那个概念已随 NgxBackend.cpp 移除。直连层读 swapchain 的 color space 是为了
+    // 判定 DLSS 的 IsHDR 标志，纯 FFX 构型下这三个 hook 是纯透传。
+    //
+    // 判据改为「直连层开着」：与原来「只对 NGX 后端装」的覆盖面等价。
+    if (g_config.dlss_input_mode != 0)
+        return true;
     return k_color_diagnostics_enabled || hdr_swapchain_spoof_active() || hdr_swapchain_force_active();
 }
 
@@ -16324,25 +16685,98 @@ static bool contains_ci(const std::wstring &hay, const wchar_t *needle)
 // provider 的 ffxQueryDescGetVersions 按 GPU 能力返回最高支持版本，降级链 4→3→2 兜底；
 // RDNA2 等需要 4.0.2c 的用户自行替换 SDK 文件（见 ini 备注）。
 // 旧签名还带 device/source 两个参数，函数体里直接 (void) 丢弃——调用方以为在传路由依据。
-static void record_adapter_info(std::uint32_t vendor, const std::wstring &desc)
+static void record_adapter_info(std::uint32_t vendor, std::uint32_t device_id, const std::wstring &desc)
 {
-    if (g_route_applied)
+    if (g_route_applied.load(std::memory_order_acquire))
         return;
     if (vendor == 0)
         return; // 检测失败：留给后续补检（设备创建后）
+    // 2026-11-15（审查 B3）：把 vendor 存下来供 dlss_gate 的路由判据用。
+    // 必须在下面的 g_route_applied 抢权**之前**写：抢输的线程也要能看到。
+    g_route_vendor_id.store(vendor, std::memory_order_relaxed);
     char vendor_hex[16] {};
     std::snprintf(vendor_hex, sizeof(vendor_hex), "0x%04X", vendor);
-    g_route_vendor_label = vendor_hex;
-    g_route_vendor_id.store(vendor, std::memory_order_relaxed);
-    g_route_gpu_name = narrow(desc.c_str());
-    g_route_sdk_path = narrow(g_config.ffx12_dll_path.c_str());
-    g_route_applied = true;
+    const std::string vendor_label = vendor_hex;
+    const std::string gpu_name = narrow(desc.c_str());
+    const std::string sdk_path = narrow(g_config.ffx12_dll_path.c_str());
+    // Ffx12Backend=auto 的落位点：这里刚拿到 vendor / device id / 描述，且本函数由
+    // route_from_d3d11_device 在**设备创建 hook 内**调用，早于同一 hook 里
+    // swapchain_hook_needed() 的求值（Dx11FsrBridge.cpp:14931 早于 :14937）——
+    // 因此落位结果能被交换链钩子的谓词立刻看到。
+    //
+    // 2026-11-14（快照发布顺序）：先落位后端拿到 note，**再**一次性构造完整快照。
+    //   旧顺序是"先写 g_route_* 再让 resolve_backend_auto 补写 note"，那样 note 永远
+    //   赶不上快照发布（发布时 note 还没算出来）。故本函数现在的顺序是：
+    //     ① 抢发布权（g_route_applied 的 exchange **返回 false** 者才继续；返回 true 说明别人先到）
+    //     ② 锁外做全部重活：narrow / snprintf / resolve_backend_auto（内含
+    //        ffx12::set_backend() 与日志）—— 都不持锁
+    //     ③ 锁内只做「判重 + 构造 + 发布」三件事
+    //   g_route_applied 必须先于发布置位：否则两个线程会各自判重失败、各发布一份。
+    //   抢输的线程直接返回（旧行为：第二个适配器不改后端、不覆盖摘要）。
+    if (g_route_applied.exchange(true, std::memory_order_acq_rel))
+        return;
+    bool published = false;
+    {
+        // 锁内只做「判重 + 构造 + 发布」三件事：不含日志、不含 ffx12::set_backend()
+        // （§二.4：不在持锁期间做 I/O）。
+        // ⚠️ 2026-11-14（专项审查：早退绕过副作用）：**本块内不得 return**。
+        //   原实现在判重命中与分配失败两处直接 return，而副作用（set_backend + 日志）在锁外
+        //   之后才执行 ⇒ 这两条路径会跳过副作用。而 resolve_backend_auto 已经把
+        //   g_backend_auto_resolved 永久置 true 并算出了 want_ngx ⇒ 落位动作再也补不回来，
+        //   后果与刚修的那次回归同型（auto 配置下后端停在 native、DLSS 全程不启用）。
+        //   ⇒ 一律用 published 标志代替 return，把控制流交回给下方统一的副作用出口。
+        std::lock_guard<std::mutex> guard(g_route_publish_mutex);
+        // 判重留在锁内，让"只发布一次"由结构保证：即便将来有人在 g_route_applied 之外
+        // 再开一条发布路径，这里也不会覆盖已发布的快照（覆盖即泄漏，见 RouteSnapshot 注释）。
+        if (g_route_snapshot.load(std::memory_order_relaxed) == nullptr)
+        {
+            RouteSnapshot *const snapshot =
+                // 2026-11-15（审查 B4）：`backend_auto_note` 随 auto 链一起删除，
+                // 这里传空串 —— 摘要的 auto= 后缀已无来源（后端选择的概念不存在了）。
+                new (std::nothrow) RouteSnapshot {gpu_name, vendor_label, sdk_path, std::string {}};
+            if (snapshot != nullptr)
+            {
+                g_route_snapshot.store(snapshot, std::memory_order_release);
+                published = true;
+            }
+        }
+        // 分配失败 / 判重命中的降级说明（两条路径的后果都是「摘要缺失」，但**不影响落位**）：
+        //   ① nothrow 分配失败 ⇒ 摘要保持未发布（焦点块打 unknown），超分主链不受影响；
+        //   ② 结构体内 4 个 std::string 的**拷贝构造**仍可能抛 bad_alloc（nothrow 只管分配，
+        //      不管构造）⇒ 异常穿出本函数。分配块本身由运行时代码释放，**不泄漏**，
+        //      但 g_route_applied / g_backend_auto_resolved 已置位 ⇒ 快照永远补不回来。
+        //   两者的暴露面与重构前「给全局 std::string 赋值」完全相同（未加重、也未消除）。
+        //   此处不额外加 try/catch：那属独立健壮性改动，混进本次会让失败无法归因（§一.3）。
+    }
+    // ★ 2026-11-14（审查：发布窗口）：副作用放在**发布之后**且**锁外**。
+    //   顺序不可颠倒：先发布 ⇒ 读者要么看到完整的旧快照、要么看到完整的新快照，
+    //   不会出现「后端已换但摘要还是 nullptr」。锁外 ⇒ 不在持锁期间做 I/O（§二.4）。
+    (void)published;
+    // ★ 2026-11-14（回归修复）：**只有真的落位了才执行副作用**。
+    //   resolve_backend_auto 在「未写 auto」「vendor==0」「别人已落位」三种情况下直接返回，
+    //   此时 auto_want_ngx 是初始的 false —— 无条件 set_backend(false) 会把 ini 里显式写的
+    //   Ffx12Backend=ngx 覆盖成 native（实测：日志里 2 秒内 ngx → native，DLSS 全程未启用）。
+    //   注意：只要 auto_resolved 为真就必须执行，**与 published 无关** —— 落位与摘要发布是
+    //   两件事，摘要缺失（分配失败）不该连带丢掉落位。
+    // 2026-11-15（审查 B4）：副作用出口已删除（resolve_backend_auto 不存在了）。
 }
 
+// 2026-11-15（审查 B4）：`resolve_backend_auto` / `apply_backend_auto_result` /
+// `g_backend_auto_requested` / `g_backend_auto_resolved` 整条 auto 链已删除。
+//
+// 为什么删而不是修：这条链的唯一目的是「按显卡型号在 native / ngx 之间落位后端」，
+// 而后端选择这个概念已随 NgxBackend.cpp 移除 —— 现在走哪条超分路径由 `DlssInput`
+// 的 dlss_gate 决定（它自己读 vendor，见 vendor_from_current_device）。
+//
+// 删除前的实际状态：`g_backend_auto_requested` 在本侧**没有任何赋值点**
+// （main 侧那两处随 NGX 配置段一起被删了），于是 resolve_backend_auto 首行就 return、
+// apply_backend_auto_result 恒不调用、auto_suffix 恒空
+// ⇒ 一边打 "ngx_core backend=native"、另一边焦点块打 "BACKEND : ngx"，
+// 同一份启动日志里两行说相反的话。
 // D3D11 设备就绪后的可靠补检（IDXGIDevice::GetAdapter 不受 loader lock 影响）
 static void route_from_d3d11_device(ID3D11Device *d3d11_device)
 {
-    if (g_route_applied || d3d11_device == nullptr)
+    if (g_route_applied.load(std::memory_order_acquire) || d3d11_device == nullptr)
         return;
     IDXGIDevice *dxgi_device = nullptr;
     if (FAILED(d3d11_device->QueryInterface(__uuidof(IDXGIDevice),
@@ -16351,6 +16785,7 @@ static void route_from_d3d11_device(ID3D11Device *d3d11_device)
         return;
     IDXGIAdapter *adapter = nullptr;
     std::uint32_t vendor = 0;
+    std::uint32_t device_id = 0;
     std::wstring desc_text;
     if (SUCCEEDED(dxgi_device->GetAdapter(&adapter)) && adapter != nullptr)
     {
@@ -16358,13 +16793,14 @@ static void route_from_d3d11_device(ID3D11Device *d3d11_device)
         if (SUCCEEDED(adapter->GetDesc(&desc)))
         {
             vendor = desc.VendorId;
+            device_id = desc.DeviceId;
             desc_text = desc.Description;
         }
         adapter->Release();
     }
     dxgi_device->Release();
     if (vendor != 0)
-        record_adapter_info(vendor, desc_text);
+        record_adapter_info(vendor, device_id, desc_text);
 }
 
 // ---------------------------------------------------------------------------
@@ -16493,6 +16929,18 @@ void initialize()
         for (const std::string &warning : g_config.logging.pending_warnings)
             LOG_WARN(blog::cat::config, warning);
         g_config.logging.pending_warnings.clear();
+        // 后端选择状态行（SDS §3.13.2 第 2 条）：在 logger 起来 + 告警回放之后，
+        // 按已生效的 ffx12::backend() **恰输出一条**，两种模式都可取证。
+        // 走 blog::cat::config 并在日志器初始化之后，故不依赖 NGX 编译开关或 ensure_init。
+        // Ffx12Backend=auto 在这一行必然还是 pending（设备尚未创建 ⇒ 适配器信息未到），
+        // 故追加 auto=pending；落位时 resolve_backend_auto() 会再打一条同格式行
+        // （ngx_core backend=… auto=… vendor=… gpu="…"）——两条成对出现，可直接当验收判据。
+        // 2026-11-14（见 RouteSnapshot 注释）：resolved 改原子后这里用 acquire 读，
+        // 语义与旧裸 bool 一致 —— 设备还没创建时必然还是 pending。
+        // 2026-11-15（审查 B4）：auto 链已删，auto=pending 后缀无来源（恒空）。
+        // 保留变量名是为了让下面那行 LOG_INFO 的 diff 最小。
+        const std::string auto_suffix;
+        LOG_INFO(blog::cat::config, "ngx_core backend=native" + auto_suffix);
     }
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
@@ -16741,6 +17189,32 @@ void final_shutdown()
 {
     std::call_once(g_final_shutdown_once, []()
         {
+            // 2026-11-15（审查 M4）：`Runtime::shutdown()` 原先是**零调用**的死代码
+            // —— feature 句柄、参数表、加载的 NGX 模块都活到进程结束。
+            //   放在这里而不是 DLL_PROCESS_DETACH：DETACH 在 loader lock 下，
+            //   而 shutdown 会调 COM 释放（可能触发驱动侧等待）。
+            //
+            // ⚠️⚠️ 2026-11-15（**实机回归：进程残留**）：上面那段推理只对了一半。
+            //   放到 atexit 仍然会卡 —— 而且症状比 FFX 那次更糟：
+            //   游戏窗口关了、主进程却挂在退出路径上不退（用户报的就是这个）。
+            //
+            //   为什么：`NVSDK_NGX_D3D11_Shutdown1` 是**第三方代码**，与 FFX 的
+            //   `ffxDestroyContext` 同型 —— 在「设备已移除 / 驱动已开始卸载」的状态下
+            //   它内部会等一个永远不会完成的 GPU 侧清理。上一段那 12 行注释
+            //   （`[SHUTDOWN] ffx12_shutdown begin` 之后再无 `ctxs_destroyed`）
+            //   记录的正是同一个坑，我又踩了一次。
+            //
+            //   ⇒ **退出路径不做任何第三方运行时的释放**（FFX 与 NGX 同规则）。
+            //   代价：feature 句柄 / 参数表 / 模块引用计数在进程退出时都不归零 ——
+            //   但进程正在退出，这些由 OS 无条件回收，**没有任何功能损失**。
+            //   反过来，为了这点收益把整个进程钉死在退出路径上，不可接受。
+            //
+            //   `Runtime::shutdown()` 仍然保留（并已按 M4 补全：destroy_parameters +
+            //   shutdown1(device)）—— 它现在只在**进程内可控的场景**下被调用：
+            //   目前没有这样的场景，但将来若要支持「运行中切换 DLSS ↔ FFX」，
+            //   那才是它的正确用途（那时设备还活着，不会阻塞）。
+            //
+            //   本函数只做日志器收尾（幂等）。
             blog::shutdown();
         });
 }

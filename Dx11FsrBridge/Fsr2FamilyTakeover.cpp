@@ -12,6 +12,8 @@ std::atomic_uint64_t g_accumulate_tick { 0 };
 std::atomic_uint64_t g_skipped { 0 };
 std::atomic_uint64_t g_replaced { 0 };
 std::atomic_uint64_t g_leave_releases { 0 };
+// 2026-11-13（独立审查第二轮 · 建议 5）：见头上 accumulate_cleared_count() 的说明。
+std::atomic_uint64_t g_accumulate_cleared { 0 };
 } // namespace
 
 void reset()
@@ -63,6 +65,13 @@ void notify_accumulate_result(bool replaced_ok, std::uint64_t now_ms)
     else
     {
         g_accumulate_replaced.store(false, std::memory_order_relaxed);
+        // 2026-11-13（独立审查第二轮 · 建议 5）：把"这次回报真的发生了"变成可观测事实。
+        //   ★ 只在 false 分支累加 —— true 分支已有 g_replaced 计数，不需要第二个计数器
+        //     表达同一件事（两个计数器描述同一个事实 = 两份可能漂移的副本）。
+        //   ★ 放在 store **之后**：与本分支里"先改状态、再留证据"的顺序一致，
+        //     且 count 的语义明确是"已执行的解除次数"，不含并发语义（relaxed 足够，
+        //     它不参与任何判据，只喂日志/验收）。
+        g_accumulate_cleared.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -87,6 +96,11 @@ std::uint64_t accumulate_replaced_count()
 std::uint64_t takeover_leave_count()
 {
     return g_leave_releases.load(std::memory_order_relaxed);
+}
+
+std::uint64_t accumulate_cleared_count()
+{
+    return g_accumulate_cleared.load(std::memory_order_relaxed);
 }
 
 bool claim_has_positive_evidence(const TokenOnlyClaimFacts &facts)

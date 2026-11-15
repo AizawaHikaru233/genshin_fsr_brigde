@@ -856,7 +856,7 @@ function Invoke-FoundationSetup {
     if ($unlockerWasMissing) {
         $source = Select-ComponentSource `
             -Name 'FPS Unlocker' `
-            -Repository '34736384/genshin-fps-unlock' `
+            -Repository 'AizawaHikaru233/genshin-fps-unlock' `
             -AssetPattern '^unlockfps_nc\.exe$' `
             -LocalPath $unlockerPath `
             -CompareMode 'Hash' `
@@ -1210,7 +1210,7 @@ function Show-AboutMenu {
         [pscustomobject]@{ Name = 'シリアCelia'; Projects = 'FSR Bridge、AntiPlayerMosaic、安装管理脚本'; Url = 'https://space.bilibili.com/8218484' },
         [pscustomobject]@{ Name = 'RenoDX 作者（Bilibili UID 3461582765951639）'; Projects = 'RenoDX HDR'; Url = 'https://space.bilibili.com/3461582765951639' },
         [pscustomobject]@{ Name = 'EndlesslyFlowering'; Projects = 'ReShade HDR shaders'; Url = 'https://github.com/EndlesslyFlowering/ReShade_HDR_shaders' },
-        [pscustomobject]@{ Name = '34736384'; Projects = 'FPS Unlocker'; Url = 'https://github.com/34736384/genshin-fps-unlock' },
+        [pscustomobject]@{ Name = '34736384'; Projects = 'FPS Unlocker（上游；本包使用其 fork）'; Url = 'https://github.com/34736384/genshin-fps-unlock' },
         [pscustomobject]@{ Name = 'OptiScaler contributors'; Projects = 'OptiScaler'; Url = 'https://github.com/optiscaler/OptiScaler' },
         [pscustomobject]@{ Name = 'crosire'; Projects = 'ReShade'; Url = 'https://reshade.me' }
     )

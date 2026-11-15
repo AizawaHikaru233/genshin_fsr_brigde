@@ -1,5 +1,5 @@
 ﻿{
-    "generatedAt":  "2026-11-08T17:46:35.1267279Z",
+    "generatedAt":  "2026-11-12T15:14:39.5242872Z",
     "optiscaler":  {
                        "Tag":  "v0.9.4",
                        "Asset":  "Optiscaler_0.9.4-final.20260718._MM.7z",
@@ -13,9 +13,9 @@
                  "DllSha256":  "D00B5B0AB29C3CA101B70C3A5ECB3A01B7EF33766A3383A28A18623083E6123E"
              },
     "fpsunlock":  {
-                      "Tag":  "v3.5.0",
+                      "Tag":  "v3.6.0",
                       "Asset":  "unlockfps_nc.exe",
-                      "Sha256":  "AB383E989A6EA0EA58024889BE36E622FC2DC75B0A3F84230DC907716A990C10"
+                      "Sha256":  "1C0A86705C83661CA67F704482839E6B30AE3673D4D6A7A065ED1534BCF77243"
                   },
     "reshade":  {
                     "Version":  "6.8.0",
@@ -30,7 +30,7 @@
                 "DllSha256":  "AAD4FCCCCB29084A655F9A4F9F613BD22C8C03FB4A0F8840148CC6543B4CCACE"
             },
     "renodx":  {
-                   "Version":  "0.2026.0714.1910",
+                   "Version":  "0.2026.1012.0135",
                    "Source":  "authorized-redistribution"
                }
 }
