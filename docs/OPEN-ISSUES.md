@@ -5,7 +5,7 @@
 > **改动历史不在这里**：某段代码为什么是现在这样，用 `git log` / `git blame` 查。
 > 条目关闭后直接删除；要留结论就移入文末「已解决」，并注明解决它的提交。
 
-最后更新：2026-11-14
+最后更新：2026-11-15
 
 ---
 
@@ -515,7 +515,7 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 - `SDK :` → `FFX SDK :`、`FSR :` → `FFX :`；ngx 模式下这两行明确标注 `(unused, backend=ngx)`，
   不再把未使用的 AMD SDK 与 `FSR?` 当成「这局在用什么」。
   注意 `BACKEND :` 行**无条件打印**、两个改名对 native 同样生效，故 native 下也从三行变四行。
-- `ngx_core init ok=1` 行追加 `dlss=<版本>`、`source=<来源>` 与 `provider=<kind>`：
+- `ngx_core init ok=1` 行追加 `dlss=<版本>`、`source=<来源>`、`provider=<kind>` 与 `entry=<路径>`：
   `ProviderHit` 的 `kind` 提升为全局供该行读取；`source` 取 `loaded` / `file` / `none`，
   用来区分「本进程已装载的模块」与「特征目录里的候选文件」—— 两条路可能给出同一版本号，只看数值无法区分。
   DLSS 版本取**已加载模块**的 FileVersion（`GetModuleHandleW` +
@@ -525,6 +525,11 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
   ⚠️ 该修复在**本会话内不可观测** —— 这段代码在 `g_inited = true` 之后，而 `ensure_init` 首行是
   `if (g_inited) return g_available`，一旦成功就再不会走到这里；退避窗口只用于**失败**的 init。
   真正会重读的只有 `shutdown_all()` 之后重建的情形。
+  `entry=<路径>` 是**真正被绑上 10 个 `NVSDK_NGX_D3D11_*` 导出的已装载模块**的完整路径，
+  与 `provider=<kind>`（从哪条路找来的）是两个不同事实：装 OptiScaler 时 `provider=` 常指向
+  DriverStore 那份 `_nvngx.dll`，而真正提供 `CreateFeature` 入口的是 `OptiScaler.dll`
+  —— 它劫持 `LoadLibraryW` 并返回自身 HMODULE。取不到打 `entry=(unknown)`。
+  该值只在导出绑定成功的唯一出口写一次，故恒等于最终采纳的那个模块（中途失败的候选不写）。
 - `Dx11FsrBridge/CMakeLists.txt` 链 `version` 库。用直接链接而非 `GetProcAddress`：
   少一条运行期失败路径，且依赖在加载期就暴露，不必等第一次读版本时才发现
   （与 `FufuGraphicsPlugin/CMakeLists.txt` 同写法）。
