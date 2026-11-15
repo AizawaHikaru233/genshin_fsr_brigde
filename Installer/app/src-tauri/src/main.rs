@@ -158,7 +158,7 @@ fn reapply(app: &AppHandle) -> String {
 
 /// DLSS 运行时的落点：桥和 OptiScaler 各自按自己的规则找文件，所以不止一处。
 /// - 桥：`NgxBackend::resolve_feature_dirs()` 在 `<payload>/Bridge/../NVIDIA/DLSS` 里找
-///   `nvngx_dlss.dll` —— 只装桥（`Ffx12Backend=ngx`，或 RTX 上的 `auto`）时这条就是唯一来源；
+///   `nvngx_dlss.dll` —— 只装桥（`DlssInput=2`，或 RTX 上的 `1`=auto）时这条就是唯一来源；
 ///   它同时也是「包内自带」的位置，所以排第一：先补齐它，后面的目标就能走「payload 里已有」。
 /// - OptiScaler：`NvngxDlssPath = auto` 相对**组件目录**解析（放版本根层在嵌套布局下找不到）。
 fn dlss_targets(s: &settings::Settings) -> Vec<PathBuf> {
@@ -180,12 +180,12 @@ fn dlss_targets(s: &settings::Settings) -> Vec<PathBuf> {
     targets
 }
 
-/// 需要这份运行时的两种情况：勾了 OptiScaler（它自己的 DLSS 扩展），或只装桥但桥会走 NGX。
+/// 需要这份运行时的两种情况：勾了 OptiScaler（它自己的 DLSS 扩展），或只装桥但桥会走 DLSS 直连。
 /// GTX 16 / A 卡（没被判定成 RTX）不部署 DLSS。
 fn dlss_applicable(s: &settings::Settings) -> bool {
     gpu::has_rtx()
         && (s.selected.iter().any(|id| id == "opti")
-            || s.selected.iter().any(|id| id == "bridge") && srinput::uses_ngx(s))
+            || s.selected.iter().any(|id| id == "bridge") && srinput::uses_dlss(s))
 }
 
 /// 补齐失败时**弹窗**（不再只是一条 toast）：把目标路径一起给界面，用户能直接打开目录手放。
@@ -772,7 +772,7 @@ fn on_switch_version(app: &AppHandle, msg: &Value) {
     );
 }
 
-/// 主页「超分输入类型」：只改**已安装那份** `Dx11FsrBridge.ini` 的 `Ffx12Backend`。
+/// 主页「超分输入类型」：只改**已安装那份** `Dx11FsrBridge.ini` 的 `DlssInput`。
 /// 规则跟随桥（只认精确小写的 auto / native / ngx），安装器不替它纠错；写成功后再补一次
 /// `nvngx_dlss.dll` —— 切到 ngx（或 RTX 上的 auto）时桥需要它，不能等下次安装。
 fn on_sr_input(app: &AppHandle, msg: &Value) {
@@ -785,7 +785,7 @@ fn on_sr_input(app: &AppHandle, msg: &Value) {
             ensure_dlss(app, &s);
         }
         Err(err) => {
-            log::write(&format!("[bridge] 写 Ffx12Backend 失败: {err}"));
+log::write(&format!("[bridge] 写 DlssInput 失败: {err}"));
             send(app, json!({ "type": "error", "message": err }));
         }
     }
