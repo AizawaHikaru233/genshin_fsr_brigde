@@ -74,7 +74,7 @@ $sdkRoot    = Join-Path $WorkspaceRoot "_msvc\sdkfull\c"
 $sdkInclude = Join-Path $sdkRoot "Include\10.0.22621.0"
 $sdkLib     = Join-Path $sdkRoot "Lib\10.0.22621.0"
 $ffxKit     = Join-Path $WorkspaceRoot "_ffxsdk\FidelityFX-SDK-main\Kits\FidelityFX"
-$outDir     = Join-Path $src "build"
+$outDir     = Join-Path $src "build-dlssbridge"   # 2026-11-16（审查 F5）：与 Build-Bridge.ps1 分开，避免 obj 互相污染
 $objDir     = Join-Path $outDir "obj"
 $tmpDir     = Join-Path $toolRoot "wtemp"
 

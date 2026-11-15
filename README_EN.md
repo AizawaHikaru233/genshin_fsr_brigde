@@ -395,7 +395,7 @@ If the game fails to start, FSR cannot be activated, switching upscalers causes 
 | # | File / Information | When it applies |
 | :---: | --- | --- |
 | 1 | `payload/Bridge/Dx11FsrBridge.log` | **Required** |
-| 2 | `payload/Bridge/ngx/nvngx.log` and the `nvngx_dlss_*.log` next to it | When using the built-in DLSS (NGX backend); the real directory is the one in the `ngx_core appdata=` log line |
+| 2 | `payload/Bridge/ngx/nvngx.log` and the `nvngx_dlss_*.log` next to it | When using the built-in DLSS (direct-connect layer). **This directory may not exist** — `nvngx.dll` is provided by the driver and does not necessarily write logs in a working directory; skip it if absent |
 | 3 | `payload/OptiScaler/OptiScaler.log` and `payload/OptiScaler/OptiScaler.ini` | When using OptiScaler |
 | 4 | `payload/ReShade/ReShade.log` | For ReShade-related issues |
 | 5 | `payload/AntiPlayerMosaic/AntiPlayerMosaic.log` | For anti-mosaic, UID, or underwater mosaic issues |
@@ -405,7 +405,9 @@ If the game fails to start, FSR cannot be activated, switching upscalers causes 
 
 When further diagnostics are needed, temporarily change `LogLevel` under `Log` in `OptiScaler.ini` (when OptiScaler is used) to `1 (Debug)` or `0 (Trace)`. Restore the release setting after diagnostics to avoid additional overhead.
 
-For the built-in DLSS, set `DlssInputJitterProbe` to `1` in `[Dx11FsrBridge]` of `payload\Bridge\Dx11FsrBridge.ini`
+For the built-in DLSS: setting `DlssInputJitterProbe` to `1` in `[Dx11FsrBridge]` of
+`payload\Bridge\Dx11FsrBridge.ini` dumps jitter phase samples (press F11 to arm).
+The log verbosity itself is controlled by `[Log] level` and is unrelated to this key.
 
 > [!CAUTION]
 > Do not submit game account details, login information, or screenshots containing personal information to a public Issue.

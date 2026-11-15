@@ -1,8 +1,8 @@
 ﻿# Build-Bridge.ps1 - 构建 Dx11FsrBridge（upstream main + DLSS 直连层）
 #
-# 这是本仓库唯一的桥构建脚本（旧的 Build-NgxOptimize.ps1 已改名）。
-# 与 2026-11-15 之前的差别：不再需要 NgxBackend.cpp 与
-# DX11FSRBRIDGE_ENABLE_NGX=1（超分改由 DlssInput.cpp 直接调 NGX）；
+# 本脚本构建**当前分支**（DLSS 直连层架构）。仓库里另有一份 `Build-DlssBridge.ps1`，
+# 它属于 `dlss-input` 开发分支、源文件列表与本分支不同（那份含 NgxBackend.cpp），
+# 两者输出到不同目录（build / build-dlssbridge），不要混用产物。
 # NgxParamMap.cpp 保留（纯计算层，FFX 路径与直连层共用）。
 # 源文件列表与 CMakeLists.txt 的 add_library() 对应。
 #

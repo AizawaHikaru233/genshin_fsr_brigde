@@ -124,6 +124,7 @@ $configValues = [ordered]@{
     # 直连层由桥自己持一份 NGX feature，不经 OptiScaler 代理。
     'DlssInput'                 = '1'   # 1=auto（默认）/ 2=force；0 等价于 auto（无 off 档）
     'DlssInputModule'           = 'nvngx.dll'
+    'DlssInputFeatureDirs'      = ''    # 空 = 自动探测（已加载模块目录 / 桥自身目录 / 桥目录\..\NVIDIA\DLSS）
     'DlssInputAllowRealNgx'     = '1'
     'DlssInputJitterMode'       = '3'   # 3 = ZeroCentred（实机基线，配错会全屏拖影）
     'DlssInputMotionSign'       = '1'   # 1 = 正 scale（实机基线）

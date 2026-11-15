@@ -3501,7 +3501,10 @@ static void log_focus_block(const char *state)
     // 直接附上即为 auto 的决策依据，不再造第二套摘要口径。
     // 2026-11-15：后端名改由直连层真值决定（原先看 ffx12::backend()，那个概念已移除）。
     // Ffx12Backend 键不再存在；超分路径由 DlssInput 决定（见日志 dlss_input_first_dispatch）。
-    const bool ngx_backend = (g_config.dlss_input_mode != 0);
+    // 2026-11-16（审查 F2）：判据从 `!= 0` 改成 `== 1 || == 2`。
+    // 桥侧 `DlssInput` 只有 1=auto / 2=force 两档，0 与未知值一律按 auto 处理
+    // （见路由点的注释）⇒「非 0 即 ngx」这个写法把 0 当成「关」，与那套口径矛盾。
+    const bool ngx_backend = (g_config.dlss_input_mode == 1 || g_config.dlss_input_mode == 2);
     std::string backend_text = ngx_backend ? "ngx" : "native";
     if (route != nullptr && !route->backend_auto_note.empty())
         backend_text += "  (" + route->backend_auto_note + ")";
@@ -4304,7 +4307,7 @@ void load_config()
     g_config.dlss_input_jitter_reduce = std::clamp<std::uint32_t>(
         static_cast<std::uint32_t>(GetPrivateProfileIntW(
             L"Dx11FsrBridge", L"DlssInputJitterReduce", 0, config_path.c_str())),
-        0u, 2u);
+        0u, 3u);   // 2026-11-16（审查 F4）：上限从 2 放到 3 —— None 档本就是"诊断"用途，被 clamp 掉就成了死档
     g_config.dlss_input_motion_fixup = std::clamp<std::uint32_t>(
         static_cast<std::uint32_t>(GetPrivateProfileIntW(
             L"Dx11FsrBridge", L"DlssInputMotionFixup", 0, config_path.c_str())),
@@ -4352,6 +4355,64 @@ void load_config()
     }(config_path);
     g_config.dlss_input_allow_real_ngx =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"DlssInputAllowRealNgx", 1, config_path.c_str()) != 0;
+    // ---- 【2026-11-16 审查 M8】已移除键的告警 ----
+    //
+    // NGX 代理后端换成 DLSS 直连层时删了 11 个键（见下方表）。按 2026-09-27 的先例
+    // （删 `legacy_log_keys_ignored`，理由：发布更新方式是覆盖安装），这里**不做**
+    // 逐键迁移提示 —— 但用户手改旧版 ini 时，那些键会被**静默忽略**，而 README
+    // 若还没同步就更难查。故只在发现时打**一条**汇总告警。
+    //
+    // 判据来源：`GetPrivateProfileSectionW` 读 `[Dx11FsrBridge]` 段的全部 "key=value"，
+    // 逐个比对一张静态表。这一段每进程只走一次（load_config 在 DllMain attach 早期），
+    // 不在任何热路径上 ⇒ 开销可忽略。
+    {
+        static const char *const k_removed_keys[] = {
+            "Ffx12Backend",        "NgxApplicationId", "NgxFeatureDirs",
+            "NgxHdr",              "NgxRenderPreset",  "NgxSetFrameTimeDelta",
+            "NgxUseReactiveMask",  "NgxLogLevel",      "NgxPassthrough",
+            "NgxProvider",         "NgxCrossKeyReuse",
+        };
+        wchar_t section_buf[8192] {};
+        const DWORD got = GetPrivateProfileSectionW(
+            L"Dx11FsrBridge", section_buf,
+            static_cast<DWORD>(std::size(section_buf)), config_path.c_str());
+        if (got > 0 && got < std::size(section_buf) - 1)
+        {
+            std::vector<std::string> found;
+            // 该 API 返回 "k=v\0k=v\0\0" 的连续块，逐个切
+            for (const wchar_t *p = section_buf; *p != L'\0'; p += wcslen(p) + 1)
+            {
+                const std::wstring entry(p);
+                const std::size_t eq = entry.find(L'=');
+                if (eq == std::wstring::npos)
+                    continue;
+                const std::string key = narrow(entry.substr(0, eq));
+                for (const char *removed : k_removed_keys)
+                {
+                    if (key == removed)
+                    {
+                        found.push_back(key);
+                        break;
+                    }
+                }
+            }
+            if (!found.empty())
+            {
+                std::string list;
+                for (std::size_t i = 0; i < found.size(); ++i)
+                {
+                    if (i != 0) list += ',';
+                    list += found[i];
+                }
+                g_config.logging.pending_warnings.push_back(
+                    "removed_keys_ignored count=" + std::to_string(found.size()) +
+                    " keys=" + list +
+                    " note=NGX proxy backend replaced by the DLSS direct-connect layer; "
+                    "these keys have no consumer - see Dx11FsrBridge.package.ini");
+            }
+        }
+    }
+
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     ffx12::set_dump_frames(static_cast<std::uint32_t>(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DumpFrames", 0, config_path.c_str())));
@@ -10763,6 +10824,10 @@ static std::atomic<std::uint32_t> g_route_vendor_id { 0u };
 // 路由结果缓存：-1=未决定 / 0=ffx / 1=dlss。只决定一次（显卡不会中途变）。
 // ⚠️ 必须是文件级：`try_fsr2_translation_draw` 在 dlss_gate 之外写它（M1 的失败回退）。
 std::atomic<int> g_path { -1 };
+// 2026-11-16（审查 §7.4）：上一次 DLSS 派发是否失败 —— 供 `FrameSpec::reset_dispatch_failed`。
+// 那条 reset 判据原先恒 false（三个 reset_* 字段无任何写入方）。
+// 放在文件级（与 g_path 同处）：`build_frame` 在 dlss_gate 之外的 draw 侧读它。
+static std::atomic_bool g_last_eval_failed { false };
 // DLSS 直连层的运行时与互斥：ensure_feature 会重建 feature，必须串行。
 // ⚠️ 必须是文件级 —— final_shutdown（atexit 路径）在 dlss_gate 之外调 shutdown()。
 dlss_input::Runtime g_runtime;
@@ -10980,7 +11045,14 @@ bool ensure_initialized(ID3D11Device *device, ID3D11DeviceContext *context)
                 add_dir_if_has_dll(rc.feature_dirs, full.substr(0, slash));
         }
     }
-    // ③ 桥自身目录
+    // ③ 桥自身目录 + 它的 ../NVIDIA/DLSS（payload 布局）
+    //
+    // ⚠️ 2026-11-16（审查 B6）：**必须同时扫 `..\NVIDIA\DLSS`**。
+    //   安装器与打包脚本把 58 MB 的 nvngx_dlss.dll 放在 `payload\NVIDIA\DLSS\`，
+    //   而本函数原来只扫「已加载模块目录」与「桥自身目录」⇒ 只装桥时三条候选
+    //   全不成立 ⇒ feature_dirs 为空 ⇒ CreateFeature 返回 0xBAD0000B。
+    //   这条路径是 main 侧 `NgxBackend.cpp` 的候选②（`base + "\\..\\NVIDIA\\DLSS"`），
+    //   本文件重写时把它丢了 —— 补回来。
     {
         wchar_t buf[MAX_PATH] {};
         // 取本 DLL 自身的句柄：GetModuleHandleExW 用 FROM_ADDRESS 反查，
@@ -10995,6 +11067,10 @@ bool ensure_initialized(ID3D11Device *device, ID3D11DeviceContext *context)
             const std::size_t slash = full.find_last_of(L"\\/");
             if (slash != std::wstring::npos)
                 add_dir_if_has_dll(rc.feature_dirs, full.substr(0, slash));
+            // ★ 同一份 full 顺手再试 payload 布局：安装器/打包脚本把 nvngx_dlss.dll
+            //   放在 `payload\NVIDIA\DLSS\`，而它既不是「已加载模块目录」也不是
+            //   「桥自身目录」⇒ 只装桥时三条候选会全落空（审查 B6）。
+            add_dir_if_has_dll(rc.feature_dirs, full.substr(0, slash) + L"\\..\\NVIDIA\\DLSS");
         }
     }
 
@@ -11063,6 +11139,15 @@ __declspec(noinline) static bool ensure_feature_guarded(const dlss_input::Featur
         *crash_code = static_cast<unsigned long>(GetExceptionCode());
         return false;
     }
+}
+
+// 2026-11-16（审查 §7.4）：暴露 active feature 的 desc 给 draw 侧，
+// 用于 `FrameSpec::reset_size_changed` 的判据 —— 那三级 reset 原先全是死字段
+// （`FrameSpec` 的三个 reset_* 只被 decide_reset 读、从无写入方）。
+// 返回 nullptr = 还没建过 feature。
+static const dlss_input::Feature::Desc *active_feature_desc()
+{
+    return g_runtime.has_active_desc() ? &g_runtime.active_desc() : nullptr;
 }
 
 __declspec(noinline) static bool evaluate_guarded(ID3D11DeviceContext *context,
@@ -11169,6 +11254,25 @@ bool ensure_depth_extract(ID3D11Device *device, ID3D11Texture2D *src)
     if (sd.Width == 0 || sd.Height == 0)
         return false;
 
+    // 已经是单通道浮点 ⇒ 不需要**格式转换**（也避免无谓的 pass）。
+    //
+    // ⚠️⚠️ 2026-11-16（审查 M2）：**这条路径不做 ×depth_scale 归一化**，是已知限制。
+    //
+    // 归一化乘数只写在 Compute Shader 里（`out_depth[...] * g_depth_scale`），
+    // 而本分支直接返回、不跑那个 pass ⇒ 源一旦是 R32_FLOAT，DLSS 收到的深度仍是
+    // 游戏原始值域 [0, ~0.03]，与 `DlssInputDepthScale=32` 的承诺不符。
+    //
+    // 后果（与下面 :11240 那段注释描述的一致）：前后景在数值上几乎不可分 ⇒
+    // DLSS 把背景整片当同一平面累积历史 ⇒ 运动中大面积拖影。
+    //
+    // 为什么这次不修：修法要么多跑一个只乘系数的 light pass（每次格式变化时一次，
+    // 代价可忽略），要么把 scale 传进调用方另行处理 —— 但两种都要把 `run_depth_extract`
+    // 的 nullptr 语义拆成「跳过」与「失败」两种，而那会牵动所有调用点。
+    // 当前游戏（原神）的深度纹理**不是** R32_FLOAT（实测走的是转换路径，日志里
+    // 没有 `dlss_depth_extract_skipped src_fmt=R32_FLOAT` 这一行），故本限制在本作上
+    // 不触发。它只影响「深度恰好已是 R32_FLOAT」的游戏/Mod 组合。
+    //
+    // 排障提示：若日志里出现下面这行且画面有拖影，先怀疑这里。
     // 已经是单通道浮点 ⇒ 不需要提取（也避免无谓的 pass）。
     // 这里**一定**要记日志：否则"深度格式本来是好的"与"提取失败"在日志里
     // 看起来完全一样，下次排障又会从零开始猜。
@@ -11870,6 +11974,27 @@ bool dispatch(ID3D11DeviceContext *context, const ffx12::FrameInput &in,
     spec.camera_fov_vertical = in.camera_fov_vertical;
     spec.reset_forced = in.reset && !first_frame;
     spec.reset_first_frame = first_frame;
+    // 2026-11-16（审查 §7.4）：`FrameSpec` 的三个 reset 字段原先**没有任何写入方**
+    // ⇒ `decide_reset` 里那三级判据恒 false（死代码）。现在接上真实来源。
+    //
+    // ⚠️ 三条都按「保守」写：只在**确有证据**时置 true，宁少 reset 不多 reset
+    //   （多余的 reset 会清掉历史，代价是画质；漏一次 reset 只影响一帧）。
+    //
+    //   size_changed    —— 本帧尺寸与「上次建 feature 用的尺寸」不同。
+    //                      基准取 runtime 里 active feature 的 desc，而不是另外记一份。
+    //   instance_changed —— 桥这一侧只有一条流水线（dlss_gate 自己持 runtime），
+    //                      实例切换对 DLSS 的表现与 size_changed 同效 ⇒ 留给 size 判据，
+    //                      本字段保持 false 并在头文件注明理由。
+    //   dispatch_failed  —— 上一帧 DLSS 派发失败过。
+    {
+        const dlss_input::Feature::Desc *active = dlss_gate::active_feature_desc();
+        spec.reset_size_changed = active != nullptr &&
+            (active->render_w != in.render_w || active->render_h != in.render_h ||
+             active->display_w != in.display_w || active->display_h != in.display_h);
+    }
+    spec.reset_instance_changed = false;
+    // `last_eval_failed` 由 `dlss_gate` 自己维护（见该命名空间内的 g_last_eval_failed）
+    spec.reset_dispatch_failed = g_last_eval_failed.load(std::memory_order_relaxed);
     spec.ms_since_last_dispatch = ms_since_last;
     // ---- mask 规划 ----
     // ⚠️ 与 ffx 路径的关键区别：ffx 的 reactive 是**后端内部**从 motion.b 合成的
@@ -12053,6 +12178,9 @@ bool dispatch(ID3D11DeviceContext *context, const ffx12::FrameInput &in,
                 " reset=" + std::to_string(frame.reset) +
                 " reason=" + frame.reset_reason);
         }
+        // 2026-11-16（审查 §7.4）：记下"上一次派发失败"，供下一帧的
+        // `FrameSpec::reset_dispatch_failed` 判据（那条判据原先恒 false）。
+        g_last_eval_failed.store(true, std::memory_order_relaxed);
         return false;
     }
 
@@ -12107,6 +12235,7 @@ bool dispatch(ID3D11DeviceContext *context, const ffx12::FrameInput &in,
             " reset=" + std::to_string(frame.reset) + "(" + frame.reset_reason + ")" +
             " mask=" + std::string(spec.mask.note));
     }
+    g_last_eval_failed.store(false, std::memory_order_relaxed);
     return true;
 }
 } // namespace dlss_gate
@@ -16049,7 +16178,7 @@ bool swapchain_control_hook_needed()
     // 直连层同样需要后缓冲格式的实时性（depth/motion 提取时要读描述），故改为
     // 「直连层开着」这个等价条件。
     return dlssg_dxgi_workaround_active() || hdr_swapchain_force_active() ||
-        g_config.dlss_input_mode != 0;
+        (g_config.dlss_input_mode == 1 || g_config.dlss_input_mode == 2);
 }
 
 bool swapchain_color_hook_needed()
@@ -16059,7 +16188,9 @@ bool swapchain_color_hook_needed()
     // 判定 DLSS 的 IsHDR 标志，纯 FFX 构型下这三个 hook 是纯透传。
     //
     // 判据改为「直连层开着」：与原来「只对 NGX 后端装」的覆盖面等价。
-    if (g_config.dlss_input_mode != 0)
+    // 2026-11-16（审查 F2）：同 3504 处 —— `DlssInput` 无「0=关」这一档，
+    // 0 与未知值都按 auto 处理 ⇒ 判据写 `1 || 2`，不写 `!= 0`。
+    if (g_config.dlss_input_mode == 1 || g_config.dlss_input_mode == 2)
         return true;
     return k_color_diagnostics_enabled || hdr_swapchain_spoof_active() || hdr_swapchain_force_active();
 }
@@ -16929,18 +17060,21 @@ void initialize()
         for (const std::string &warning : g_config.logging.pending_warnings)
             LOG_WARN(blog::cat::config, warning);
         g_config.logging.pending_warnings.clear();
-        // 后端选择状态行（SDS §3.13.2 第 2 条）：在 logger 起来 + 告警回放之后，
-        // 按已生效的 ffx12::backend() **恰输出一条**，两种模式都可取证。
-        // 走 blog::cat::config 并在日志器初始化之后，故不依赖 NGX 编译开关或 ensure_init。
-        // Ffx12Backend=auto 在这一行必然还是 pending（设备尚未创建 ⇒ 适配器信息未到），
-        // 故追加 auto=pending；落位时 resolve_backend_auto() 会再打一条同格式行
-        // （ngx_core backend=… auto=… vendor=… gpu="…"）——两条成对出现，可直接当验收判据。
-        // 2026-11-14（见 RouteSnapshot 注释）：resolved 改原子后这里用 acquire 读，
-        // 语义与旧裸 bool 一致 —— 设备还没创建时必然还是 pending。
-        // 2026-11-15（审查 B4）：auto 链已删，auto=pending 后缀无来源（恒空）。
-        // 保留变量名是为了让下面那行 LOG_INFO 的 diff 最小。
-        const std::string auto_suffix;
-        LOG_INFO(blog::cat::config, "ngx_core backend=native" + auto_suffix);
+        g_config.logging.pending_warnings.clear();
+        // 超分路径状态行：按**真实路由**输出，与焦点块的 `BACKEND :` 用同一判据。
+        //
+        // ⚠️ 2026-11-16（审查 F3）：这里原来是硬编码的 `"ngx_core backend=native"`，
+        //   而焦点块按 `dlss_input_mode` 判出 `ngx` ⇒ 同一份启动日志两行互相矛盾。
+        //   原注释还在引用 `resolve_backend_auto()`「落位时再打一条同格式行」——
+        //   该函数已随审查 B4 删除，那段说明也已失效。
+        //
+        //   现在与 `:3507` 的焦点块共用同一表达式，保证两行永远一致。
+        {
+            const bool dlss_active =
+                (g_config.dlss_input_mode == 1 || g_config.dlss_input_mode == 2);
+            LOG_INFO(blog::cat::config,
+                     std::string("ngx_core backend=") + (dlss_active ? "dlss" : "ffx"));
+        }
     }
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)

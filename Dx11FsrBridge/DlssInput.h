@@ -419,7 +419,17 @@ struct RouteInput
     Vendor vendor = Vendor::Unknown;
     bool optiscaler_present = false;
     bool dlss_runtime_present = false; // nvngx.dll 可解析到 NVSDK_NGX_D3D11_*
-    int user_preference = -1;          // ini：-1=auto / 0=ffx / 1=dlss
+    // 2026-11-16（审查 F2 / §7.4）：**生产路径永不传 0**。
+    //
+    // 桥侧的实现是 `in.user_preference = (mode == 2) ? 1 : -1` ——
+    // 只有 1（force dlss）与 -1（auto）两种取值。原来的 `0 = ffx` 之所以被删，
+    // 是因为它会让桥自己跑 FFX 超分，与 OptiScaler 的 Dx11Upscaler=dlss 抢同一条
+    // draw（实机 07:27:51 卡死）。`DlssInput` 键因此只有 1=auto / 2=force 两档。
+    //
+    // `route_output` 里 `user_preference == 0` 那个分支**保留**但生产路径不可达 ——
+    // 它是一条契约层的显式「我不走 DLSS」信号，供将来若支持运行中切换时使用。
+    // 单测覆盖它，是为了在那天明文钉住这条语义。
+    int user_preference = -1;   // -1=auto / 1=force dlss；0 见上方说明（生产路径不产生）
     // 2026-11-15（审查 B3）：auto 分支是否允许直接用 NVIDIA 原生 NGX。
     // 接通前 auto 只看 `dlss_runtime_present`（= 模块**已加载**），而无 OptiScaler
     // 时游戏根本不加载 nvngx.dll ⇒ auto 恒回 FFX，直连层从代码上不可达。
@@ -755,6 +765,11 @@ class Runtime
     // ⚠️ `context` **必须**传游戏的 immediate context：NGX 的 D3D11 CreateFeature
     //    用 `InDevCtx->GetDevice()` 反查设备，传 null 会在 OptiScaler 内部 READ 0x0。
     bool ensure_feature(const Feature::Desc &desc, ID3D11DeviceContext *context);
+    // 2026-11-16（审查 §7.4）：暴露 active feature 的 desc，供调用方判断「尺寸变了」。
+    // 返回 nullptr = 还没建过 feature（此时任何尺寸都算"first frame"，由 first_frame 判据处理）。
+    // 返回的指针指向 runtime 内部存储，只在下次 ensure_feature 之前有效。
+    bool has_active_desc() const { return feature_.alive(); }
+    const Feature::Desc &active_desc() const { return current_; }
     Feature &feature() { return feature_; }
     const std::string &feature_error() const { return feature_.error(); }
     void shutdown();

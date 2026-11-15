@@ -382,7 +382,7 @@ Bridge 和反虚化组件默认会保留错误日志（接入 OptiScaler/ReShade
 | # | 文件 / 信息 | 适用场景 |
 | :---: | --- | --- |
 | 1 | `payload/Bridge/Dx11FsrBridge.log` | **必须** |
-| 2 | `payload/Bridge/ngx/nvngx.log` 与同目录的 `nvngx_dlss_*.log` | 使用内置 DLSS（NGX 后端）时；目录以日志里 `ngx_core appdata=` 那行为准 |
+| 2 | `payload/Bridge/ngx/nvngx.log` 与同目录的 `nvngx_dlss_*.log` | 使用内置 DLSS（直连层）时。**这个目录可能不存在**：`nvngx.dll` 是驱动提供的，它不一定在工作目录写日志；找不到就跳过 |
 | 3 | `payload/OptiScaler/OptiScaler.log` 与 `payload/OptiScaler/OptiScaler.ini` | 使用 OptiScaler 时 |
 | 4 | `payload/ReShade/ReShade.log` | 涉及 ReShade 时 |
 | 5 | `payload/AntiPlayerMosaic/AntiPlayerMosaic.log` | 涉及反虚化、UID 或水下马赛克时 |
@@ -392,7 +392,8 @@ Bridge 和反虚化组件默认会保留错误日志（接入 OptiScaler/ReShade
 
 需要进一步排查时，可临时将 `OptiScaler.ini`（接入 OptiScaler 时）中 `Log` 下的 `LogLevel` 改为 `1（Debug）`或 `0（Trace）`，但诊断结束后应恢复正式配置以避免额外开销。
 
-排查内置 DLSS 时，可把 `payload\Bridge\Dx11FsrBridge.ini` 的 `[Dx11FsrBridge] DlssInputJitterProbe` 设为 `1` 调到 `2`（info）或 `3`（debug）；默认 `1` 只记录错误级的取证行（`ngx_core …` 与 NGX 自己的返回码）。
+排查内置 DLSS 时：把 `payload\Bridge\Dx11FsrBridge.ini` 的 `[Dx11FsrBridge] DlssInputJitterProbe`
+设为 `1` 可打印抖动相位采样（按 F11 触发）。日志等级另由 `[Log] level` 控制，与这个键无关。
 
 > [!CAUTION]
 > 不要把游戏账号、登录信息或包含个人信息的截图提交到公开 Issue。

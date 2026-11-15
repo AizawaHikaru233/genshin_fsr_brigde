@@ -8,18 +8,65 @@
 
 ## 0. 一句话结论
 
-原桥在 N 卡上的问题**不是"没适配 N 卡"，而是"选错了输入契约"**。
+**本改造是把 NGX 的参数填充层从平台代码里剥离出来，写成可单测的纯函数，并给 NGX 入口加上 SEH 守卫 —— 不是"换了输入契约"。**
 
-它把自己伪装成一个 **FSR2 游戏**（`ffxFsr2ContextDispatch` / `ffxDispatchDescUpscale`），于是 OptiScaler 只能走 **FSR2/FFX 输入**那条**降级**链路，DLSS 拿到的是"按 FSR2 语义标定过"的 jitter / 运动矢量 / 色彩 / 蒙版。这条路线上有 6 处**架构级**语义错配，且其中至少 2 处（jitter 被钳成常量、PQ 码值被当作 HDR）**不可能靠 ini 配置修正**。
+### 先说清楚「不是什么」
 
-本改造新增**第二条输入契约**：桥反过来伪装成一个 **DLSS 游戏**（`nvngx` 客户端），直接按 `NVSDK_NGX_*` 的参数表逐帧填值。于是：
+> ⚠️ 2026-11-16（审查 §7.1 / §7.6 更正）：本节旧版写过「原桥伪装成 FSR2 游戏 ⇒ OptiScaler 只能走降级链路 ⇒ 本改造新增第二条输入契约」。
+> **那个说法是错的**，同一份文档的 §1 早就逐条否掉了它：
+>
+> - 当前基线已经没有 `ffxFsr2*` 导出，也没有 GetProcAddress shim（§1.1）；
+> - 「桥 + OptiScaler」从来不是「桥把 FSR2 转给 OptiScaler」，而是**两条独立链路并行**（§1.2）；
+> - 换输入类型**不会**改变 OptiScaler 用哪个后端（§1.3）。
+>
+> 代码侧也坐实这一点：`git diff main...HEAD -- Dx11FsrBridge/Ffx12Backend.h` 只删了 5 行
+> （`enum BackendKind` / `set_backend` / `backend` 及两行注释），**`struct FrameInput` 逐字未动**。
+> 桥这一侧的「输入契约」只有那一个结构体，不存在第二份。
+>
+> 「DLSS input」是 **OptiScaler 侧**的术语（它的 `ApiUpscalerInput` 枚举 + `CompareFileNameW`
+> 的匹配规则）。桥侧没有这个对象 —— 桥只有「一份 `FrameInput` + 两个输出后端」。
+> 而 main 的 `NgxBackend` 早在用同一套机制（`LoadLibraryW(L"_nvngx.dll")` 被 OptiScaler
+> 的 `LdrLoadDll` 钩子截获 ⇒ 在 OptiScaler 视角下它本来就是 DLSS input）。
 
-- 有 OptiScaler 时 → OptiScaler 走 `ApiUpscalerInput::DLSS_DX11`（**完整信息**），DLSS/XeSS/FSR 都能选；
-- 没有 OptiScaler 时 → 直接接 NVIDIA 的 `nvngx.dll`，**N 卡像 A 卡直出 FSR4 一样直出 DLSS**。
+### 那这次改的是什么
 
-两条路径共用**同一份**输入抓取（draw 识别 / il2cpp token / 资源槽位 / 归属裁决），差别只在"喂给谁"。
+| 项 | main | 本分支 |
+|---|---|---|
+| 参数填充层的位置 | 埋在 `NgxBackend.cpp`（4561 行，与 D3D12/池/feature 生命周期混在一起）| 剥成 `DlssInput.h/.cpp`（零平台依赖的纯函数层）|
+| 可测性 | 只有 `NgxParamMapTest` 11 节 | `DlssInputTest.cpp` 13 节 / **651 checks** |
+| NGX 入口的 SEH 守卫 | `NgxBackend.cpp` 里 `__try` **0 处** | 三个 `__declspec(noinline)` 包装：`init_ngx_guarded` / `ensure_feature_guarded` / `evaluate_guarded` |
 
----
+**净行为差异**（逐项对照 main 的 `NgxBackend` 填充逻辑，默认等价 8 项）：
+
+| # | 项 | main | 本分支 |
+|---|---|---|---|
+| 1 | depth 归一化 | 恒 `1.0f` | 默认 **32.0f**（`DlssInputDepthScale`）|
+| 2 | DLSS 选档 | 向 NGX 问六档 range 后选 | **纯阈值**（无 range 查询）|
+| 3 | TransparencyMask | 无此键 | 与 `kBiasMask` 同时设（默认都不绑）|
+
+`IsHDR` **不算差异**：main 默认 `NgxHdr=0` 就是强制 SDR，两侧默认等价；
+本分支减少的只是可选的 `auto/1` 入口。
+
+### 真正的收益（两件，均可单独摘出）
+
+1. **映射层纯函数化 + 单测** —— 见上表前两行。
+2. **三个 SEH 守卫** —— `main` 的 `NgxBackend.cpp` 里 `__try` 零处；本分支把
+   三处 NGX 入口调用都包了 SEH，任何访问违例只让本次失败，不带走进程。
+
+### 代价（如实记录）
+
+- **−RenderPreset**：`NgxRenderPreset` 键与六个 `NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_*` 一并移除。
+- **−DLSS 直连侧的 range 查询**：选档退回纯阈值（见上表第 2 行）。
+- **−`Ffx12Backend` 强制 native 的能力**：该键随 NGX 代理后端一起移除。
+- **11 个用户可见键消失**：`Ffx12Backend` / `NgxApplicationId` / `NgxFeatureDirs` / `NgxHdr` /
+  `NgxRenderPreset` / `NgxSetFrameTimeDelta` / `NgxUseReactiveMask` / `NgxLogLevel` /
+  `NgxPassthrough` / `NgxProvider` / `NgxCrossKeyReuse`。旧 ini 里这些键会被静默忽略，
+  `load_config` 现有一条 `removed_keys_ignored` 汇总告警提示它们已无消费者。
+- **不再 vendor NVIDIA 头 ≠ 合规改善**：真实减少的是**维护负担**（`third_party/ngx/` 5 个文件
+  77,822 B + `tools/Fetch-NgxHeaders.ps1` 207 行全删）。但二进制仍调用该 SDK
+  （`DlssInput.cpp` 19 处 + `DlssInput.h` 13 处 `NVSDK_NGX` 引用），而 main 原本随包分发
+  `NVIDIA-NGX-SDK-LICENSE.txt` 履行了随附许可文本义务 —— 这个履行在本分支被删掉了。
+  结论不是「风险降低」，而是「文本义务少一件，风险不变或略升」。
 
 ## 1. 先纠正三个错误前提
 
@@ -41,7 +88,7 @@
 | 残留日志块被 `DX11FSRBRIDGE_SERVER_DEBUG_RUNTIME` 门控，而该宏**全仓无定义** | `Dx11FsrBridge.cpp:7019-7032` |
 | 该块调用的 `fsr2_get_proc_address_shim_query_mask()` **无定义体** ⇒ 定义该宏会**链接失败** | 同上 |
 
-⇒ `OPTISCALER_COMPATIBILITY.md` 是**过期文档**（最后修改 2026-07-21，早于删除）。本次已将其改写为"当前真实契约"。
+⇒ `OPTISCALER_COMPATIBILITY.md` 是**过期文档**（最后修改 2026-07-21，早于删除）。**本分支没有改它** —— 若要改需单独提交
 
 ### 1.2 v1.1.5 那六个导出**什么都不转发**（历史参考）
 
@@ -238,9 +285,9 @@ TextureLoader 在 N 卡上的问题至今没定位的原因（README 自己写�
 2. **绝不静默失败**。任何失败都带可读原因：`create_feature_failed(0x%08X)` / `ngx_init_failed(0x%08X)` /
    `params_null` / `bad_sizes` / `missing=...`。初始化失败后**永久退回 ffx**（不每帧重试），并打一条 WARN。
 3. **绝不把桥已有的行为改成"只在 N 卡上对"**。wrap 与 clamp 在值本来合法时**逐位相同**；
-   `DlssInput` 默认 **0=关**。A 卡用户不显式打开就完全不受影响。
-
----
+   `DlssInput` 默认 **1=auto**：auto 只在「N 卡 + 能拿到 NGX」时才切直连，A 卡用户不受影响。
+   **没有 `0=off` 这一档** —— 旧设计里 0 表示「显式选 FFX」，那会让桥自己跑 FFX 超分，
+   与 OptiScaler 的 `Dx11Upscaler=dlss` 抢同一条 draw（实机卡死）。
 
 ## 5. 落地改动清单
 
@@ -256,10 +303,10 @@ TextureLoader 在 N 卡上的问题至今没定位的原因（README 自己写�
 
 | 文件 | 改动 |
 |---|---|
-| `Dx11FsrBridge/Dx11FsrBridge.cpp` | ① 新增 `dlss_gate` 命名空间（路由 + 首次初始化 + 一次派发）；② `Config` 增 5 个 `dlss_input_*` 字段；③ `load_config()` 读同名 ini 键；④ **唯一派发点**改为"路由决定喂 ffx 还是 NGX" |
+| `Dx11FsrBridge/Dx11FsrBridge.cpp` | ① 新增 `dlss_gate` 命名空间（路由 + 首次初始化 + 一次派发）；② `Config` 增 **14** 个 `dlss_input_*` 字段；③ `load_config()` 读同名 ini 键；④ **唯一派发点**改为"路由决定喂 ffx 还是 NGX" |
 | `Dx11FsrBridge/Dx11FsrBridge.cpp`（`record_adapter_info`） | 新增 `g_route_vendor_id`（数值 vendor id）；原先只有 `"0x10DE"` 字符串标签，路由要按厂商决策 |
 | `Dx11FsrBridge/CMakeLists.txt` | 主 target 加 `DlssInput.cpp`；新增 `DlssInputTest` target + `add_test` |
-| `Dx11FsrBridge/OPTISCALER_COMPATIBILITY.md` | 改写为**当前真实契约**（原文描述的六个导出已不存在） |
+| `Dx11FsrBridge/OPTISCALER_COMPATIBILITY.md` | **本分支未改**（该文件最后修改 2026-07-21）。若要同步需单独提交 —— 它描述的六个 `ffxFsr2*` 导出确实已不存在，但那是基线状态，不是本分支的改动 |
 
 ### 5.3 派发点的改动（最小侵入）
 
@@ -346,7 +393,8 @@ clang++ -std=c++20 -O1 -Wall -Wextra -static `
 ./DlssInputTest.exe
 ```
 
-CMake 侧也已接入（`DX11FSRBRIDGE_BUILD_TESTS=ON` 时自动 `add_test`）。
+CMake 侧已接入：`NgxParamMapTest` 与 `DlssInputTest` 的 `add_test` 都在
+`if(DX11FSRBRIDGE_BUILD_TESTS)` **之前**，即**无条件**注册（该开关只控制其余几个测试 target）。
 
 覆盖：jitter 的**多样性差异**（本项目最核心的 N 卡缺陷）、wrap 边界与负值对称性、cb0 一帧相位补偿、
 MV 符号两种修法、PQ 不得标 HDR、AutoExposure 需真绑曝光纹理、perf quality 量化与改写规避、
@@ -376,10 +424,11 @@ SEH self-check:
 SHA-256。没有它链接器会把当前时间写进 PE 头，每次重建哈希都变，"这两个二进制是不是
 同一份"就变得无法回答。
 
-- 9 个编译单元（8 个 .cpp + 1 个 .rc）全部通过，**零编译警告**。
+- **10** 个编译单元（9 个 .cpp + 1 个 .rc）全部通过，**零编译警告**。
+  （CMake 的 `add_library` 含 8 个 .cpp + `.rc`，`target_sources` 再加 `DlssInput.cpp`）
 - 依赖只有系统 DLL（静态 CRT ⇒ 不需要 VC 运行库）。
 - **Exception Directory 存在**（0x5910 字节）⇒ 19 处 `__try` 是真正的 SEH 保护。
-- 版本资源正确：`FileVersion 2.4.0.0` / `FileDescription "Genshin Impact DX11 FSR Bridge"`。
+- 版本资源正确：`FileVersion 2.5.0.0` / `FileDescription "Genshin Impact DX11 FSR Bridge"`。
 - 无导出（注入型 DLL），有 `DllMain` 入口点。
 - 新代码确实编入：二进制内含 `dlss_input_route` / `dlss_input_init_ok` / `dlss_input_frame` /
   `dlss_input_fallback_to_ffx` 等字符串，以及 5 个 `DlssInput*` ini 键名（宽字符）。
@@ -401,7 +450,8 @@ SHA-256。没有它链接器会把当前时间写进 PE 头，每次重建哈希
 ### 7.1 最小验证（N 卡 + OptiScaler）
 
 1. 装最新桥 + OptiScaler（顺序：**Bridge 先、OptiScaler 后**，现有脚本已保证）。
-2. `Dx11FsrBridge.ini` 里加 `DlssInput=1`。
+2. 确认 `Dx11FsrBridge.ini` 的 `DlssInput=1`（**默认就是 1**，这一步通常无需操作；
+   设 `2` 可强制走直连，用于排除 auto 判据的影响）。
 3. `OptiScaler.ini` 里 `[Upscalers] Dx11Upscaler=dlss`（或 `dlss_on12`）、`Dx12Upscaler=dlss`。
 4. 进游戏，开 FSR2 抗锯齿 + 渲染精度 < 1。
 5. 看 `Dx11FsrBridge.log`：
