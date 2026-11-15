@@ -55,19 +55,17 @@ $routes = @()
 #    已从发布版整块剔除：本清单与发布模板都不再包含它们；需要诊断请用开发构建。
 #    Diagnostic keys are excluded from the release build - do not add them back here.
 #
-# ⚠️ 四个**故意不写**的例外：
+# ⚠️ 三个**故意不写**的例外：
 #    · Ffx12AsyncUpscale —— 由安装器 / 芙芙启动器按显卡自动写入（RDNA2→0、其他→1），
 #      本脚本写死 1 会与它的按显卡判定打架；
 #    · Ffx12DllPath     —— 路径键：留空即"随包 payload\AMD 的 SDK"，本脚本不覆盖
 #      用户自定义路径；
-#    · Ffx12Backend     —— **部署脚本不得静默改写用户已选的后端**（auto / native / ngx 三种都算）。
-#      本脚本每次部署都跑，若在这里写死任何一个值，都会把用户手改的选择清掉，
-#      而后端写错是**静默**的（回落到 native 只是性能/画质变化，不会崩、不会报错）。
-#      缺键时走代码内建缺省——与发布模板同为 auto（load_config 的 lpDefault=L"auto"），
-#      所以不写这个键也天然安全，用户手改的值也就保得住。
+#    · （原 Ffx12Backend 例外已删除：该键随 NGX 代理后端一起移除，现由 DlssInput 取代。
+#      DlssInput **在** $configValues 表里 —— 新装用户需要它有个明确默认值，
+#      而 ini 里缺键时桥按 1=auto 处理，两者一致，不存在"覆盖用户选择"的风险。）
 #    · Ffx12SingleInstance —— 发布模板缺省 0=全部接管（FFX 后端多机位/分屏场景的正确值），
-#      NGX 后端在代码里无视该键、一律按 1 处理。本脚本每次部署都跑，写死任一个值都会盖掉
-#      用户的手改；缺键时走代码内建缺省（同为 0，load_config 的 lpDefault=0），故不写也安全。
+#      本脚本每次部署都跑，写死任一个值都会盖掉用户的手改；缺键时走代码内建缺省
+#      （同为 0，load_config 的 lpDefault=0），故不写也安全。
 $configValues = [ordered]@{
     # ---- 1. 核心功能 / Core features ----
     'Enabled'                   = '1'

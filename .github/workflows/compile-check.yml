@@ -245,7 +245,8 @@ jobs:
           # 宽字符串必须按 UTF-16 查（AGENTS.md §四.A）
           $bytes = [IO.File]::ReadAllBytes((Resolve-Path $dll).Path)
           $uni = [Text.Encoding]::Unicode.GetString($bytes)
-          foreach ($needle in @('NgxRenderPreset', 'NgxHdr', 'ngx_hdr_decision')) {
-            if (-not $uni.Contains($needle)) { throw "NGX config string '$needle' missing from $dll" }
+          # 2026-11-15：NGX 代理后端已换成 DLSS 直连层，检查直连层的特征串。
+          foreach ($needle in @('DlssInputJitterMode', 'DlssInputDepthScale', 'DlssInputModule')) {
+            if (-not $uni.Contains($needle)) { throw "DLSS direct-connect string '$needle' missing from $dll" }
           }
-          Write-Host 'NGX config strings present in binary'
+          Write-Host 'DLSS direct-connect strings present in binary'

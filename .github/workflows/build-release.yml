@@ -111,12 +111,14 @@ jobs:
           $bytes = [IO.File]::ReadAllBytes($dll)
           # 宽字符串必须按 UTF-16 查（AGENTS.md §四.A）
           $uni = [Text.Encoding]::Unicode.GetString($bytes)
-          foreach ($needle in @('Ffx12Backend', 'NgxRenderPreset', 'NgxHdr', 'ngx_hdr_decision')) {
+          # 2026-11-15：桥已改用 DLSS 直连层（DlssInput），NGX 代理后端的键全部移除。
+          # 这里检查直连层的特征串 —— 它们缺失说明构建漏了 DlssInput.cpp。
+          foreach ($needle in @('DlssInputJitterMode', 'DlssInputDepthScale', 'DlssInputModule')) {
               if (-not $uni.Contains($needle)) {
-                  throw "NGX string '$needle' missing from the packaged bridge - this build downgraded to NGX OFF"
+              throw "DLSS direct-connect string '$needle' missing from the packaged bridge - DlssInput.cpp probably not compiled in"
               }
           }
-          Write-Host "NGX backend present in $($archive.Name) (bridge $($bytes.Length) bytes)"
+          Write-Host "DLSS direct-connect layer present in $($archive.Name) (bridge $($bytes.Length) bytes)"
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
