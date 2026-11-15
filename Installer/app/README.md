@@ -255,16 +255,19 @@ Windows 的 `curl.exe` 并不保证存在（本机 `System32` 里就没有）。
 - 芙芙启动器（FuFuLauncher）：插件已上架插件商城，在商城装「FSR-Bridge-Plugin（原神FSR2桥接插件）」后用芙芙启动即可，不需要填路径。
 - `state` 字段：`desktopShortcut` / `unlockerDir` / `shortcutName`。
 
-## 超分输入类型（Ffx12Backend）
+## 超分输入类型（DlssInput）
 
 主页「帧率上限」与「安装内容」之间的一行，镜像已安装那份 `payload\Bridge\Dx11FsrBridge.ini` 的
-`[Dx11FsrBridge] Ffx12Backend`，改完立刻写盘（消息 `srInput`，只收 `auto` / `native` / `ngx`）。
+`[Dx11FsrBridge] DlssInput`，改完立刻写盘（消息 `srInput`，只收 `1` / `2`）。
 
-- **界面名 → 写入值**：`Auto` → `auto`、`FFX` → `native`、`NVNGX` → `ngx`。
-  界面上不出现 `native` 这个词：它选的是「超分输入接口由谁提供」，不是选超分算法。
-- **规则跟随桥**：文件里没有该键、或值不是这三个之一，一律按 `auto` 显示（桥对非法值也是回退 `native`，
-  所以界面显示 `FFX` 而文件里是脏值这种组合不会出现）。
-- **何时用到 NVNGX**：`ngx` ⇒ 一定；`auto` ⇒ 本机是 RTX 时；其余 ⇒ 不会。DLSS 运行时补齐按这个判据决定
+- **界面名 → 写入值**：`Auto` → `1`、`强制 DLSS` → `2`。
+  界面上不出现 `DlssInput` / `ffx` 这些词：它选的是「超分输入接口由谁提供」，不是选超分算法。
+- **没有 `0` 这一档**：旧版的 `Ffx12Backend=native` 已随 NGX 代理后端一起移除。
+  桥侧 `0` 会让它自己跑 FFX 超分，与 OptiScaler 的 `Dx11Upscaler=dlss` 抢同一条 draw ⇒ 实机卡死。
+  `srinput::VALUES` 只有 `["1", "2"]`，且有单测钉住「没有 0」这件事。
+- **规则跟随桥**：文件里没有该键、或值不是这两个之一，一律按 `1`（Auto）显示 ——
+  桥侧的映射是 `mode == 2 ? force : auto`，所以除 `2` 之外的一切都等价于 auto。
+- **何时用到 DLSS**：`2` ⇒ 一定；`1` ⇒ 本机是 RTX 且能拿到 NGX 时。DLSS 运行时补齐按这个判据决定
   （见下一节）。
 - **桥没装时置灰**：找不到 `Dx11FsrBridge.ini`（`srInput.available = false`）就禁用这一行。
 - 备注文案写在行内（`.srnote`）：说明这是超分输入接口、不是超分选择。
@@ -274,13 +277,15 @@ Windows 的 `curl.exe` 并不保证存在（本机 `System32` 里就没有）。
 - **触发条件**：检测到 RTX 架构 N 卡（`gpu::has_rtx()`：设备 ID 属 RTX 世代且不是 GTX 16，或型号名含 `RTX`）
   时，只要满足下面任一条就补齐：
   - 勾了 `OptiScaler`（它的 NGX 需要 `nvngx_dlss.dll`）；
-  - 勾了 `Dx11FsrBridge` 且「超分输入类型」实际会走 NVNGX（`srinput::uses_ngx()`：`NVNGX`，或 `Auto` 且本机是 RTX）。
+  - 勾了 `Dx11FsrBridge` 且「超分输入类型」实际会走直连（`srinput::uses_dlss()`：`2`，或 `1` 且本机是 RTX）。
 
-  只装桥的用户因此也能拿到运行时 —— 以前只在勾 OptiScaler 时才下载，`auto` 在 RTX 上选了 `ngx` 却没有
-  `nvngx_dlss.dll`，表现成「没有超分」。
+  只装桥的用户因此也能拿到运行时 —— 直连层的 `PathListInfo` 要指向一个**确实含**
+  `nvngx_dlss.dll` 的目录，否则 `CreateFeature` 返回 `0xBAD0000B`（PathListInfo 配错）。
 - **放在哪**（两个目标，缺哪个补哪个）：
-  - `payload\NVIDIA\DLSS\nvngx_dlss.dll`：桥的 `NgxBackend::resolve_feature_dirs()` 会在
-    `payload\Bridge\..\NVIDIA\DLSS` 下找它，也是「随包内置」的位置，所以排第一；
+  - `payload\NVIDIA\DLSS\nvngx_dlss.dll`：历史位置，保留兼容；
+  - **桥所在目录**（`payload\Bridge\`）：直连层的候选顺序里「桥自身目录」是第 ③ 项，
+    而 ① 已加载模块目录 ② ini 的 `DlssInputFeatureDirs` 在纯安装场景下都不成立 ⇒
+    这一份是「只装桥」时**唯一**能被自动找到的位置。
   - OptiScaler 的**组件目录**（嵌套布局下是 `OptiScaler_v0.10.0\OptiScaler\`）：ini 的
     `NvngxDlssPath = auto` 相对 `OptiDllPath` 解析，放根层 N 卡上会找不到 DLSS。
 

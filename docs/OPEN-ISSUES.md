@@ -769,7 +769,18 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 - **覆盖范围有限**：一台机器、一个 DLSS 版本、3840x2160 一种分辨率；
   external provider 的单例回退对照未做。
 
-### 发布管线不启用 NGX 构型（2026-11-10）
+### ~~发布管线不启用 NGX 构型（2026-11-10）~~ 已被移除，见下
+
+**2026-11-15 更新**：NGX 代理后端（`NgxBackend.cpp` 与整个 `third_party/ngx/`）
+已被 DLSS 直连层取代（`DlssInput.cpp` 自己声明最小 NVSDK_NGX ABI，不 vendor 任何
+NVIDIA 头）。因此下面这段「把 NGX 头随仓库分发」的决策**整体作废**：
+`Fetch-NgxHeaders.ps1` 已删除、`payload\\Bridge\\NVIDIA-NGX-SDK-LICENSE.txt` 不再生成、
+`build-release.yml` 的断言串已换成直连层特征串。
+
+保留以下原文作为历史依据（含当时评估过的许可风险，对理解为何最终选择
+「不 vendor 专有头」有参考价值）：
+
+#### 原记录（2026-11-10）
 
 **解决提交**：《chore(ngx): NVIDIA NGX 头随仓库分发，发布构型启用 NGX 后端》（`git log --oneline --grep=chore(ngx)` 可定位）。
 
@@ -782,7 +793,10 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 
 **残余风险（务必知悉）**：这不是许可合规，只是「先例多、执行风险低」。NVIDIA RTX SDKs License §4.e 禁止使 SDK 受开源许可约束，§2.c 要求以同等保护条款分发，RTX Supplement §1 把授权限定在 NVIDIA GPU 系统；本仓库以 GPL-3.0-or-later 分发含 NGX 代码的二进制因此仍与之冲突，风险落点是编译并分发该二进制的人。
 
-### `third_party/ngx/README.md` 与实际脚本不一致（2026-11-10）
+### ~~`third_party/ngx/README.md` 与实际脚本不一致（2026-11-10）~~ 文件已删除
+
+**2026-11-15 更新**：`third_party/ngx/` 整个目录已随 NGX 代理后端移除，本条不再适用。
+
 
 **解决提交**：《chore(ngx): NVIDIA NGX 头随仓库分发，发布构型启用 NGX 后端》（`git log --oneline --grep=chore(ngx)` 可定位）。
 

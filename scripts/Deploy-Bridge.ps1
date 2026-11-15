@@ -55,19 +55,17 @@ $routes = @()
 #    已从发布版整块剔除：本清单与发布模板都不再包含它们；需要诊断请用开发构建。
 #    Diagnostic keys are excluded from the release build - do not add them back here.
 #
-# ⚠️ 四个**故意不写**的例外：
+# ⚠️ 三个**故意不写**的例外：
 #    · Ffx12AsyncUpscale —— 由安装器 / 芙芙启动器按显卡自动写入（RDNA2→0、其他→1），
 #      本脚本写死 1 会与它的按显卡判定打架；
 #    · Ffx12DllPath     —— 路径键：留空即"随包 payload\AMD 的 SDK"，本脚本不覆盖
 #      用户自定义路径；
-#    · Ffx12Backend     —— **部署脚本不得静默改写用户已选的后端**（auto / native / ngx 三种都算）。
-#      本脚本每次部署都跑，若在这里写死任何一个值，都会把用户手改的选择清掉，
-#      而后端写错是**静默**的（回落到 native 只是性能/画质变化，不会崩、不会报错）。
-#      缺键时走代码内建缺省——与发布模板同为 auto（load_config 的 lpDefault=L"auto"），
-#      所以不写这个键也天然安全，用户手改的值也就保得住。
+#    · （原 Ffx12Backend 例外已删除：该键随 NGX 代理后端一起移除，现由 DlssInput 取代。
+#      DlssInput **在** $configValues 表里 —— 新装用户需要它有个明确默认值，
+#      而 ini 里缺键时桥按 1=auto 处理，两者一致，不存在"覆盖用户选择"的风险。）
 #    · Ffx12SingleInstance —— 发布模板缺省 0=全部接管（FFX 后端多机位/分屏场景的正确值），
-#      NGX 后端在代码里无视该键、一律按 1 处理。本脚本每次部署都跑，写死任一个值都会盖掉
-#      用户的手改；缺键时走代码内建缺省（同为 0，load_config 的 lpDefault=0），故不写也安全。
+#      本脚本每次部署都跑，写死任一个值都会盖掉用户的手改；缺键时走代码内建缺省
+#      （同为 0，load_config 的 lpDefault=0），故不写也安全。
 $configValues = [ordered]@{
     # ---- 1. 核心功能 / Core features ----
     'Enabled'                   = '1'
@@ -117,20 +115,27 @@ $configValues = [ordered]@{
     'Fsr2Il2CppHook'            = '1'   # 代码内建缺省是 0 ⇒ 删行会让桥接失效
     'Ffx12ReuseSameGeneration'  = '0'   # 开启会产生残像
     'Ffx12FeatureFallback'      = '1'
-    # ---- 7. NGX(DLSS) 后端 / NGX backend（后端由 Ffx12Backend=auto 按显卡型号选）----
+    # ---- 7. DLSS 直连层 / DLSS direct-connect layer（超分路径由 DlssInput 决定）----
     # 默认值逐键与 Dx11FsrBridge.package.ini 的 [Dx11FsrBridge] 段、以及代码内建缺省一致
-    # （load_config 的 NGX 键解析段）。改这里必须四处同步改（load_config + 本脚本 + package.ini + 提交信息）。
-    # ⚠️ Ffx12Backend **故意不在本表里**：见文件顶部"三个故意不写的例外"。
-    'NgxApplicationId'          = '1337'
-    'NgxFeatureDirs'            = ''    # 空 = 自动探测含 nvngx_dlss.dll 的目录
-    'NgxHdr'                    = '0'    # 0 = 强制 SDR（默认，NGX 收到 IsHDR 会拖影）/ auto 自动探测 / 1 强制 HDR
-    'NgxRenderPreset'           = '0'   # 0 = 六个 preset 参数都不设（跟随 NGX 自身规则）；5..15 可显式指定
-    'NgxSetFrameTimeDelta'      = '1'
-    'NgxUseReactiveMask'        = '0'
-    'NgxLogLevel'               = '1'   # 0=全关 1=error（默认，取证行已可见）2=info 3=debug
-    'NgxPassthrough'            = '0'
-    'NgxProvider'               = 'auto' # NGX 实现来源：auto（默认）/ nvidia / external（非 N 卡经 OptiScaler）
-    'NgxCrossKeyReuse'          = '1'   # 1 = key 变化但尺寸/格式全等时复用实例（消除角色界面切换 ~500ms 卡顿）；0 = 每次切换都销毁重建
+    # （load_config 的 DlssInput 键解析段）。改这里必须四处同步改（load_config + 本脚本 + package.ini + 提交信息）。
+    #
+    # 1=auto（默认）/ 2=force 走 DLSS 直连。**没有 0=off 这一档** —— 原先把 0 当
+    # 「强制 FFX」会让桥自己跑 FFX 超分，与 OptiScaler 的 Dx11Upscaler=dlss 冲突 ⇒ 卡死。
+    # 直连层由桥自己持一份 NGX feature，不经 OptiScaler 代理。
+    'DlssInput'                 = '1'   # 1=auto（默认）/ 2=force；0 等价于 auto（无 off 档）
+    'DlssInputModule'           = 'nvngx.dll'
+    'DlssInputFeatureDirs'      = ''    # 空 = 自动探测（已加载模块目录 / 桥自身目录 / 桥目录\..\NVIDIA\DLSS）
+    'DlssInputAllowRealNgx'     = '1'
+    'DlssInputJitterMode'       = '3'   # 3 = ZeroCentred（实机基线，配错会全屏拖影）
+    'DlssInputMotionSign'       = '1'   # 1 = 正 scale（实机基线）
+    'DlssInputDepthScale'       = '32'  # 逆深度 [0,0.03] x32 -> [0,0.96]
+    'DlssInputJitterSource'     = '0'
+    'DlssInputJitterReduce'     = '0'
+    'DlssInputMotionFixup'      = '0'
+    'DlssInputReactiveMask'     = '0'
+    'DlssInputAlphaUpscaling'   = '0'
+    'DlssInputJitterProbe'      = '0'
+    'DlssInputMvProbe'          = '0'
     # ---- 日志（[Log] 段）/ Logging ----
     # 必须在这里写：Add-LogSection 只在**没有** [Log] 段时才补整段，
     # 而已部署的 ini 都已有 [Log] 段 → 段内的新键永远不会被补上（实测 queue_capacity 缺失）。

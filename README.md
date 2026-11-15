@@ -112,8 +112,8 @@ Bridge 只拦截一次游戏原生 FSR2 调用，然后在它后面接上两条�
 ```mermaid
 flowchart LR
     G["原神 DX11 客户端<br/>原生 FSR2 调用"] --> B["Dx11FsrBridge.dll<br/>DX11 Hook · FFX12 资源转接"]
-    B -->|"Ffx12Backend=native，或 auto 判为非 RTX"| S["AMD FFX12 SDK<br/>FSR4 / FSR3 / FSR2"]
-    B -->|"Ffx12Backend=ngx，或 auto 判为 RTX"| N["NVIDIA NGX<br/>DLSS"]
+    B -->|"DlssInput 判为 FFX（非 N 卡 / 拿不到 NGX）"| S["AMD FFX12 SDK<br/>FSR4 / FSR3 / FSR2"]
+    B -->|"DlssInput 判为 DLSS 直连（N 卡 + 能拿到 NGX）"| N["NVIDIA NGX<br/>DLSS"]
     S --> P["游戏画面<br/>超分输出"]
     N --> P
 ```
@@ -141,49 +141,62 @@ flowchart LR
 
 <sub>✅ 支持 · ⚠️ 有前提或不推荐</sub>
 
-### N 卡不接 OptiScaler 也能开 DLSS（NGX 后端）
+### N 卡不接 OptiScaler 也能开 DLSS（DLSS 直连层）
 
-Bridge 内置了一个 **NVIDIA NGX 后端**：在 N 卡上直接把游戏原生的 FSR2 调用转成 **DLSS**，**不需要 OptiScaler**。走哪条后端由 `payload\Bridge\Dx11FsrBridge.ini` 的 `[Dx11FsrBridge] Ffx12Backend` 决定 —— 安装器主页的「超分输入类型」就是它的图形入口：
+Bridge 内置了一条 **DLSS 直连层**：在 N 卡上直接把游戏原生的 FSR2 调用转成 **DLSS**，
+**不需要 OptiScaler**。它和「把 FSR2 语义交给 OptiScaler 翻译」是两条互斥的路 ——
+直连层由桥**自己**以 DLSS 客户端身份持一份 NGX feature，所以游戏释放它自己的
+feature 时不会连带重建。
+
+走哪条由 `payload\Bridge\Dx11FsrBridge.ini` 的 `[Dx11FsrBridge] DlssInput` 决定 ——
+安装器主页的「超分输入类型」就是它的图形入口：
 
 | 安装器选项 | 写入值 | 含义 |
 | --- | --- | --- |
-| **Auto**（默认） | `auto` | 按显卡型号自动落位：RTX 走 NGX（DLSS），其余走 FFX（FSR4/FSR3/FSR2） |
-| **FFX** | `native` | 强制走自带的 FFX12 SDK，只出 FSR4/FSR3/FSR2 |
-| **NVNGX** | `ngx` | 强制走 NVIDIA NGX，只出 DLSS；非 N 卡 / 非 RTX 会失败并回退游戏原版 FSR2 |
+| **Auto**（默认） | `1` | N 卡且能拿到 NGX 时走 DLSS 直连，其余走 FFX（FSR4/FSR3/FSR2）|
+| **强制 DLSS** | `2` | 不管显卡都尝试直连；拿不到 NGX 则回退游戏原版 FSR2 |
 
-> [!NOTE]
-> 这是**超分输入接口**（把游戏的超分调用接到哪条后端），**不是**超分档位或超分类型的选择。
+> ⚠️ **没有 `0` 这一档**。旧设计里 `0` 表示「显式选 FFX」，但那样桥会自己跑 FFX 超分，
+> 而 OptiScaler 侧通常还开着 `Dx11Upscaler=dlss`，两套超分同时接管同一条 draw ⇒
+> 实机卡死。桥现在把 `0` 与任何未知值都按 auto 处理。
 
-`auto` 的判定在 `Dx11FsrBridge/GpuBackendPick.h`：厂商必须是 NVIDIA（`0x10DE`）；适配器描述含 `GTX` / `MX` 判否（这两条产品线没有 Tensor 核心，GTX 16 系也不行）；含 `RTX` 判是；描述被 OEM 改写认不出关键字时按 device id 兜底，只认 Ampere / Ada / Blackwell —— Turing 段与 GTX 16 系同段、无法区分，保守判否。判错不会坏：真跑不起来时逐帧 fail-open 回退游戏原生 FSR2。
+**前置条件**（两条都必须满足）：
 
-**开 DLSS 的三个前提（缺一不可）**：
+1. **NVIDIA RTX 显卡** + 正常安装的显卡驱动。加载器 `nvngx.dll` 由驱动装在
+   `<系统盘>\Windows\System32\DriverStore\FileRepository\nv_dispi.inf_amd64_*\`，
+   桥会自动去那里找（那个目录**不在**标准 DLL 搜索顺序里，所以要显式探测）。
+2. **DLSS 运行时 `nvngx_dlss.dll`（约 56 MB）必须存在** —— 它**不在**驱动里，
+   必须单独提供。桥按此顺序找：① ini 的 `DlssInputFeatureDirs`（分号分隔，写了就优先）
+   ② 已加载的 `nvngx_dlss.dll` 所在目录 ③ **桥自身所在目录**。
 
-1. **NVIDIA RTX 显卡** + 正常安装的显卡驱动。`_nvngx.dll` 由驱动提供，Bridge 从注册表 `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore` 找到它（来源也可用 `NgxProvider` 指定：`nvidia` / `external` / `auto`）。
-2. **DLSS 运行时 `nvngx_dlss.dll` 必须存在**（仓库与发布包都**不内置**它）。放进下面任一位置即可，Bridge 按此顺序自动探测（判据是**目录里确实有 `nvngx_dlss.dll`**，不是目录存在）：
-   1. `payload\Bridge\`（`Dx11FsrBridge.dll` 同目录）
-   2. `payload\NVIDIA\DLSS\` ← **安装器的放置位置**
-   3. `payload\OptiScaler\Optiscaler\`（OptiScaler 自带的那份）
+> 安装器在勾选 Dx11FsrBridge、显卡是 RTX 且超分输入类型为 Auto / 强制 DLSS 时，
+> 会自动把 `nvngx_dlss.dll` 放到桥所在目录 —— 所以正常安装流程下无需手工干预。
 
-   也可以用 `payload\Bridge\Dx11FsrBridge.ini` 的 `NgxFeatureDirs` 写死目录（分号分隔，写了就不再自动探测）。
-3. 有**可写**的 NGX 工作目录：默认 `payload\Bridge\ngx\`，不可写时回落到 `%LOCALAPPDATA%\GenshinFsrBridge\ngx\`；实际路径见日志 `ngx_core appdata=…`。
+**验收判据**（`Dx11FsrBridge.log`）：
 
-**怎么拿到 `nvngx_dlss.dll`**：在安装器里勾选 **Dx11FsrBridge**，显卡是 RTX 且超分输入类型为 Auto / NVNGX 时，安装器会自动从 NVIDIA 官方 Streamline 取一份放到 `payload\NVIDIA\DLSS\`（勾了 OptiScaler 时同一份还会再放进 OptiScaler 的组件目录）。也可以自己下载 DLSS 运行时（`nvngx_dlss.dll`，例如从 NVIDIA Streamline 包里取）后**导入**到上面任一目录 —— 手动导入与自动下载完全等价。
-
-**验收判据**（`payload\Bridge\Dx11FsrBridge.log`，默认日志等级下即可见）：
-
-```text
-ngx_core backend=ngx auto=ngx vendor=0x10DE gpu="NVIDIA GeForce RTX 4070 SUPER"
-ngx_core provider resolved=nvidia_registry module=...\_nvngx.dll
-ngx_core init ok=1 available=1 rc=0x1
-ngx_core create_feature ok=1 preset=0 rc=0x1
+```
+dlss_input_route path=dlss reason=ngx_runtime_present vendor=0x10DE optiscaler=0 ngx=1 mode=1
+dlss_input_init_ok impl=nvidia-ngx module=nvngx.dll path=...
+dlss_input_first_dispatch render=2556x1438 display=2560x1440
+  FFX SDK : (unused, backend=ngx)
+  FFX : (unused, backend=ngx)
 ```
 
-游戏内应能看到 NVIDIA 的 DLSS 调试叠加层（形如 `DLSS V310.9.16 (default) DX11 chain d3d`）。叠加层消失、日志停在 `create_feature ok=0 rc=…`，说明这次会话的 NGX 没建起来。
+游戏内应能看到 NVIDIA 的 DLSS 调试叠加层（形如 `DLSS V310.9.16 (default) DX11 chain d3d`）。
+叠加层消失、日志停在 `dlss_input_feature_failed error=create_feature_failed(0x…)`，
+说明这条会话的 NGX 没建起来 —— 常见原因就是 `nvngx_dlss.dll` 不在上面三个位置之一。
 
-**参数语义**：通用段的键（`TransparentJitter`、`Ffx12DepthInverted`、`Ffx12JitterMode`、`Ffx12JitterDelay`、`Fsr2MotionVectorsJittered`）两条后端都生效；FFX 专用段的键（`Ffx12NonLinear`、`Ffx12Hdr`、`Ffx12FovScale`、`Ffx12CameraNear` 等）**只对 FFX 生效**，NGX 走自己的 `Ngx*` 段（`NgxHdr`、`NgxRenderPreset`、`NgxCrossKeyReuse`、`NgxLogLevel` 等）。
+**参数语义**：通用段的键（`TransparentJitter`、`Ffx12DepthInverted`、`Ffx12JitterMode`、
+`Ffx12JitterDelay`、`Fsr2MotionVectorsJittered`）两条后端都生效；FFX 专用段的键
+（`Ffx12NonLinear`、`Ffx12Hdr`、`Ffx12FovScale`、`Ffx12CameraNear` 等）**只对 FFX 生效**。
+直连层有自己的 `DlssInput*` 段（`DlssInputJitterMode`、`DlssInputMotionSign`、
+`DlssInputDepthScale` 等共 14 个键，完整表见 `Dx11FsrBridge/DLSS_INPUT.md` §5.4）。
 
-> [!WARNING]
-> **已知问题（2.5.0 及更早版本）**：游戏渲染精度高于 `0.7`（菜单里的 `0.8`–`0.999`）时，部分机器上 NGX 建 feature 会失败（`ngx_core create_feature ok=0 rc=0xBAD00010`，即 `UnsupportedParameter`），且**本次游戏会话内不会重试** —— 表现为 DLSS 调试叠加层消失、超分回到游戏原版 FSR2，必须重启游戏。原因是桥把这几档的显示/渲染比（≈1.0–1.3）一律映射成 DLSS 的 `UltraQuality` 档，而该档只接受固定比例。主分支已修复（建 feature 前把该档兜底为 `MaxQuality`，渲染精度 `0.9` 实测由失败转为正常），修复随下一版发布；在此之前渲染精度用 `0.7` 及以下可以避开（`0.7` 已实测正常，更低档未逐一验证）。
+> **已知限制**：三渲二角色的描边、头发、衣摆边缘会有轻微抖动。根因是**游戏侧的相位
+> 序列只有 8 帧周期**（标准 Halton(2) 前 8 项，之后截断回开头），而桥不能自己补长 ——
+> 实测强行补长会让整个画面抖得更厉害。这是所有 DLSS 输入方案的共同限制，
+> 完整排障过程见 `Dx11FsrBridge/DLSS_INPUT.md` §11。
+
 
 ### N 卡上 OptiScaler 与 ReShade 同时启用可能不稳定
 
@@ -369,7 +382,7 @@ Bridge 和反虚化组件默认会保留错误日志（接入 OptiScaler/ReShade
 | # | 文件 / 信息 | 适用场景 |
 | :---: | --- | --- |
 | 1 | `payload/Bridge/Dx11FsrBridge.log` | **必须** |
-| 2 | `payload/Bridge/ngx/nvngx.log` 与同目录的 `nvngx_dlss_*.log` | 使用内置 DLSS（NGX 后端）时；目录以日志里 `ngx_core appdata=` 那行为准 |
+| 2 | `payload/Bridge/ngx/nvngx.log` 与同目录的 `nvngx_dlss_*.log` | 使用内置 DLSS（直连层）时。**这个目录可能不存在**：`nvngx.dll` 是驱动提供的，它不一定在工作目录写日志；找不到就跳过 |
 | 3 | `payload/OptiScaler/OptiScaler.log` 与 `payload/OptiScaler/OptiScaler.ini` | 使用 OptiScaler 时 |
 | 4 | `payload/ReShade/ReShade.log` | 涉及 ReShade 时 |
 | 5 | `payload/AntiPlayerMosaic/AntiPlayerMosaic.log` | 涉及反虚化、UID 或水下马赛克时 |
@@ -379,7 +392,8 @@ Bridge 和反虚化组件默认会保留错误日志（接入 OptiScaler/ReShade
 
 需要进一步排查时，可临时将 `OptiScaler.ini`（接入 OptiScaler 时）中 `Log` 下的 `LogLevel` 改为 `1（Debug）`或 `0（Trace）`，但诊断结束后应恢复正式配置以避免额外开销。
 
-排查内置 DLSS 时，可把 `payload\Bridge\Dx11FsrBridge.ini` 的 `[Dx11FsrBridge] NgxLogLevel` 从默认 `1` 调到 `2`（info）或 `3`（debug）；默认 `1` 只记录错误级的取证行（`ngx_core …` 与 NGX 自己的返回码）。
+排查内置 DLSS 时：把 `payload\Bridge\Dx11FsrBridge.ini` 的 `[Dx11FsrBridge] DlssInputJitterProbe`
+设为 `1` 可打印抖动相位采样（按 F11 触发）。日志等级另由 `[Log] level` 控制，与这个键无关。
 
 > [!CAUTION]
 > 不要把游戏账号、登录信息或包含个人信息的截图提交到公开 Issue。
@@ -387,7 +401,8 @@ Bridge 和反虚化组件默认会保留错误日志（接入 OptiScaler/ReShade
 ## 第三方组件
 
 - FFX12 ffx-api 头文件与 Microsoft Detours 仅作为构建依赖，保留各自原始许可证与声明。
-- NVIDIA NGX（DLSS）头文件同样仅作为构建依赖（编译可选的 DLSS 后端），来源、固定版本与 SHA-256 见 `Dx11FsrBridge/third_party/ngx/NOTICE.md`。它按 NVIDIA RTX SDKs License 授权，**不由 GPL-3.0-or-later 覆盖**；许可原文随该目录与发布包内 `payload/Bridge/NVIDIA-NGX-SDK-LICENSE.txt` 一并提供。
+- NVIDIA NGX（DLSS）的 ABI 由 `Dx11FsrBridge/DlssInput.h` **就地声明最小子集**，
+  不再随仓库分发任何 NVIDIA 头文件（原 `third_party/ngx/` 已随 NGX 代理后端一并移除）。
 - OptiScaler 是独立项目：<https://github.com/optiscaler/OptiScaler>。
 - 本地分发包需要自行补齐相应组件，并遵守各组件授权要求。
 - 本项目不包含 NVIDIA DLSS 与 AMD FSR SDK 运行时二进制（`_nvngx.dll` 由显卡驱动提供，`nvngx_dlss.dll` 由安装器在用户机器上获取，也可自行下载后放进上文列出的目录）。

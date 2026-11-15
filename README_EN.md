@@ -114,8 +114,8 @@ The bridge intercepts the game's native FSR2 calls once and then attaches two ba
 ```mermaid
 flowchart LR
     G["Genshin DX11 client<br/>native FSR2 calls"] --> B["Dx11FsrBridge.dll<br/>DX11 hook · FFX12 resource bridge"]
-    B -->|"Ffx12Backend=native, or auto on a non-RTX GPU"| S["AMD FFX12 SDK<br/>FSR4 / FSR3 / FSR2"]
-    B -->|"Ffx12Backend=ngx, or auto on an RTX GPU"| N["NVIDIA NGX<br/>DLSS"]
+    B -->|"DlssInput resolves to FFX (non-NVIDIA / no NGX)"| S["AMD FFX12 SDK<br/>FSR4 / FSR3 / FSR2"]
+    B -->|"DlssInput resolves to the DLSS direct layer (NVIDIA + NGX reachable)"| N["NVIDIA NGX<br/>DLSS"]
     S --> P["Game frame<br/>upscaled output"]
     N --> P
 ```
@@ -143,49 +143,68 @@ flowchart LR
 
 <sub>✅ Supported · ⚠️ Conditional or not recommended</sub>
 
-### DLSS on NVIDIA without OptiScaler (NGX backend)
+### DLSS on NVIDIA without OptiScaler (DLSS direct-connect layer)
 
-The bridge ships a **NVIDIA NGX backend**: on an NVIDIA card it turns the game's native FSR2 calls into **DLSS** directly, **without OptiScaler**. Which backend runs is decided by `Ffx12Backend` in `payload\Bridge\Dx11FsrBridge.ini` (section `[Dx11FsrBridge]`) — the installer's **Super resolution input** row is its graphical entry point:
+The bridge ships a **DLSS direct-connect layer**: on an NVIDIA card it turns the game's native
+FSR2 call directly into **DLSS**, **without OptiScaler**. It is mutually exclusive with
+"hand the FSR2 semantics to OptiScaler for translation" — the direct layer holds its **own**
+NGX feature as a DLSS client, so the game releasing its feature does not tear the chain down.
 
-| Installer option | Value written | Meaning |
+Which path is taken is decided by `[Dx11FsrBridge] DlssInput` in
+`payload\Bridge\Dx11FsrBridge.ini` — the installer's "Upscale input type" is its GUI entry:
+
+| Installer option | Value | Meaning |
 | --- | --- | --- |
-| **Auto** (default) | `auto` | Picked by GPU model: RTX goes NGX (DLSS), everything else goes FFX (FSR4/FSR3/FSR2) |
-| **FFX** | `native` | Force the bundled FFX12 SDK: FSR4/FSR3/FSR2 only |
-| **NVNGX** | `ngx` | Force NVIDIA NGX: DLSS only; a non-NVIDIA / non-RTX card fails and falls back to the game's own FSR2 |
+| **Auto** (default) | `1` | On an NVIDIA card that can reach NGX, take the DLSS direct path; otherwise FFX (FSR4/FSR3/FSR2) |
+| **Force DLSS** | `2` | Always try the direct path; fall back to the game's native FSR2 if NGX is unreachable |
 
-> [!NOTE]
-> This is the **super-resolution input interface** (which backend the game's upscaling call is wired to), **not** an upscaling-quality or upscaling-type choice.
+> ⚠️ **There is no `0` tier.** In the old design `0` meant "explicitly choose FFX", but that
+> makes the bridge run FFX upscaling itself while OptiScaler usually still has
+> `Dx11Upscaler=dlss` — two upscalers claiming the same draw ⇒ the game hangs at runtime.
+> The bridge now treats `0` and any unknown value as auto.
 
-`auto` is decided in `Dx11FsrBridge/GpuBackendPick.h`: the vendor must be NVIDIA (`0x10DE`); an adapter description containing `GTX` or `MX` is rejected (neither product line has Tensor cores, GTX 16 included); `RTX` is accepted; when an OEM rewrote the description beyond recognition it falls back to the device id and only accepts Ampere / Ada / Blackwell — the Turing range overlaps GTX 16 and cannot be told apart, so it conservatively says no. A wrong guess is harmless: when it cannot actually run, every frame fails open back to the game's native FSR2.
+**Prerequisites** (both required):
 
-**Three prerequisites for DLSS (all required)**:
+1. **An NVIDIA RTX card** with a properly installed driver. The loader `nvngx.dll` is installed
+   under `<system drive>\Windows\System32\DriverStore\FileRepository\nv_dispi.inf_amd64_*\` —
+   the bridge probes that directory explicitly, because it is **not** on the standard DLL search path.
+2. **The DLSS runtime `nvngx_dlss.dll` (about 56 MB) must be present** — it does **not** ship with
+   the driver and must be provided separately. The bridge looks in this order:
+   ① `DlssInputFeatureDirs` in the ini (semicolon-separated; takes priority when set)
+   ② the directory of an already-loaded `nvngx_dlss.dll` ③ **the bridge's own directory**.
 
-1. **An NVIDIA RTX card** with a properly installed driver. `_nvngx.dll` comes from the driver and the bridge locates it through the registry key `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore` (the source can also be pinned with `NgxProvider`: `nvidia` / `external` / `auto`).
-2. **The DLSS runtime `nvngx_dlss.dll` must be present** (neither the repository nor the release package bundles it). Put it in any of the following; the bridge probes them in this order (the test is **the directory really contains `nvngx_dlss.dll`**, not that the directory exists):
-   1. `payload\Bridge\` (next to `Dx11FsrBridge.dll`)
-   2. `payload\NVIDIA\DLSS\` — **where the installer puts it**
-   3. `payload\OptiScaler\Optiscaler\` (the copy OptiScaler ships)
+> When Dx11FsrBridge is selected, the card is RTX, and the upscale input type is Auto or
+> Force DLSS, the installer automatically places `nvngx_dlss.dll` next to the bridge — so the
+> normal install flow needs no manual steps.
 
-   You can also hard-code directories in `NgxFeatureDirs` in `payload\Bridge\Dx11FsrBridge.ini` (semicolon-separated; setting it disables auto-probing).
-3. A **writable** NGX working directory: `payload\Bridge\ngx\` by default, falling back to `%LOCALAPPDATA%\GenshinFsrBridge\ngx\` when it is not writable; the actual path is logged as `ngx_core appdata=…`.
+**Acceptance evidence** (`Dx11FsrBridge.log`):
 
-**How to obtain `nvngx_dlss.dll`**: tick **Dx11FsrBridge** in the installer; when the card is an RTX and the super-resolution input is Auto / NVNGX, the installer fetches one from NVIDIA Streamline into `payload\NVIDIA\DLSS\` (with OptiScaler also ticked, the same file is copied into the OptiScaler component directory as well). You can equally download the DLSS runtime yourself (`nvngx_dlss.dll`, e.g. from an NVIDIA Streamline package) and **import** it into any of those directories — a manual import behaves exactly like the automatic download.
-
-**Acceptance criteria** (`payload\Bridge\Dx11FsrBridge.log`, visible at the default log level):
-
-```text
-ngx_core backend=ngx auto=ngx vendor=0x10DE gpu="NVIDIA GeForce RTX 4070 SUPER"
-ngx_core provider resolved=nvidia_registry module=...\_nvngx.dll
-ngx_core init ok=1 available=1 rc=0x1
-ngx_core create_feature ok=1 preset=0 rc=0x1
+```
+dlss_input_route path=dlss reason=ngx_runtime_present vendor=0x10DE optiscaler=0 ngx=1 mode=1
+dlss_input_init_ok impl=nvidia-ngx module=nvngx.dll path=...
+dlss_input_first_dispatch render=2556x1438 display=2560x1440
+  FFX SDK : (unused, backend=ngx)
+  FFX : (unused, backend=ngx)
 ```
 
-The NVIDIA DLSS debug overlay (something like `DLSS V310.9.16 (default) DX11 chain d3d`) should show up in game. If the overlay disappears and the log stops at `create_feature ok=0 rc=…`, NGX did not come up for that session.
+You should see NVIDIA's DLSS debug overlay in game (e.g. `DLSS V310.9.16 (default) DX11 chain d3d`).
+If the overlay is gone and the log stops at
+`dlss_input_feature_failed error=create_feature_failed(0x…)`, NGX was not created for this
+session — the usual cause is `nvngx_dlss.dll` missing from all three locations above.
 
-**Parameter semantics**: the keys in the common section (`TransparentJitter`, `Ffx12DepthInverted`, `Ffx12JitterMode`, `Ffx12JitterDelay`, `Fsr2MotionVectorsJittered`) apply to both backends; the FFX-only keys (`Ffx12NonLinear`, `Ffx12Hdr`, `Ffx12FovScale`, `Ffx12CameraNear`, …) apply to **FFX only** — NGX reads its own `Ngx*` keys (`NgxHdr`, `NgxRenderPreset`, `NgxCrossKeyReuse`, `NgxLogLevel`, …).
+**Parameter semantics**: the keys in the common section (`TransparentJitter`, `Ffx12DepthInverted`,
+`Ffx12JitterMode`, `Ffx12JitterDelay`, `Fsr2MotionVectorsJittered`) apply to both backends; the
+FFX-only keys (`Ffx12NonLinear`, `Ffx12Hdr`, `Ffx12FovScale`, `Ffx12CameraNear`, …) apply to
+**FFX only**. The direct layer has its own `DlssInput*` section (`DlssInputJitterMode`,
+`DlssInputMotionSign`, `DlssInputDepthScale` — 14 keys in total; the full table is in
+`Dx11FsrBridge/DLSS_INPUT.md` §5.4).
 
-> [!WARNING]
-> **Known issue (2.5.0 and earlier)**: with the in-game render scale above `0.7` (the menu's `0.8`–`0.999` slots), NGX fails to create the feature on some machines (`ngx_core create_feature ok=0 rc=0xBAD00010`, i.e. `UnsupportedParameter`) and **does not retry within that game session** — the DLSS debug overlay disappears and upscaling drops back to the game's own FSR2; restart the game. Cause: the bridge mapped the display/render ratio of those slots (≈1.0–1.3) to DLSS's `UltraQuality` level, which only accepts a fixed ratio. Fixed on the main branch (that level is now clamped to `MaxQuality` before the feature is created; render scale `0.9` was verified to go from failing to working); the fix ships with the next release. Until then, staying at `0.7` or below avoids it (`0.7` verified working; lower slots were not tested individually).
+> **Known limitation**: cel-shaded outlines, hair and hem edges show slight shimmering. The root
+> cause is **the game's phase sequence has only an 8-frame period** (the first 8 items of standard
+> Halton(2), truncated back to the start). The bridge cannot lengthen it — forcing a longer
+> sequence makes the whole screen shake far worse. This is a shared limitation of every
+> DLSS-input approach; the full investigation is in `Dx11FsrBridge/DLSS_INPUT.md` §11.
+
 
 ### Enabling OptiScaler and ReShade together may be unstable on NVIDIA
 
@@ -376,7 +395,7 @@ If the game fails to start, FSR cannot be activated, switching upscalers causes 
 | # | File / Information | When it applies |
 | :---: | --- | --- |
 | 1 | `payload/Bridge/Dx11FsrBridge.log` | **Required** |
-| 2 | `payload/Bridge/ngx/nvngx.log` and the `nvngx_dlss_*.log` next to it | When using the built-in DLSS (NGX backend); the real directory is the one in the `ngx_core appdata=` log line |
+| 2 | `payload/Bridge/ngx/nvngx.log` and the `nvngx_dlss_*.log` next to it | When using the built-in DLSS (direct-connect layer). **This directory may not exist** — `nvngx.dll` is provided by the driver and does not necessarily write logs in a working directory; skip it if absent |
 | 3 | `payload/OptiScaler/OptiScaler.log` and `payload/OptiScaler/OptiScaler.ini` | When using OptiScaler |
 | 4 | `payload/ReShade/ReShade.log` | For ReShade-related issues |
 | 5 | `payload/AntiPlayerMosaic/AntiPlayerMosaic.log` | For anti-mosaic, UID, or underwater mosaic issues |
@@ -386,7 +405,9 @@ If the game fails to start, FSR cannot be activated, switching upscalers causes 
 
 When further diagnostics are needed, temporarily change `LogLevel` under `Log` in `OptiScaler.ini` (when OptiScaler is used) to `1 (Debug)` or `0 (Trace)`. Restore the release setting after diagnostics to avoid additional overhead.
 
-For the built-in DLSS, raise `NgxLogLevel` in `[Dx11FsrBridge]` of `payload\Bridge\Dx11FsrBridge.ini` from the default `1` to `2` (info) or `3` (debug); the default `1` only records the error-level evidence lines (`ngx_core …` and NGX's own return codes).
+For the built-in DLSS: setting `DlssInputJitterProbe` to `1` in `[Dx11FsrBridge]` of
+`payload\Bridge\Dx11FsrBridge.ini` dumps jitter phase samples (press F11 to arm).
+The log verbosity itself is controlled by `[Log] level` and is unrelated to this key.
 
 > [!CAUTION]
 > Do not submit game account details, login information, or screenshots containing personal information to a public Issue.
@@ -394,7 +415,9 @@ For the built-in DLSS, raise `NgxLogLevel` in `[Dx11FsrBridge]` of `payload\Brid
 ## Third-Party Components
 
 - FFX12 ffx-api headers and Microsoft Detours are build dependencies only; their original licenses and notices are retained.
-- The NVIDIA NGX (DLSS) headers are likewise a build dependency only (for the optional DLSS backend); their source, pinned version, and SHA-256 are documented in `Dx11FsrBridge/third_party/ngx/NOTICE.md`. They are licensed under the NVIDIA RTX SDKs License and are **not covered by GPL-3.0-or-later**; the license text ships with that directory and inside the package at `payload/Bridge/NVIDIA-NGX-SDK-LICENSE.txt`.
+- The NVIDIA NGX (DLSS) ABI is declared **in place** (a minimal subset) in
+  `Dx11FsrBridge/DlssInput.h`; no NVIDIA headers are vendored any more
+  (the previous `third_party/ngx/` tree was removed together with the NGX proxy backend).
 - OptiScaler is an independent project: <https://github.com/optiscaler/OptiScaler>.
 - Local distributions must complete the required components on their own and comply with each component's licensing terms.
 - This project does not include NVIDIA DLSS or AMD FSR SDK runtime binaries (`_nvngx.dll` comes from the GPU driver; `nvngx_dlss.dll` is fetched on the user's machine by the installer, or can be downloaded and placed in one of the directories listed above).

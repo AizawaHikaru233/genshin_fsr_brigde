@@ -535,7 +535,7 @@
           </div>
         </div>
 
-        <!-- 超分输入类型：只镜像 Dx11FsrBridge.ini 的 Ffx12Backend，选完立刻写回那份 ini -->
+        <!-- 超分输入类型：只镜像 Dx11FsrBridge.ini 的 DlssInput，选完立刻写回那份 ini -->
         <div class="row intro" style="animation-delay:120ms">
           <div class="ico">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
@@ -545,13 +545,12 @@
           </div>
           <div style="min-width:0">
             <div class="rlabel">超分输入类型</div>
-            <div class="rvalue srnote">这是超分输入接口，不是超分选择，Auto 为 N 卡使用 NVNGX，A 卡使用 FFX 更稳定</div>
+            <div class="rvalue srnote">这是超分输入接口，不是超分选择。Auto 能拿到 NGX 就走 DLSS 直连，否则退回 FFX</div>
           </div>
           <div class="seg" id="srseg" role="group" aria-label="超分输入类型">
             <span class="segthumb"></span>
-            <button type="button" data-v="auto" aria-pressed="true">Auto</button>
-            <button type="button" data-v="native" aria-pressed="false">FFX</button>
-            <button type="button" data-v="ngx" aria-pressed="false">NVNGX</button>
+            <button type="button" data-v="1" aria-pressed="true">Auto</button>
+            <button type="button" data-v="2" aria-pressed="false">强制 DLSS</button>
           </div>
         </div>
 
@@ -1024,7 +1023,7 @@
     uiLang: 'system',    // 界面语言：system | zh | en
     theme: 'system',     // 明暗主题：system | light | dark
     shortcutOn: true,    // 安装时创建桌面快捷方式
-    srInput: 'auto',     // 超分输入类型：auto | native | ngx（= Dx11FsrBridge.ini 的 Ffx12Backend）
+  srInput: '1',          // 超分输入类型：1=auto | 2=force（= Dx11FsrBridge.ini 的 DlssInput）
     srAvailable: false,  // 桥装好了、那份 ini 在，才允许改
     unlockerDir: '',     // 解帧工具目录（payload\FpsUnlocker）
     shortcutName: '',    // 快捷方式文件名（跟随界面语言）
@@ -1737,8 +1736,8 @@
   [].forEach.call(document.querySelectorAll('[data-fpsctl]'), function(el){ createFpsControl(el); });
 
   // ── 超分输入类型 ──
-  // 显示名与写入值不是一回事：FFX 写 native、NVNGX 写 ngx —— 后端只认后一套名字，
-  // 界面上照用户看得懂的说法叫。值由后端读回（post_state 的 srInput），这里只负责显示与点击。
+  // 值由后端读回（post_state 的 srInput），这里只负责显示与点击。
+  // ⚠️ 没有「0 = 关闭」这一档：桥侧 0 会走 FFX 并与 OptiScaler 的 Dx11Upscaler 冲突。
   var srSeg = $('#srseg');
   function syncSrInput(){
     if (!srSeg) return;
@@ -2682,7 +2681,7 @@ $('#warnscrim').addEventListener('click', function(){ closeWarn(false, false); }
       state.opacity = (typeof msg.opacity === 'number') ? msg.opacity : 80;
       syncMaximized();
       applyAppearance();
-      state.srInput = (msg.srInput && msg.srInput.value) || 'auto';
+    state.srInput = (msg.srInput && msg.srInput.value) || '1';
       state.srAvailable = !!(msg.srInput && msg.srInput.available);
       syncFpsUI();
       syncSrInput();

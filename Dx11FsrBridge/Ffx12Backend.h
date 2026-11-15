@@ -61,11 +61,6 @@ void set_depth_scale(float scale); // XeSS/DLSS 定向——depth 值域归一�
 void set_motion_vectors_jittered(bool jittered);
 // 输入颜色为 HDR（10-bit 线性 HDR 管线）时置 true（FSR2 需按 HDR 处理颜色/曝光）。
 void set_hdr_input(bool hdr);
-// 后端选择（SDS §3.9A.3）：Native = 改造前行为（默认，REQ-04）；Ngx = 走 D3D11 NGX 后端。
-// 由桥的 ini 读取点（Ffx12Backend 键）设置；NgxBackend.cpp 只读 backend()，不自己存一份。
-enum class BackendKind { Native, Ngx };
-void set_backend(BackendKind k);
-BackendKind backend();
 // 配置真值的只读查询（SDS §3.9A.2）：对应 g_* 在 Ffx12Backend.cpp 的匿名命名空间内，
 // 其它 TU（NgxBackend.cpp）读不到，必须经这两个 getter。实现在匿名命名空间之外。
 bool hdr_input();                 // ↔ set_hdr_input()
