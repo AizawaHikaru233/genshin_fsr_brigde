@@ -67,6 +67,7 @@
 // 本 TU 只负责"取输入 → 调纯函数 → 写输出"；公式全部在 NgxParamMap.cpp，
 // 由 NgxParamMapTest.cpp 做离线位级回归（NGX=OFF 也能构建）。
 #include "NgxParamMap.h"
+#include "NgxProviderPick.h"   // 实现来源选择（纯函数，零平台依赖；PR A / A2）
 // ★ 2026-11-13（独立审查第 1 条）：白名单 rc 失败时必须回报"累积 pass 未被替换"，
 //   否则 FSR2 族预处理 pass 会继续被跳过、而这一路没有桥输出 ⇒ 冻帧到 500ms 过期。
 //   为什么**可以**从这里直接调（跨模块耦合的评估结论）：
@@ -436,6 +437,12 @@ PFN_NGX_EvaluateFeature          g_eval       = nullptr;
 PFN_NGX_Shutdown1                g_shutdown   = nullptr;
 PFN_NGX_GetFeatureRequirements   g_req        = nullptr;
 
+// ---- SEH 守卫的异常码出口（§3.4.0）----
+// 守卫 wrapper 是 POD-only（MSVC 不允许它持 C++ 对象），因此异常码通过这个
+// 全局写出，调用方读完后自行决定怎么记日志。用 thread_local：守卫都在渲染线程
+// 上同步调用，不需要跨线程可见性，也就不需要原子操作（避免热路径上的额外代价）。
+static thread_local unsigned long g_release_crash = 0;
+
 // ---- 自写 CS（全局，形状与尺寸无关；只编一次，§3.5）----
 // T-2 只声明；ensure_shaders 是 T-4 的交付物。
 Microsoft::WRL::ComPtr<ID3D11ComputeShader> g_depth_cs;
@@ -501,6 +508,8 @@ int                       g_hdr_mode      = 0;         // 0=auto 1=force-on 2=fo
 int                       g_render_preset = 0;          // P-11：默认 0 = 不设 preset，跟随 NGX 自身规则
 bool                      g_dt_enabled    = true;
 bool                      g_use_reactive  = false;
+// §3.6.5 深度值域归一化倍数（b0.x）。默认 1.0 = 与改动前逐字节等价（见 set_depth_scale 注释）。
+float                     g_depth_scale = 1.0f;
 int                       g_log_level     = 1;
 bool                      g_passthrough   = false;
 
@@ -1669,6 +1678,97 @@ static bool soft_fail_init(const std::wstring &detail)
 //   "§3.8.1 辅助函数"段（本函数之后）—— 直接调即 C3861（本项目已因"定义在后"烧过两次）。
 //   这里只放声明；理由写在此处，免得下一个人把它当成可以随意挪动的顺序。
 static bool ensure_query_params(const char **why);
+// ============================================================================
+// §3.4.0 SEH 守卫（2026-11-17）
+//
+// 【为什么需要】本后端要调四个**第三方函数指针**（GPU 厂商 DLL 里的实现）：
+//   g_init_ext / g_release / g_create / g_eval。这些实现不在本进程控制之下 ——
+//   版本不匹配、模块被提前卸载、驱动层 vtable 未就绪，任何一种都可能在调用点
+//   触发 ACCESS_VIOLATION。桥是注入型 DLL：**一次 AV 就是整个游戏进程被带走**，
+//   而不是 fail-open。
+//
+// 【此前状态】本文件 `__try` 出现次数为 0（2026-11-17 复核）。也就是说上面
+//   四个调用点一旦 Fault，症状是「游戏直接消失、日志 0 字节」—— 没有可归因的
+//   现场。这与本项目其它钩子点「__try 一律 fail-open」的纪律不一致。
+//
+// 【做法】为每个调用点包一层 `__declspec(noinline)` 的**独立**函数，`__try`
+//   只放在 wrapper 内部：
+//     · 必须 noinline：MSVC 不允许在含 C++ 对象（std::wstring / ComPtr 等）
+//       需要展开的函数里混用 SEH（C2712）。把 SEH 隔离到只含 POD 的 wrapper
+//       里，调用方可以照常持对象。
+//     · wrapper 只接受/返回 POD，**不持任何 C++ 对象**。
+//     · 接住异常后返回失败 + 写出异常码，由调用方走既有失败路径
+//       （fail_init / eval 失败计数 / handle 置空），**不改变正常路径语义**。
+//
+// 【边界】这层只负责「不让进程死」，不负责「让失败被修复」。异常码会进日志
+//   与（eval 路径的）失败计数，便于事后归因。
+// ============================================================================
+
+// 必须 noinline 且不含需要 C++ 展开的对象（MSVC C2712）。
+__declspec(noinline) static NVSDK_NGX_Result guarded_init_ext(unsigned long long app_id, const wchar_t *appdata,
+                                                             ID3D11Device *dev, NVSDK_NGX_Version sdk_version,
+                                                             const NVSDK_NGX_FeatureCommonInfo *common_info,
+                                                             unsigned long *crash_code)
+{
+    __try
+    {
+        return g_init_ext(app_id, appdata, dev, sdk_version, common_info);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *crash_code = static_cast<unsigned long>(GetExceptionCode());
+        return NVSDK_NGX_Result_Fail;
+    }
+}
+
+// Release 的返回值本来就被调用方丢弃（handle 已失效时 NGX 返回失败，不影响后续），
+// 这里只关心「有没有把进程炸掉」。
+__declspec(noinline) static bool guarded_release(PFN_NGX_ReleaseFeature release, NVSDK_NGX_Handle *feature,
+                                                 unsigned long *crash_code)
+{
+    __try
+    {
+        if (release != nullptr && feature != nullptr)
+            (void)release(feature);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *crash_code = static_cast<unsigned long>(GetExceptionCode());
+        return false;
+    }
+}
+
+__declspec(noinline) static NVSDK_NGX_Result guarded_create(ID3D11DeviceContext *ctx, NVSDK_NGX_Feature feature_id,
+                                                            NVSDK_NGX_Parameter *params,
+                                                            NVSDK_NGX_Handle **out_handle, unsigned long *crash_code)
+{
+    __try
+    {
+        return g_create(ctx, feature_id, params, out_handle);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *crash_code = static_cast<unsigned long>(GetExceptionCode());
+        return NVSDK_NGX_Result_Fail;
+    }
+}
+
+__declspec(noinline) static NVSDK_NGX_Result guarded_eval(ID3D11DeviceContext *ctx, NVSDK_NGX_Handle *feature,
+                                                          NVSDK_NGX_Parameter *params,
+                                                          PFN_NVSDK_NGX_ProgressCallback progress,
+                                                          unsigned long *crash_code)
+{
+    __try
+    {
+        return g_eval(ctx, feature, params, progress);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *crash_code = static_cast<unsigned long>(GetExceptionCode());
+        return NVSDK_NGX_Result_Fail;
+    }
+}
 
 static bool ensure_init(ID3D11Device *dev)
 {
@@ -1713,36 +1813,69 @@ static bool ensure_init(ID3D11Device *dev)
     bool provided = false;
     std::wstring fallback_detail;   // auto/external 失败时的诊断（只出现在 soft_fail 行里）
 
+    // ---- 2026-11-17（PR A / A2）：选择顺序抽成纯函数，探测调用留在原地 ----
+    //
+    // 为什么这么切：**探测**（读注册表 / LoadLibrary / 扫模块）必须碰平台，
+    // **选择**（哪条命中用哪个、什么情况硬失败、什么情况继续找）不该碰。
+    // 后者才是"为什么这次没用上 OptiScaler"这类问题的所在，而它此前只能靠
+    // 实机凑环境验证。现在 `ngx_provider_pick::pick()` 把顺序钉死并单测。
+    //
+    // ★ 行为零变化：下面的探测条件、失败分支、detail 拼接与重构前逐条对应。
+    ngx_provider_pick::ProbeResults probes {};
+    unsigned nvidia_rc = 0;
+    std::wstring ext_detail;
+
     if (g_provider_mode != kProviderExternal)
     {
-        unsigned nvidia_rc = 0;
         const ProviderStage stage = try_nvidia_registry(&hit, &nvidia_rc);
-        if (stage == ProviderStage::ok)
+        switch (stage)
         {
-            provided = true;
-        }
-        else if (g_provider_mode == kProviderNvidia)
-        {
-            // 显式 nvidia：与 v1 逐条相同（三条 reason + rc 原样），不重试、不换来源
-            return fail_init(provider_stage_reason(stage), nvidia_rc);
-        }
-        else
-        {
-            wchar_t buf[64] {};
-            swprintf_s(buf, L"%s(0x%X)", provider_stage_reason(stage), nvidia_rc);
-            fallback_detail = buf;
+        case ProviderStage::ok:            probes.registry = ngx_provider_pick::RegistryStage::Ok; break;
+        case ProviderStage::no_registry:   probes.registry = ngx_provider_pick::RegistryStage::NoRegistry; break;
+        case ProviderStage::load_failed:   probes.registry = ngx_provider_pick::RegistryStage::LoadFailed; break;
+        case ProviderStage::missing_entry: probes.registry = ngx_provider_pick::RegistryStage::MissingEntry; break;
         }
     }
 
+    const ngx_provider_pick::Mode pick_mode =
+        ngx_provider_pick::clamp_mode(static_cast<std::int32_t>(g_provider_mode));
+
+    // 先只问「注不注册表这一路已经命中了吗」——外部的两条探测要等第一轮决策之后
+    // 才知道要不要跑（External 模式跳过注册表、Auto 命中注册表就不再找外部）。
+    ngx_provider_pick::PickOutcome outcome = ngx_provider_pick::pick(pick_mode, probes);
+
+    if (outcome.decision == ngx_provider_pick::Decision::HardFailRegistry)
+    {
+        // 显式 nvidia：与 v1 逐条相同（三条 reason + rc 原样），不重试、不换来源
+        return fail_init(provider_stage_reason(probes.registry == ngx_provider_pick::RegistryStage::Ok
+                                                   ? ProviderStage::ok
+                                                   : static_cast<ProviderStage>(static_cast<int>(probes.registry))),
+                         nvidia_rc);
+    }
+
+    if (outcome.record_registry_detail)
+    {
+        // 与重构前同一条格式：reason(0xRC)
+        wchar_t buf[64] {};
+        swprintf_s(buf, L"%s(0x%X)",
+                   provider_stage_reason(static_cast<ProviderStage>(static_cast<int>(probes.registry))), nvidia_rc);
+        fallback_detail = buf;
+    }
+
+    provided = (outcome.decision == ngx_provider_pick::Decision::UseRegistry);
+
     if (!provided)
     {
-        std::wstring ext_detail;
+        // 外部实现：load 与 scan 的先后顺序保持原样（见 try_external 内部），
+        // 这里只把「命中与否」回填给决策层。
         if (try_external(&hit, &ext_detail))
         {
-            provided = true;
+            probes.external_load_ok = true;
+            provided                = true;
         }
         else
         {
+            // 外部也没命中 ⇒ 与重构前完全一致的收尾。
             if (ext_detail.empty())
                 ext_detail = L"unknown";
             if (!fallback_detail.empty())
@@ -1780,8 +1913,12 @@ static bool ensure_init(ID3D11Device *dev)
     log_ngx_error(L"ngx_core appdata=%s", appdata.c_str());
 
     // ---- 第 6 步：Init_Ext(app_id, appdata, dev, NVSDK_NGX_Version_API, &fc) ← 第 5 参是 fc ----
+    // 2026-11-17：改走 SEH 守卫（§3.4.0）。g_init_ext 是厂商 DLL 实现，AV 会带走整进程。
+    unsigned long init_crash = 0;
     const NVSDK_NGX_Result init_rc =
-        g_init_ext(g_app_id, appdata.c_str(), dev, NVSDK_NGX_Version_API, &fc);
+        guarded_init_ext(g_app_id, appdata.c_str(), dev, NVSDK_NGX_Version_API, &fc, &init_crash);
+    if (init_crash != 0)
+        return fail_init(L"init_crash", init_crash);
     if (init_rc != NVSDK_NGX_Result_Success)
         return fail_init(L"init", static_cast<unsigned>(init_rc));
 
@@ -2726,7 +2863,7 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
 
     // 释放旧 handle。返回值【不处理】：handle 已失效时 NGX 返回失败，不影响后续 CreateFeature。
     // 不调 g_params->Reset()（3.9.5）—— 那会清掉 CreateFeature 设的 7 项。
-    if (g_release && inst.feature) (void)g_release(inst.feature);
+    if (g_release && inst.feature) (void)guarded_release(g_release, inst.feature, &g_release_crash);
     inst.feature = nullptr;
 
     // 偏离 1（防御，不改变正常路径）：g_params / g_create 为 null 只可能是 ensure_init
@@ -2820,8 +2957,10 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     // 7. 六个 preset 键（v1 全设同一值）
     apply_render_preset(g_render_preset);
 
+    // 2026-11-17：改走 SEH 守卫（§3.4.0）。g_create 是厂商 DLL 实现，AV 会带走整进程。
+    unsigned long create_crash = 0;
     const NVSDK_NGX_Result rr =
-        g_create(ctx, NVSDK_NGX_Feature_SuperSampling, g_params, &inst.feature);
+        guarded_create(ctx, NVSDK_NGX_Feature_SuperSampling, g_params, &inst.feature, &create_crash);
 
     // 2026-11-13（独立审查第二轮 · 建议 6）：**成功与失败都写出真实 rc**。
     //   放在这里（g_create 之后、日志之前）而不是各 return 点各写一遍：本函数的结局
@@ -3220,7 +3359,7 @@ static void destroy_instance()
     // ★ feature 是裸 handle，ComPtr 管不到，必须手工释放
     if (g_inst.feature)
     {
-        if (g_release) g_release(g_inst.feature);
+        if (g_release) guarded_release(g_release, g_inst.feature, &g_release_crash);
         g_inst.feature = nullptr;
     }
     g_inst.feature_create_failed = false;   // 对象销毁 ⇒ 锁存随对象消失（不是「清锁重试」）
@@ -3777,7 +3916,7 @@ void shutdown_all()
     // ---- 1. 释放 feature（裸 handle，ComPtr 管不到，必须手工 Release）----
     // ★ 先判 g_release 非空：ensure_init 未跑过时它还是 nullptr。
     if (g_release && g_inst.feature)
-        g_release(g_inst.feature);
+        guarded_release(g_release, g_inst.feature, &g_release_crash);
     g_inst.feature = nullptr;
 
     // ---- 2. 清全部实例资源 + 两个随对象消失的锁存 ----
@@ -3942,6 +4081,17 @@ void set_use_reactive_mask(bool on)
     g_use_reactive = on;
 }
 
+void set_depth_scale(float scale)
+{
+    // §3.13 的纪律：非法值回退并记录，不静默。0 / 负 / NaN 都无物理意义。
+    // 上限 64：原神 reverse-z 值域约 [0, 0.03]，32 已足够映满 [0,1]，留一档余量。
+    if (!(scale > 0.0f) || scale > 64.0f)
+    {
+        log_ngx_error(L"ngx_depth_scale_invalid value=%f fallback=1.0", static_cast<double>(scale));
+        scale = 1.0f;
+    }
+    g_depth_scale = scale;
+}
 void set_log_level(int lv)
 {
     if (lv < 0 || lv > 3)
@@ -4149,7 +4299,7 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
         flags_changed)
     {
         if (g_release && inst.feature)
-            g_release(inst.feature);
+            guarded_release(g_release, inst.feature, &g_release_crash);
         inst.feature = nullptr;
 
         // ★ 建池之前必须先把新尺寸与新格式写回 inst：create_pool 直接读 inst.color_fmt /
@@ -4310,7 +4460,10 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     // ---- 第 8 步：深度提取 CS（§3.6.1）----
     if (!ensure_depth_src_srv(in, inst))
         return false;
-    upload_cb(ctx, inst, 1.0f, 1.0f);      // ★ depth_scale / flip 恒 1.0（§3.6.5），两段 CS 共用一个 cb
+    // 2026-11-17（PR A / A3）：depth_scale 不再硬编码 —— 接 g_depth_scale（默认 1.0，
+    //   与改动前等价）。原神 reverse-z 值域约 [0, 0.03]，是否要放大需实机 A/B。
+    //   flip 仍恒 1.0：motion 解码段用 b0.y，深度段不用，保持原语义。
+    upload_cb(ctx, inst, g_depth_scale, 1.0f);
     dispatch_depth_cs(ctx, inst);
 
     // ---- 第 9 步：motion 解码 CS（§3.6.2）----
@@ -4398,7 +4551,10 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
         return false;
 
     const std::uint64_t eval_t0 = qpc_us();
-    const NVSDK_NGX_Result rr = g_eval(ctx, inst.feature, g_params, nullptr);
+    // 2026-11-17：改走 SEH 守卫（§3.4.0）。g_eval 是厂商 DLL 实现，AV 会带走整进程；
+    // 接住后返回 Fail，走下方既有的失败计数/设备丢失判定路径，不改正常语义。
+    unsigned long eval_crash = 0;
+    const NVSDK_NGX_Result rr = guarded_eval(ctx, inst.feature, g_params, nullptr, &eval_crash);
     const std::uint64_t eval_us = qpc_us() - eval_t0;
 
     if (rr != NVSDK_NGX_Result_Success)

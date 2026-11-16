@@ -48,6 +48,14 @@ DXGI_FORMAT swapchain_format();
 void set_render_preset(int v);                              // NgxRenderPreset，默认 0（跟随 NGX）
 void set_frame_time_delta(bool on);                         // NgxSetFrameTimeDelta，默认 true
 void set_use_reactive_mask(bool on);                        // NgxUseReactiveMask，默认 false
+// NgxDepthScale，默认 1.0。深度提取 CS 的值域归一化倍数（b0.x）。
+// ★ 2026-11-17（PR A / A3）：此前 NGX 路径把该系数**硬编码为 1.0**，而 shader
+//   本体支持相乘（Ffx12ShaderSource.h 的 `* g_depth_scale`），FFX 侧也有
+//   set_depth_scale() —— 只有 NGX 分支没用上。原神是 reverse-z 且原始值域约
+//   [0, 0.03]，不放大则前后景在数值上几乎不可分，时间累积会把背景当同一平面。
+// ⚠️ 默认 1.0 = 与改动前**逐字节等价**，不改变现有行为；是否要非 1.0 需实机 A/B
+//   （关/开各跑一次，看 dlss_depth_extract_skipped 与画面拖影）。
+void set_depth_scale(float scale);
 void set_log_level(int lv);                                 // NgxLogLevel 0..3，默认 1
 void set_passthrough(bool on);                              // NgxPassthrough，默认 false
 // NgxCrossKeyReuse，默认 true（ini 里 1）。语义：instance_key 变了，但建池/建 feature 真正
