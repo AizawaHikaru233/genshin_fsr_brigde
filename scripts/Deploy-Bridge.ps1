@@ -127,6 +127,7 @@ $configValues = [ordered]@{
     'NgxRenderPreset'           = '0'   # 0 = 六个 preset 参数都不设（跟随 NGX 自身规则）；5..15 可显式指定
     'NgxSetFrameTimeDelta'      = '1'
     'NgxUseReactiveMask'        = '0'
+    'NgxDepthScale'             = '1.0' # 深度提取归一化倍数（b0.x）。1.0 = 不改行为（默认）；>0 且 <=64。是否要非 1.0 需实机 A/B
     'NgxLogLevel'               = '1'   # 0=全关 1=error（默认，取证行已可见）2=info 3=debug
     'NgxPassthrough'            = '0'
     'NgxProvider'               = 'auto' # NGX 实现来源：auto（默认）/ nvidia / external（非 N 卡经 OptiScaler）

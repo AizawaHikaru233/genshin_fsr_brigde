@@ -4344,6 +4344,22 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxUseReactiveMask", 0, config_path.c_str());
     ngx::set_use_reactive_mask(ngx_react != 0);
 
+    // ---- 键 7b：NgxDepthScale（2026-11-17 增，PR A / A3；默认 1.0）----
+    // 深度提取 CS 的值域归一化倍数（b0.x）。默认 1.0 = 与改动前**逐字节等价**。
+    // 此前 NGX 路径把它硬编码成 1.0，而 shader 本体支持相乘、FFX 侧也有 setter ——
+    // 只有 NGX 分支没用上。原神 reverse-z、原始值域约 [0, 0.03]，不放大时前后景
+    // 在数值上几乎不可分。
+    // ⚠️ 要不要非 1.0 必须实机 A/B 决定（关/开各跑一次，看 dlss_depth_extract_skipped
+    //    与画面拖影），本键只负责把旋钮接出来，不预设答案。
+    {
+        wchar_t ds_buf[32] {};
+        GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxDepthScale", L"1.0", ds_buf,
+                                 static_cast<DWORD>(std::size(ds_buf)), config_path.c_str());
+        // 上下界与 ngx::set_depth_scale 内部校验一致（>0 且 <=64），这里不重复 clamp 上限，
+        // 由 setter 统一裁决并在非法时打 ngx_depth_scale_invalid。
+        ngx::set_depth_scale(std::wcstof(ds_buf, nullptr));
+    }
+
     // ---- 键 8：NgxLogLevel（默认 1；0=全关 1=error 2=info 3=debug）----
     const int ngx_lv =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxLogLevel", 1, config_path.c_str());
