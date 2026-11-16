@@ -130,6 +130,7 @@ add_library(Dx11FsrBridge SHARED
     TransparentJitterHook.cpp
     Ffx12Backend.cpp
     NgxParamMap.cpp
+    NgxProviderPick.cpp
 )
 
 # ⚠️ `Fsr2InputDump.cpp`（抓帧诊断）**只在诊断构建里**进源列表：
@@ -362,6 +363,20 @@ fsrbridge_configure_test(NgxParamMapTest)
 target_include_directories(NgxParamMapTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 enable_testing()
 add_test(NAME NgxParamMapTest COMMAND NgxParamMapTest)
+
+# ---- NgxProviderPickTest：NGX「实现来源」选择顺序（PR A / A2）----
+# 与 NgxParamMapTest 同性质：`NgxProviderPick.h/.cpp` 零 D3D / 零 NGX / 零全局，
+# 因此同样不需要任何开关、不需要 GPU/游戏/注册表。
+# 它钉住的是 ensure_init() 第 1..3 步的选择顺序：
+#   Nvidia 模式硬失败不换来源 / External 模式跳过注册表 / Auto 模式注册表优先。
+# 这几条此前只能靠实机凑环境（无 OptiScaler、只装桥、有/无注册表）验证。
+add_executable(NgxProviderPickTest
+    NgxProviderPickTest.cpp
+    NgxProviderPick.cpp
+)
+fsrbridge_configure_test(NgxProviderPickTest)
+target_include_directories(NgxProviderPickTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME NgxProviderPickTest COMMAND NgxProviderPickTest)
 
 if(DX11FSRBRIDGE_BUILD_TESTS)
     # il2cpp callsite hook：观察/跳过/还原模式 + per-instance 隔离 + 相机 hook。
