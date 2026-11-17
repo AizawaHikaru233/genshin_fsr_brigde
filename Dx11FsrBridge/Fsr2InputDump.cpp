@@ -299,6 +299,7 @@ struct Pending
     std::uint32_t fmt_depth = 0;
     std::uint32_t fmt_motion = 0;
     std::uint32_t fmt_output = 0;
+    bool await_output = false;   // true = 本帧 output 尚未补入（由 on_dispatch_post 补）
     std::vector<CaptureItem> items;
 };
 
@@ -1005,6 +1006,11 @@ void on_dispatch(ID3D11DeviceContext *ctx, const FrameDesc &desc, bool allow_rea
     p.fmt_depth = desc.fmt_depth;
     p.fmt_motion = desc.fmt_motion;
     p.fmt_output = desc.fmt_output;
+    // output 改为 dispatch 成功之后再补（on_dispatch_post）。
+    // 连带影响（有意行为）：output 的失败原因不再进 reasons；下方 p.items.empty() 的判定
+    // 只依赖 4 张输入 ⇒ 「只有 output 能抓」的帧现在会走自毁分支。该场景下 output 单独抓到
+    // 也无分析价值（box_down(output) 需与 color/mv 配对）⇒ 可接受。
+    p.await_output = true;
 
     std::string reasons;
     auto add_reason = [&reasons](const std::string &r)
@@ -1027,9 +1033,8 @@ void on_dispatch(ID3D11DeviceContext *ctx, const FrameDesc &desc, bool allow_rea
     r.clear();
     queue_texture(dev, ctx, p, "transparency", desc.transparency, r);
     add_reason(r);
-    r.clear();
-    queue_texture(dev, ctx, p, "output", desc.output, r);
-    add_reason(r);
+    // output 不在这里排队：它必须在 ffx12::dispatch 成功返回后补（见 on_dispatch_post）。
+    // 本函数在 dispatch **之前**，此时 output_target 里还是上 1~2 帧的结果。
     dev->Release();
 
     if (!s.logged_ready)
@@ -1056,6 +1061,56 @@ void shutdown()
 {
     std::lock_guard<std::mutex> lock(state_mutex());
     release_pending(state().pending);
+}
+
+// dispatch **成功返回后**补抓 output（同帧抓取的唯一入口）。
+//
+// 为什么必须在这里而不能在 pre（on_dispatch）里：pre 跑在 ffx12::dispatch **之前**，
+// 那时 output_target 里还是上 1~2 帧的结果（实机 warp 扫描峰值 s=-2.0）。
+// NGX 后端在 dispatch 返回时已把本帧结果同步写进 output_target，
+// 五个 Release 之后紧跟 return true，这里是本 draw 内 output 的最后有效窗口。
+void on_dispatch_post(ID3D11DeviceContext *ctx, ID3D11Texture2D *output,
+                      bool allow_readback,
+                      std::uint64_t frame_index, std::uint64_t instance)
+{
+    if (!g_maybe_active.load(std::memory_order_relaxed)) return;   // 快路径，锁外
+    if (!ctx || !output) return;
+    if (!allow_readback) return;                                   // 与 pre 的 if (!allow_readback) 同源
+    if (frame_index == 0) return;                                  // K9
+    // 不判 instance == 0（K8）：Ffx12Backend.h 的默认参数就是 0，误判会让 post 永不执行且无日志
+
+    std::string fail_reason;          // 声明在锁外 ⇒ 出块后可见（析构晚于 lock_guard）
+    {
+        std::lock_guard<std::mutex> lock(state_mutex());   // 显式块：锁在 } 处释放
+        State &s = state();
+        if (!s.configured || !s.enabled) return;
+        if (!s.pending.used) return;
+        if (!s.pending.await_output) return;            // 已补过
+        if (s.pending.frame_index != frame_index || s.pending.instance != instance)
+        {
+            fail_reason = "identity_mismatch";          // 实测不可达，保留作防御
+        }
+        else
+        {
+            ID3D11Device *dev = nullptr;
+            ctx->GetDevice(&dev);
+            if (!dev)
+            {
+                fail_reason = "no_device";
+            }
+            else
+            {
+                std::string skip;
+                queue_texture(dev, ctx, s.pending, "output", output, skip);
+                if (skip.empty()) s.pending.await_output = false;
+                else fail_reason = skip;
+                dev->Release();
+            }
+        }
+    }   // 锁在此释放（不是函数末尾）
+
+    if (!fail_reason.empty())
+        FSR2DUMP_LOG(WARN, std::string("fsr2_input_dump post_skip=") + fail_reason);
 }
 
 } // namespace fsr2dump

@@ -12925,8 +12925,10 @@ bool try_fsr2_translation_draw(
                 // 开关关闭时永远不会进入 ⇒ 热键永远武装不上。关闭时内部走一次原子读即返回。
                 // 只在这里喂参数与纹理，读回由模块跨帧延迟完成——不在本 draw 内做 CPU 同步。
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                // 声明上移到块外：下面 dispatch 之后的后置抓帧（on_dispatch_post）也要用同一个
+                // 谓词，而它不在本块的 { } 内。三个使用点（声明 / pre / post）全在同一诊断宏内。
+                bool dump_dx11on12 = false, dump_gpu_only = false;
                 {
-                    bool dump_dx11on12 = false, dump_gpu_only = false;
                     ffx12::interop_capabilities(dump_dx11on12, dump_gpu_only);
                     fsr2dump::FrameDesc dump_desc;
                     dump_desc.color = color_tex;
@@ -13406,6 +13408,16 @@ bool try_fsr2_translation_draw(
                         st->out_a = draw_out_ptr;
                         st->out_a_tick = GetTickCount64();
                     }
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                    // 同帧抓取后置入口：dispatch 已返回 true，NGX 后端已在
+                    // ngx::dispatch 内同步写完 output（NgxBackend.cpp 的 ctx->CopyResource(in.output_target, ...)）。
+                    // 必须在下面五个 Release 之前——它们是本 draw 内 output 的最后有效窗口。
+                    if (output_tex != nullptr)
+                    {
+                        fsr2dump::on_dispatch_post(context, output_tex, !dump_dx11on12,
+                                                   call_params.frame_index, call_params.instance);
+                    }
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS
                     color_tex->Release();
                     depth_tex->Release();
                     motion_tex->Release();

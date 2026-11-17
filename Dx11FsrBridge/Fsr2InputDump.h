@@ -76,6 +76,24 @@ void configure(const wchar_t *ini_path);
 //   allow_readback —— false 表示当前是 D3D11On12 共享队列路径，读回不安全（直接拒绝）
 void on_dispatch(ID3D11DeviceContext *ctx, const FrameDesc &desc, bool allow_readback);
 
+// 符号锚点：grep -n -F 'void on_dispatch_post' Dx11FsrBridge/Fsr2InputDump.h
+//
+// dispatch **成功返回后**、output_tex->Release() **之前**调用一次。
+//
+// allow_readback：必须与同一帧 pre 传的是**同一个谓词**（= !dump_dx11on12）。
+//   理由：On12 下 pre 在 on_dispatch 的 if (!allow_readback) 处提前 return，既不 flush 也不重建 pending。
+//   若 post 不设同源门控，会把本帧 output 塞进上一帧遗留的 Pending
+//   ⇒ 产出「旧 color + 新 output」的错帧，且无任何日志。
+//   与 AGENTS.md §二.6「外层调用点与内层必须共用同一谓词」一致。
+//
+// 关闭态：一次 relaxed 原子读即返回（热路径红线）。
+// 实现必须放在 Fsr2InputDump.cpp 的匿名 namespace **之后**
+//   （要用 namespace 内的 queue_texture / state() / state_mutex() / g_maybe_active，
+//     这些在 .h 里均无声明 —— 符号锚点：grep -n -F 'namespace' Dx11FsrBridge/Fsr2InputDump.cpp）
+void on_dispatch_post(ID3D11DeviceContext *ctx, ID3D11Texture2D *output,
+                      bool allow_readback,
+                      std::uint64_t frame_index, std::uint64_t instance);
+
 // 进程退出/卸载时释放未落盘的 staging
 void shutdown();
 
