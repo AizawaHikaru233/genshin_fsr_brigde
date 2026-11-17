@@ -557,6 +557,10 @@ enum NgxConfigWarn : unsigned {
     //   而 provider 拼错（ngx / NVIDIA / 外部 / 空值）会让人以为"已经切到外部实现"，
     //   所以必须留下一条位名，随配置快照一起打出来。
     kWarnProviderInvalid = 1u << 2,  // NgxProvider 非法值 → 回退 auto
+    // 2026-11-17（NgxDepthScale 非法值静默回退）：必须留一条位名，理由与 provider 那条同理 ——
+    //   1.0 恰好也是"压根没写这个键"的默认值，非法值回退 1.0 之后，用户看到的行为与
+    //   "旋钮没生效"完全一样，没有位名就分不出「输入被拒」与「输入正常且等于默认」。
+    kWarnDepthScaleInvalid = 1u << 3,  // NgxDepthScale 非法值 → 回退 1.0
 };
 unsigned g_config_warn = 0;
 
@@ -945,8 +949,8 @@ std::string flags_to_string(unsigned int flags)
     return out;
 }
 
-// §3.13 末：配置位 → 位名。**三位**（appid_zero / preset_invalid / provider_invalid；
-// 第三位是 2026-11-10 的 B154 加的：NgxProvider 非法值）。
+// §3.13 末：配置位 → 位名。**四位**（appid_zero / preset_invalid / provider_invalid /
+// depth_scale_invalid；第三位 NgxProvider 非法值，第四位 2026-11-17 增的 NgxDepthScale 非法值）。
 // backend_invalid 不在此位图（它走 pending_warnings，因为 Native 回退后 ensure_init 不可达）。
 // bits == 0 返回空串（调用方只在 g_config_warn != 0 时调，见 §3.13.2 第 2 条）。
 std::string warn_to_string(unsigned int bits)
@@ -956,6 +960,7 @@ std::string warn_to_string(unsigned int bits)
         { kWarnAppIdZero,      "appid_zero" },
         { kWarnPresetInvalid,  "preset_invalid" },
         { kWarnProviderInvalid, "provider_invalid" },
+        { kWarnDepthScaleInvalid, "depth_scale_invalid" },
     };
     if (bits == 0)
         return std::string {};
@@ -4085,10 +4090,19 @@ void set_depth_scale(float scale)
 {
     // §3.13 的纪律：非法值回退并记录，不静默。0 / 负 / NaN 都无物理意义。
     // 上限 64：原神 reverse-z 值域约 [0, 0.03]，32 已足够映满 [0,1]，留一档余量。
+    //
+    // ★ 为什么这里**只记位、不打日志**：本函数由 load_config() 调用，而 blog::init() 在其**之后**
+    //   执行（见本文件上方配置 setter 段的理由）。此时 BridgeLogger 的 g_active 仍为 false，
+    //   enabled() 返回 false，write() 直接把整条记录丢弃 —— 在这里调 log_ngx_error，
+    //   得到的是一条**永远打不出来**的告警，而不是一次失败（正是此前那条
+    //   "ngx_depth_scale_invalid" 的实际处境）。
+    // ★ 告警实际从哪里出来：ensure_init 的配置快照尾行
+    //   "ngx_core config_warn bits=depth_scale_invalid"，由 log_config_snapshot 经
+    //   warn_to_string(g_config_warn) 拼出；那一行在 blog::init() 之后才产生，是真正可见的。
     if (!(scale > 0.0f) || scale > 64.0f)
     {
-        log_ngx_error(L"ngx_depth_scale_invalid value=%f fallback=1.0", static_cast<double>(scale));
         scale = 1.0f;
+        g_config_warn |= kWarnDepthScaleInvalid;
     }
     g_depth_scale = scale;
 }

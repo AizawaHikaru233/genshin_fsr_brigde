@@ -4356,7 +4356,9 @@ void load_config()
         GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxDepthScale", L"1.0", ds_buf,
                                  static_cast<DWORD>(std::size(ds_buf)), config_path.c_str());
         // 上下界与 ngx::set_depth_scale 内部校验一致（>0 且 <=64），这里不重复 clamp 上限，
-        // 由 setter 统一裁决并在非法时打 ngx_depth_scale_invalid。
+        // 由 setter 统一裁决；非法值时它记 depth_scale_invalid 位，告警随 ensure_init 的
+        // "ngx_core config_warn bits=…" 一行输出 —— **不是**在这里或 setter 里打，
+        // 因为本函数跑在 blog::init() 之前，此刻任何日志都会被丢弃。
         ngx::set_depth_scale(std::wcstof(ds_buf, nullptr));
     }
 
