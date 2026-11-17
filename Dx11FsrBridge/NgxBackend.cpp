@@ -1815,17 +1815,32 @@ static bool ensure_init(ID3D11Device *dev)
     // 来源由 NgxProvider 决定（g_provider_mode）：nvidia / external / auto（默认：先 nvidia 再 external）。
     // ★ 绑定之后的第 4..10 步与 v1 **逐字相同** —— 本改动只换「谁是 NGX 实现」，不换流程。
     ProviderHit hit;
-    bool provided = false;
     std::wstring fallback_detail;   // auto/external 失败时的诊断（只出现在 soft_fail 行里）
 
-    // ---- 2026-11-17（PR A / A2）：选择顺序抽成纯函数，探测调用留在原地 ----
+    // ---- 2026-11-17：选择顺序抽成纯函数，探测调用留在原地 ----
     //
     // 为什么这么切：**探测**（读注册表 / LoadLibrary / 扫模块）必须碰平台，
     // **选择**（哪条命中用哪个、什么情况硬失败、什么情况继续找）不该碰。
     // 后者才是"为什么这次没用上 OptiScaler"这类问题的所在，而它此前只能靠
     // 实机凑环境验证。现在 `ngx_provider_pick::pick()` 把顺序钉死并单测。
     //
-    // ★ 行为零变化：下面的探测条件、失败分支、detail 拼接与重构前逐条对应。
+    // ★★ 决策**问两轮**，第二轮才是最终裁决（曾经只问一轮，外部半边永远不可达）：
+    //   缺陷原状：pick() 在任何探测之前只被调一次，此后 `try_external()` 是否命中由调用方
+    //   直接置位 —— 于是调用当时 external_load_ok / external_scan_ok 恒为 false，
+    //   Decision::UseExternal 这条分支在生产里**永远不可能返回**，只有单测能构造出来。
+    //   （同一处缺陷的另一半：ProbeResults 曾把外部拆成 load / scan 两个字段，而 try_external()
+    //    只交回一个 bool ⇒ external_scan_ok 同样恒为 false。现合并成 external_found。）
+    //   现在把探测结果回填后**再问一次**，由第二轮 decision 决定「用外部 / 软失败」。
+    //
+    // ★★★ 逐组输入的结局与改动前**逐字节等价**（这是本次接线的验收前提）：
+    //   第一轮跑在外部探测之前，外部两个输入恒为 false ⇒ 它只可能给出三种结局；
+    //   每种结局下第二轮的输入与结局分别为 ——
+    //     · UseRegistry        ⇒ 不探外部，第二轮仍 UseRegistry（改动前也是用它）
+    //     · HardFailRegistry   ⇒ 上面已 fail_init 早退，到不了第二轮
+    //     · SoftFailNoProvider ⇒ 才探外部，回填真实结局后：捕中 ⇒ UseExternal
+    //                           （改动前由调用方置位，同一结局）；未捕中 ⇒ SoftFailNoProvider
+    //                           （改动前 soft_fail_init，同一结局）
+    //   ⇒ 生产行为不变，变的是"外部半边现在真的会参与决策"。
     ngx_provider_pick::ProbeResults probes {};
     unsigned nvidia_rc = 0;
     std::wstring ext_detail;
@@ -1845,20 +1860,21 @@ static bool ensure_init(ID3D11Device *dev)
     const ngx_provider_pick::Mode pick_mode =
         ngx_provider_pick::clamp_mode(static_cast<std::int32_t>(g_provider_mode));
 
-    // 先只问「注不注册表这一路已经命中了吗」——外部的两条探测要等第一轮决策之后
-    // 才知道要不要跑（External 模式跳过注册表、Auto 命中注册表就不再找外部）。
-    ngx_provider_pick::PickOutcome outcome = ngx_provider_pick::pick(pick_mode, probes);
+    // 第一轮：外部探测**还没跑**，所以它只可能回答「注册表命中 / 硬失败 / 继续找外部」。
+    const ngx_provider_pick::PickOutcome first = ngx_provider_pick::pick(pick_mode, probes);
 
-    if (outcome.decision == ngx_provider_pick::Decision::HardFailRegistry)
+    // 判据走 is_failure / is_soft_failure，而不是直接比枚举：这两个谓词就是为
+    //   "调用方据此决定走 fail_init 还是继续"而导出的（见 NgxProviderPick.h 的声明处）。
+    if (is_failure(first.decision) && !is_soft_failure(first.decision))
     {
-        // 显式 nvidia：与 v1 逐条相同（三条 reason + rc 原样），不重试、不换来源
+        // 显式 nvidia：与 v1 逐条相同（三条 reason + rc 原样），不重试、不换来源。
         return fail_init(provider_stage_reason(probes.registry == ngx_provider_pick::RegistryStage::Ok
                                                    ? ProviderStage::ok
                                                    : static_cast<ProviderStage>(static_cast<int>(probes.registry))),
                          nvidia_rc);
     }
 
-    if (outcome.record_registry_detail)
+    if (first.record_registry_detail)
     {
         // 与重构前同一条格式：reason(0xRC)
         wchar_t buf[64] {};
@@ -1867,29 +1883,50 @@ static bool ensure_init(ID3D11Device *dev)
         fallback_detail = buf;
     }
 
-    provided = (outcome.decision == ngx_provider_pick::Decision::UseRegistry);
+    // ---- 外部探测：只在注册表那条路**没**命中时才跑（与改动前的条件逐字对应）----
+    // 回填的是 try_external() 的真实结局，它同时是"load 与 scan 的先后顺序"的唯一出处
+    // （见该函数内部）；决策层只关心"命中 / 未命中"，不复制它的优先级。
+    if (first.decision != ngx_provider_pick::Decision::UseRegistry)
+        probes.external_found = try_external(&hit, &ext_detail);
 
-    if (!provided)
+    // 第二轮：带外部结果重新裁决 —— **这一轮才是最终结局**。
+    const ngx_provider_pick::PickOutcome outcome = ngx_provider_pick::pick(pick_mode, probes);
+
+    // 决策取证行：把「要什么来源 / 注册表走到哪一档 / 外部有没有命中 / 最终怎么裁决」放在一行。
+    // 为什么值得单独一行：`Ffx12Backend=ngx` 只说用户要 ngx，provider resolved= 只说最终用了谁，
+    //   而"为什么没用上外部实现"恰恰要靠**中间这一档**才能回答 —— 那正是这套纯函数抽出来的目的。
+    // ★ 频次：每次 ensure_init 一条（首初始化 + 5 秒退避后的重试），不在每帧路径上。
+    //   ⚠️ soft_fail 的 12 次重试会各打一条 —— 与既有的 soft_fail 行同频，不额外刷屏。
+    // ★ registry= 必须区分「探过但没命中」与「压根没探」：Mode::External 不探注册表，
+    //   此时 ProbeResults::registry 仍是默认值，照直打会读出"探过、结果是 no_registry"这个假事实
+    //   （§五.6 日志口径自洽）。所以没探就写 "-"。
+    const char *const reg_field = (g_provider_mode != kProviderExternal)
+                                      ? ngx_provider_pick::stage_reason(probes.registry)
+                                      : "-";
+    log_ngx_core(blog::Level::Error, L"ngx_core provider pick mode=%hs registry=%hs external=%d decision=%hs",
+                 ngx_provider_pick::mode_name(pick_mode), reg_field,
+                 probes.external_found ? 1 : 0,
+                 ngx_provider_pick::decision_name(outcome.decision));
+
+    // ★★ 判据必须是 is_failure，**不能**写 `!= UseExternal`：后者对 UseRegistry 也成立，
+    //   会把"注册表命中"当失败打进 soft_fail_init —— 等于把默认路径整个关掉。
+    //   is_failure 覆盖 HardFailRegistry + SoftFailNoProvider；而 HardFailRegistry 只在
+    //   Mode::Nvidia 出现，那种情况第一轮就已经 fail_init 早退了，到不了这里。
+    //   ⇒ 本分支实际只剩 SoftFailNoProvider，与改动前的 soft_fail_init 逐字对应。
+    if (is_failure(outcome.decision))
     {
-        // 外部实现：load 与 scan 的先后顺序保持原样（见 try_external 内部），
-        // 这里只把「命中与否」回填给决策层。
-        if (try_external(&hit, &ext_detail))
-        {
-            probes.external_load_ok = true;
-            provided                = true;
-        }
-        else
-        {
-            // 外部也没命中 ⇒ 与重构前完全一致的收尾。
-            if (ext_detail.empty())
-                ext_detail = L"unknown";
-            if (!fallback_detail.empty())
-                fallback_detail += L" external=";
-            fallback_detail += ext_detail;
-            // ★ 不置 g_release_all：OptiScaler 可能还没加载完（§3.4.2A）
-            return soft_fail_init(fallback_detail);
-        }
+        // 注册表与外部都没命中 ⇒ 与重构前完全一致的收尾。
+        if (ext_detail.empty())
+            ext_detail = L"unknown";
+        if (!fallback_detail.empty())
+            fallback_detail += L" external=";
+        fallback_detail += ext_detail;
+        // ★ 不置 g_release_all：OptiScaler 可能还没加载完（§3.4.2A）
+        return soft_fail_init(fallback_detail);
     }
+    // 走到这里 ⇒ 第二轮裁决为 UseRegistry 或 UseExternal，两条都意味着"来源已经绑定好"：
+    //   UseRegistry 时 hit 由 try_nvidia_registry() 填好；UseExternal 时由 try_external() 填好。
+    //   ⇒ 与改动前一样，下面一行 provider resolved= 一定打得出真实的 kind/path。
 
     // ---- 第 3 步收尾：来源取证（Error 级 ⇒ 默认 NgxLogLevel=1 就可见）----
     // 为什么要单独一行：`Ffx12Backend=ngx` 只说明"用户要 ngx"，这一行才说明"实际用的是谁"。

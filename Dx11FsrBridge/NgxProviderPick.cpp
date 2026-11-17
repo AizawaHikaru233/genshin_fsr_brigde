@@ -51,20 +51,18 @@ PickOutcome pick(Mode mode, const ProbeResults &probes)
         out.record_registry_detail = true;
     }
 
-    // ---- 第 2 步：外部实现（load 与 scan 任一命中即算命中）----
-    // 原实现里两者的顺序是 load 先、scan 后，但**对决策结果没有影响**
-    // （都是 provided = true），差别只在 detail 字符串的措辞。
-    // 因此这里合并成一个 or，不复制其优先级。
-    if (probes.external_load_ok || probes.external_scan_ok)
+    // ---- 第 2 步：外部实现 ----
+    // try_external() 内部先 LoadLibraryW("_nvngx.dll") 再扫已加载模块，对决策层只交一个 bool：
+    // 两条路的差别只在 detail 字符串的措辞，**对决策结果没有影响**（都是 provided = true），
+    // 所以这里不复制它的优先级（§五.2：判据常量单一来源）。
+    if (probes.external_found)
     {
         out.decision = Decision::UseExternal;
         return out;
     }
 
     // ---- 第 3 步：谁都没命中 ----
-    out.decision              = Decision::SoftFailNoProvider;
-    out.record_external_detail = true;
-    out.external_detail_empty  = true;   // 调用方按实际 detail 覆盖
+    out.decision = Decision::SoftFailNoProvider;
     return out;
 }
 

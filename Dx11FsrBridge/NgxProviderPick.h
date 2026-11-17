@@ -65,12 +65,18 @@ enum class RegistryStage : std::int32_t
     MissingEntry = 3,
 };
 
-// 三条探测路线的结果 —— **只描述事实，不携带任何 DLL 句柄**。
+// 两条探测路线的结果 —— **只描述事实，不携带任何 DLL 句柄**。
+//
+// ★ 2026-11-17：外部那一侧原本拆成 external_load_ok / external_scan_ok 两个字段，但生产侧
+//   **无法分别回填** —— try_external() 内部先 LoadLibraryW("_nvngx.dll") 再扫已加载模块，
+//   对调用方只返回一个 bool。拆成两个字段的后果是 external_scan_ok 在生产里永远是 false，
+//   "只扫到已加载模块"这条组合只有单测能构造 ⇒ 测试断言的状态生产不可达。
+//   现合并为一个 external_found，与 try_external() 的返回值一一对应。
+//   （两条路的**优先级**仍然留在 try_external() 内部，那是它唯一该在的地方。）
 struct ProbeResults
 {
     RegistryStage registry = RegistryStage::NoRegistry;   // 注册表那条路
-    bool external_load_ok  = false;   // LoadLibraryW("_nvngx.dll") + 导出绑定成功
-    bool external_scan_ok  = false;   // 扫已加载模块命中
+    bool external_found    = false;   // try_external() 的返回值：load 或 scan 任一命中
 };
 
 // 最终决策。
@@ -91,12 +97,11 @@ struct PickOutcome
     // true = 这次失败对最终结局有解释价值（auto 模式下会继续找外部，需要留下线索）。
     bool record_registry_detail = false;
 
-    // 外部实现失败时，是否要把它的 detail 记进 fallback 明细。
-    bool record_external_detail = false;
-
-    // 外部失败时，失败细节是否为空 —— 空则调用方填 "unknown"。
-    // 单独拎出来是因为原实现里这个判定与字符串拼接混在一起，容易漏。
-    bool external_detail_empty = true;
+    // ★ 2026-11-17：原有两个"外部明细"字段（record_external_detail / external_detail_empty）
+    //   已删除。它们在任何输入下都由本文件写死、且调用方**一处都不读** —— 那正是"纯函数导出了
+    //   一个生产不可达的状态"这一类问题的另一半：留着它们，单测就得为没人看的字段写断言，
+    //   而断言通过并不能说明生产会做任何事。外部失败的 detail 由调用方从 try_external() 直接
+    //   取（它才是该字符串的出处），不需要决策层转述。
 };
 
 // 纯函数：给定用户开关与三条探测结果，返回该走哪条路。
@@ -111,6 +116,14 @@ struct PickOutcome
 //
 // ⚠️ Mode::External 时**不试注册表**（条件 1），所以 HardFailRegistry 不可能出现
 //    —— 这条由 `assert`-风格的返回保证：External + 任意 registry 值都不会返回 HardFail。
+//
+// ★ 调用方（NgxBackend.cpp 的 ensure_init）**调它两次**，这不是冗余：
+//   第一次跑在外部探测之前（外部两个输入恒 false），用来决定「注不注册表命中 / 硬失败 /
+//   还要不要去找外部」；找到就填 ProbeResults::external_found，再用**同一份 probes**
+//   问第二次，第二次的 decision 才是最终结局。
+//   ⇒ 本函数必须保持**无副作用 + 只看入参**：两次调用之间唯一的差别就是 probes 被回填了。
+//     若将来把任何探测挪进本函数，"外部半边永远不可达"那个缺陷就会以新的形式回来
+//     （第一次调用拿到的是尚未发生的探测结果）。
 PickOutcome pick(Mode mode, const ProbeResults &probes);
 
 // 把 Mode 的合法范围夹住：未知整数一律回落 Auto（与 Dx11FsrBridge 的读键行为一致）。
