@@ -438,10 +438,11 @@ PFN_NGX_Shutdown1                g_shutdown   = nullptr;
 PFN_NGX_GetFeatureRequirements   g_req        = nullptr;
 
 // ---- SEH 守卫的异常码出口（§3.4.0）----
-// 守卫 wrapper 是 POD-only（MSVC 不允许它持 C++ 对象），因此异常码通过这个
-// 全局写出，调用方读完后自行决定怎么记日志。用 thread_local：守卫都在渲染线程
-// 上同步调用，不需要跨线程可见性，也就不需要原子操作（避免热路径上的额外代价）。
-static thread_local unsigned long g_release_crash = 0;
+// 守卫 wrapper 是 POD-only（MSVC 不允许它持 C++ 对象），因此异常码靠**传址出参**交回调用方，
+// 调用方读完后自行决定怎么记日志。
+// ★ 2026-11-17：这里曾有一个 `static thread_local unsigned long g_release_crash`，给四处
+//   guarded_release 调用点复用。它与另外两个 crash 码一样**只写不读** —— 记了异常码却没人看，
+//   等于没有归因能力，反而让"异常码会进日志"的说法看着像真的。现已改成各调用点自己的局部量。
 
 // ---- 自写 CS（全局，形状与尺寸无关；只编一次，§3.5）----
 // T-2 只声明；ensure_shaders 是 T-4 的交付物。
@@ -625,6 +626,9 @@ namespace log_throttle_slot
 {
 // ★★ 唯一的真值源：新增/删除/改名调用点只改这一处，enum 与常量表都由它展开。
 //   格式：X(枚举子名, 槽号)。槽号是**手写常量**、只用来标识身份，不是任何哈希的结果。
+// 2026-11-17：EvalCrash 是 GPU 厂商 DLL 在 EvaluateFeature 里抛出的结构化异常。
+//   它发生在**每帧**的 eval 路径上（设备被打断后可连续多帧），故必须走本闸门；
+//   但它同时是"NGX 运行时已经不可用"的唯一证据，同槽的"前 8 条必打"保证首现不丢。
 #define LOG_SLOT_LIST(X) \
     X(PoolTexFail,       14) \
     X(ColorSrvFail,       3) \
@@ -633,7 +637,8 @@ namespace log_throttle_slot
     X(SampleStagingFail, 26) \
     X(SampleMapFail,     15) \
     X(InstReuse,         17) \
-    X(InstReuseSkip,     18)
+    X(InstReuseSkip,     18) \
+    X(EvalCrash,         21)
 
 // ① 调用点可以传的**全部**槽位（模板参数的类型就是它）。
 #define LOG_SLOT_ENUM_ITEM(name, value) name = value,
@@ -1705,8 +1710,20 @@ static bool ensure_query_params(const char **why);
 //     · 接住异常后返回失败 + 写出异常码，由调用方走既有失败路径
 //       （fail_init / eval 失败计数 / handle 置空），**不改变正常路径语义**。
 //
-// 【边界】这层只负责「不让进程死」，不负责「让失败被修复」。异常码会进日志
-//   与（eval 路径的）失败计数，便于事后归因。
+// 【边界】这层只负责「不让进程死」，不负责「让失败被修复」。
+//
+// 【异常码去哪了】（2026-11-17 补：此前四个码只写不读，本条注释却在声称"会进日志"）
+//   四个调用点各持一个**局部** crash 码，按性质分别在下列位置被消费 ——
+//     · init   → reason=init_crash 的 init ok=0 行（rc= 字段就是异常码）
+//     · create → create_feature 的 reason=create_crash 行（失败分支，非热路径，不闸门）
+//     · eval   → "ngx_core eval crash" 行（**每帧路径 ⇒ 走 log_ngx_error_throttled 槽
+//                EvalCrash**，前 8 条必打、之后每 1024 条一条）
+//     · release→ 释放路径上"进程没死就继续"是既定语义，故只在真接住异常时打一条
+//                release_crash 行（释放本身不在每帧路径上）；rc 不入失败计数 ——
+//                那个计数（eval_fail_streak）的语义是"eval 连续失败"，混入释放失败会让
+//                连续 3 次放手的判据提前触发。
+//   ⇒ 判据：**没有读取点的异常码一律不留**。写进全局再没人看，比不记更糟 ——
+//     它让下一个人以为现场有归因能力。
 // ============================================================================
 
 // 必须 noinline 且不含需要 C++ 展开的对象（MSVC C2712）。
@@ -2905,7 +2922,18 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
 
     // 释放旧 handle。返回值【不处理】：handle 已失效时 NGX 返回失败，不影响后续 CreateFeature。
     // 不调 g_params->Reset()（3.9.5）—— 那会清掉 CreateFeature 设的 7 项。
-    if (g_release && inst.feature) (void)guarded_release(g_release, inst.feature, &g_release_crash);
+    //
+    // 2026-11-17（异常码此前只写到 thread_local 全局、无人读取）：改成局部量并在**接住异常时**
+    //   打一条。不进失败计数 —— eval_fail_streak 的语义是"eval 连续失败"，混入释放失败会让
+    //   "连续 3 次放手"的判据提前触发（§五.6：口径不能混）。释放不在每帧路径上，不闸门。
+    if (g_release && inst.feature)
+    {
+        unsigned long release_crash = 0;
+        (void)guarded_release(g_release, inst.feature, &release_crash);
+        if (release_crash != 0)
+            log_ngx_error(L"ngx_core release_crash where=create_feature ex=0x%08X",
+                          static_cast<unsigned>(release_crash));
+    }
     inst.feature = nullptr;
 
     // 偏离 1（防御，不改变正常路径）：g_params / g_create 为 null 只可能是 ensure_init
@@ -3003,6 +3031,15 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     unsigned long create_crash = 0;
     const NVSDK_NGX_Result rr =
         guarded_create(ctx, NVSDK_NGX_Feature_SuperSampling, g_params, &inst.feature, &create_crash);
+
+    // 2026-11-17（异常码此前只写不读）：守卫接住 AV 时 rr 只会是笼统的 Fail，单看 rc 无法与
+    //   "NGX 自己返回失败"区分 —— 归因全靠这一行。放在既有 create_feature 行**之前**：
+    //   那一行说的是"结果"，这一行说的是"结果为什么长这样"。
+    // ★ 不走闸门：CreateFeature 只在建 feature 时调用（尺寸/格式变化或白名单 rc 重试），
+    //   不在每帧路径上；且此处的失败会直接置 g_release_all 或进白名单重试，次数本就有限。
+    if (create_crash != 0)
+        log_ngx_error(L"ngx_core create_feature reason=create_crash ex=0x%08X rw=%u rh=%u dw=%u dh=%u",
+                      static_cast<unsigned>(create_crash), inst.rw, inst.rh, inst.dw, inst.dh);
 
     // 2026-11-13（独立审查第二轮 · 建议 6）：**成功与失败都写出真实 rc**。
     //   放在这里（g_create 之后、日志之前）而不是各 return 点各写一遍：本函数的结局
@@ -3401,7 +3438,16 @@ static void destroy_instance()
     // ★ feature 是裸 handle，ComPtr 管不到，必须手工释放
     if (g_inst.feature)
     {
-        if (g_release) guarded_release(g_release, g_inst.feature, &g_release_crash);
+        // 2026-11-17：异常码改局部量并消费（见 §3.4.0 的「异常码去哪了」）。
+        // 不进失败计数：eval_fail_streak 的语义是"eval 连续失败"。
+        if (g_release)
+        {
+            unsigned long release_crash = 0;
+            guarded_release(g_release, g_inst.feature, &release_crash);
+            if (release_crash != 0)
+                log_ngx_error(L"ngx_core release_crash where=destroy_instance ex=0x%08X",
+                              static_cast<unsigned>(release_crash));
+        }
         g_inst.feature = nullptr;
     }
     g_inst.feature_create_failed = false;   // 对象销毁 ⇒ 锁存随对象消失（不是「清锁重试」）
@@ -3957,8 +4003,15 @@ void shutdown_all()
 {
     // ---- 1. 释放 feature（裸 handle，ComPtr 管不到，必须手工 Release）----
     // ★ 先判 g_release 非空：ensure_init 未跑过时它还是 nullptr。
+    // 2026-11-17：异常码改局部量并消费（见 §3.4.0 的「异常码去哪了」）。不进失败计数。
     if (g_release && g_inst.feature)
-        guarded_release(g_release, g_inst.feature, &g_release_crash);
+    {
+        unsigned long release_crash = 0;
+        guarded_release(g_release, g_inst.feature, &release_crash);
+        if (release_crash != 0)
+            log_ngx_error(L"ngx_core release_crash where=shutdown_all ex=0x%08X",
+                          static_cast<unsigned>(release_crash));
+    }
     g_inst.feature = nullptr;
 
     // ---- 2. 清全部实例资源 + 两个随对象消失的锁存 ----
@@ -4349,8 +4402,15 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
         cdesc.Format != inst.color_fmt || odesc.Format != inst.output_fmt ||
         flags_changed)
     {
+        // 2026-11-17：异常码改局部量并消费（见 §3.4.0 的「异常码去哪了」）。不进失败计数。
         if (g_release && inst.feature)
-            guarded_release(g_release, inst.feature, &g_release_crash);
+        {
+            unsigned long release_crash = 0;
+            guarded_release(g_release, inst.feature, &release_crash);
+            if (release_crash != 0)
+                log_ngx_error(L"ngx_core release_crash where=key_changed ex=0x%08X",
+                              static_cast<unsigned>(release_crash));
+        }
         inst.feature = nullptr;
 
         // ★ 建池之前必须先把新尺寸与新格式写回 inst：create_pool 直接读 inst.color_fmt /
@@ -4621,6 +4681,22 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
         ++inst.eval_fail_total;
         if (!device_removed)
             ++inst.eval_fail_streak;   // §4.2 第 12 行 / §3.9.7：设备丢失**不累加** streak
+
+        // 2026-11-17（异常码此前只写不读）：守卫接住 AV 时 rr 恒为 Result_Fail，与"NGX 自己
+        //   返回 Fail"在日志里**无法区分** —— 而两者处置不同（前者的运行时已经不可用，后者
+        //   可能只是本帧参数问题）。故单独留一条带**原始异常码**的行。
+        // ★★ 必须走计数闸门：本行在**每帧**的 eval 路径上，设备被打断后可连续多帧抛异常，
+        //   不闸门就是每帧一条（AGENTS.md §五.6）。槽 EvalCrash 是独立特化 ⇒ "前 8 条必打"
+        //   保证首现一定留在日志里，之后每 1024 条一条。
+        // ★ 位置：在 eval_fail_total 自增**之后**、下面那条 eval 失败行**之前** ——
+        //   两个数字必须同源（§五.6 日志口径自洽：本行的 eval_fail_total 含本次失败，
+        //   与紧邻的 eval ok=0 行是同一个值，不是"上一帧的数"）。
+        if (eval_crash != 0)
+            log_ngx_error_throttled<log_throttle_slot::Slot::EvalCrash>(
+                L"ngx_core eval crash ex=0x%08X rc=0x%X eval_fail_total=%llu inst=0x%llX",
+                static_cast<unsigned>(eval_crash), static_cast<unsigned>(rr),
+                static_cast<unsigned long long>(inst.eval_fail_total),
+                static_cast<unsigned long long>(instance_key));
 
         if (log_gate_fail8_every256(inst.eval_fail_total))
         {
