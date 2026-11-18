@@ -5,7 +5,7 @@
 > **改动历史不在这里**：某段代码为什么是现在这样，用 `git log` / `git blame` 查。
 > 条目关闭后直接删除；要留结论就移入文末「已解决」，并注明解决它的提交。
 
-最后更新：2026-11-15
+最后更新：2026-11-18
 
 ---
 
@@ -586,6 +586,73 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
   信号，新增块的收益不抵噪声。
 - **独立 NGX 摘要块不做**：把 `BACKEND :` 与 DLSS 版本并入现有行已覆盖主要痛点，独立块与
   焦点块内容重复。
+
+## 7. NGX 后端启动期崩溃缺乏可归因现场（两条 upstream issue 未结案）
+
+**现状**
+
+- 上游仓库有两条 open issue 报告崩溃，本仓库均**未能复现**，也未定位到确切的崩溃指令：
+  - 「NVNGX 启动即退出」：把超分输入切成 `Ffx12Backend=ngx` 后，游戏在窗口出现前静默退出；切回 `native` 正常。用户提供的 `Dx11FsrBridge.log` 为 **0 字节**。
+  - 「OptiScaler 0xc0000005 @0x3e87a」：崩溃发生在随包分发的 OptiScaler 二进制内，与桥无关。
+- 已排除的说法（**不要重新提出**）：「日志 0 字节 ⇒ 崩在 `blog::init()` 之前 ⇒ 与 NGX 无关」。
+  实测：`BridgeLogger` 全程不 flush，只有 writer 线程关闭文件时才 flush；`std::ofstream` 缓冲约 4090 字节。
+  写 <4000 B 后硬杀进程，磁盘上确实是 0 字节；写 ≥4090 B 则落盘 4183 B。
+  本机正常会话到 `hooked CreateSwapChainForHwnd` 累计仅约 2054 B，首次越过 4096 B 是在首次 draw 的 NGX 段。
+  ⇒ 0 字节日志的真实含义是「崩在日志器初始化之后、累计日志不足约 4 KB 之前」，这个窗口**覆盖** swapchain 钩子安装与 NGX 初始化早期。
+- 已完成的加固：`NgxBackend.cpp` 的 8 个厂商函数指针中，6 个已加 SEH 守卫（init/release/create/eval/get_caps/destroy）。
+  `g_shutdown` / `g_req` 只有绑定与 `note()` 登记，**无任何调用点**，故不存在第 7、8 个裸调用。
+
+**影响**
+
+- 两条 issue 都无法给出「已修复」的结论。SEH 守卫把「进程直接消失且无现场」改成「该功能失败并可归因」，
+  这是无论如何都正确的行为改变，但**不是**对该崩溃的证明。
+- 若真实成因在厂商 DLL 内部对状态的破坏（而非调用点 AV），SEH 只能把进程从崩溃变成「功能失效」，
+  用户侧可能表现为 DLSS 不生效而游戏能进。
+
+**推进需要**
+
+1. 让报告者提供 Windows 事件日志 `Application Error` / `BEX64` 条目里的**故障模块名与故障偏移** ——
+   这一条能直接区分崩溃发生在桥内、厂商 DLL 内还是 OptiScaler 内。
+2. 确认 `payload\Bridge\Dx11FsrBridge.log` 是**存在且 0 字节**，还是**根本不存在**（两者结论相反）。
+3. 确认 `payload\Bridge\ngx\` 下是否存在 `nvngx.log`（存在说明已走到 appinit 步骤，崩溃更晚）。
+4. 在能复现的机器上抓 `.dmp`（WER LocalDumps 即可），提供 `ExceptionAddress` 与栈。
+5. 拿到上述任一条后，按 §8.4 把结论从 E0 提升；在此之前任何「已修复」的说法都不成立。
+
+**相关代码位置**
+
+- `Dx11FsrBridge/NgxBackend.cpp`：六个 SEH 守卫 wrapper 及三处调用点（`guarded_get_caps` / `guarded_destroy`）、
+  `ensure_init` 第 7 步、`ensure_query_params`、`release_query_params`
+- `Dx11FsrBridge/BridgeLogger.cpp`：`writer_loop` 的 flush 时机（只在收到停止信号后 flush）
+- `Dx11FsrBridge/Dx11FsrBridge.cpp`：`initialize()` 里 `load_config` → `ffx12::preload` → `blog::init` 的顺序；
+  `install_swapchain_hooks` → `clone_and_patch_vtable`
+
+---
+
+## 8. NGX 后端仍有厂商代码调用未加 SEH 守卫
+
+**现状**
+
+- 已加守卫的只是 6 个**函数指针**调用点。同一批厂商 DLL 还有三类调用**未加守卫**：
+  - `g_params->Get(...)` —— `NVSDK_NGX_Parameter` 的虚表调用（读参数）
+  - `p->Set(...)` —— 同上，写参数
+  - 最优设置回调 `cb(p)` —— `NGX_DLSS_GET_OPTIMAL_SETTINGS` 传入的函数指针，由厂商实现回调
+- 这三类与已守卫的六处同属「第三方实现不在本进程控制之下」，AV 同样会带走进程。
+
+**影响**
+
+- 与上一节同形：进程直接消失、现场不可归因。区别只是它们此前不在那条 issue 的分析路径上，未被一并加固。
+- `Get/Set` 可能落在每帧路径上，加守卫前必须先判断是否真的每帧调用。
+
+**推进需要**
+
+- 先确认每一项的调用频率（是否每帧），再决定守卫形态与是否需要闸门。
+- 需要独立探针或故障注入来证明守卫有效（本项目没有覆盖渲染主链的自动化测试）。
+- 加守卫后必须实测帧数，证明没有可观察的帧数损失（§二.5 的既有纪律：先测「不开守卫 vs 开守卫」的差，
+  不要把「看起来开销很小」当成结论）。
+
+**相关代码位置**
+
+- `Dx11FsrBridge/NgxBackend.cpp`：`g_params->Get` / `p->Set` 的调用点、`query_dlss_optimal_range` 里传入的回调
 
 ---
 
