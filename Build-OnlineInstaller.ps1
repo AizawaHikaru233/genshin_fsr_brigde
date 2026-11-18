@@ -540,9 +540,9 @@ function Prepare-FpsStage {
     Remove-Item -LiteralPath (Join-Path $stagePayloadReShade 'ReShade.ini'), (Join-Path $stagePayloadReShade 'ReShadePreset.ini') -Force -ErrorAction SilentlyContinue
     # 完整组件包：OptiScaler 运行时全家桶（FFX SDK / XeSS / XeLL / D3D12Core / Licenses）始终内置。
     Copy-DirectoryContents -Source $optiRuntime -Destination $stageOpti
-    # 临时方案：OptiScaler 自带的 FFX 运行时替换成 AMD 官方 release 版本（与 payload\AMD 同一份）。
-    # 上游 OptiScaler 更新后应复核兼容性，再决定是否保留这行。
-    Copy-Item -LiteralPath $ffxDll -Destination (Join-Path $stageOpti 'amd_fidelityfx_upscaler_dx12.dll') -Force
+    # OptiScaler 自带的 FFX 运行时不再覆盖：自 0.9.5 起上游随包的副本与 payload\AMD 的 AMD 官方基线
+    # 逐字节相同（4.1.2.4555），保留上游原件即可；两者一旦不同源，Assert-ManifestMatchesStagedFiles
+    # 对 payload\OptiScaler 的 SHA-256 断言会失败关闭。
     # 桥默认 FSR SDK 路径（Ffx12DllPath 留空时使用 payload\AMD\）。
     Copy-Item -LiteralPath $ffxDll -Destination (Join-Path $stageAmd 'amd_fidelityfx_upscaler_dx12.dll') -Force
     # AMD FFX12 SDK license（FSR4 = FFX API 2.x，从 OptiScaler\Licenses 复制）。
@@ -730,8 +730,7 @@ try {
     }
     Copy-Item -LiteralPath $ngxLicense -Destination (Join-Path $bridge 'NVIDIA-NGX-SDK-LICENSE.txt') -Force
     Copy-DirectoryContents -Source $optiRuntime -Destination $opti
-    # 临时方案：同上，芙芙包里的 OptiScaler 也换成 AMD 官方 FFX 运行时。
-    Copy-Item -LiteralPath $ffxDll -Destination (Join-Path $opti 'amd_fidelityfx_upscaler_dx12.dll') -Force
+    # 芙芙包的 OptiScaler 同样保留上游自带的 FFX 运行时（与 AMD 官方基线同源，见上方说明）。
     Copy-Item -LiteralPath $ffxDll -Destination (Join-Path $amd 'amd_fidelityfx_upscaler_dx12.dll') -Force
     # AMD FFX12 SDK license（FSR4 = FFX API 2.x，从 OptiScaler\Licenses 复制）。
     Copy-Item -LiteralPath (Join-Path $optiRuntime 'Licenses\FidelityFX_v2_LICENSE.md') -Destination (Join-Path $amd 'FidelityFX_v2_LICENSE.md') -Force
