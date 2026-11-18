@@ -286,6 +286,7 @@ function Assert-CleanPackage {
     param([string]$Path)
     $forbiddenNames = @(
         'amd_fidelityfx_framegeneration_dx12.dll', 'amd_fidelityfx_vk.dll',
+        'amd_fidelityfx_upscaler_vk.dll', 'amd_fidelityfx_framegeneration_vk.dll',
         'dlssg_to_fsr3_amd_is_better.dll', 'fakenvapi.dll', 'fakenvapi.ini', 'libxess_fg.dll',
         'nvngx_dlssg.dll', 'nvngx_dlssd.dll'
     )

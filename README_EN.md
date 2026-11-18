@@ -98,7 +98,7 @@ The output is written to `dist\原神解帧FSR插件包_v*.7z`, while the GitHub
 
 ## FuFu Launcher Plugin Source and Local Build
 
-`FufuGraphicsPlugin/` contains the FuFu Launcher plugin source, configuration templates, and the marketplace/local-test Lua installer scripts. The repository does not commit a prebuilt FuFu Launcher plugin binary. Before a local build, run `tools/Update-UpstreamComponents.ps1` to refresh the upstream component baseline (OptiScaler is pinned to v0.9.4; DLSS, ReShade, and FPS Unlocker fetch their latest official releases with SHA-256 verification), then run:
+(OptiScaler is pinned to v0.9.5;
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\Update-UpstreamComponents.ps1 -WorkspaceRoot .
@@ -352,7 +352,7 @@ Visual Studio with the Desktop development with C++ workload, the Windows SDK, a
 
 A Rust toolchain (`cargo`) is also required to build the graphical installer: run `Installer\app\build-app.ps1` once to produce `Installer\app\GenshinFSRBridgeInstaller.exe`; the packaging script takes that file directly and fails with a hint when it is missing.
 
-First refresh the upstream component baseline (only needed when component versions change; the script pins OptiScaler to v0.9.4 and fetches the latest official DLSS, ReShade, and FPS Unlocker releases):
+the script pins OptiScaler to v0.9.5 and
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\Update-UpstreamComponents.ps1 -WorkspaceRoot .

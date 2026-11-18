@@ -1516,7 +1516,7 @@ static void log_config_snapshot()
 // §3.4.3A provider 解析（2026-11-10 增，B154）
 // 为什么要有这一层：v1 把"谁是 NGX 实现"写死成"注册表 FullPath 指向的那个 _nvngx.dll"。
 //   可注册表只是 NVIDIA 驱动的一条**发现路径**，不是 NGX 的唯一来源 —— OptiScaler 就导出
-//   同一套 NVSDK_NGX_D3D11_* 入口（v0.9.4-final 共 53 个 NVSDK_NGX_* 导出，D3D11 十项齐全）。
+//   同一套 NVSDK_NGX_D3D11_* 入口（v0.9.5-final 共 53 个 NVSDK_NGX_* 导出，本层要的 10 个 D3D11 入口齐全）。
 //   于是非 N 卡机器上"注册表不存在"被当成确定性失败（fail_init 置不可逆的 g_release_all），
 //   ngx 后端整个会话报废 —— 这是把**观测源**和**动作**绑死（AGENTS.md §五.1）。
 // 本层只做一件事：给定"来源"，把 10 个入口绑定好；绑定之后的流程一字未变。

@@ -52,7 +52,7 @@ $optiRootDir = Join-Path $payload 'OptiScaler'
 #
 # 上游 OptiScaler 有**且仅有两种**发行布局，两者都必须支持：
 #
-#   平铺（flat，旧版 / v0.9.4）：
+#   平铺（flat，0.9.x 各版本，含 v0.9.5）：
 #     payload\OptiScaler\
 #       OptiScaler.dll, OptiScaler.ini, amd_fidelityfx_upscaler_dx12.dll,
 #       libxess.dll, D3D12_Optiscaler\D3D12Core.dll, Licenses\...
@@ -175,10 +175,10 @@ if ($null -ne $script:UpstreamVersions -and $null -ne $script:UpstreamVersions.o
     $optiFileVersion = [string]$script:UpstreamVersions.optiscaler.fileVersion
 }
 else {
-    $optiTag = 'v0.9.4'
-    $optiAssetName = 'Optiscaler_0.9.4-final.20260718._MM.7z'
-    $optiArchiveSha256 = '575CB4DF866116093DF75AF607E37FD70E10F5163E0F23FD5C804142E80EF0AD'
-    $optiFileVersion = '0.9.4.0'
+    $optiTag = 'v0.9.5'
+    $optiAssetName = 'Optiscaler_0.9.5-final.20261116.7z'
+    $optiArchiveSha256 = '77E3ED76BED04E1FB32BACB5A72799FF172F3DA22ED5231C0CF3E84FE6761662'
+    $optiFileVersion = '0.9.5.5'
 }
 
 . (Join-Path $scriptDirectory 'Localization.ps1')

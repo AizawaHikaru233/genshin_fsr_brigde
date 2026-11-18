@@ -96,7 +96,7 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 
 ## 芙芙启动器插件包源码与本地构建
 
-`FufuGraphicsPlugin/` 提供芙芙启动器插件的源码、配置模板以及商城/本地测试 Lua 安装脚本；仓库不提交芙芙启动器插件二进制包。本地构建前先运行 `tools/Update-UpstreamComponents.ps1` 获取上游组件基线（OptiScaler 固定 v0.9.4，DLSS、ReShade、FPS Unlocker 获取各自最新正式版并做 SHA-256 校验），再运行：
+上游组件基线（OptiScaler 固定 v0.9.5，
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\Update-UpstreamComponents.ps1 -WorkspaceRoot .
@@ -345,7 +345,7 @@ ReShade 的着色器 / 纹理 / Preset / 截图路径均使用**相对路径**�
 
 还要 Rust 工具链（`cargo`）来编图形安装器：先跑一次 `Installer\app\build-app.ps1` 生成 `Installer\app\GenshinFSRBridgeInstaller.exe`，打包脚本会直接取它；没有这个 exe 时会报错提示。
 
-先更新上游组件基线（仅需在组件版本变化时执行；脚本固定 OptiScaler v0.9.4，DLSS、ReShade、FPS Unlocker 获取各自最新正式版）：
+脚本固定 OptiScaler v0.9.5，
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\Update-UpstreamComponents.ps1 -WorkspaceRoot .

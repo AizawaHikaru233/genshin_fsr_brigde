@@ -77,7 +77,7 @@ GenshinFSRBridge\
   payload\
     FpsUnlocker\unlockfps_nc.exe        ← 解帧工具原地运行，fps_config.json 也在这里
     Bridge_v2.2.0\Dx11FsrBridge.dll
-    OptiScaler_v0.9.4\OptiScaler.dll
+    OptiScaler_v0.9.5\OptiScaler.dll
     ReShade\ReShade64.dll
     TextureLoader\…
     AntiPlayerMosaic\…
@@ -91,7 +91,7 @@ GenshinFSRBridge\
 在「插件配置」页可切换。切换后**只**改写被切那一版的 ini 与 `fps_config.json` 的 `DllList`：
 另一版、ReShade、TextureLoader 等组件的配置一概不动，`FPSTarget` / `UseHDR` 也不动。
 
-- OptiScaler 0.9.x 是**平铺**布局：`OptiScaler_v0.9.4\OptiScaler.dll` 与
+- OptiScaler 0.9.x 是**平铺**布局：`OptiScaler_v0.9.5\OptiScaler.dll` 与
   `amd_fidelityfx_upscaler_dx12.dll` 同级，`OptiDllPath` 写版本目录本身。
 - OptiScaler 0.10 起是**嵌套**布局：DLL 在 `OptiScaler_v0.10.0\OptiScaler\` 下，
   ini 仍在版本目录根，`OptiDllPath` 写 `…\OptiScaler_v0.10.0\OptiScaler`。

@@ -1,10 +1,10 @@
 ﻿{
-    "generatedAt":  "2026-11-12T15:14:39.5242872Z",
+    "generatedAt":  "2026-11-18T07:15:16.4807418Z",
     "optiscaler":  {
-                       "Tag":  "v0.9.4",
-                       "Asset":  "Optiscaler_0.9.4-final.20260718._MM.7z",
-                       "ArchiveSha256":  "575CB4DF866116093DF75AF607E37FD70E10F5163E0F23FD5C804142E80EF0AD",
-                       "FileVersion":  "0.9.4.0"
+                       "Tag":  "v0.9.5",
+                       "Asset":  "Optiscaler_0.9.5-final.20261116.7z",
+                       "ArchiveSha256":  "77E3ED76BED04E1FB32BACB5A72799FF172F3DA22ED5231C0CF3E84FE6761662",
+                       "FileVersion":  "0.9.5.5"
                    },
     "dlss":  {
                  "Tag":  "v2.14.16",

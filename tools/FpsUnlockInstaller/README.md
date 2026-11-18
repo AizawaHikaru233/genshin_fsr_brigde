@@ -8,7 +8,7 @@
 2. `AntiPlayerMosaic.dll`（反虚化、隐藏 UID 与水下马赛克修复）
 3. `TextureLoader.dll`（纹理/Mod 加载器：3DMigoto 兼容 `[TextureOverride]` 替换，DDS + GDDS DirectStorage GPU 解压，Mods 目录随包）
 4. 官方 ReShade Add-on 版与获得明确再分发授权的 RenoDX Add-on（闭源，授权凭据随包归档）
-5. OptiScaler 0.9.4 及随包 FFX 2.3 SDK（FSR 4.1.1）/ XeSS / XeLL / D3D12Core 运行时与各自许可文件
+5. OptiScaler 0.9.5 及随包 FFX 运行时（FSR 4.1.2）/ XeSS 2.0.2 / XeLL 1.3.2 / D3D12Core 与各自许可文件
 6. OptiScaler 与 ReShade 的全新默认配置模板
 7. 交互安装、卸载、组件更新和脚本自更新功能
 
@@ -26,11 +26,11 @@
 ## 组件来源
 
 - FPS Unlocker：<https://github.com/AizawaHikaru233/genshin-fps-unlock/releases>（本项目维护的 fork，带高帧防检测）
-- OptiScaler 0.9.4：<https://github.com/optiscaler/OptiScaler/releases/tag/v0.9.4>
+- OptiScaler 0.9.5：<https://github.com/optiscaler/OptiScaler/releases/tag/v0.9.5>
 - NVIDIA DLSS 超分组件：<https://github.com/NVIDIA-RTX/Streamline/releases>
 - ReShade：<https://reshade.me/downloads>
 
-上游组件由 `tools/Update-UpstreamComponents.ps1` 在构建时从上述官方来源获取并锁定版本基线（`upstream-versions.json` 随包内置）：OptiScaler 固定 0.9.4 正式版，DLSS / ReShade / FPS Unlocker 获取最新正式版。安装脚本按同一基线补齐缺失组件（不自由追 latest），旧包无基线文件时回退内置默认值。
+OptiScaler 固定 0.9.5 正式版，DLSS / ReShade / FPS Unlocker 获取最新正式版。
 
 本地发布包内置 DLSS 与 ReShade64.dll（含各自许可文件）。GitHub 发布包不内置：首次配置检测到 RTX 显卡时从 NVIDIA 官方 Streamline 发行版下载 DLSS（验证 NVIDIA 数字签名后安装并保留许可证）；ReShade 二进制与效果库由安装器从 reshade.me 与各原作者官方仓库下载（SHA-256 校验、许可文件保留）。已有有效文件时不会覆盖；`nvngx_dlssg.dll` 和 `nvngx_dlssd.dll` 不在自动下载范围内。
 

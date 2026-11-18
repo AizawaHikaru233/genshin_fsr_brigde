@@ -22,7 +22,7 @@ $userAgent = 'GenshinFsrBridge-UpstreamUpdater'
 
 # ---------------------------------------------------------------------------
 # 版本基线策略（与安装脚本 Configure.ps1 / ReShadeResources.ps1 共享）：
-#   - OptiScaler   : 固定 v0.9.4 正式版（构建基线，含 FFX 2.3 SDK / XeSS / XeLL / D3D12Core）
+#   - OptiScaler   : 固定 v0.9.5 正式版（构建基线，含 FFX 运行时 FSR 4.1.2 / XeSS 2.0.2 / XeLL 1.3.2 / D3D12Core）
 #   - DLSS         : NVIDIA Streamline 最新正式版（提取 nvngx_dlss.dll + license）
 #   - ReShade      : reshade.me 官方最新正式版（Setup exe 提取 ReShade64.dll）
 #   - FPS Unlocker : 本项目维护的 fork（AizawaHikaru233/genshin-fps-unlock），固定 v3.6.0
@@ -106,9 +106,9 @@ function Assert-NvidiaSignedFile {
 }
 
 function Update-OptiScaler {
-    # 固定 v0.9.4 正式版。官方包内含 FFX 2.3 SDK（FSR 4.1.1）/ XeSS / XeLL / D3D12Core / Licenses。
-    Write-Host '--- OptiScaler (固定 v0.9.4) ---' -ForegroundColor Cyan
-    $asset = Get-GitHubReleaseAsset -Repository 'optiscaler/OptiScaler' -Tag 'v0.9.4' -AssetFilter { $_.name -match '^Optiscaler_.*\.7z$' }
+    # 固定 v0.9.5 正式版。官方包内含 FFX 运行时（FSR 4.1.2）/ XeSS 2.0.2 / XeLL 1.3.2 / D3D12Core / Licenses。
+    Write-Host '--- OptiScaler (固定 v0.9.5) ---' -ForegroundColor Cyan
+    $asset = Get-GitHubReleaseAsset -Repository 'optiscaler/OptiScaler' -Tag 'v0.9.5' -AssetFilter { $_.name -match '^Optiscaler_.*\.7z$' }
     $work = Join-Path $env:TEMP ("GenshinUpstream-Opti-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $work | Out-Null
     try {
@@ -134,6 +134,8 @@ function Update-OptiScaler {
         $preserve = @('OptiScaler-UpscalingFiles.json')
         $exclude = @(
             'amd_fidelityfx_framegeneration_dx12.dll', 'amd_fidelityfx_vk.dll',
+            # 0.9.5 把 Vulkan 版 FFX 运行时拆成两个大文件（合计约 73 MB），Windows DX11 发布包用不到。
+            'amd_fidelityfx_upscaler_vk.dll', 'amd_fidelityfx_framegeneration_vk.dll',
             'dlssg_to_fsr3_amd_is_better.dll', 'fakenvapi.dll', 'fakenvapi.ini',
             'libxess_fg.dll', 'nvngx_dlssg.dll', 'nvngx_dlssd.dll',
             'setup_linux.sh', 'setup_windows.bat', '!! README_EXTRACT ALL FILES TO GAME FOLDER !!.txt'
