@@ -1689,17 +1689,19 @@ static bool soft_fail_init(const std::wstring &detail)
 //   这里只放声明；理由写在此处，免得下一个人把它当成可以随意挪动的顺序。
 static bool ensure_query_params(const char **why);
 // ============================================================================
-// §3.4.0 SEH 守卫（2026-11-17）
+// §3.4.0 SEH 守卫（2026-11-17，2026-11-18 补 get_caps / destroy）
 //
-// 【为什么需要】本后端要调四个**第三方函数指针**（GPU 厂商 DLL 里的实现）：
-//   g_init_ext / g_release / g_create / g_eval。这些实现不在本进程控制之下 ——
-//   版本不匹配、模块被提前卸载、驱动层 vtable 未就绪，任何一种都可能在调用点
-//   触发 ACCESS_VIOLATION。桥是注入型 DLL：**一次 AV 就是整个游戏进程被带走**，
-//   而不是 fail-open。
+// 【为什么需要】本后端要调六个**第三方函数指针**（GPU 厂商 DLL 里的实现）：
+//   g_init_ext / g_release / g_create / g_eval / g_get_caps / g_destroy。
+//   这些实现不在本进程控制之下 —— 版本不匹配、模块被提前卸载、驱动层 vtable
+//   未就绪，任何一种都可能在调用点触发 ACCESS_VIOLATION。桥是注入型 DLL：
+//   **一次 AV 就是整个游戏进程被带走**，而不是 fail-open。
 //
 // 【此前状态】本文件 `__try` 出现次数为 0（2026-11-17 复核）。也就是说上面
-//   四个调用点一旦 Fault，症状是「游戏直接消失、日志 0 字节」—— 没有可归因的
+//   这些调用点一旦 Fault，症状是「游戏直接消失、日志 0 字节」—— 没有可归因的
 //   现场。这与本项目其它钩子点「__try 一律 fail-open」的纪律不一致。
+//   ★ 2026-11-18：当时只覆盖了 4 个（init/release/create/eval），g_get_caps 与
+//     g_destroy 的 3 处调用仍是裸调用；本次补齐，故本段统一写成「这些调用点」。
 //
 // 【做法】为每个调用点包一层 `__declspec(noinline)` 的**独立**函数，`__try`
 //   只放在 wrapper 内部：
@@ -1710,18 +1712,39 @@ static bool ensure_query_params(const char **why);
 //     · 接住异常后返回失败 + 写出异常码，由调用方走既有失败路径
 //       （fail_init / eval 失败计数 / handle 置空），**不改变正常路径语义**。
 //
+// 【crash 码出参的初始化约定】（2026-11-18 补，两套写法并存的原因）
+//   · 既有 4 个 wrapper（init_ext / release / create / eval）**不清零**，由调用方
+//     在自己的局部量声明处清零（见各调用点的 "unsigned long xxx_crash = 0;"）。
+//   · 2026-11-18 新增的 get_caps / destroy 两个 wrapper **额外在入口先清零**。
+//   ⇒ 为什么允许并存：四个旧 wrapper 的调用点都已经显式清零，改动它们属于无收益的
+//     扰动（§一.3 一次改动只做一件事）；而清零的收益是"调用方忘了初始化时不会把栈上
+//     垃圾值误读成崩溃"（方向相反的假警报）。新 wrapper 直接把这个保护内建，
+//     旧 wrapper 保持原状。
+//   ⇒ **写新调用点时的规则**：无论用哪个 wrapper，局部量都按本文件的既有形态
+//     "unsigned long xxx_crash = 0;" 声明。对新增的两个 wrapper 这是冗余保险，
+//     对既有的四个则是**必需**。不要因为"wrapper 里清了"就省掉声明处的清零。
+//
 // 【边界】这层只负责「不让进程死」，不负责「让失败被修复」。
 //
 // 【异常码去哪了】（2026-11-17 补：此前四个码只写不读，本条注释却在声称"会进日志"）
-//   四个调用点各持一个**局部** crash 码，按性质分别在下列位置被消费 ——
-//     · init   → reason=init_crash 的 init ok=0 行（rc= 字段就是异常码）
-//     · create → create_feature 的 reason=create_crash 行（失败分支，非热路径，不闸门）
-//     · eval   → "ngx_core eval crash" 行（**每帧路径 ⇒ 走 log_ngx_error_throttled 槽
-//                EvalCrash**，前 8 条必打、之后每 1024 条一条）
-//     · release→ 释放路径上"进程没死就继续"是既定语义，故只在真接住异常时打一条
-//                release_crash 行（释放本身不在每帧路径上）；rc 不入失败计数 ——
-//                那个计数（eval_fail_streak）的语义是"eval 连续失败"，混入释放失败会让
-//                连续 3 次放手的判据提前触发。
+//   每个调用点各持一个**局部** crash 码，按性质分别在下列位置被消费 ——
+//     · init      → reason=init_crash 的 init ok=0 行（rc= 字段就是异常码）
+//     · create    → create_feature 的 reason=create_crash 行（失败分支，非热路径，不闸门）
+//     · eval      → "ngx_core eval crash" 行（**每帧路径 ⇒ 走 log_ngx_error_throttled 槽
+//                   EvalCrash**，前 8 条必打、之后每 1024 条一条）
+//     · release   → 释放路径上"进程没死就继续"是既定语义，故只在真接住异常时打一条
+//                   release_crash 行（释放本身不在每帧路径上）；rc 不入失败计数 ——
+//                   那个计数（eval_fail_streak）的语义是"eval 连续失败"，混入释放失败会让
+//                   连续 3 次放手的判据提前触发。
+//     · get_caps① → reason=get_caps_crash 的 init ok=0 行（2026-11-18 补，ensure_init 第 7 步）
+//     · get_caps② → 两条：① 数值直接进 "ngx_core get_caps_crash where=query_params ex=0x%08X"
+//                   行（每进程至多一条，紧随其后就置粘滞位）；
+//                   ② g_query_params_fail = "get_caps_crash"，经 ensure_query_params 的
+//                   粘滞分支交回调用方，由第 10b 步的 pq_query_params ok=0 reason=%hs 行打印
+//                   （2026-11-18 补，数值那一条按审核 MINOR-1 补；走既有回退路径，
+//                   选档回退比例表，不降级可用性）
+//     · destroy   → release_crash 行 where=destroy_query_params（2026-11-18 补；释放失败
+//                   照样清指针 —— "进程没死就继续"的既定语义）
 //   ⇒ 判据：**没有读取点的异常码一律不留**。写进全局再没人看，比不记更糟 ——
 //     它让下一个人以为现场有归因能力。
 // ============================================================================
@@ -1789,6 +1812,70 @@ __declspec(noinline) static NVSDK_NGX_Result guarded_eval(ID3D11DeviceContext *c
     {
         *crash_code = static_cast<unsigned long>(GetExceptionCode());
         return NVSDK_NGX_Result_Fail;
+    }
+}
+
+// 2026-11-18：GetCapabilityParameters 的 SEH 守卫（此前是裸调用）。
+//   证据：厂商 DLL 是第三方实现（本文件 §3.4.3A：注册表的 _nvngx.dll 或 OptiScaler 一类
+//   外部实现，都不在本进程控制之下），AV 会带走整进程；而发布构建**无 /EHsc**
+//   （Dx11FsrBridge/CMakeLists.txt 的 target_compile_options 只在 Debug 加 /EHsc），
+//   异常不会被任何人接住 —— 症状是"游戏直接消失、日志 0 字节"。
+//
+// ★ 为什么**判空放在 wrapper 内**（而不是留给两个调用点各自判）：
+//   ① 两个调用点对"入口非空"的保证强度**不同**：ensure_init 第 7 步依赖的是
+//      bind_entries_from 的不变式"十项全有或全清"（见该函数头注释），它自己**不**判空；
+//      而 ensure_query_params 有一处更早的显式判空（"no_entry" 分支）。后者保留 ——
+//      那条分支给出的原因比"no_params"精确，删掉会让日志退化。
+//      所以 wrapper 内的判空不是替代它们，而是**兜住那条只有一层保证的路径**：
+//      即使日后 bind_entries_from 的"全清"不变式被改坏，这里也只会返回失败，
+//      不会拿空指针进 __try。
+//   ② 更重要的是**异常码的语义**：入口为空根本不是"厂商实现崩了"，它是一种**确定的**
+//      能力缺失。若让它拿空指针进 __try，crash_code 会变成 0xC0000005，于是日志把它
+//      报成"厂商 DLL AV" —— 那是**错误归因**，会把排查引到驱动上去。
+//      故空入口在这里直接返回 NVSDK_NGX_Result_Fail 且 crash_code 保持 0，
+//      由既有失败分支（no_params / 粘滞 no_params）接手。
+//      ★ 这里是一次**行为改善**，不是"与改动前逐字一致"（2026-11-18 审核 MINOR-2 更正）：
+//        改动前入口为空时是**裸调用空指针 ⇒ AV ⇒ 进程直接消失、日志 0 字节**，
+//        根本不存在任何 no_params 行；现在它变成一条可归因的失败日志。
+//        逐字未变的只有**正常路径**（入口非空、厂商实现不抛异常那一条）。
+// ★ crash_code **无条件先置 0**：调用方的局部量若忘记初始化，读到栈上垃圾值就会把
+//   "成功"误判成"崩溃"（方向相反的假警报）。统一在这里清零，调用方只需判 != 0。
+__declspec(noinline) static NVSDK_NGX_Result guarded_get_caps(NVSDK_NGX_Parameter **out_params,
+                                                             unsigned long *crash_code)
+{
+    *crash_code = 0;
+    if (g_get_caps == nullptr)
+        return NVSDK_NGX_Result_Fail;
+    __try
+    {
+        return g_get_caps(out_params);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *crash_code = static_cast<unsigned long>(GetExceptionCode());
+        return NVSDK_NGX_Result_Fail;
+    }
+}
+
+// 2026-11-18：DestroyParameters 的 SEH 守卫（此前是裸调用，见 release_query_params）。
+//   与 guarded_release 同形：返回值本来就被调用方丢弃，这里只关心"有没有把进程炸掉"。
+// ★ 判空后返回 true：g_destroy / params 任一为空即**无事可做**，不是失败 ——
+//   与 guarded_release 的语义保持一致（它也对空句柄返回 true），否则调用方会把
+//   "本来就不需要释放"当成一次异常去记日志。
+__declspec(noinline) static bool guarded_destroy(NVSDK_NGX_Parameter *params, unsigned long *crash_code)
+{
+    *crash_code = 0;
+    if (g_destroy == nullptr || params == nullptr)
+        return true;
+    __try
+    {
+        (void)g_destroy(params);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *crash_code = static_cast<unsigned long>(GetExceptionCode());
+        return false;
     }
 }
 
@@ -1982,8 +2069,15 @@ static bool ensure_init(ID3D11Device *dev)
         return fail_init(L"init", static_cast<unsigned>(init_rc));
 
     // ---- 第 7 步：GetCapabilityParameters（全局一份，**不调 Reset()**）----
+    // 2026-11-18：改走 SEH 守卫（§3.4.0）。厂商 DLL 是第三方实现，AV 会带走整进程；
+    //   发布构建无 /EHsc ⇒ 异常无人接住。异常码的**读取点**就是下面这一行 fail_init：
+    //   它打出 reason=get_caps_crash 与 rc=0x<异常码>（Error 级，一次初始化至多一条，
+    //   不在每帧路径上，故不加闸门）。
     NVSDK_NGX_Parameter *params = nullptr;
-    const NVSDK_NGX_Result caps_rc = g_get_caps(&params);
+    unsigned long caps_crash = 0;
+    const NVSDK_NGX_Result caps_rc = guarded_get_caps(&params, &caps_crash);
+    if (caps_crash != 0)
+        return fail_init(L"get_caps_crash", static_cast<unsigned>(caps_crash));
     if (caps_rc != NVSDK_NGX_Result_Success || params == nullptr)
         return fail_init(L"no_params", static_cast<unsigned>(caps_rc));
     g_params = params;
@@ -2455,7 +2549,8 @@ bool g_query_params_owned = false;
 //   变成了每帧一次 NGX 入口调用 —— AGENTS.md §二.5 的形态。
 //   ⇒ 失败一次即记下原因、永不再试，直到 shutdown_all 把整套状态清掉（换设备/换 provider
 //     是唯一值得重试的时机）。
-const char *g_query_params_fail = nullptr;   // "no_entry" / "no_params" / "shared_singleton"
+// 2026-11-18：新增 "get_caps_crash"（厂商入口抛异常，见 ensure_query_params 的 SEH 守卫）。
+const char *g_query_params_fail = nullptr;   // "no_entry" / "no_params" / "shared_singleton" / "get_caps_crash"
 
 // 六档区间的缓存。key 只用 display 宽高：查询输入 = (Width=display, Height=display, 档位)，
 // 与 render 尺寸无关（render 只决定"选哪档"）。尺寸变化才重查。
@@ -2504,8 +2599,25 @@ static void release_query_params()
 {
     // ★ 顺序：先判 owned 再 Destroy，最后清标志。任何一条路径漏清标志都会导致
     //   下一次 shutdown_all 对已释放的指针再 Destroy 一次。
-    if (g_query_params != nullptr && g_query_params_owned && g_destroy != nullptr)
-        (void)g_destroy(g_query_params);
+    //
+    // 2026-11-18：改走 SEH 守卫（§3.4.0）。厂商 DLL 是第三方实现，AV 会带走整进程；
+    //   发布构建无 /EHsc ⇒ 异常无人接住。（shutdown_all 里那条"2026-11-13 残余风险"
+    //   已记：外部 provider 的 DestroyParameters 在设备刚丢失的时刻未实测过。）
+    // ★ 异常码的**读取点**在下面那个 if 里：真接住异常时打一条 release_crash，与另外四处
+    //   guarded_release 的 where= 写法同形。释放不在每帧路径上（只在 shutdown_all 里调），
+    //   故不加闸门；rc 也不进任何失败计数（见 §3.4.0 的「异常码去哪了」）。
+    // ★★ 接住异常后**继续往下清指针**：释放失败不得影响状态机 —— 若因为"释放崩了"就
+    //   保留 g_query_params，下一个使用点会拿着一个已失效的对象去查询，而 shutdown_all
+    //   的幂等契约也会被破坏（下一次还会再 Destroy 一次同一个指针）。
+    //   这与既有的"进程没死就继续"语义一致。
+    if (g_query_params != nullptr && g_query_params_owned)
+    {
+        unsigned long destroy_crash = 0;
+        (void)guarded_destroy(g_query_params, &destroy_crash);
+        if (destroy_crash != 0)
+            log_ngx_error(L"ngx_core release_crash where=destroy_query_params ex=0x%08X",
+                          static_cast<unsigned>(destroy_crash));
+    }
     g_query_params = nullptr;
     g_query_params_owned = false;
     // ★ 粘滞失败原因也一并清：本函数只在 shutdown_all 里调用（设备级关停），
@@ -2533,8 +2645,38 @@ static bool ensure_query_params(const char **why)
         return false;
     }
 
+    // 2026-11-18：改走 SEH 守卫（§3.4.0）。这是**选档路径**上的厂商调用 —— 首帧
+    //   （以及设备重建后第一次选档）就会走到，同样是"AV 带走整进程 + 发布构建无 /EHsc"。
+    // ★ 异常码的**读取点**有两处，各管一件事，缺一不可：
+    //   ① 数值：下面 if 里直接打一条带 ex=0x%08X 的行（2026-11-18 审核 MINOR-1 补）。
+    //      为什么不能只靠 ②："get_caps_crash" 这个字符串只有**布尔语义**，
+    //      从日志里分不清 0xC0000005（AV）与其它异常码，而两者的处置完全不同。
+    //      代价可控：紧接其后就置粘滞位 ⇒ 每进程至多一条，不是每帧日志。
+    //   ② 原因：同时记成粘滞失败原因（与上面 "no_entry" 分支同一形态），
+    //      经本函数的 *why 出参交回调用方，落点在 ensure_init 第 10b 步的
+    //      ngx_core pq_query_params ok=0 reason=%hs 行（Error 级）。
+    //      保留它的理由：选档回退的**决策依据**要与另外三个粘滞原因同口径（§五.6），
+    //      否则读日志的人无法判断本次回退是哪一类建不起来。
+    // ★ 粘滞失败 ⇒ 之后每帧只读一个指针就返回，不会每帧重调到会崩的入口
+    //   （§二.5 热路径红线；理由同 g_query_params_fail 的注释）。
+    // ★ 走既有回退路径：返回 false ⇒ refresh_optimal_ranges 返 0 ⇒ 选档回退比例表，
+    //   **不降级可用性**。
     NVSDK_NGX_Parameter *qs = nullptr;
-    const NVSDK_NGX_Result rc = g_get_caps(&qs);
+    unsigned long caps_crash = 0;
+    const NVSDK_NGX_Result rc = guarded_get_caps(&qs, &caps_crash);
+    if (caps_crash != 0)
+    {
+        // 2026-11-18（审核 MINOR-1）：把**异常码数值**打出来，而不是只留一个布尔语义。
+        //   理由：另外 5 处 crash 码都带 ex=0x%08X，只有这里退化成字符串原因，
+        //   排查时就分不清 0xC0000005（AV）与其它异常码 —— 而两者的处置完全不同。
+        // ★ 紧接其后就置粘滞位 ⇒ 本行**每个进程至多一条**，不违反 §二.5 热路径红线：
+        //   之后每次 ensure_query_params 都在上头那个粘滞分支直接返回，走不到这里。
+        log_ngx_error(L"ngx_core get_caps_crash where=query_params ex=0x%08X",
+                      static_cast<unsigned>(caps_crash));
+        g_query_params_fail = "get_caps_crash";
+        if (why) *why = g_query_params_fail;
+        return false;
+    }
     if (rc != NVSDK_NGX_Result_Success || qs == nullptr)
     {
         g_query_params_fail = "no_params";
