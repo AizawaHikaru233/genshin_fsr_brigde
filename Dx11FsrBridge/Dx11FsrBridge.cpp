@@ -74,6 +74,10 @@ constexpr std::size_t k_device_vtable_size = 80;
 // Keep all inherited entries when cloning its vtable, not only the older
 // IDXGISwapChain2-sized prefix.
 constexpr std::size_t k_swapchain_vtable_size = 41;
+// IDXGISwapChain3Vtbl 的项数（40）：与上面 41 项的 IDXGISwapChain4Vtbl 只差最后一项
+// SetHDRMetaData。克隆 vtable 时必须按「实际拿到的接口」选长度 —— 拿 41 去拷 IDXGISwapChain3
+// 会多读一项邻接内存，拿 40 去覆盖 IDXGISwapChain4 则会漏拷末项。
+constexpr std::size_t k_swapchain3_vtable_size = 40;
 constexpr std::size_t k_factory_vtable_size = 32;
 constexpr std::size_t k_factory2_vtable_size = 40;
 #if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
@@ -115,9 +119,15 @@ constexpr std::size_t k_idx_set_fullscreen_state = k_swapchain_base_methods + 2;
 constexpr std::size_t k_idx_get_fullscreen_state = k_swapchain_base_methods + 3;
 constexpr std::size_t k_idx_resize_buffers = k_swapchain_base_methods + 5;
 constexpr std::size_t k_idx_resize_target = k_swapchain_base_methods + 6;
+// 槽位来源：Windows SDK 10.0.26100.0 的 shared/dxgi1_5.h:511 —— IDXGISwapChain4Vtbl 共 41 项，
+// [37] CheckColorSpaceSupport、[38] SetColorSpace1、[39] ResizeBuffers1、[40] SetHDRMetaData。
+// ★ [39] ResizeBuffers1 有意不钩，不是漏的：桥自身不发起重建、也不读回队列信息，只在
+//   ResizeBuffers（槽 13）成功后做后置刷新；ResizeBuffers1 上未做属已知取舍。
+// 2026-11-18：k_idx_set_hdr_metadata 原写作 39（指向 ResizeBuffers1，与 hooked_set_hdr_metadata
+//   逐参不符），依据见上面这处 SDK 头原文。
 constexpr std::size_t k_idx_check_color_space_support = 37;
 constexpr std::size_t k_idx_set_color_space1 = 38;
-constexpr std::size_t k_idx_set_hdr_metadata = 39;
+constexpr std::size_t k_idx_set_hdr_metadata = 40;
 constexpr std::size_t k_idx_factory_create_swap_chain = 10;
 constexpr std::size_t k_idx_factory2_create_swap_chain_for_hwnd = 15;
 constexpr std::size_t k_idx_output6_get_desc1 = 27;
@@ -14926,7 +14936,9 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
         else if (SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3))) && swapchain3 != nullptr)
         {
             hook_instance = swapchain3;
-            hook_method_count = 39;
+            // 退化到 IDXGISwapChain3：vtable 只有 40 项（无 SetHDRMetaData 槽）。
+            // 槽 40 不存在 ⇒ supports_hdr_metadata 保持 false、HDR 钩子不装，这是预期行为，不是缺口。
+            hook_method_count = k_swapchain3_vtable_size;
         }
         else
         {
