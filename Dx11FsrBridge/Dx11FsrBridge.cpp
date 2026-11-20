@@ -6151,8 +6151,9 @@ void install_loader_hooks_for_loaded_modules()
 //
 // 为什么必须这么做（2026-11-20，issue #19 实机崩溃的根因）：
 // 公开接口的项数（IDXGISwapChain4 = 41）只是**基类前缀**的长度。DXGI 返回的实际对象是
-// 内部实现类，vtable 远长于此 —— 本机实测 D3D11 的 swapchain 有 242 个连续代码槽，
-// device 173、factory2 103。按公开项数克隆会得到一张**截断的替身 vtable**：
+// 内部实现类，vtable 远长于此 —— 本机实测（连续「指向可执行内存」的槽数，三次复跑一致）：
+// swapchain 242、device 173、device context 302、factory2 103。
+// 按公开项数克隆会得到一张**截断的替身 vtable**：
 // VirtualAlloc 按 4KB 页提交且零填充，于是槽 [public_count, ...) 全是 0，而不是原函数。
 //
 // 实测证据（独立探针 EXE，单变量对照：同一对象、同一路径，只改克隆长度）：
