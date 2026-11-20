@@ -6166,37 +6166,110 @@ void install_loader_hooks_for_loaded_modules()
 //
 // 判据只要求「指针落在已提交的可执行页内」，不要求「在同一个模块」—— 其它 overlay 把自己的
 // 函数挂进 vtable 是合法且常见的，那类项同样必须被完整拷贝，否则同样会变成 0。
+//
+// 2026-11-20（下限校验）：public_method_count 是**调用方断言**的项数，此前从未被验证 ——
+// 循环只从它往上探，若它大于原 vtable 真实长度，克隆时的 memcpy 就会越过 vtable 末尾读取。
+// 因此先在 [0, public_method_count) 上逐槽校验可读性，并把下限收窄到第一个不可读槽位。
+// ★ 必须**逐槽**判，不能用「VirtualQuery(source) 所在区域的剩余空间」一次性算 ——
+//   vtable 可以跨多个连续已提交区域，那样会过度收窄，重新制造 issue #19（克隆体被截短）。
+//   「过度收窄」比「多读一点」危险得多：少拷的槽位在克隆体里是 0，被调用即 call 0。
+// ★ 判据与下方的探测循环**完全同一套**（同一个 lambda，正反两个方向），不另立口径。
+// ★ 已知局限（诚实记录）：本判据只能识别「槽位本身不可读」。若对象的真实 vtable 短于
+//   调用方的下限、而紧随其后的内存仍可读（例如整条 vtable 落在一张已提交的堆页里），
+//   收窄不会发生，memcpy 仍会多读若干字节 —— 读的是可读内存，不会立即访问违例，
+//   但拷进克隆体的是 vtable 之外的数据。VirtualQuery 无法区分「属于 vtable」与
+//   「紧邻的其它数据」，故不追求消除这一项，只用补丁边界守卫（见 clone_and_patch_vtable）
+//   拦住真正会写坏内存的那部分。
+// ★ 只在安装期跑一次，最多 512 次 VirtualQuery，不在热路径，不做性能优化。
 static std::size_t cloned_vtable_capacity(void **source, std::size_t public_method_count)
 {
-    constexpr std::size_t k_max_probe = 512; // 上限只为防越界；实测最大值 242
+    constexpr std::size_t k_max_probe = 512; // 上限只为防越界；实测最大值 302（device context）
     constexpr DWORD k_exec_mask = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-    std::size_t count = public_method_count;
-    MEMORY_BASIC_INFORMATION mbi {};
-    for (std::size_t i = public_method_count; i < k_max_probe; ++i)
+
+    // 槽位可读的判据（**唯一来源**，两处循环共用）。为什么先验证再读：包装型实现会自建
+    // vtable（new void*[41]），越过末尾就是未映射内存；先读 source[i] 会在安装期直接崩，
+    // 症状与本函数要修的崩溃同类。按 AGENTS.md §二.3，读未知内存一律先验证再读。
+    const auto slot_readable = [](void **base, std::size_t index)
     {
-        // **先确认槽位本身可读，再解引用**。顺序不能反：包装型实现会自建 vtable
-        // （new void*[41]），越过末尾就是未映射内存；先读 source[i] 会在安装期直接崩，
-        // 症状与本函数要修的崩溃同类。按 AGENTS.md §二.3，读未知内存一律先验证再读。
-        if (VirtualQuery(&source[i], &mbi, sizeof(mbi)) != sizeof(mbi))
-            break;
+        MEMORY_BASIC_INFORMATION mbi {};
+        if (VirtualQuery(&base[index], &mbi, sizeof(mbi)) != sizeof(mbi))
+            return false;
         if (mbi.State != MEM_COMMIT)
-            break;
+            return false;
         // PAGE_GUARD 页可读一次即失效；PAGE_EXECUTE 单独出现时不可读 —— 两种都不能解引用。
         if ((mbi.Protect & PAGE_GUARD) != 0)
-            break;
+            return false;
         if ((mbi.Protect & (PAGE_NOACCESS | PAGE_EXECUTE)) != 0)
+            return false;
+        return true;
+    };
+
+    // ---- 下限校验：[0, public_method_count) 逐槽验证，遇到第一个不可读槽就收窄 ----
+    // 只用**槽位自身**的可读性（不要求槽内指针指向可执行页）：下限是调用方报的项数，
+    // 它只可能因为「调用方多报了」而错，多报只会让 memcpy 越过表尾多读。
+    const std::size_t caller_lower_bound = public_method_count;
+    std::size_t count = public_method_count;
+    bool narrowed = false;
+    for (std::size_t i = 0; i < public_method_count; ++i)
+    {
+        if (!slot_readable(source, i))
+        {
+            count = i;
+            narrowed = true;
             break;
+        }
+    }
+    if (narrowed)
+    {
+        LOG_WARN(blog::cat::hook, "vtable_lower_bound_narrowed caller_lower_bound=" +
+            std::to_string(caller_lower_bound) + " readable_slots=" + std::to_string(count) +
+            " reason=caller_lower_bound_beyond_readable memory source=" +
+            hex64(reinterpret_cast<std::uintptr_t>(source)));
+    }
+
+    // ---- 向上探测实际长度 ----
+    // ⚠ 未验证：上限被走满时只说明真实长度「可能」大于上限，不是已证明。本机实测最大
+    //   302（device context），离 512 尚远，生产里没有触发条件。
+    bool hit_probe_cap = true;
+    for (std::size_t i = count; i < k_max_probe; ++i)
+    {
+        if (!slot_readable(source, i))
+        {
+            hit_probe_cap = false;
+            break;
+        }
         void *entry = source[i];
         if (entry == nullptr)
+        {
+            hit_probe_cap = false;
             break;
+        }
         MEMORY_BASIC_INFORMATION target {};
         if (VirtualQuery(entry, &target, sizeof(target)) != sizeof(target))
+        {
+            hit_probe_cap = false;
             break;
+        }
         if (target.State != MEM_COMMIT)
+        {
+            hit_probe_cap = false;
             break;
+        }
         if ((target.Protect & k_exec_mask) == 0)
+        {
+            hit_probe_cap = false;
             break;
+        }
         count = i + 1;
+    }
+    // 走到这里仍为 true 只有两种情形：① 一路可读直到撞上上限；② 调用方下限已不小于上限，
+    // 循环一次都没跑。两种都属于「克隆体可能被截断」，同一口径告警。
+    if (hit_probe_cap)
+    {
+        LOG_WARN(blog::cat::hook, "vtable_probe_truncated probe_cap=" + std::to_string(k_max_probe) +
+            " cloned_slots=" + std::to_string(count) +
+            " caller_lower_bound=" + std::to_string(caller_lower_bound) +
+            " reason=probe_cap_reached action=clone_may_be_truncated");
     }
     return count;
 }
@@ -6214,6 +6287,28 @@ bool clone_and_patch_vtable(void *instance, std::size_t method_count, const std:
     void **source = *object;
     // 按**原 vtable 实际长度**克隆，而不是按公开接口项数 —— 见 cloned_vtable_capacity 注释。
     method_count = cloned_vtable_capacity(source, method_count);
+
+    // 2026-11-20（补丁越界）：克隆长度现在是**探测**出来的，可能比调用方以为的短 ——
+    // 探测在「目标指针不指向可执行页」处就停（vtable 里出现数据指针、或包装实现自建的短表）。
+    // 此前 patches 的应用没有任何边界检查，长度一旦短于最大补丁槽位就是**越界写**，
+    // 而且是悄悄写坏相邻内存、随后才以别处崩溃的形式暴露。这里按「不装」处理并留痕。
+    // 不装是安全侧：这些槽位全部是「加上去更容易崩」的诊断/接管钩子，装不上等于退回原函数。
+    std::size_t patch_high_water = 0;
+    for (const auto &patch : patches)
+    {
+        if (patch.first + 1 > patch_high_water)
+            patch_high_water = patch.first + 1;
+    }
+    if (patch_high_water > method_count)
+    {
+        LOG_WARN(blog::cat::hook, "vtable_patch_out_of_range instance=" +
+            hex64(reinterpret_cast<std::uintptr_t>(instance)) +
+            " detected_slots=" + std::to_string(method_count) +
+            " patch_high_water=" + std::to_string(patch_high_water) +
+            " action=skip_clone");
+        return false;
+    }
+
     void **clone = reinterpret_cast<void **>(VirtualAlloc(nullptr, sizeof(void *) * method_count, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (clone == nullptr)
         return false;
