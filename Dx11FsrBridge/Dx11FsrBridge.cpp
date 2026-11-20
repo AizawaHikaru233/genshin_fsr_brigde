@@ -6181,7 +6181,10 @@ void install_loader_hooks_for_loaded_modules()
 //   「紧邻的其它数据」，故不追求消除这一项，只用补丁边界守卫（见 clone_and_patch_vtable）
 //   拦住真正会写坏内存的那部分。
 // ★ 只在安装期跑一次，最多 512 次 VirtualQuery，不在热路径，不做性能优化。
-static std::size_t cloned_vtable_capacity(void **source, std::size_t public_method_count)
+// ★ what：调用方的安装路径名（context / device / swapchain / factory / factory2），只用于日志归因。
+//   同一个实例可能有 6 条安装路径，只打裸指针时几条 WARN 无法区分是谁触发的；
+//   值由调用方以字符串字面量传入，本函数不保存、不比较它。
+static std::size_t cloned_vtable_capacity(void **source, std::size_t public_method_count, const char *what)
 {
     constexpr std::size_t k_max_probe = 512; // 上限只为防越界；实测最大值 302（device context）
     constexpr DWORD k_exec_mask = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
@@ -6221,10 +6224,12 @@ static std::size_t cloned_vtable_capacity(void **source, std::size_t public_meth
     }
     if (narrowed)
     {
-        LOG_WARN(blog::cat::hook, "vtable_lower_bound_narrowed caller_lower_bound=" +
-            std::to_string(caller_lower_bound) + " readable_slots=" + std::to_string(count) +
-            " reason=caller_lower_bound_beyond_readable memory source=" +
-            hex64(reinterpret_cast<std::uintptr_t>(source)));
+        // 2026-11-20：此前这里写 "memory source="（悬空单词，且 source= 在本仓库既有用法里是
+        // 事件来源，如 source=ResizeBuffers），而这里打的是**表的地址** ⇒ 改为 vtable=。
+        LOG_WARN(blog::cat::hook, std::string("vtable_lower_bound_narrowed what=") + what +
+            " vtable=" + hex64(reinterpret_cast<std::uintptr_t>(source)) +
+            " caller_lower_bound=" + std::to_string(caller_lower_bound) +
+            " readable_slots=" + std::to_string(count) + " reason=caller_lower_bound_beyond_readable");
     }
 
     // ---- 向上探测实际长度 ----
@@ -6266,7 +6271,8 @@ static std::size_t cloned_vtable_capacity(void **source, std::size_t public_meth
     // 循环一次都没跑。两种都属于「克隆体可能被截断」，同一口径告警。
     if (hit_probe_cap)
     {
-        LOG_WARN(blog::cat::hook, "vtable_probe_truncated probe_cap=" + std::to_string(k_max_probe) +
+        LOG_WARN(blog::cat::hook, std::string("vtable_probe_truncated what=") + what +
+            " probe_cap=" + std::to_string(k_max_probe) +
             " cloned_slots=" + std::to_string(count) +
             " caller_lower_bound=" + std::to_string(caller_lower_bound) +
             " reason=probe_cap_reached action=clone_may_be_truncated");
@@ -6274,7 +6280,10 @@ static std::size_t cloned_vtable_capacity(void **source, std::size_t public_meth
     return count;
 }
 
-bool clone_and_patch_vtable(void *instance, std::size_t method_count, const std::vector<std::pair<std::size_t, void *>> &patches)
+// what：安装路径名（context / device / swapchain / factory / factory2），仅用于本函数与
+// cloned_vtable_capacity 的 WARN 归因 —— 同一实例可能有 6 条安装路径，裸指针无法区分。
+bool clone_and_patch_vtable(void *instance, std::size_t method_count,
+    const std::vector<std::pair<std::size_t, void *>> &patches, const char *what)
 {
     if (instance == nullptr)
         return false;
@@ -6286,13 +6295,21 @@ bool clone_and_patch_vtable(void *instance, std::size_t method_count, const std:
     void ***object = reinterpret_cast<void ***>(instance);
     void **source = *object;
     // 按**原 vtable 实际长度**克隆，而不是按公开接口项数 —— 见 cloned_vtable_capacity 注释。
-    method_count = cloned_vtable_capacity(source, method_count);
+    method_count = cloned_vtable_capacity(source, method_count, what);
 
     // 2026-11-20（补丁越界）：克隆长度现在是**探测**出来的，可能比调用方以为的短 ——
     // 探测在「目标指针不指向可执行页」处就停（vtable 里出现数据指针、或包装实现自建的短表）。
     // 此前 patches 的应用没有任何边界检查，长度一旦短于最大补丁槽位就是**越界写**，
     // 而且是悄悄写坏相邻内存、随后才以别处崩溃的形式暴露。这里按「不装」处理并留痕。
-    // 不装是安全侧：这些槽位全部是「加上去更容易崩」的诊断/接管钩子，装不上等于退回原函数。
+    // 2026-11-20（影响面修正）：此前这里写「这些槽位全部是『加上去更容易崩』的诊断/接管钩子，
+    // 装不上等于退回原函数」—— 前半句的**结论**（不装是安全侧）对，后半句的**影响面**是错的。
+    // 代码本身没错：本路径在 `*object = clone` 之前 return false，对象仍指向**原** vtable，故**进程安全**；
+    // 但被它拦下的 patches 里包含**主功能钩子**，不是「少一条诊断」：
+    //   · install_context_hooks：draw / draw_indexed / om_set_render_targets / copy_resource 等；
+    //   · install_device_hooks：create_buffer / create_pixel_shader 等；
+    //   · install_swapchain_hooks：Present / ResizeBuffers 等。
+    // 这些一旦被跳过，桥就**完全透传**（不再接管任何渲染调用），而除这条 WARN 外没有任何信号。
+    // ⇒ 看到本行时必须理解成「整桥静默降级」，并且**只能**从这条 WARN 归因（WARN 已带 what= 区分安装路径）。
     std::size_t patch_high_water = 0;
     for (const auto &patch : patches)
     {
@@ -6301,8 +6318,8 @@ bool clone_and_patch_vtable(void *instance, std::size_t method_count, const std:
     }
     if (patch_high_water > method_count)
     {
-        LOG_WARN(blog::cat::hook, "vtable_patch_out_of_range instance=" +
-            hex64(reinterpret_cast<std::uintptr_t>(instance)) +
+        LOG_WARN(blog::cat::hook, std::string("vtable_patch_out_of_range what=") + what +
+            " instance=" + hex64(reinterpret_cast<std::uintptr_t>(instance)) +
             " detected_slots=" + std::to_string(method_count) +
             " patch_high_water=" + std::to_string(patch_high_water) +
             " action=skip_clone");
@@ -14691,7 +14708,7 @@ void install_context_hooks(ID3D11DeviceContext *context)
         { k_idx_clear_dsv, reinterpret_cast<void *>(&hooked_clear_dsv) },
     });
 #endif
-    clone_and_patch_vtable(context, context_vtable_size(context), patches);
+    clone_and_patch_vtable(context, context_vtable_size(context), patches, "context");
 }
 
 HRESULT STDMETHODCALLTYPE hooked_create_buffer(ID3D11Device *device, const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial_data, ID3D11Buffer **buffer)
@@ -14920,7 +14937,7 @@ void install_device_hooks(ID3D11Device *device)
         { k_idx_device_create_compute_shader, reinterpret_cast<void *>(&hooked_create_compute_shader) },
     });
 #endif
-    clone_and_patch_vtable(device, k_device_vtable_size, patches);
+    clone_and_patch_vtable(device, k_device_vtable_size, patches, "device");
 
     if (g_config.trace_texture_creates || g_config.native_ldr_final_target_unorm)
     {
@@ -14933,7 +14950,7 @@ void install_device_hooks(ID3D11Device *device)
             if (FAILED(device->QueryInterface(interface_id, reinterpret_cast<void **>(&extended))) || extended == nullptr)
                 return;
             const auto interface_key = reinterpret_cast<std::uint64_t>(extended);
-            clone_and_patch_vtable(extended, k_device_vtable_size, texture_patches);
+            clone_and_patch_vtable(extended, k_device_vtable_size, texture_patches, "device");
             LOG_DEBUG(blog::cat::hook, std::string("texture_device_interface_hook interface=") + interface_name +
                 " instance=" + hex64(interface_key));
             extended->Release();
@@ -15124,9 +15141,16 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
                 // 另一项此前未写明的后果（同为本分支的既有行为）：本分支不只是丢掉 color space 钩子 ——
                 // ngx::set_swapchain_format(desc.BufferDesc.Format) 也在下方 if (should_hook_color &&
                 // has_color_interface) 块内，本分支把 has_color_interface 变为假 ⇒ 该项同样不再被写入。
-                // 而 ngx 的 HDR 判定优先级是「color space（hook）> swapchain buffer 格式（本项）>
-                // 输入纹理格式」，所以本分支的实际后果是**同时丢掉前两个来源**，退化到最不可靠的
-                // 输入纹理格式那一档。是否可接受未实机评估：本分支无复现条件。
+                // 而 ngx 的 HDR 探测是**四级**（权威表述见 NgxBackend.h:25-31）：
+                //   ① swapchain color space（SetColorSpace1 hook）＞ ② Windows 显示配置 API
+                //   （probe_displayconfig_hdr，ensure_init 时探一次）＞ ③ swapchain buffer 格式
+                //   （set_swapchain_format，即本项）＞ ④ 输入纹理格式（最后兜底）。
+                // 所以本分支丢掉的是 ① 与 ③，**不是**「前两个来源」。② 由 ensure_init 里的
+                // QueryDisplayConfig 独立探测（写入点见 NgxBackend.cpp 的 probe_displayconfig_hdr），
+                // 完全不经过 install_swapchain_hooks，不受本分支影响。因此只要 ② 已知
+                // （有活动显示器的机器上会返回 1 或 2），HDR 判定就落在 ② 这一级，**不会**退化到
+                // 「最不可靠的输入纹理格式」；只有 ② 也为 0（无活动显示路径、显式查询失败）时
+                // 才落到 ④。是否可接受未实机评估：本分支无复现条件。
             }
             else
             {
@@ -15169,8 +15193,13 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
                 // ⚠ 2026-11-20（补记此前未写明的后果）：丢掉的不止 color space 钩子 ——
                 // ngx::set_swapchain_format(desc.BufferDesc.Format) 也在下方 if (should_hook_color &&
                 // has_color_interface) 块内，本分支把 has_color_interface 变为假 ⇒ 该项同样不再写入。
-                // ngx 的 HDR 判定优先级是「color space（hook）> swapchain buffer 格式（本项）>
-                // 输入纹理格式」⇒ 本分支同时丢掉前两个来源，退化到最不可靠的输入纹理格式那一档。
+                // ngx 的 HDR 探测是**四级**（权威表述见 NgxBackend.h:25-31），与上面 SW4 分支同一口径：
+                //   ① color space（hook）＞ ② Windows 显示配置 API（probe_displayconfig_hdr）＞
+                //   ③ swapchain buffer 格式（本项）＞ ④ 输入纹理格式（最后兜底）。
+                // ⇒ 本分支丢掉的是 ① 与 ③，**不是**「前两个来源」：② 由 ensure_init 独立探测、
+                // 不经 install_swapchain_hooks，本分支不影响它；只要 ② 已知（有活动显示器时返回
+                // 1 或 2），判定就落在 ②，**不会**退化到「最不可靠的输入纹理格式」；只有 ② 也为 0
+                // 时才落到 ④。
                 hook_method_count = k_swapchain3_vtable_size;
             }
             else
@@ -15287,7 +15316,7 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
             swapchain3->Release();
         return;
     }
-    clone_and_patch_vtable(hook_instance, hook_method_count, patches);
+    clone_and_patch_vtable(hook_instance, hook_method_count, patches, "swapchain");
     if (swapchain4 != nullptr)
         swapchain4->Release();
     if (swapchain3 != nullptr)
@@ -15322,7 +15351,7 @@ void install_factory_hooks(IDXGIFactory *factory)
 
     clone_and_patch_vtable(factory, k_factory_vtable_size, {
         { k_idx_factory_create_swap_chain, reinterpret_cast<void *>(&hooked_factory_create_swap_chain) },
-    });
+    }, "factory");
 }
 
 void install_factory2_hooks(IDXGIFactory2 *factory)
@@ -15337,7 +15366,7 @@ void install_factory2_hooks(IDXGIFactory2 *factory)
     clone_and_patch_vtable(factory, k_factory2_vtable_size, {
         { k_idx_factory_create_swap_chain, reinterpret_cast<void *>(&hooked_factory_create_swap_chain) },
         { k_idx_factory2_create_swap_chain_for_hwnd, reinterpret_cast<void *>(&hooked_factory2_create_swap_chain_for_hwnd) },
-    });
+    }, "factory2");
 }
 
 void install_factory_hooks_from_device(ID3D11Device *device)
