@@ -15388,14 +15388,77 @@ void set_output_size(UINT width, UINT height, const char *source)
         LOG_INFO(blog::cat::core, std::string(source) + " output_size=" + std::to_string(width) + "x" + std::to_string(height));
 }
 
+// 2026-11-21（自递归修复）：取工厂「原函数」时**只能**用原始 vtable。
+// 为什么需要单独一个取值函数：IDXGIFactory 与 IDXGIFactory2 的 GetParent 返回**同一个对象**
+//   （实测两接口指针相同、vtable 相同），而 install_factory2_hooks 的补丁集同时改写槽 10 与槽 15。
+//   所以一旦该实例被克隆过，*reinterpret_cast<void ***>(instance) 已经是克隆体，槽 10 上是
+//   hooked_factory_create_swap_chain —— 把它当「原函数」缓存下来，钩子里的原函数调用就会跳回
+//   自己（无限递归）。实测：调用槽 10 抛 0xC00000FD（栈溢出）。
+// 取值顺序（先查表、后解引用）：
+//   ① g_original_vtables 命中 ⇒ 用克隆时记录下的那张表（唯一可信来源）；
+//   ② 否则仅当该实例从未被克隆（g_cloned_vtables 未命中）才解引用当前 vptr；
+//   ③ 已克隆但表里没有记录（不应出现）⇒ 返回 nullptr，由调用点跳过缓存并留 WARN ——
+//      宁可留空也不要再缓存一个可能是钩子的地址。
+// 与 clone_and_patch_vtable / set_cloned_vtable_enabled 共用 g_vtable_mutex：两张表会在安装钩子
+//   的线程上被写，不加锁读是数据竞争。
+void **original_vtable_of_instance(void *instance)
+{
+    if (instance == nullptr)
+        return nullptr;
+
+    std::lock_guard lock(g_vtable_mutex);
+    const auto original = g_original_vtables.find(instance);
+    if (original != g_original_vtables.end())
+        return original->second;
+    if (g_cloned_vtables.contains(instance))
+        return nullptr; // 已被克隆却查不到原表：克隆体不能当原表用
+    return *reinterpret_cast<void ***>(instance);
+}
+
+// 2026-11-21（自递归修复）：缓存动作**必须发生在任何克隆之前**，且来源是原始表。
+// 两个 install 函数既会被 install_factory_hooks_from_device 依次调用，也可能被单独调用，
+//   所以判空 + 取值这一步必须留在各自入口里（不能只修 _from_device 那条路径）；
+//   _from_device 额外在克隆前先调用它一次，保证「先缓存、后克隆」这个顺序在全路径成立。
+// 取不到原始函数时不做任何写入（保持 nullptr），由钩子里的判空兜底返回 E_FAIL，
+//   绝不会把钩子自身缓存成「原函数」。
+void cache_original_factory_create_swap_chain(IDXGIFactory *factory)
+{
+    if (factory == nullptr || g_original_factory_create_swap_chain != nullptr)
+        return;
+
+    void **const vtable = original_vtable_of_instance(factory);
+    if (vtable == nullptr)
+    {
+        LOG_WARN(blog::cat::hook, "factory_original_cache_unavailable what=factory"
+            " instance=" + hex64(reinterpret_cast<std::uintptr_t>(factory)) +
+            " slot=" + std::to_string(k_idx_factory_create_swap_chain) + " action=leave_null");
+        return;
+    }
+    g_original_factory_create_swap_chain = reinterpret_cast<factory_create_swap_chain_fn>(vtable[k_idx_factory_create_swap_chain]);
+}
+
+void cache_original_factory2_create_swap_chain_for_hwnd(IDXGIFactory2 *factory)
+{
+    if (factory == nullptr || g_original_factory2_create_swap_chain_for_hwnd != nullptr)
+        return;
+
+    void **const vtable = original_vtable_of_instance(factory);
+    if (vtable == nullptr)
+    {
+        LOG_WARN(blog::cat::hook, "factory_original_cache_unavailable what=factory2"
+            " instance=" + hex64(reinterpret_cast<std::uintptr_t>(factory)) +
+            " slot=" + std::to_string(k_idx_factory2_create_swap_chain_for_hwnd) + " action=leave_null");
+        return;
+    }
+    g_original_factory2_create_swap_chain_for_hwnd = reinterpret_cast<factory2_create_swap_chain_for_hwnd_fn>(vtable[k_idx_factory2_create_swap_chain_for_hwnd]);
+}
+
 void install_factory_hooks(IDXGIFactory *factory)
 {
     if (factory == nullptr)
         return;
 
-    void **vtable = *reinterpret_cast<void ***>(factory);
-    if (g_original_factory_create_swap_chain == nullptr)
-        g_original_factory_create_swap_chain = reinterpret_cast<factory_create_swap_chain_fn>(vtable[k_idx_factory_create_swap_chain]);
+    cache_original_factory_create_swap_chain(factory);
 
     clone_and_patch_vtable(factory, k_factory_vtable_size, {
         { k_idx_factory_create_swap_chain, reinterpret_cast<void *>(&hooked_factory_create_swap_chain) },
@@ -15407,9 +15470,7 @@ void install_factory2_hooks(IDXGIFactory2 *factory)
     if (factory == nullptr)
         return;
 
-    void **vtable = *reinterpret_cast<void ***>(factory);
-    if (g_original_factory2_create_swap_chain_for_hwnd == nullptr)
-        g_original_factory2_create_swap_chain_for_hwnd = reinterpret_cast<factory2_create_swap_chain_for_hwnd_fn>(vtable[k_idx_factory2_create_swap_chain_for_hwnd]);
+    cache_original_factory2_create_swap_chain_for_hwnd(factory);
 
     clone_and_patch_vtable(factory, k_factory2_vtable_size, {
         { k_idx_factory_create_swap_chain, reinterpret_cast<void *>(&hooked_factory_create_swap_chain) },
@@ -15433,15 +15494,29 @@ void install_factory_hooks_from_device(ID3D11Device *device)
         return;
     }
 
+    // 2026-11-21（自递归修复）：两个 GetParent 都提前到**任何克隆之前**。
+    // 实测这两个调用返回同一对象、同一张 vtable，而 factory2 的补丁集同时改写槽 10 ——
+    // 若按原顺序「先装 factory2、后装 factory」，装 factory 时读到的已是克隆体，
+    // 槽 10 上是钩子本身（实测调用槽 10 抛 0xC00000FD 栈溢出）。
+    // 因此这里分两步：先取到两个接口并缓存原函数，再分别装钩。
     IDXGIFactory2 *factory2 = nullptr;
-    if (SUCCEEDED(adapter->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void **>(&factory2))) && factory2 != nullptr)
+    const bool has_factory2 = SUCCEEDED(adapter->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void **>(&factory2))) && factory2 != nullptr;
+
+    IDXGIFactory *factory = nullptr;
+    const bool has_factory = SUCCEEDED(adapter->GetParent(__uuidof(IDXGIFactory), reinterpret_cast<void **>(&factory))) && factory != nullptr;
+
+    if (has_factory2)
+        cache_original_factory2_create_swap_chain_for_hwnd(factory2);
+    if (has_factory)
+        cache_original_factory_create_swap_chain(factory);
+
+    if (has_factory2)
     {
         install_factory2_hooks(factory2);
         factory2->Release();
     }
 
-    IDXGIFactory *factory = nullptr;
-    if (SUCCEEDED(adapter->GetParent(__uuidof(IDXGIFactory), reinterpret_cast<void **>(&factory))) && factory != nullptr)
+    if (has_factory)
     {
         install_factory_hooks(factory);
         factory->Release();
@@ -15570,7 +15645,14 @@ HRESULT STDMETHODCALLTYPE hooked_factory_create_swap_chain(IDXGIFactory *factory
         LOG_INFO(blog::cat::hdr, "native_ldr_swapchain_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM api=CreateSwapChain");
     }
 
-    HRESULT hr = g_original_factory_create_swap_chain(factory, device, effective_desc, swapchain);
+    // 2026-11-21（自递归修复）：判空与 hooked_present 的既有写法一致。
+    // 取不到原函数时返回失败而不是解引用 —— 此前这条路径把「钩子自身」当原函数，
+    // 一旦被调用就无限递归（栈溢出）；改成返回 E_FAIL 后，最坏情况只是创建交换链失败，
+    // 不会带走整个进程。未验证部分：本行触发时的游戏侧现象未实测（生产里目前没有解引用空指针的路径）。
+    factory_create_swap_chain_fn const original_create_swap_chain = g_original_factory_create_swap_chain;
+    HRESULT hr = original_create_swap_chain != nullptr
+        ? original_create_swap_chain(factory, device, effective_desc, swapchain)
+        : E_FAIL;
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
     LOG_DEBUG(blog::cat::hook, "dxgi_swapchain_result id=" + std::to_string(request_id) +
         " api=CreateSwapChain hr=" + hex32(static_cast<std::uint32_t>(hr)) +
@@ -15616,7 +15698,11 @@ HRESULT STDMETHODCALLTYPE hooked_factory2_create_swap_chain_for_hwnd(IDXGIFactor
         LOG_INFO(blog::cat::hdr, "native_ldr_swapchain_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM api=CreateSwapChainForHwnd");
     }
 
-    HRESULT hr = g_original_factory2_create_swap_chain_for_hwnd(factory, device, hwnd, effective_desc, fullscreen_desc, restrict_to_output, swapchain);
+    // 2026-11-21（自递归修复）：判空写法同 hooked_present / hooked_factory_create_swap_chain。
+    factory2_create_swap_chain_for_hwnd_fn const original_create_swap_chain_for_hwnd = g_original_factory2_create_swap_chain_for_hwnd;
+    HRESULT hr = original_create_swap_chain_for_hwnd != nullptr
+        ? original_create_swap_chain_for_hwnd(factory, device, hwnd, effective_desc, fullscreen_desc, restrict_to_output, swapchain)
+        : E_FAIL;
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
     LOG_DEBUG(blog::cat::hook, "dxgi_swapchain_result id=" + std::to_string(request_id) +
         " api=CreateSwapChainForHwnd hr=" + hex32(static_cast<std::uint32_t>(hr)) +
