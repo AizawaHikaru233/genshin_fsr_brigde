@@ -38,7 +38,9 @@ void set_swapchain_hdr(bool hdr);            // 由 Dx11FsrBridge 的 SetColorSp
 // ★ 为什么需要它：DXGI **没有** GetColorSpace（IDXGISwapChain3 只有
 //   CheckColorSpaceSupport / SetColorSpace1），无法主动读回"当前" color space。
 //   若游戏从不调用 SetColorSpace1，上面的 set_swapchain_hdr 永远不会被调到 ⇒
-//   只能靠 install_swapchain_hooks() 主动读 BufferDesc.Format 作为第二来源。
+//   只能靠 install_swapchain_hooks() 主动读 BufferDesc.Format 补上这一级。
+//   2026-11-21（层级修正）：此处原写「作为第二来源」—— 在四级判据里它是 **③**（② 是
+//   probe_displayconfig_hdr，与 SetColorSpace1 是否被调用无关），见本文件上方 25-31 行。
 //   DXGI_FORMAT_UNKNOWN(0) 表示"未知/不参与判定"。
 void set_swapchain_format(DXGI_FORMAT f);    // 由 install_swapchain_hooks() 主动调用
 

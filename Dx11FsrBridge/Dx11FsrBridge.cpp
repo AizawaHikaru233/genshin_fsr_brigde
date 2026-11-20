@@ -6181,7 +6181,11 @@ void install_loader_hooks_for_loaded_modules()
 //   「紧邻的其它数据」，故不追求消除这一项，只用补丁边界守卫（见 clone_and_patch_vtable）
 //   拦住真正会写坏内存的那部分。
 // ★ 只在安装期跑一次，最多 512 次 VirtualQuery，不在热路径，不做性能优化。
-// ★ what：调用方的安装路径名（context / device / swapchain / factory / factory2），只用于日志归因。
+// ★ what：调用方的安装路径名，只用于日志归因。**共 6 条**，与 install_* 一一对应：
+//   context / device / device_extended（ID3D11Device1..5 的扩展 QI 路径）/ swapchain /
+//   factory / factory2。
+//   2026-11-21：此前这里写「6 条安装路径」却只列了 5 个名字，差额就是 device_extended ——
+//   它原本与主 device 路径共用 "device"，导致同一实例的两条路径在 WARN 里无法区分。
 //   同一个实例可能有 6 条安装路径，只打裸指针时几条 WARN 无法区分是谁触发的；
 //   值由调用方以字符串字面量传入，本函数不保存、不比较它。
 static std::size_t cloned_vtable_capacity(void **source, std::size_t public_method_count, const char *what)
@@ -6226,10 +6230,14 @@ static std::size_t cloned_vtable_capacity(void **source, std::size_t public_meth
     {
         // 2026-11-20：此前这里写 "memory source="（悬空单词，且 source= 在本仓库既有用法里是
         // 事件来源，如 source=ResizeBuffers），而这里打的是**表的地址** ⇒ 改为 vtable=。
+        // 2026-11-21：补 action= 与另两条 vtable 告警（vtable_probe_truncated /
+        // vtable_patch_out_of_range）统一尾部键。动作确实是「把下限收窄后继续」——
+        // 收窄只是把 memcpy 长度降到可读范围内，克隆照常进行，不是放弃安装。
         LOG_WARN(blog::cat::hook, std::string("vtable_lower_bound_narrowed what=") + what +
             " vtable=" + hex64(reinterpret_cast<std::uintptr_t>(source)) +
             " caller_lower_bound=" + std::to_string(caller_lower_bound) +
-            " readable_slots=" + std::to_string(count) + " reason=caller_lower_bound_beyond_readable");
+            " readable_slots=" + std::to_string(count) + " reason=caller_lower_bound_beyond_readable" +
+            " action=narrow_lower_bound");
     }
 
     // ---- 向上探测实际长度 ----
@@ -6280,8 +6288,9 @@ static std::size_t cloned_vtable_capacity(void **source, std::size_t public_meth
     return count;
 }
 
-// what：安装路径名（context / device / swapchain / factory / factory2），仅用于本函数与
-// cloned_vtable_capacity 的 WARN 归因 —— 同一实例可能有 6 条安装路径，裸指针无法区分。
+// what：安装路径名（context / device / device_extended / swapchain / factory / factory2），
+// 仅用于本函数与 cloned_vtable_capacity 的 WARN 归因 —— 同一实例可能有 6 条安装路径，
+// 裸指针无法区分；device_extended 指 ID3D11Device1..5 的扩展 QI 路径（与 device 分开归因）。
 bool clone_and_patch_vtable(void *instance, std::size_t method_count,
     const std::vector<std::pair<std::size_t, void *>> &patches, const char *what)
 {
@@ -6308,8 +6317,18 @@ bool clone_and_patch_vtable(void *instance, std::size_t method_count,
     //   · install_context_hooks：draw / draw_indexed / om_set_render_targets / copy_resource 等；
     //   · install_device_hooks：create_buffer / create_pixel_shader 等；
     //   · install_swapchain_hooks：Present / ResizeBuffers 等。
-    // 这些一旦被跳过，桥就**完全透传**（不再接管任何渲染调用），而除这条 WARN 外没有任何信号。
-    // ⇒ 看到本行时必须理解成「整桥静默降级」，并且**只能**从这条 WARN 归因（WARN 已带 what= 区分安装路径）。
+    // 2026-11-21（影响面修正）：此前这里把影响面写成「桥就**完全透传**」「整桥静默降级」——
+    // **过头了**。守卫是**按调用点**生效的：clone_and_patch_vtable 每次独立调用，return false
+    // 只回滚**本次**这一条安装路径，不会连带回滚别处已装好的 install_*。
+    // 准确表述：
+    //   · 被跳过的是**该安装路径上的全部钩子**（context / device / device_extended /
+    //     swapchain / factory / factory2 各自独立），其它路径不受影响；
+    //   · 只有当被拦的是 **context 或 device 路径** 时，渲染接管才整体失效
+    //     （draw / copy / create_* 这些主功能钩子都在这两条路径上）；
+    //   · 若拦的是 swapchain 路径，context 上的 draw / copy 钩子仍会装上 ——
+    //     此时只剩色空间 / 呈现相关能力缺失，不是「整桥透传」。
+    // ⇒ 看到本行时按 what= 判断到底降级到哪一步，**不要**一律读成整桥失效；
+    //   除这条 WARN 外没有别的信号，故 WARN 已带 what= 区分安装路径。
     std::size_t patch_high_water = 0;
     for (const auto &patch : patches)
     {
@@ -7791,8 +7810,11 @@ HRESULT STDMETHODCALLTYPE hooked_resize_buffers(
         //   ★ 失败处理：GetDesc 失败 ⇒ 保持旧值不动。切勿写 UNKNOWN(0) ——
         //     写 0 不是「把未知当探测」：refresh_hdr_probe_cache 对 fmt_raw==0 是
         //     显式跳过（判断条件是 if (fmt_raw != 0)），不会产出 1/2 的假信号。
-        //     真实风险是清掉已知值：原本有效的 24/29 被清成未知 ⇒ ①②③ 三级都拿不到值
-        //     ⇒ 掉到 ④ 输入纹理格式兜底 ⇒ 翻转 HDR 决策（比「没更新」更糟）。
+        //     真实风险是清掉已知值：原本有效的 24/29 被清成未知 ⇒ ③ 归零 ⇒ 若 ① 与 ②
+        //     也都为 0 就掉到 ④ 输入纹理格式兜底 ⇒ 翻转 HDR 决策（比「没更新」更糟）。
+        //     ★ 2026-11-21（层级修正）：此处原写「①②③ 三级都拿不到值」，不准确 ——
+        //     本分支清掉的只是 ③（g_swapchain_format），②（g_displayconfig_hdr_state，
+        //     由 ensure_init 的 probe_displayconfig_hdr 写）与 ① 都不受影响。
         //   ★ 必须留在 ENABLE_NGX 守卫内：OFF 构型没有 NgxBackend.cpp（否则 LNK2019）。
         if (swapchain != nullptr)
         {
@@ -14950,7 +14972,11 @@ void install_device_hooks(ID3D11Device *device)
             if (FAILED(device->QueryInterface(interface_id, reinterpret_cast<void **>(&extended))) || extended == nullptr)
                 return;
             const auto interface_key = reinterpret_cast<std::uint64_t>(extended);
-            clone_and_patch_vtable(extended, k_device_vtable_size, texture_patches, "device");
+            // 2026-11-21：这里传 "device_extended" 而不是 "device" —— 它是 ID3D11Device1..5
+            // 的**扩展 QI 路径**，与上面主 device 路径是两条独立安装路径（同一实例的 vtable
+            // 若已被主路径克隆过，本函数会因 g_cloned_vtables 命中而直接返回，但两者归因必须分开：
+            // 克隆下限收窄 / 补丁越界这些 WARN 只打 what=，名字一样就分不出是哪条路径触发的）。
+            clone_and_patch_vtable(extended, k_device_vtable_size, texture_patches, "device_extended");
             LOG_DEBUG(blog::cat::hook, std::string("texture_device_interface_hook interface=") + interface_name +
                 " instance=" + hex64(interface_key));
             extended->Release();
@@ -15151,6 +15177,12 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
                 // （有活动显示器的机器上会返回 1 或 2），HDR 判定就落在 ② 这一级，**不会**退化到
                 // 「最不可靠的输入纹理格式」；只有 ② 也为 0（无活动显示路径、显式查询失败）时
                 // 才落到 ④。是否可接受未实机评估：本分支无复现条件。
+                // ★ 2026-11-21（② 的性质，别读错）：② 是**进程级一次性锁存**，不是「随时可能变成已知」。
+                //   它的探测写在 NgxBackend.cpp:1908 的 !g_logged_config.exchange(true) 块里
+                //   （第 0 步配置快照旁边），而 g_logged_config 在 shutdown_all 中被**刻意保留**
+                //   （见该函数末尾「以下故意不清」的清单）⇒ 整个进程生命周期内只探这一次。
+                //   后果：首次 ensure_init 若探测失败返回 0，则后续设备重建**不会重探**，② 恒为 0。
+                //   所以「只要 ② 已知」这句有前提 —— ② 已知与否在进程早期就定死了。
             }
             else
             {
@@ -15200,13 +15232,22 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
                 // 不经 install_swapchain_hooks，本分支不影响它；只要 ② 已知（有活动显示器时返回
                 // 1 或 2），判定就落在 ②，**不会**退化到「最不可靠的输入纹理格式」；只有 ② 也为 0
                 // 时才落到 ④。
+                // ★ 2026-11-21（② 的性质，与上面 SW4 分支同一条）：② 是**进程级一次性锁存** ——
+                //   探测只在 NgxBackend.cpp:1908 的 !g_logged_config.exchange(true) 块里做一次，
+                //   而 g_logged_config 在 shutdown_all 中被刻意保留 ⇒ 后续设备重建不会重探。
+                //   首次 ensure_init 探测失败返回 0 的话，② 在整个进程里恒为 0。
                 hook_method_count = k_swapchain3_vtable_size;
             }
             else
             {
                 hook_instance = swapchain3;
-                // 退化到 IDXGISwapChain3：vtable 只有 40 项（无 SetHDRMetaData 槽）。
-                // 槽 40 不存在 ⇒ supports_hdr_metadata 保持 false、HDR 钩子不装，这是预期行为，不是缺口。
+                // 退化到 IDXGISwapChain3：**公开接口**到 IDXGISwapChain3（40 项），实际 vtable 更长。
+                // ★ 2026-11-21（措辞修正）：此处原写「vtable 只有 40 项」—— 已过期。自 vtable 克隆
+                //   改按原表实测长度之后（实测交换链 242 槽），40 只是**公开接口项数**与克隆**下限**，
+                //   不是实际长度。下面这句传的 k_swapchain3_vtable_size 现在就是那个下限。
+                // 结论不变：槽 40 属于 IDXGISwapChain4 的 SetHDRMetaData，公开接口只到
+                // IDXGISwapChain3 的对象没有这一项 ⇒ supports_hdr_metadata 保持 false、
+                // HDR 钩子不装，这是预期行为，不是缺口。该判断本来就是**公开接口维度**的。
                 hook_method_count = k_swapchain3_vtable_size;
             }
         }
@@ -15279,16 +15320,23 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
                 " size=" + std::to_string(desc.BufferDesc.Width) + "x" + std::to_string(desc.BufferDesc.Height) +
                 " swapchain4=" + std::to_string(supports_hdr_metadata ? 1 : 0));
 #if defined(DX11FSRBRIDGE_ENABLE_NGX)
-            // T-8 M4-b（路径 A）：把后缓冲格式主动交给 NGX 侧，作为 HDR 判定的第二来源。
+            // T-8 M4-b（路径 A）：把后缓冲格式主动交给 NGX 侧，作为 HDR 判定的第三来源（③）。
             // 为什么需要"主动"：DXGI **没有** GetColorSpace（IDXGISwapChain3 只有
             //   CheckColorSpaceSupport / SetColorSpace1，已 grep Windows SDK
             //   10.0.26100.0/shared/dxgi1_4.h:121/127 确认），读不回"当前" color space。
-            //   因此若游戏从不调用 SetColorSpace1，hooked_set_color_space1 永远不会跑，
-            //   ngx 的 auto 探测就只能退到"输入纹理格式"这一最不可靠的来源。
+            //   ★ 2026-11-21（层级修正）：此处原写「若游戏从不调 SetColorSpace1，auto 探测就
+            //   只能退到输入纹理格式这一最不可靠的来源」—— **该说法是错的，漏掉了 ②**。
+            //   ngx 的 auto 探测是**四级**（权威表述见 NgxBackend.h:25-31，实现见
+            //   NgxBackend.cpp 的 resolve_is_hdr）：① swapchain color space（SetColorSpace1 hook）
+            //   ＞ ② Windows 显示配置 API（probe_displayconfig_hdr，ensure_init 时探一次）
+            //   ＞ ③ swapchain buffer 格式（即本项）＞ ④ 输入纹理格式（最后兜底）。
+            //   ② 由 ensure_init 经 QueryDisplayConfig 独立取得，完全不经过 SetColorSpace1
+            //   ⇒ 游戏不调 SetColorSpace1 时判定落在 ②，并不会直接掉到 ④。
+            //   本项补的是 ② 也拿不到值的场合（无活动显示路径、显式查询失败 ⇒ ② 为 0）。
             //   这里读的是 swapchain 自述的 BufferDesc.Format —— 它不依赖任何 hook 时机，
             //   是本进程内能拿到的、与 HDR 相关的最早一手信息。
             // ★ 它只是"能力级"信号（后缓冲是 16F 还是 8-bit），不是"状态级"；
-            //   所以 ngx 侧的优先级是：color space（hook）> 本项 > 输入纹理格式。
+            //   所以它在四级里的位置是 ③：低于 color space（hook）与 DisplayConfig，高于输入纹理格式。
             // ★ 必须在 ENABLE_NGX 守卫内：OFF 构型没有 NgxBackend.cpp，否则 LNK2019。
             ngx::set_swapchain_format(desc.BufferDesc.Format);
 #endif

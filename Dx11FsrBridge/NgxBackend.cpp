@@ -497,7 +497,7 @@ std::atomic<unsigned>     g_displayconfig_hdr_state { 0 };
 //   设计原则：探测源都是**事件驱动**的（hook / ensure_init），不是每帧变化的，
 //   所以不该在每帧路径上重复读+重复判断。写入方在状态变化后立即调
 //   refresh_hdr_probe_cache() 刷新本缓存，每帧只做一次 atomic load。
-//   ★ 只有缓存为 0（三级都没探测到）时，才回落到 ④ 的「按输入纹理格式猜」。
+//   ★ 只有缓存为 0（①②③ 都没探测到）时，才回落到 ④ 的「按输入纹理格式猜」。
 std::atomic<unsigned>     g_hdr_probe_cache { 0 };
 
 // ★ m4：g_hdr_mode **故意保持普通 int**：它只由 load_config() 在 blog::init() 之前写入，
@@ -749,7 +749,7 @@ static void refresh_hdr_probe_cache()
         return;
     }
 
-    g_hdr_probe_cache.store(0u, std::memory_order_relaxed);   // 三级都未定 ⇒ ④ 兜底
+    g_hdr_probe_cache.store(0u, std::memory_order_relaxed);   // ①②③ 都未定 ⇒ ④ 兜底
 }
 
 // ---- T-8：IsHDR 决策（定义在 §3.8.2 开头的 build_create_flags 之前）----
@@ -4257,7 +4257,7 @@ void set_hdr_mode(int mode)
     else
         g_hdr_mode = 0;
     // ★ T-11：本函数改的是强制模式、**不改变缓存内容**；这里刷新是为了让
-    //   「NgxHdr=auto 切换进来」时缓存一定与当前三级探测一致（幂等，无副作用）。
+    //   「NgxHdr=auto 切换进来」时缓存一定与当前 ①②③ 探测一致（幂等，无副作用）。
     refresh_hdr_probe_cache();
 }
 
@@ -4278,7 +4278,10 @@ void set_swapchain_hdr(bool hdr)
 // 装 hook 时主动调用 —— 不依赖 SetColorSpace1 是否被调用过。
 // ★ 为什么这是"能力级"而非"状态级"信号：DXGI 没有 GetColorSpace，读不回当前 color space；
 //   BufferDesc.Format 只说明"后缓冲是什么格式"。但它对"游戏从不调 SetColorSpace1"这类
-//   情况是净收益，且优先于输入纹理格式（见 resolve_is_hdr 的三级判据）。
+//   情况是净收益；在四级判据里它是 ③，高于 ④ 输入纹理格式（权威表述见 NgxBackend.h:25-31，
+//   实现见下方 resolve_is_hdr）。
+//   2026-11-21（层级修正）：此处原写「见 resolve_is_hdr 的三级判据」—— 判据实为四级，
+//   且 ① 与 ② 都写在 ensure_init / hook 里、不在本函数；本项是 ③。
 // ★ DXGI_FORMAT_UNKNOWN(0) = 未知，resolve_is_hdr 会跳过它。
 void set_swapchain_format(DXGI_FORMAT f)
 {
