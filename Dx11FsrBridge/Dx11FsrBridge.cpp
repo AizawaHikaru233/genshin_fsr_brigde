@@ -6168,19 +6168,32 @@ void install_loader_hooks_for_loaded_modules()
 static std::size_t cloned_vtable_capacity(void **source, std::size_t public_method_count)
 {
     constexpr std::size_t k_max_probe = 512; // 上限只为防越界；实测最大值 242
+    constexpr DWORD k_exec_mask = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
     std::size_t count = public_method_count;
     MEMORY_BASIC_INFORMATION mbi {};
     for (std::size_t i = public_method_count; i < k_max_probe; ++i)
     {
-        void *entry = source[i];
-        if (entry == nullptr)
-            break;
-        if (VirtualQuery(entry, &mbi, sizeof(mbi)) == 0)
+        // **先确认槽位本身可读，再解引用**。顺序不能反：包装型实现会自建 vtable
+        // （new void*[41]），越过末尾就是未映射内存；先读 source[i] 会在安装期直接崩，
+        // 症状与本函数要修的崩溃同类。按 AGENTS.md §二.3，读未知内存一律先验证再读。
+        if (VirtualQuery(&source[i], &mbi, sizeof(mbi)) != sizeof(mbi))
             break;
         if (mbi.State != MEM_COMMIT)
             break;
-        const DWORD exec_mask = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-        if ((mbi.Protect & exec_mask) == 0)
+        // PAGE_GUARD 页可读一次即失效；PAGE_EXECUTE 单独出现时不可读 —— 两种都不能解引用。
+        if ((mbi.Protect & PAGE_GUARD) != 0)
+            break;
+        if ((mbi.Protect & (PAGE_NOACCESS | PAGE_EXECUTE)) != 0)
+            break;
+        void *entry = source[i];
+        if (entry == nullptr)
+            break;
+        MEMORY_BASIC_INFORMATION target {};
+        if (VirtualQuery(entry, &target, sizeof(target)) != sizeof(target))
+            break;
+        if (target.State != MEM_COMMIT)
+            break;
+        if ((target.Protect & k_exec_mask) == 0)
             break;
         count = i + 1;
     }
@@ -14998,11 +15011,12 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
                 supports_hdr_metadata = false;
                 // hook_instance / hook_method_count 保持 swapchain 与 k_swapchain_vtable_size
                 // （本分支上方只赋过 hook_instance，从未改过 hook_method_count）。
-                // 为何这里保留 41 是安全的，与下面 SW3 分支取 40 对称：能走到本分支说明该对象
+                // 这里的 41 只是**下限**，不是最终克隆长度：clone_and_patch_vtable 会以它为起点
+                // 探测原 vtable 的实际长度（见 cloned_vtable_capacity）。能走到本分支说明该对象
                 // 自己声明支持 IDXGISwapChain4（QI 在 swapchain 自身上发起且成功）⇒ 按 DXGI 契约
-                // 它至少有 IDXGISwapChain4Vtbl 的 41 项。即使这个判断失误，代价也只是 memcpy
-                // 多读少量邻接指针 —— 克隆区是 VirtualAlloc 独立分配、按 method_count 申请，
-                // 写越界不会发生。
+                // 它至少有 IDXGISwapChain4Vtbl 的 41 项，作为下限成立。
+                // ⚠ 2026-11-20：此前这里写「即使判断失误，代价也只是多读少量邻接指针」是**错的** ——
+                // 真实代价是克隆体在槽 41+ 全是 0，DXGI 释放交换链时读 vptr[44] 直接 call 0（issue #19）。
             }
             else
             {
@@ -15027,10 +15041,10 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
                 // 弃用后 hook_instance 保持调用方传入的 swapchain。它的**静态类型**是 IDXGISwapChain
                 // （IDXGISwapChainVtbl 只有 18 项），但克隆长度不能按 18 取 —— 克隆的是该对象的
                 // **实际** vtable，静态类型不决定它的项数。
-                // 长度取 40 的依据：QI 是在 swapchain 自身上发起的，能走到本分支就意味着
+                // 40 同样只是**下限**：clone_and_patch_vtable 会以此为起点探测原 vtable 的实际
+                // 长度。取 40 的依据是 QI 在 swapchain 自身上发起，能走到本分支就意味着
                 // IDXGISwapChain4 的 QI 已失败、IDXGISwapChain3 的 QI 成功 ⇒ 按 DXGI 契约该对象
-                // 最多只实现到 IDXGISwapChain3（IDXGISwapChain3Vtbl = 40 项）；按 41 项 memcpy
-                // 会多读 8 字节邻接内存。40 同时也是本分支正常路径的取值，一致。
+                // 至少实现到 IDXGISwapChain3（IDXGISwapChain3Vtbl = 40 项）。
                 // 本路径可达的 patches 最大槽位是 14（k_idx_resize_target，见 :116-121）——
                 // color / HDR 的 37/38/40 在本路径均不可达 —— 40 项足够覆盖，
                 // 故这次降级不影响 present / controls 钩子的安装，只放弃 color space / HDR 钩子。
@@ -15140,8 +15154,9 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
         // 已逐路径核对：present 或 controls 任一为真时 patches 必非空（present 加 1 项；
         //   general_controls 加 4 项；native_ldr_resize 加 1 项），本守卫不会提前拦下任何既有路径。
         // 为什么必须拦：克隆一份内容完全相同的 vtable 没有任何好处 —— 反而多出一块
-        //   method_count × 8 字节的常驻分配（41 项 = 328 B），并把目标对象的 vptr 换成
-        //   指向同样内容的克隆，后续任何「克隆过 ⇒ 可以安全还原」的假设都会踩到空补丁。
+        //   常驻分配（长度由 cloned_vtable_capacity 探测得出，实测交换链为 242 项 ≈ 1936 B），
+        //   并把目标对象的 vptr 换成指向同样内容的克隆，
+        //   后续任何「克隆过 ⇒ 可以安全还原」的假设都会踩到空补丁。
         // 释放写法与末尾的统一释放一致，保证任何一条提前返回的路径都不漏 Release。
         if (swapchain4 != nullptr)
             swapchain4->Release();
