@@ -15107,12 +15107,26 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
                 supports_hdr_metadata = false;
                 // hook_instance / hook_method_count 保持 swapchain 与 k_swapchain_vtable_size
                 // （本分支上方只赋过 hook_instance，从未改过 hook_method_count）。
-                // 这里的 41 只是**下限**，不是最终克隆长度：clone_and_patch_vtable 会以它为起点
-                // 探测原 vtable 的实际长度（见 cloned_vtable_capacity）。能走到本分支说明该对象
-                // 自己声明支持 IDXGISwapChain4（QI 在 swapchain 自身上发起且成功）⇒ 按 DXGI 契约
-                // 它至少有 IDXGISwapChain4Vtbl 的 41 项，作为下限成立。
+                // 41 只是**下限**，不是最终克隆长度：clone_and_patch_vtable 会以它为起点探测
+                // 原 vtable 的实际长度（见 cloned_vtable_capacity）。
                 // ⚠ 2026-11-20：此前这里写「即使判断失误，代价也只是多读少量邻接指针」是**错的** ——
                 // 真实代价是克隆体在槽 41+ 全是 0，DXGI 释放交换链时读 vptr[44] 直接 call 0（issue #19）。
+                //
+                // ⚠ 2026-11-20（未验证的推断，原论证已作废）：此前这里写「能走到本分支说明该对象
+                // 自己声明支持 IDXGISwapChain4 ⇒ 按 DXGI 契约它至少有 41 项，下限成立」。这个论证是错的 ——
+                // 本分支要处理的恰恰是 **QI 被转发/聚合** 的情形：外层对象可以把 QI 转给内层对象而
+                // 返回 S_OK，自己完全不必实现 IDXGISwapChain4。也就是说，触发本分支的条件正好
+                // 否证了拿来支撑 41 的前提。**若 QI 确实被转发，41 这个下限没有任何依据**。
+                // 现在只剩两道兜底：① cloned_vtable_capacity 逐槽校验下限并把越界部分的读取收窄；
+                // ② clone_and_patch_vtable 在补丁槽位超出探测长度时放弃安装（打 vtable_patch_out_of_range）。
+                // ⚠ 仍未验证：生产里的交换链 QI 目前恒返回同一对象，本分支没有实机复现条件，
+                // 「转发型交换链会真的走到这里、且其 vtable 短于 41 项」这条路径从未被执行过。
+                // 另一项此前未写明的后果（同为本分支的既有行为）：本分支不只是丢掉 color space 钩子 ——
+                // ngx::set_swapchain_format(desc.BufferDesc.Format) 也在下方 if (should_hook_color &&
+                // has_color_interface) 块内，本分支把 has_color_interface 变为假 ⇒ 该项同样不再被写入。
+                // 而 ngx 的 HDR 判定优先级是「color space（hook）> swapchain buffer 格式（本项）>
+                // 输入纹理格式」，所以本分支的实际后果是**同时丢掉前两个来源**，退化到最不可靠的
+                // 输入纹理格式那一档。是否可接受未实机评估：本分支无复现条件。
             }
             else
             {
@@ -15141,9 +15155,22 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
                 // 长度。取 40 的依据是 QI 在 swapchain 自身上发起，能走到本分支就意味着
                 // IDXGISwapChain4 的 QI 已失败、IDXGISwapChain3 的 QI 成功 ⇒ 按 DXGI 契约该对象
                 // 至少实现到 IDXGISwapChain3（IDXGISwapChain3Vtbl = 40 项）。
+                // ⚠ 2026-11-20（未验证的推断）：上面这条依据与 IDXGISwapChain4 分支同源、也同样不成立 ——
+                // 若 QI 被转发/聚合，成功的 QI 返回的是**另一个对象**，外层对象不必自己实现
+                // IDXGISwapChain3 ⇒ 40 这个下限没有依据。现在同样靠 cloned_vtable_capacity 的
+                // 下限校验与 clone_and_patch_vtable 的补丁边界守卫兜底。生产里的交换链 QI 目前恒
+                // 返回同一对象，本分支无实机复现条件，故该路径未被执行验证。
                 // 本路径可达的 patches 最大槽位是 14（k_idx_resize_target，见 :116-121）——
                 // color / HDR 的 37/38/40 在本路径均不可达 —— 40 项足够覆盖，
                 // 故这次降级不影响 present / controls 钩子的安装，只放弃 color space / HDR 钩子。
+                // （2026-11-20 补充前提：上句成立的前提是探测出的长度 ≥ 15。clone_and_patch_vtable
+                //   现在会在补丁槽位超出探测长度时放弃整个克隆，那种情形下 present / controls 也一并
+                //   不装 —— 比越界写坏内存安全，但要能从 vtable_patch_out_of_range 这条 WARN 区分出来。）
+                // ⚠ 2026-11-20（补记此前未写明的后果）：丢掉的不止 color space 钩子 ——
+                // ngx::set_swapchain_format(desc.BufferDesc.Format) 也在下方 if (should_hook_color &&
+                // has_color_interface) 块内，本分支把 has_color_interface 变为假 ⇒ 该项同样不再写入。
+                // ngx 的 HDR 判定优先级是「color space（hook）> swapchain buffer 格式（本项）>
+                // 输入纹理格式」⇒ 本分支同时丢掉前两个来源，退化到最不可靠的输入纹理格式那一档。
                 hook_method_count = k_swapchain3_vtable_size;
             }
             else
