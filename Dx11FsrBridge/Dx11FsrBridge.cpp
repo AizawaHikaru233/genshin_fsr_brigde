@@ -14930,15 +14930,77 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
     {
         if (SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain4), reinterpret_cast<void **>(&swapchain4))) && swapchain4 != nullptr)
         {
-            hook_instance = swapchain4;
-            supports_hdr_metadata = true;
+            // 2026-11-19（D2，方案 A）：QI 不保证返回同一个对象 —— 包装型实现（wrapped/代理交换链）
+            // 会返回另一个对象。为什么必须在这里拦下：hooked_present 等回调拿到的是**调用方传入的**
+            // this（见 clone_and_patch_vtable 只改 hook_instance 的 vtable，而 present 钩子里的
+            // swapchain 形参是调用方那个对象），函数指针却取自另一个对象的 vtable ⇒
+            // 用 A 的 this 去跑 B 的函数体，B 若按自己的内部布局取字段，读到的是 A 的无关内存。
+            // 更常见、也更确定的后果：补丁落在「游戏根本不会经由它调 Present 的那个对象」上 ⇒
+            // 钩子静默不装，无日志、无报错，外部只看到功能没生效；
+            // 上面那种「用 A 的 this 跑 B 的函数体」反而要更特殊的折叠/共享形态才会发生。
+            // 既有的 try_emplace(hook_instance, ...) / try_emplace(swapchain, ...) 双登记只解决
+            // "查得到原始函数"，解决不了"装错对象"。
+            // 取舍：**有意降级** —— 宁可少钩一层（该交换链不装 color space / HDR 钩子），
+            // 也不装到一个我们无法证明布局一致的对象上。present / controls 钩子不受影响，照常安装
+            // （本分支之后的 clone_and_patch_vtable 用的是 hook_instance，它仍是 swapchain）。
+            // 只在安装期走一次，不在逐帧路径，故不加计数闸门。
+            // ⚠ 未验证：生产里的交换链 QI 目前恒返回同一对象（同一 IID 查询到自身），本分支无实机复现条件。
+            if (static_cast<IDXGISwapChain *>(swapchain4) != swapchain)
+            {
+                LOG_WARN(blog::cat::hook, "swapchain_hook_identity_mismatch"
+                    " swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)) +
+                    " other=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain4)) +
+                    " iid=IDXGISwapChain4 action=fallback");
+                swapchain4->Release();
+                swapchain4 = nullptr;
+                supports_hdr_metadata = false;
+                // hook_instance / hook_method_count 保持 swapchain 与 k_swapchain_vtable_size
+                // （本分支上方只赋过 hook_instance，从未改过 hook_method_count）。
+                // 为何这里保留 41 是安全的，与下面 SW3 分支取 40 对称：能走到本分支说明该对象
+                // 自己声明支持 IDXGISwapChain4（QI 在 swapchain 自身上发起且成功）⇒ 按 DXGI 契约
+                // 它至少有 IDXGISwapChain4Vtbl 的 41 项。即使这个判断失误，代价也只是 memcpy
+                // 多读少量邻接指针 —— 克隆区是 VirtualAlloc 独立分配、按 method_count 申请，
+                // 写越界不会发生。
+            }
+            else
+            {
+                hook_instance = swapchain4;
+                supports_hdr_metadata = true;
+            }
         }
         else if (SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3))) && swapchain3 != nullptr)
         {
-            hook_instance = swapchain3;
-            // 退化到 IDXGISwapChain3：vtable 只有 40 项（无 SetHDRMetaData 槽）。
-            // 槽 40 不存在 ⇒ supports_hdr_metadata 保持 false、HDR 钩子不装，这是预期行为，不是缺口。
-            hook_method_count = k_swapchain3_vtable_size;
+            // 2026-11-19（D2，方案 A）：与 IDXGISwapChain4 分支同源的异身份判据，理由同上方注释 ——
+            // QI 可能返回另一个对象，而 clone_and_patch_vtable 只改 hook_instance 的 vtable，
+            // 回调里的 this 却仍是调用方的 swapchain ⇒ 用 A 的 this 跑 B 的函数体。
+            // 取舍同样是**有意降级**：该交换链不装 color space 钩子，present / controls 钩子照装。
+            if (static_cast<IDXGISwapChain *>(swapchain3) != swapchain)
+            {
+                LOG_WARN(blog::cat::hook, "swapchain_hook_identity_mismatch"
+                    " swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)) +
+                    " other=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain3)) +
+                    " iid=IDXGISwapChain3 action=fallback");
+                swapchain3->Release();
+                swapchain3 = nullptr;
+                // 弃用后 hook_instance 保持调用方传入的 swapchain。它的**静态类型**是 IDXGISwapChain
+                // （IDXGISwapChainVtbl 只有 18 项），但克隆长度不能按 18 取 —— 克隆的是该对象的
+                // **实际** vtable，静态类型不决定它的项数。
+                // 长度取 40 的依据：QI 是在 swapchain 自身上发起的，能走到本分支就意味着
+                // IDXGISwapChain4 的 QI 已失败、IDXGISwapChain3 的 QI 成功 ⇒ 按 DXGI 契约该对象
+                // 最多只实现到 IDXGISwapChain3（IDXGISwapChain3Vtbl = 40 项）；按 41 项 memcpy
+                // 会多读 8 字节邻接内存。40 同时也是本分支正常路径的取值，一致。
+                // 本路径可达的 patches 最大槽位是 14（k_idx_resize_target，见 :116-121）——
+                // color / HDR 的 37/38/40 在本路径均不可达 —— 40 项足够覆盖，
+                // 故这次降级不影响 present / controls 钩子的安装，只放弃 color space / HDR 钩子。
+                hook_method_count = k_swapchain3_vtable_size;
+            }
+            else
+            {
+                hook_instance = swapchain3;
+                // 退化到 IDXGISwapChain3：vtable 只有 40 项（无 SetHDRMetaData 槽）。
+                // 槽 40 不存在 ⇒ supports_hdr_metadata 保持 false、HDR 钩子不装，这是预期行为，不是缺口。
+                hook_method_count = k_swapchain3_vtable_size;
+            }
         }
         else
         {
@@ -15023,6 +15085,27 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
             ngx::set_swapchain_format(desc.BufferDesc.Format);
 #endif
         }
+    }
+    if (patches.empty())
+    {
+        // 2026-11-19（D2 审核 MINOR-3）：patches 为空 = present / controls / color 三者都没有要装的钩子。
+        // 何时到达：should_hook_color 为真，但两种 QI 结局都使 has_color_interface 为假 ——
+        //   ① SW4 的 QI 成功、身份不符而被弃用（else if 结构决定此时 SW3 的 QI 根本没发起）；
+        //   ② SW4 的 QI 失败，SW3 的 QI 成功、身份不符而被弃用。
+        //   两种情形都只弃用了**一条**接口，不存在"两条都被弃用"。
+        //   再叠加 present 与 controls 也都不需要 —— 这是本次身份比对**新增**出来的组合。
+        //   改动前「两条 QI 都没拿到接口」那条路径已在 :15003-15004 提前 return，所以走不到这里。
+        // 已逐路径核对：present 或 controls 任一为真时 patches 必非空（present 加 1 项；
+        //   general_controls 加 4 项；native_ldr_resize 加 1 项），本守卫不会提前拦下任何既有路径。
+        // 为什么必须拦：克隆一份内容完全相同的 vtable 没有任何好处 —— 反而多出一块
+        //   method_count × 8 字节的常驻分配（41 项 = 328 B），并把目标对象的 vptr 换成
+        //   指向同样内容的克隆，后续任何「克隆过 ⇒ 可以安全还原」的假设都会踩到空补丁。
+        // 释放写法与末尾的统一释放一致，保证任何一条提前返回的路径都不漏 Release。
+        if (swapchain4 != nullptr)
+            swapchain4->Release();
+        if (swapchain3 != nullptr)
+            swapchain3->Release();
+        return;
     }
     clone_and_patch_vtable(hook_instance, hook_method_count, patches);
     if (swapchain4 != nullptr)
