@@ -6147,6 +6147,46 @@ void install_loader_hooks_for_loaded_modules()
         LOG_INFO(blog::cat::core, summary);
 }
 
+// 原 vtable 的**实际**可达长度（连续「指向可执行内存」的项数），下限为 public_method_count。
+//
+// 为什么必须这么做（2026-11-20，issue #19 实机崩溃的根因）：
+// 公开接口的项数（IDXGISwapChain4 = 41）只是**基类前缀**的长度。DXGI 返回的实际对象是
+// 内部实现类，vtable 远长于此 —— 本机实测 D3D11 的 swapchain 有 242 个连续代码槽，
+// device 173、factory2 103。按公开项数克隆会得到一张**截断的替身 vtable**：
+// VirtualAlloc 按 4KB 页提交且零填充，于是槽 [public_count, ...) 全是 0，而不是原函数。
+//
+// 实测证据（独立探针 EXE，单变量对照：同一对象、同一路径，只改克隆长度）：
+//   克隆 41 槽 → Release 交换链时 RIP=0、info={0x8,0x0}、RBP=0x100000001、[rsp]=dxgi+0x3A23B
+//   克隆 64 槽 → 存活
+//   克隆 128 槽 → 存活
+// 崩溃路径（dxgi.dll+0x3A215）：mov rax,[rax+0x160] 即读 vptr[44]，读到 0 后 call 0。
+// 槽 44 不在 IDXGISwapChain4Vtbl 里，只在内部实现类的 vtable 里 —— 原版有，克隆体没有。
+// 这与 issue #19 用户 dump 逐字段一致（RCX=交换链、RBP=0x0000000100000001、[rsp]=dxgi+0x3A23B）。
+//
+// 判据只要求「指针落在已提交的可执行页内」，不要求「在同一个模块」—— 其它 overlay 把自己的
+// 函数挂进 vtable 是合法且常见的，那类项同样必须被完整拷贝，否则同样会变成 0。
+static std::size_t cloned_vtable_capacity(void **source, std::size_t public_method_count)
+{
+    constexpr std::size_t k_max_probe = 512; // 上限只为防越界；实测最大值 242
+    std::size_t count = public_method_count;
+    MEMORY_BASIC_INFORMATION mbi {};
+    for (std::size_t i = public_method_count; i < k_max_probe; ++i)
+    {
+        void *entry = source[i];
+        if (entry == nullptr)
+            break;
+        if (VirtualQuery(entry, &mbi, sizeof(mbi)) == 0)
+            break;
+        if (mbi.State != MEM_COMMIT)
+            break;
+        const DWORD exec_mask = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if ((mbi.Protect & exec_mask) == 0)
+            break;
+        count = i + 1;
+    }
+    return count;
+}
+
 bool clone_and_patch_vtable(void *instance, std::size_t method_count, const std::vector<std::pair<std::size_t, void *>> &patches)
 {
     if (instance == nullptr)
@@ -6158,6 +6198,8 @@ bool clone_and_patch_vtable(void *instance, std::size_t method_count, const std:
 
     void ***object = reinterpret_cast<void ***>(instance);
     void **source = *object;
+    // 按**原 vtable 实际长度**克隆，而不是按公开接口项数 —— 见 cloned_vtable_capacity 注释。
+    method_count = cloned_vtable_capacity(source, method_count);
     void **clone = reinterpret_cast<void **>(VirtualAlloc(nullptr, sizeof(void *) * method_count, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (clone == nullptr)
         return false;
