@@ -1058,6 +1058,70 @@ set_color_space1_fn g_original_set_color_space1 = nullptr;
 set_hdr_metadata_fn g_original_set_hdr_metadata = nullptr;
 std::mutex g_swapchain_resize_mutex;
 std::unordered_map<void *, resize_buffers_fn> g_original_resize_buffers_by_instance;
+
+// ---------------------------------------------------------------------------
+// 2026-11-21（跨类尾调缺陷，Refs #19）：按**原 vtable 指针**为键登记的原函数表。
+//
+// 为什么需要这一组表：上面那七个 `g_original_*` 是裸全局变量，安装处（本文件
+//   install_swapchain_hooks 的登记段）用 `== nullptr` 作判据 ⇒ **只有第一个交换链会写入，
+//   之后永不更新**。而钩子可能装到**不同类**的对象上：实测一次真实会话里先后装到
+//   原生 dxgi 交换链与 OptiScaler 的 WrappedIDXGISwapChain4（两个对象地址不同）。
+//   第二次安装时这些全局指针全都非空 ⇒ 一条都不写 ⇒ 包装类对象的回调里用
+//   **包装类的 this** 去跑**原生 dxgi 的函数体**。这就是 issue #19 的崩溃机制：
+//   原生实现开头 `mov rcx,[rcx+8]` 把 this+8 处的字段当第二个 vptr 用，包装对象该字段
+//   为 0（探针实测原生交换链 +8 恒为第二个 vptr、非零）⇒ 随后 `mov rax,[rcx]` 读零页。
+//
+// 为什么按 vtable 而不是按对象作键：同类对象的 vtable 相同（同类即同函数体），
+//   用 vtable 作键天然把同类对象归并；clone_and_patch_vtable 本来就持有 source（原表），
+//   回调侧也能由 this 反查原表（original_vtable_of_instance）。同类的第二个实例会命中
+//   同一条记录，不会误配成别的类。
+//
+// 为什么每项单独一张 map：七个槽的函数指针类型互不相同（签名不同）。
+//   用 union / void* 强转抹平类型 = 自己放弃编译期检查，故不这样做。
+//
+// 与 g_original_*_by_instance 的分工（**并存，不替代**）：
+//   · 本组按**vtable**为键 —— **优先**。键是原 vtable 首地址，正常情形下指向模块 .rdata，
+//     进程内稳定、天然按类归并。
+//   · 按**对象**为键的那两张（present / resize_buffers）—— resize_buffers 那张已排到本组
+//     **之后**，只在拿不到 vtable 键或该类没登记时才兜底；present 那张**本次未改**，
+//     仍是 hooked_present 的第一级（遗留，见下面「present 的两处真实风险」）。
+//   · 2026-11-21（优先级反转，Refs #19）修正：此前按对象的表排在前面，理由是「更具体」。在本仓库里
+//     这个理由不成立 —— 「更具体」的代价正是**键会被复用**：DXGI 交换链销毁后对象地址会被
+//     复用，复用给**另一个类**时，按对象的表会命中旧类的函数体、却配上新类的 `this`，
+//     正是 issue #19 的崩溃形态。类键更粗：键的**值**不受对象地址被复用影响；但它的**取得**要经按对象地址的表，缺口见下方「类键的限定条件」（2026-11-21 措辞修正，未验证）。
+//   · 具体优先级见各回调里的兜底链注释（resize_buffers 是三级链）。
+//
+// present 的两处真实风险（2026-11-21 记录）：① 未修，② 本次已修。逐条写清现状与修法。
+//
+//   ①【未修】hooked_present 仍**优先**查按对象地址为键的 g_original_present_by_instance
+//     （见 hooked_present 里那两级查找）。该表**只增不减**，DXGI 交换链销毁后对象地址会被
+//     复用；复用一个**异类**对象时，查到的就是旧类的函数体 ⇒ 用新类的 this 跑旧类的实现，
+//     即 issue #19 的跨类尾调形态，只是命中条件比本次修掉的「全局兜底」更窄。
+//     为什么本次不动它：hooked_present 是**每帧**路径，改查找顺序属于热路径改动。
+//     按本仓库的规矩，热路径必须先给出帧数采样数据再改 —— 本项目有过「热路径加计时探针
+//     吃掉 7~8% 帧数，且测到的其实是探针」的事故，故这里不允许凭「看起来更快」下判断。
+//     修它需要先做的：㈠ 用**无诊断探针**的构建，对「present 两级查找 vs 仅按类查找」各采一次
+//     帧数（用外部工具或极低采样率，不要每帧计时）；㈡ 数据支持后再交换两级顺序。
+//
+//   ②【本次已修】present 的**安装期缓存值**此前从裸 vptr 读槽位：若该实例此前已被克隆过，
+//     vptr[k_idx_present] 就是 &hooked_present 本身 ⇒ 被当成「原函数」缓存 ⇒ 一调用即
+//     无限递归。现改为从原表读（见下方 present 登记块），与另外七个槽同一口径；
+//     该块每次安装只跑一次，不在逐帧路径上，故按热路径红线无需测量。
+//     仍未修的部分：g_original_present / g_original_present_by_instance 两张表同样
+//     **只增不减**（对象销毁后条目保留），故风险 ① 的地址复用缺口不因本条修复而消失。
+//     要彻底关掉它需要：给这两张表加**对象销毁时的移除**（目前没有可用的 DXGI 销毁回调
+//     能可靠触发移除），或让 present 也只按 vtable 为键 —— 后者正是风险 ① 要先测量的那件事。
+//
+// 键的类型是 `void **`（即 clone_and_patch_vtable 的 source、原 vtable 的首地址）。
+// ---------------------------------------------------------------------------
+std::mutex g_swapchain_vtable_originals_mutex;
+std::unordered_map<void **, set_fullscreen_state_fn> g_original_set_fullscreen_state_by_vtable;
+std::unordered_map<void **, get_fullscreen_state_fn> g_original_get_fullscreen_state_by_vtable;
+std::unordered_map<void **, resize_buffers_fn> g_original_resize_buffers_by_vtable;
+std::unordered_map<void **, resize_target_fn> g_original_resize_target_by_vtable;
+std::unordered_map<void **, check_color_space_support_fn> g_original_check_color_space_support_by_vtable;
+std::unordered_map<void **, set_color_space1_fn> g_original_set_color_space1_by_vtable;
+std::unordered_map<void **, set_hdr_metadata_fn> g_original_set_hdr_metadata_by_vtable;
 #if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
 std::mutex g_fsr2_color_diagnostics_mutex;
 std::string g_last_fsr2_color_diagnostics;
@@ -1153,6 +1217,10 @@ bool swapchain_hook_needed();
 void update_swapchain_backbuffer_resources(IDXGISwapChain *swapchain);
 void record_hdr_composite_candidate(UINT element_count, bool indexed);
 void record_hdr_composite_target_bind(const ResourceInfo &target);
+
+// 2026-11-21（跨类尾调缺陷，Refs #19）：回调侧要用它由 this 反查「原 vtable」作查表键。
+// 定义在文件后段（紧邻 install_factory_hooks_from_device），故此处只放声明。
+void **original_vtable_of_instance(void *instance);
 
 std::wstring current_process_name()
 {
@@ -7690,6 +7758,12 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
     // 无挂起时零开销（单锁内布尔检查）。
     if (ffx12::async_upscale_enabled())
         ffx12::finish_pending();
+    // 2026-11-21（Refs #19，**遗留未修**）：本处仍是「按对象地址 → 全局」两级，顺序**有意未改**。
+    //   风险：g_original_present_by_instance 只增不减，交换链销毁后对象地址被异类对象复用时，
+    //   这里会取到旧类的函数体 ⇒ 用新类的 this 跑旧类的实现（即本提交修掉的那种跨类尾调）。
+    //   为什么不动：这是**每帧**路径，改查找顺序属热路径改动，必须先有帧数采样数据
+    //   （本项目有过热路径计时探针吃掉 7~8% 帧数的先例），不能凭「看起来更快」下手。
+    //   修它要做的：用无诊断探针的构建采「两级查找 vs 仅按类查找」的帧数，数据支持后再换序。
     present_fn original_present = g_original_present;
     {
         std::lock_guard lock(g_swapchain_present_mutex);
@@ -7698,6 +7772,156 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
             original_present = it->second;
     }
     return original_present != nullptr ? original_present(swapchain, sync_interval, flags) : E_FAIL;
+}
+
+// ---------------------------------------------------------------------------
+// 2026-11-21（跨类尾调缺陷，Refs #19）：回调侧按 vtable 查「本类自己的原函数」。
+//
+// 为什么不能在回调里直接用全局 g_original_*：它们是**裸全局**、安装处以 `== nullptr` 作
+//   判据 ⇒ 只有第一个交换链会写入。钩子若装到第二个、**属于另一个类**的交换链上（实测：
+//   原生 dxgi 交换链 + 包装交换链），回调就会拿 B 的 this 去跑 A 的函数体，A 的实现按自己的
+//   内部布局读 this 的字段 ⇒ 读到 B 的无关内存（issue #19 的崩溃就是这么来的：
+//   mov rcx,[rcx+8] 取到 0，随后 mov rax,[rcx] 读零页）。
+//
+// 死锁分析（为什么不会嵌套死锁）—— 采用「**先取键、再查表**」这两段式，锁不嵌套：
+//   ① `original_vtable_of_instance(this)` 内部会**自己**取 g_vtable_mutex 并在返回前释放
+//      （见其函数体的 `std::lock_guard lock(g_vtable_mutex);`，存活范围只到该函数结束）；
+//   ② 本组查询另用**另一把** g_swapchain_vtable_originals_mutex，且**只在 ① 返回之后**才取。
+//   ⇒ 任一时刻每个线程最多持有一把锁，不存在 A→B / B→A 的环，也没有同一把锁的递归获取。
+//   ⚠ 反例（本实现**刻意没有**这样写）：不要写成「先取 g_swapchain_vtable_originals_mutex，
+//     再在里面调 original_vtable_of_instance」—— 那样虽然仍不构成环（两把锁方向固定），
+//     但只要以后有人把某处改成先取 g_vtable_mutex 再取本组的锁，就会与这个方向对撞成死锁；
+//     而「键先算好、锁范围只覆盖一次哈希查询」本身也更短，热路径更好。
+//
+// 热路径代价：一次原表反查（g_vtable_mutex + 一次 unordered_map 查找）加一次本组查找。
+//   本组查询只在槽被调用时发生（ResizeBuffers / SetColorSpace1 等），这些调用是
+//   「游戏切换分辨率 / 色空间 / 全屏」级别的低频事件，**不在每帧、更不在每 draw 路径**上；
+//   唯一沾每帧的 is Present，而 Present 走的是按对象为键的既有表（本次未改其查找方式）。
+//   ⚠ 未验证：没有为这两次哈希查找做单独的采样测量（本改动不是性能改动，且所在路径低频）；
+//   若日后要在 Present 上也套用本组表，必须先按 §二.5 测量再定。
+//
+// 兜底链（七个回调统一，逐函数见各自函数体）—— 2026-11-21（Refs #19）**顺序已反转**：
+//   ① 按**vtable**为键的表（按类）—— 键是原 vtable 首地址，正常情形指向模块 .rdata、
+//      进程内稳定；但它**不是无条件稳定**，限定条件与缺口见下方「类键的限定条件」；
+//   ② 按**对象**为键的表（present / resize_buffers 各有一张）—— 只在 ① 拿不到键（key == nullptr）
+//      或 ① 未命中时兜底。它更「具体」，但对象地址会随交换链销毁被复用，复用给另一个类时
+//      就会用新类的 this 跑旧类的函数体（issue #19 的崩溃形态）；
+//   ③ 全局 g_original_*（首个交换链写下的那份）—— 兼容既有行为；
+//   ④ 都没有 ⇒ 返回各回调原有的错误码（不 dereference 空指针）。
+// ⇒ 注意：七个槽里只有 present 与 resize_buffers 有 ②；其余五个是 ①→③→④。
+//   present 的查找顺序本次**未改**（见 hooked_present）：它的键同样是对象地址、同样有复用
+//   风险，但它在每帧路径上，改查找顺序需要先给出帧数采样数据；逐条理由与修法见文件头部
+//   「present 的两处真实风险」。present 的**安装期缓存值**本次已改为取原表（不在逐帧路径）。
+//
+// 类键的限定条件（2026-11-21 补记，**本次不改逻辑**，写清楚是为了不被当成无条件结论读）：
+//   · 「vtable 为键」的稳定性来自「键指向模块 .rdata 里按类归并的表」这一**前提**，
+//     而不是「键是 vtable」这个形式本身。
+//   · 缺口（已知、未修）：键是由 original_vtable_of_instance 按**对象地址**从
+//     g_original_vtables 查出来的，而该表**只增不减**（对象销毁后条目保留）。
+//     交换链 A 销毁、其地址被 B 复用时，只要 A 的条目还在，这里返回的就是 **A 的陈旧记录**，
+//     键从一开始就不是「B 的类」。配套后果：clone_and_patch_vtable 会因
+//     g_cloned_vtables.contains(B) 为真而直接 return true、**静默不克隆**
+//     ⇒ 该交换链一条钩子都不装，且没有任何告警。
+//     要修需要：给 g_original_vtables / g_cloned_vtables 加**对象销毁时的移除**
+//     （目前没有可用的 DXGI 销毁回调能可靠触发移除），或改用不依赖对象地址的类标识
+//     （如从 vtable 内容反查模块与槽位指纹）。两者都不是本提交的范围。
+//   · 另一个限定：上面前提「表按类归并在模块 .rdata」只对**模块内的类**成立。
+//     包装类若为**每个实例**各 VirtualAlloc 一张 vtable（构造这种包装类是很容易的，验收
+//     跨类尾调时用的就是这一形态），则每实例各占一条记录，键的稳定性退化为**堆分配的
+//     寿命** —— 实例释放后该地址可能被别的分配复用，与按对象为键者同病。
+//     ⚠ 未验证：生产里是否真有包装实现按实例自建 vtable，尚未在实机确认；
+//     本条只说明「类键的稳定性有前提」，不主张该前提在线上总成立。
+// ---------------------------------------------------------------------------
+
+// 取键：返回 nullptr 表示「拿不到这个对象的类键」，调用点据此继续下一级兜底。
+// 只有一种情形返回 nullptr —— 该实例已被克隆、却查不到它的原表记录（不应出现，见
+//   original_vtable_of_instance 的 ③）。此时**不能**退而解引用当前 vptr 顶上：那通常是克隆体，
+//   槽上是钩子自己（把它当键 ⇒ 永远查不到；把它当值 ⇒ 自递归）。
+static void **current_original_vtable_key(void *instance)
+{
+    if (instance == nullptr)
+        return nullptr;
+    // 取键在锁外完成：original_vtable_of_instance 内部自己加 g_vtable_mutex 并在返回前释放，
+    //   本组自己的锁只在随后的哈希查询里取（锁不嵌套，见上方死锁分析）。
+    return original_vtable_of_instance(instance);
+}
+
+static set_fullscreen_state_fn original_set_fullscreen_state_for(void *instance)
+{
+    void **const key = current_original_vtable_key(instance);
+    if (key != nullptr)
+    {
+        std::lock_guard lock(g_swapchain_vtable_originals_mutex);
+        const auto it = g_original_set_fullscreen_state_by_vtable.find(key);
+        if (it != g_original_set_fullscreen_state_by_vtable.end())
+            return it->second;
+    }
+    return g_original_set_fullscreen_state;
+}
+
+static get_fullscreen_state_fn original_get_fullscreen_state_for(void *instance)
+{
+    void **const key = current_original_vtable_key(instance);
+    if (key != nullptr)
+    {
+        std::lock_guard lock(g_swapchain_vtable_originals_mutex);
+        const auto it = g_original_get_fullscreen_state_by_vtable.find(key);
+        if (it != g_original_get_fullscreen_state_by_vtable.end())
+            return it->second;
+    }
+    return g_original_get_fullscreen_state;
+}
+
+static resize_target_fn original_resize_target_for(void *instance)
+{
+    void **const key = current_original_vtable_key(instance);
+    if (key != nullptr)
+    {
+        std::lock_guard lock(g_swapchain_vtable_originals_mutex);
+        const auto it = g_original_resize_target_by_vtable.find(key);
+        if (it != g_original_resize_target_by_vtable.end())
+            return it->second;
+    }
+    return g_original_resize_target;
+}
+
+static check_color_space_support_fn original_check_color_space_support_for(void *instance)
+{
+    void **const key = current_original_vtable_key(instance);
+    if (key != nullptr)
+    {
+        std::lock_guard lock(g_swapchain_vtable_originals_mutex);
+        const auto it = g_original_check_color_space_support_by_vtable.find(key);
+        if (it != g_original_check_color_space_support_by_vtable.end())
+            return it->second;
+    }
+    return g_original_check_color_space_support;
+}
+
+static set_color_space1_fn original_set_color_space1_for(void *instance)
+{
+    void **const key = current_original_vtable_key(instance);
+    if (key != nullptr)
+    {
+        std::lock_guard lock(g_swapchain_vtable_originals_mutex);
+        const auto it = g_original_set_color_space1_by_vtable.find(key);
+        if (it != g_original_set_color_space1_by_vtable.end())
+            return it->second;
+    }
+    return g_original_set_color_space1;
+}
+
+static set_hdr_metadata_fn original_set_hdr_metadata_for(void *instance)
+{
+    void **const key = current_original_vtable_key(instance);
+    if (key != nullptr)
+    {
+        std::lock_guard lock(g_swapchain_vtable_originals_mutex);
+        const auto it = g_original_set_hdr_metadata_by_vtable.find(key);
+        if (it != g_original_set_hdr_metadata_by_vtable.end())
+            return it->second;
+    }
+    return g_original_set_hdr_metadata;
 }
 
 HRESULT STDMETHODCALLTYPE hooked_set_fullscreen_state(IDXGISwapChain *swapchain, BOOL fullscreen, IDXGIOutput *target)
@@ -7714,15 +7938,20 @@ HRESULT STDMETHODCALLTYPE hooked_set_fullscreen_state(IDXGISwapChain *swapchain,
         return S_OK;
     }
 
-    return g_original_set_fullscreen_state != nullptr
-        ? g_original_set_fullscreen_state(swapchain, fullscreen, target)
+    // 兜底链（2026-11-21，Refs #19）：按 vtable 查本类的原函数 → 全局 → DXGI_ERROR_INVALID_CALL。
+    // 本槽没有「按对象为键」的表（那是 present / resize_buffers 独有的更细粒度机制）。
+    const set_fullscreen_state_fn original = original_set_fullscreen_state_for(swapchain);
+    return original != nullptr
+        ? original(swapchain, fullscreen, target)
         : DXGI_ERROR_INVALID_CALL;
 }
 
 HRESULT STDMETHODCALLTYPE hooked_get_fullscreen_state(IDXGISwapChain *swapchain, BOOL *fullscreen, IDXGIOutput **target)
 {
-    return g_original_get_fullscreen_state != nullptr
-        ? g_original_get_fullscreen_state(swapchain, fullscreen, target)
+    // 兜底链同 hooked_set_fullscreen_state：按 vtable → 全局 → DXGI_ERROR_INVALID_CALL。
+    const get_fullscreen_state_fn original = original_get_fullscreen_state_for(swapchain);
+    return original != nullptr
+        ? original(swapchain, fullscreen, target)
         : DXGI_ERROR_INVALID_CALL;
 }
 
@@ -7768,7 +7997,34 @@ HRESULT STDMETHODCALLTYPE hooked_resize_buffers(
         }
     }
 
+    // 兜底链（2026-11-21，Refs #19；同日修正**顺序**，理由见下）：
+    //   ① g_original_resize_buffers_by_vtable（按类 / 原 vtable）—— 优先
+    //   ② g_original_resize_buffers_by_instance（按对象）—— 只在 ① 拿不到键或未命中时
+    //   ③ g_original_resize_buffers（全局，首个交换链写下的那份）
+    //
+    // 为什么把「按对象」降到第二级：上一版让它优先，理由是「对象比类更具体」。在本仓库里这个
+    //   理由**是错的** —— 更具体的代价是**键会被复用**。交换链销毁后对象地址会被复用，若复用给
+    //   **另一个类**的新交换链，② 会命中旧类的函数体、配上新类的 this，正是 issue #19 的崩溃
+    //   形态；而本提交同时把 ② 的登记条件放宽到「每条交换链一条」，等于把这条路的流量从
+    //   「几乎为零」放大到「每链一条」，因此本处必须把它移出第一级。
+    //   vtable 指针正常指向模块 .rdata 里按类归并的表，因此**不受对象地址复用影响**
+    //   （限定条件与已知缺口见回调侧「类键的限定条件」那段：键是从按对象地址的表里查出来的，
+    //   对象销毁后该表不清理 ⇒ 极端情形下会拿到陈旧记录；包装类自建 vtable 时每实例一张表，
+    //   稳定性退化为堆分配寿命）。本处只调整查找顺序，未处理这两个缺口。
+    // 为什么 ② 仍然保留（不删）：它是 key 拿不到时唯一的按实例兜底 —— 见
+    //   current_original_vtable_key 的返回 nullptr 分支（已克隆却查不到原表，不应出现）。
     resize_buffers_fn original_resize = nullptr;
+    {
+        void **const key = current_original_vtable_key(swapchain);
+        if (key != nullptr)
+        {
+            std::lock_guard lock(g_swapchain_vtable_originals_mutex);
+            const auto it = g_original_resize_buffers_by_vtable.find(key);
+            if (it != g_original_resize_buffers_by_vtable.end())
+                original_resize = it->second;
+        }
+    }
+    if (original_resize == nullptr)
     {
         std::lock_guard lock(g_swapchain_resize_mutex);
         const auto it = g_original_resize_buffers_by_instance.find(swapchain);
@@ -7854,8 +8110,10 @@ HRESULT STDMETHODCALLTYPE hooked_resize_target(IDXGISwapChain *swapchain, const 
         return S_OK;
     }
 
-    return g_original_resize_target != nullptr
-        ? g_original_resize_target(swapchain, target_parameters)
+    // 兜底链（2026-11-21，Refs #19）：按 vtable → 全局 → DXGI_ERROR_INVALID_CALL。
+    const resize_target_fn original = original_resize_target_for(swapchain);
+    return original != nullptr
+        ? original(swapchain, target_parameters)
         : DXGI_ERROR_INVALID_CALL;
 }
 
@@ -7967,8 +8225,14 @@ HRESULT STDMETHODCALLTYPE hooked_check_color_space_support(
     UINT *support)
 {
     void *const caller = _ReturnAddress();
-    const HRESULT physical_hr = g_original_check_color_space_support != nullptr
-        ? g_original_check_color_space_support(swapchain, color_space, support)
+    // 兜底链（2026-11-21，Refs #19）：按 vtable → 全局 → DXGI_ERROR_INVALID_CALL。
+    // ★ 本槽**不能**像 hooked_set_hdr_metadata 那样在 spoof 为真时短路跳过原函数：
+    //   它的原函数负责把 *support 填上（本函数随后只对 spoof 命中项 OR 标志位），
+    //   先算 spoof 再跳过原函数会让 *support 保持调用方传入的旧值 ⇒ 调用方读到垃圾。
+    //   这里「先调原函数、后算 spoof」是有意的顺序，不是遗漏。
+    const check_color_space_support_fn original = original_check_color_space_support_for(swapchain);
+    const HRESULT physical_hr = original != nullptr
+        ? original(swapchain, color_space, support)
         : DXGI_ERROR_INVALID_CALL;
     const bool spoof = hdr_swapchain_spoof_active() && is_hdr10_color_space(color_space);
     if (spoof && support != nullptr)
@@ -8010,8 +8274,10 @@ HRESULT STDMETHODCALLTYPE hooked_set_color_space1(
     const DXGI_COLOR_SPACE_TYPE physical_color_space = spoof
         ? DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
         : color_space;
-    const HRESULT physical_hr = g_original_set_color_space1 != nullptr
-        ? g_original_set_color_space1(swapchain, physical_color_space)
+    // 兜底链（2026-11-21，Refs #19）：按 vtable → 全局 → DXGI_ERROR_INVALID_CALL。
+    const set_color_space1_fn original = original_set_color_space1_for(swapchain);
+    const HRESULT physical_hr = original != nullptr
+        ? original(swapchain, physical_color_space)
         : DXGI_ERROR_INVALID_CALL;
 
 #if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
@@ -8039,10 +8305,13 @@ HRESULT STDMETHODCALLTYPE hooked_set_hdr_metadata(
 {
     void *const caller = _ReturnAddress();
     const bool spoof = hdr_swapchain_spoof_active() && type == DXGI_HDR_METADATA_TYPE_HDR10;
+    // 兜底链（2026-11-21，Refs #19）：按 vtable → 全局 → DXGI_ERROR_INVALID_CALL。
+    // 注意 spoof 分支仍然最先短路（spoof 为真时**不调用**原函数），这与兜底链无关。
+    const set_hdr_metadata_fn original = spoof ? nullptr : original_set_hdr_metadata_for(swapchain);
     const HRESULT physical_hr = spoof
         ? S_OK
-        : (g_original_set_hdr_metadata != nullptr
-            ? g_original_set_hdr_metadata(swapchain, type, size, metadata)
+        : (original != nullptr
+            ? original(swapchain, type, size, metadata)
             : DXGI_ERROR_INVALID_CALL);
 
 #if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
@@ -15260,36 +15529,209 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
         }
     }
 
-    void **vtable = *reinterpret_cast<void ***>(hook_instance);
+    // ★ 2026-11-21（present 的安装期缓存值也改取原表，故原表取值点提前到这里）：
+    //   原表指针原先在下方「按 vtable 登记」的长注释之后才取（原 :15522），而 present 登记块
+    //   在它**之前**。present 的键与值同样必须取自原表 —— 理由与其它七个槽完全相同（见下方
+    //   那段长注释的 ①②）—— 故把取值点提前到 present 块之前。
+    //   为什么这次移动**不改变任何其它逻辑**：original_vtable_of_instance 只做一次在
+    //   g_vtable_mutex 保护下的两表查询，返回前已释放该锁，不持有任何锁、不写任何状态；
+    //   下方各处对它的使用彼此无顺序依赖（都是「拿到指针后读某个槽位」），故提前只让
+    //   present 这一块也能看到它。
+    //   ⚠ 未验证：本顺序调整没有单独的实机验证用例；它只改变 present 的取值来源。
+    void **const original_vtable = original_vtable_of_instance(hook_instance);
+    if (original_vtable == nullptr)
+    {
+        // 只可能是「已克隆却查不到原表」这一不应出现的状态（见 original_vtable_of_instance 的 ③）。
+        // 此时**键与原函数都无从确定**：仍照旧装补丁的话，回调的 ① 拿不到键、② 未登记
+        //   ⇒ 一路落到 ③ 全局 g_original_*，而那些全局**很可能已被前一个类写过** ⇒ 正好是
+        //   本提交要消除的「用 B 的 this 跑 A 的函数体」。即：照旧装补丁**不是**安全侧。
+        // 故本路径**不装任何钩子**（该交换链退回系统原函数），也不登记任何原函数 ——
+        //   宁可少钩一条链，也不登记一个可能是钩子自身的地址（错误码可见，自递归必崩）。
+        // 与下方 patches 为空时的早退同构：两条都要先释放 QI 到的引用再返回。
+        // 注：上方 swapchain_hook_decision install=1 是**决策**，本行才是**结果**；那条决策日志
+        //   的既有含义（「判据放行」而非「钩子装上了」）不变。
+        LOG_WARN(blog::cat::hook, "swapchain_original_vtable_unavailable instance=" +
+            hex64(reinterpret_cast<std::uintptr_t>(hook_instance)) + " action=skip_clone_no_original_key");
+        if (swapchain4 != nullptr)
+            swapchain4->Release();
+        if (swapchain3 != nullptr)
+            swapchain3->Release();
+        return;
+    }
+
+    // present 登记：**键**仍是对象地址（按实例），**值**取自原表。
+    //   取当前 vptr 会把克隆体上的 &hooked_present 本身当成「原函数」缓存 ⇒ 之后一调用即
+    //   无限递归。本块此前读的正是裸 vptr，且不受原表判据保护（它在判据之前执行）。
     if (should_hook_present)
     {
-        const auto original_present = reinterpret_cast<present_fn>(vtable[k_idx_present]);
+        const auto original_present = reinterpret_cast<present_fn>(original_vtable[k_idx_present]);
         if (g_original_present == nullptr)
             g_original_present = original_present;
         std::lock_guard lock(g_swapchain_present_mutex);
         g_original_present_by_instance.try_emplace(hook_instance, original_present);
         g_original_present_by_instance.try_emplace(swapchain, original_present);
     }
-    if (should_hook_general_swapchain_controls && g_original_set_fullscreen_state == nullptr)
-        g_original_set_fullscreen_state = reinterpret_cast<set_fullscreen_state_fn>(vtable[k_idx_set_fullscreen_state]);
-    if (should_hook_general_swapchain_controls && g_original_get_fullscreen_state == nullptr)
-        g_original_get_fullscreen_state = reinterpret_cast<get_fullscreen_state_fn>(vtable[k_idx_get_fullscreen_state]);
-    if (should_hook_general_swapchain_controls && g_original_resize_buffers == nullptr)
-        g_original_resize_buffers = reinterpret_cast<resize_buffers_fn>(vtable[k_idx_resize_buffers]);
-    if (should_hook_native_ldr_resize)
+    const bool has_color_interface = swapchain4 != nullptr || swapchain3 != nullptr;
+
+    // 2026-11-21（跨类尾调缺陷，Refs #19）：原函数按**原 vtable 指针**登记到各槽自己的表里。
+    //
+    // 为什么必须新增这一层：下面那七个 `g_original_*` 全局变量以 `== nullptr` 作写入判据
+    //   ⇒ **只有第一个交换链会写入，之后永不更新**。实测一次真实会话里先后装到原生 dxgi
+    //   交换链与包装交换链（日志 dxgi_color_hooks_active 打出的两个对象地址不同）⇒ 第二个
+    //   对象一条都写不进 ⇒ 回调拿包装类的 this 去跑原生 dxgi 的函数体：原生实现开头
+    //   mov rcx,[rcx+8] 把 this+8 当第二个 vptr 用，包装对象该处为 0 ⇒ 随后 mov rax,[rcx]
+    //   读零页（issue #19 的崩溃指令序列）。按 vtable 登记后，每个**类**各有一条记录，互不覆盖。
+    //
+    // 键**与值**都必须取自 original_vtable_of_instance(hook_instance)，不能用**此刻**的 vptr
+    //   （即解引用实例得到的那张表）：若该实例此前已被克隆过，clone_and_patch_vtable 会直接
+    //   return true 且**不再改指针** ⇒ 此刻的 vptr 已是**克隆体**，槽位上躺的是 hooked_* 自己。
+    //   两个后果，都必须避免：
+    //     ① 拿克隆体当键 ⇒ 回调侧（见 current_original_vtable_key 及其上的 original_*_for
+    //        一组函数）用 original_vtable_of_instance 反查出来的是**原表**，键永远对不上；
+    //     ② 从克隆体读槽位当「原函数」⇒ 存进去的其实是**钩子本身**，一旦调用就无限递归
+    //        （这类自递归本仓库已踩过一次，见 original_vtable_of_instance 的注释）。
+    //   ⇒ 本段的键与值、以及本段之后各处，**一律取自 original_vtable**；该指针在上方
+    //     （present 登记块之前）取一次，为 nullptr 时**整条链不装钩子**直接返回 —— 键不确定时
+    //     宁可少钩一条链，也不能登记一个可能是钩子的地址（错误码可见，自递归必崩）。
+    //   ★ 2026-11-21（取值口径统一）：全局那七行此前仍读 vtable，与紧邻的「值不能取 vtable」
+    //     规则两套口径。首次安装时两者恰好相等，所以看不出来；但同一实例若已被克隆过再走一次，
+    //     那七行会把 hooked_* 缓存成「原函数」⇒ 自递归。现改为与按表登记同一取值来源，
+    //     且条件逐条对齐 patches 段：set/get_fullscreen_state 与 resize_target 用
+    //     general_controls、resize_buffers 用 controls||native_ldr_resize、color 三项用
+    //     color && has_color_interface（HDR 再叠加 supports_hdr_metadata）。
+    //   ⚠ 未验证：生产里尚未观察到同一实例被 install_swapchain_hooks 走两次的情形，
+    //   「克隆体」这条分支没有实机触发记录；但取值口径按上面两条来写，走不到也不会出错。
+    //   ★ 2026-11-21（日志口径修正）：本文件此前的写法是「original_vtable == nullptr 时
+    //     只跳过原函数登记、补丁照装」，并打一条 action=skip_all_original_registration。
+    //     那句 action 与事实不符 —— present 的登记不受原表判据约束，执行到那一行时
+    //     g_original_present 与 g_original_present_by_instance 早已写完，跳过的从来不是「全部」。
+    //     该分支现在不存在了：原表为 nullptr 在更上方就整条链不装钩子直接返回（present 也已
+    //     改走原表），故这里**没有**任何跳过分支，全局兜底写入是本路径必然执行的一步；
+    //     唯一会「跳过」的判据只剩各槽自己的 == nullptr（只记第一份，保持既有行为），
+    //     与上方按表登记是否新增条目无关，两者不再共用一个可能被误读的 action 字段。
+    {
+        // 全局兜底：判据仍是 == nullptr（只记第一份，保持既有行为），但**取值改自原表**。
+        // 条件逐条与下方 patches 段对齐 —— 差一条就会留下「补丁装了、全局兜底却没值」的构型
+        //   （对齐 patches 段）。改动前 color 三项只看 has_color_interface、不看 should_hook_color；
+        //   而 resize_buffers 只看 should_hook_general_swapchain_controls —— 后者在
+        //   native_ldr_resize=1 && controls=0 时补丁装了、全局却没值，回调只能落到错误码。
+        // 注意 resize_buffers 这一行是**唯一的例外**：patches 段把它放在
+        //   controls || native_ldr_resize 里，故这里用 should_hook_swapchain_controls。
+        if (should_hook_general_swapchain_controls && g_original_set_fullscreen_state == nullptr)
+            g_original_set_fullscreen_state = reinterpret_cast<set_fullscreen_state_fn>(original_vtable[k_idx_set_fullscreen_state]);
+        if (should_hook_general_swapchain_controls && g_original_get_fullscreen_state == nullptr)
+            g_original_get_fullscreen_state = reinterpret_cast<get_fullscreen_state_fn>(original_vtable[k_idx_get_fullscreen_state]);
+        if (should_hook_swapchain_controls && g_original_resize_buffers == nullptr)
+            g_original_resize_buffers = reinterpret_cast<resize_buffers_fn>(original_vtable[k_idx_resize_buffers]);
+        if (should_hook_general_swapchain_controls && g_original_resize_target == nullptr)
+            g_original_resize_target = reinterpret_cast<resize_target_fn>(original_vtable[k_idx_resize_target]);
+        if (should_hook_color && has_color_interface && g_original_check_color_space_support == nullptr)
+            g_original_check_color_space_support = reinterpret_cast<check_color_space_support_fn>(original_vtable[k_idx_check_color_space_support]);
+        if (should_hook_color && has_color_interface && g_original_set_color_space1 == nullptr)
+            g_original_set_color_space1 = reinterpret_cast<set_color_space1_fn>(original_vtable[k_idx_set_color_space1]);
+        if (should_hook_color && has_color_interface && supports_hdr_metadata && g_original_set_hdr_metadata == nullptr)
+            g_original_set_hdr_metadata = reinterpret_cast<set_hdr_metadata_fn>(original_vtable[k_idx_set_hdr_metadata]);
+    }
+
+    // 按**对象**为键的表：登记条件与 patches 段的 resize_buffers 同构（should_hook_swapchain_controls）。
+    //   ★ 2026-11-21（Refs #19 的优先级反转）—— 这张表已**降到第二级**（按 vtable 查不到时才查它），
+    //     故不再具备「第一级 + 永不过期 + 默认必然登记」三条同时成立的危险。
+    //     交换链销毁后对象地址确实会被复用，但只有在该类的 vtable 表查不到、且新对象**恰好**
+    //     落到同一地址时才会被读到；两条同时成立的概率远低于「每条链都登记、每次都优先命中」。
+    //     登记条件保留放宽（与补丁同构）是有意的：两级都登记才能保证「vtable 表缺失」这种退化
+    //     情形下仍有按实例的兜底；而它已不是第一级，地址复用时无害。
+    //   ★ 值必须是**原函数**，故同样取自 original_vtable（取 vtable 会把克隆体上的钩子登记进来）。
+    //   original_vtable 在此已必非空（空值在上方整条链直接返回），故不再重复判空。
+    if (should_hook_swapchain_controls)
     {
         std::lock_guard lock(g_swapchain_resize_mutex);
-        g_original_resize_buffers_by_instance.try_emplace(hook_instance, reinterpret_cast<resize_buffers_fn>(vtable[k_idx_resize_buffers]));
+        g_original_resize_buffers_by_instance.try_emplace(hook_instance,
+            reinterpret_cast<resize_buffers_fn>(original_vtable[k_idx_resize_buffers]));
     }
-    if (should_hook_general_swapchain_controls && g_original_resize_target == nullptr)
-        g_original_resize_target = reinterpret_cast<resize_target_fn>(vtable[k_idx_resize_target]);
-    const bool has_color_interface = swapchain4 != nullptr || swapchain3 != nullptr;
-    if (has_color_interface && g_original_check_color_space_support == nullptr)
-        g_original_check_color_space_support = reinterpret_cast<check_color_space_support_fn>(vtable[k_idx_check_color_space_support]);
-    if (has_color_interface && g_original_set_color_space1 == nullptr)
-        g_original_set_color_space1 = reinterpret_cast<set_color_space1_fn>(vtable[k_idx_set_color_space1]);
-    if (supports_hdr_metadata && g_original_set_hdr_metadata == nullptr)
-        g_original_set_hdr_metadata = reinterpret_cast<set_hdr_metadata_fn>(vtable[k_idx_set_hdr_metadata]);
+
+    // 按 vtable 登记（七个槽各一张表）。try_emplace 而不是 operator[]/insert_or_assign：
+    //   同一类的第二个实例会命中已存在的键，值本来就是同一个函数体，无需覆盖；
+    //   不覆盖也让「第一次登记」的唯一性可保持（不会因后装对象把值换成别的）。
+    //   ★ 值一律取自 original_vtable（原表），**不能**取 vtable：理由见上方 ①②（克隆体上躺的是钩子）。
+    //   ★ 键就是 original_vtable 本身，故原表为 nullptr 时无从登记 —— 该情形已在更上方
+    //     整条链返回（不装钩子、也不登记），本块必定拿到非空的键。
+    {
+        // registered 只统计**本槽位真的新增了条目**的次数，用来让下面那条日志说实话：
+        //   三个闸门全为 0 时（present=1、controls=0、color=0，早退守卫不触发）本块会走到、
+        //   却一条都没登记；改动前照样打「controls=0 color=0 hdr=0」，读者会读成「登记成功」
+        //   （日志必须反映实际登记，不能只反映闸门）。
+        int registered = 0;
+        // 锁范围只覆盖这几次 try_emplace：LOG_DEBUG 会去取 g_queue_mutex / g_cat_mutex，
+        //   在持本锁期间写日志就把锁序变成「本锁 → 日志锁」（§二.4 不要在持锁期间做 I/O）。
+        //   故日志放在内层 {} 之外、它的**外层 {} 之内**；数量在内层块里已经定下，移出锁不影响准确性。
+        //   （日志已移到锁外，见下）。
+        {
+            std::lock_guard lock(g_swapchain_vtable_originals_mutex);
+            if (should_hook_general_swapchain_controls)
+            {
+                registered += g_original_set_fullscreen_state_by_vtable.try_emplace(original_vtable,
+                    reinterpret_cast<set_fullscreen_state_fn>(original_vtable[k_idx_set_fullscreen_state])).second ? 1 : 0;
+                registered += g_original_get_fullscreen_state_by_vtable.try_emplace(original_vtable,
+                    reinterpret_cast<get_fullscreen_state_fn>(original_vtable[k_idx_get_fullscreen_state])).second ? 1 : 0;
+                registered += g_original_resize_target_by_vtable.try_emplace(original_vtable,
+                    reinterpret_cast<resize_target_fn>(original_vtable[k_idx_resize_target])).second ? 1 : 0;
+            }
+            if (should_hook_swapchain_controls)
+            {
+                registered += g_original_resize_buffers_by_vtable.try_emplace(original_vtable,
+                    reinterpret_cast<resize_buffers_fn>(original_vtable[k_idx_resize_buffers])).second ? 1 : 0;
+            }
+            if (should_hook_color && has_color_interface)
+            {
+                registered += g_original_check_color_space_support_by_vtable.try_emplace(original_vtable,
+                    reinterpret_cast<check_color_space_support_fn>(original_vtable[k_idx_check_color_space_support])).second ? 1 : 0;
+                registered += g_original_set_color_space1_by_vtable.try_emplace(original_vtable,
+                    reinterpret_cast<set_color_space1_fn>(original_vtable[k_idx_set_color_space1])).second ? 1 : 0;
+                if (supports_hdr_metadata)
+                {
+                    registered += g_original_set_hdr_metadata_by_vtable.try_emplace(original_vtable,
+                        reinterpret_cast<set_hdr_metadata_fn>(original_vtable[k_idx_set_hdr_metadata])).second ? 1 : 0;
+                }
+            }
+        }
+
+        // 2026-11-21（跨类尾调缺陷，Refs #19）：登记结果必须可见，否则本机制**完全无法验证**。
+        // 口径：key = 原 vtable（按类归并，同类实例打同一行）；instance = 本次安装的对象；
+        //   registered = 本次**新增**的条目数（try_emplace 不覆盖，故同类的第二个实例为 0）。
+        // 判据：同一会话里出现**多个不同的 key** ⇒ 确实装到了不同类的对象上，按类登记生效了；
+        //   只有一直一个 key ⇒ 本次会话没遇到跨类情形，本机制未被走到（不代表它不生效）。
+        // 只在安装期打一次，不在逐帧路径；用 DEBUG 等级，发布默认不输出。
+        //
+        // ★ 这条日志的位置与前提（2026-11-21 措辞修正，纯注释、未验证）：它在 early-return 之后、
+        //   patches 之前的外层 {} 之内 —— 原表为 nullptr 的情形已在更上方 :15542 直接 return，故走到
+        //   这里 original_vtable **必然非空**，key 不可能印成 key=0x0（那条 WARN 与这条日志互斥）。
+        //   本处 registered > 0 才打，== 0 走下面 *_skip 分支，读者不会把「一条都没新增」读成
+        //   「登记了一条空键的记录」。
+        if (registered > 0)
+        {
+            LOG_DEBUG(blog::cat::hook, "swapchain_original_by_vtable key=" +
+                hex64(reinterpret_cast<std::uintptr_t>(original_vtable)) +
+                " instance=" + hex64(reinterpret_cast<std::uintptr_t>(hook_instance)) +
+                " registered=" + std::to_string(registered) +
+                " controls=" + std::to_string(should_hook_swapchain_controls ? 1 : 0) +
+                " color=" + std::to_string((should_hook_color && has_color_interface) ? 1 : 0) +
+                " hdr=" + std::to_string((should_hook_color && has_color_interface && supports_hdr_metadata) ? 1 : 0));
+        }
+        else
+        {
+            // registered == 0 有两种可能，**都不是失败**，故不用 WARN：
+            //   ① 该类此前已登记过（同类的第二个实例）⇒ 值已在表中，try_emplace 不覆盖；
+            //   ② 三个闸门全为 0 ⇒ 本次没有任何槽需要登记（早退守卫只拦「三者全 0 且 present 也为 0」，
+            //      故 present=1 时本块会走到这里）。
+            // 单列一条「本行未新增条目」，既不让 registered=0 被读成失败，也不让旧日志那种
+            //   「打出 controls=0 color=0 hdr=0 却像在报告成功」的歧义留在实现里。
+            LOG_DEBUG(blog::cat::hook, "swapchain_original_by_vtable_skip key=" +
+                hex64(reinterpret_cast<std::uintptr_t>(original_vtable)) +
+                " instance=" + hex64(reinterpret_cast<std::uintptr_t>(hook_instance)) +
+                std::string(" reason=") + ((should_hook_swapchain_controls || (should_hook_color && has_color_interface))
+                    ? "already_registered" : "no_slot_gated_on"));
+        }
+    }
     std::vector<std::pair<std::size_t, void *>> patches;
     if (should_hook_present)
         patches.emplace_back(k_idx_present, reinterpret_cast<void *>(&hooked_present));
