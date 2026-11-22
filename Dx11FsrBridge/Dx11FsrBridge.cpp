@@ -4756,24 +4756,34 @@ void load_config()
         //   · 键缺失              ⇒ 静默 500（ini 里不写这个键是合法的，发布模板会写）
         //   · 纯十进制、0         ⇒ 0（关闭）
         //   · 纯十进制、1..10000  ⇒ 原值；<200 ⇒ 200
-        //   · 纯十进制、>10000    ⇒ 10000（格式正确、仅超范围 ⇒ 钳制而非回落）
+        //   · 纯十进制、>10000 且 ≤9 位 ⇒ 10000（格式正确、仅超范围 ⇒ 钳制而非回落）
+        //   · 纯十进制、>9 位（含被缓冲截断的前缀）⇒ 500 +
+        //     `log_flush_interval_too_long` 告警（见下）
         //   · 其它（空/符号/abc/x10/尾随垃圾）⇒ 500 + `log_flush_interval_unparsed` 告警
-        //   · 超长（≥63 宽字符，会被 GetPrivateProfileStringW 截断）⇒ 500 +
-        //     `log_flush_interval_too_long` 告警（不静默截断后照用，见 flush_truncated）
+        //
+        // ⚠️ 为什么 >9 位不按"钳到 10000"处理：本键合法值最多 5 位（10000）。9 位以上
+        //   只可能是手滑或刻意塞长串，而且**无法区分它是写太长还是被缓冲截断** ——
+        //   截断后的前缀可能整段是 '0'（如 66 个 '0' + "500"），照用会静默把间隔改成 0
+        //   = 关闭本功能。宁可告警 + 回落，也不猜。
         {
             // 哨兵用不可能出现在 ini 里的控制字符：区分"键缺失"（正常，静默用默认）与
             // "键存在但值为空"（写了没填，属手滑，值得告警）。两者若都用默认值判定，
             // 空值要么被静默吞掉、要么把"没写这个键"也一起报警。
             const wchar_t *const k_missing = L"\x01";
             wchar_t flush_text[64] {};
-            const DWORD flush_copied =
-                GetPrivateProfileStringW(L"Log", L"flush_interval_ms", k_missing, flush_text,
-                                         static_cast<DWORD>(std::size(flush_text)), config_path.c_str());
-            // 截断检测：返回值达到缓冲上限 -1 说明原值可能更长，此时 flush_text 是被**静默
-            // 截断**的前缀。不检测的话，一个超长但数字合法的写法（如 40 个 '0' + "500"）
-            // 会被截成合法数字并原样应用，既不告警也不回落 —— 用户改了值却不知道没生效。
-            const bool flush_truncated = (flush_copied >= std::size(flush_text) - 1);
+            GetPrivateProfileStringW(L"Log", L"flush_interval_ms", k_missing, flush_text,
+                                     static_cast<DWORD>(std::size(flush_text)), config_path.c_str());
             const std::wstring flush_value(flush_text);
+            // 超长值检测 —— **不能**用"返回值是否达到缓冲上限"来判断：
+            // GetPrivateProfileStringW 返回值是"已复制的字符数"，而"恰好 63 字符"与
+            // "≥64 字符被截断到 63"两种情况**返回同一个 63**（已实测：63/64 字符的值
+            // 在 64 缓冲下都返回 63），二者无法区分 ⇒ 会把合法值误判成超长。
+            // 改用位数上限：本键合法值只有 0..10000（最多 5 位），任何 9 位以上的数字
+            // 都不可能是有效输入，按解析失败处理即可。这样判断不依赖缓冲大小。
+            // 不检测的后果（原缺陷）：超长但数字合法的写法会被截成前缀数字后**照用**，
+            // 既不告警也不回落 —— 用户改了值却不知道没生效。
+            constexpr std::size_t k_max_ini_digits = 9;
+            const bool flush_too_long = (flush_value.size() > k_max_ini_digits);
             std::uint32_t parsed_interval = 500;
             if (flush_value != k_missing)
             {
@@ -4783,11 +4793,11 @@ void load_config()
                     !flush_value.empty() &&
                     std::all_of(flush_value.begin(), flush_value.end(),
                                 [](wchar_t c) { return c >= L'0' && c <= L'9'; });
-                if (!all_digits || flush_truncated)
+                if (!all_digits || flush_too_long)
                 {
                     g_config.logging.pending_warnings.push_back(
-                        std::string(flush_truncated ? "log_flush_interval_too_long value="
-                                                    : "log_flush_interval_unparsed value=") +
+                        std::string(flush_too_long ? "log_flush_interval_too_long value="
+                                                   : "log_flush_interval_unparsed value=") +
                         narrow(flush_value) + " fallback=500");
                 }
                 else
