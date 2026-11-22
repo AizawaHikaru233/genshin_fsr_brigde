@@ -178,7 +178,9 @@ function Set-IniValue {
         # 文件最后 → 之后所有新键都落进 [Log.Categories] 段，被当成"分类名=等级"。
         # 实测后果：queue_capacity / Ffx12PresentProbe 落进 [Log.Categories]，
         # 日志里出现 `categories=...,Ffx12PresentProbe=ERROR`，而桥**从未读到这两个键**。
-        $section = if ($Key -in @('level','to_file','to_debugger','truncate_on_start','max_file_kb','rotate_keep','queue_capacity','flush_interval_ms','compat_prefix','debugger_max_per_sec')) { '[Log]' } else { '[Dx11FsrBridge]' }
+        $logKeys = @('level','to_file','to_debugger','truncate_on_start','max_file_kb','rotate_keep',
+                     'queue_capacity','flush_interval_ms','compat_prefix','debugger_max_per_sec')
+        $section = if ($Key -in $logKeys) { '[Log]' } else { '[Dx11FsrBridge]' }
         $sectionStart = -1
         $sectionEnd = $out.Count
         for ($i = 0; $i -lt $out.Count; ++$i) {
@@ -342,7 +344,8 @@ if ($appliedCount -eq 0) {
 if (-not $Rollback) {
     Write-Host ""
     Write-Host "校验清单（下次采集时先看这几行）:" -ForegroundColor Cyan
-    Write-Host "  1. logger effective level=... flush_interval_ms=... categories=... file=... queue_capacity=...  ← 日志器生效确认"
+    Write-Host "  1. logger effective level=... flush_interval_ms=... categories=..." -NoNewline
+    Write-Host " file=... queue_capacity=...  ← 日志器生效确认"
     Write-Host "  2. swapchain_hook_decision install=1 present=.. controls=.. color=..      ← 交换链钩子决策（本轮修复）"
     Write-Host "  3. hooked D3D11CreateDevice / rtv_bind_target                            ← D3D11 钩子是否装上"
     Write-Host "  4. transparent_jitter_installed ... force=1                              ← 透明队列抖动修复是否生效（正式功能）"
