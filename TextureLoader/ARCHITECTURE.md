@@ -14,7 +14,7 @@
 | 产物 | `TextureLoader.dll`（~180 KB，随宿主插件加载器 DllList 注入） |
 | 许可证 | GPL-3.0-or-later（`LICENSE.GPL.txt` + `NOTICE.md` 完整溯源） |
 | 构建 | CMake + Ninja（依赖系统 Windows SDK 与仓库内 `third_party/`） |
-| 配置 | `TextureLoader.ini`（`mods_dir`、`observe_only`、`log_level`、`vram_threshold`、`max_texture_side`、`async_load`） |
+| 配置 | `TextureLoader.ini`（`mods_dir`、`observe_only`、`log_level`、`dump_hashes`、`vram_threshold`、`max_texture_side`、`async_load`） |
 
 ### 核心链路
 
@@ -33,7 +33,7 @@
 | `D3D11CreateDevice` / `D3D11CreateDeviceAndSwapChain` | 设备就绪时 `AttachToDevice`：挂 device/context vtable、启动后台线程 |
 | `ID3D11Device::CreateTexture2D` | 对带初始数据的纹理计算 3DMigoto 兼容哈希；命中则登记替换（refcount++、挂 ReplacementTracker、登记活跃数组、丢异步加载队列） |
 | `ID3D11DeviceContext::PSSetShaderResources` / `VS` / `GS` / `HS` / `DS` / `CS` | 六个阶段统一替换（飘带/布料在 VS/CS 采样，只换 PS 会导致阶段间数据不一致） |
-| `ID3D11DeviceContext::UpdateSubresource` | 被替换后的纹理若再被更新 → 标记动态，绑定慢路径跳过（避免闪烁） |
+| `ID3D11DeviceContext::UpdateSubresource` | **只计数，不改任何替换行为**（2026-11-23）：钩子自增 `upd_calls` 后直接转发，不写私有数据、不碰活跃集、不看任何配置。旧的 `MarkDynamic`+`ActiveRemove`（把纹理永久排除出替换）已删除 —— 它与 `f07bb04` 修掉的 `CopyResource` 缺陷同型。2026-11-22 的 TTL 抑制窗口（`update_suppress_ms`）也已回滚：实机 107 秒 166,018 次调用、命中替换集 0 次，与 `CopyResource` 同构的「只计数」形态已足够 |
 | `ID3D11DeviceContext::CopyResource` | 保留钩子**仅累计计数**（`copyresource_hit_calls`，判定该路径在实机是否发生），**不**标记动态、**不**移出活跃数组：这个标记不可撤销，会让纹理永久失去替换。失效形态与取舍理由见 `TextureLoader.cpp` 中 `HookCopyResource` 上方注释 |
 
 ## 2. 哈希算法（3DMigoto 兼容，逐字移植）

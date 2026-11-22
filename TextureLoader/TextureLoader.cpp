@@ -387,9 +387,12 @@ static void IdleIndexRemove(uint32_t hash)
 // 缓存总占用（原子维护：登记 += mem，淘汰 -= mem；监控线程 O(1) 读）
 static std::atomic<uint64_t> g_cacheBytesTotal{0};
 
-// 资源私有数据 GUID（用于存储纹理 hash 与动态标记、释放跟踪器）
+// 资源私有数据 GUID（用于存储纹理 hash、释放跟踪器）
+// 2026-11-23：原 TL_DYNAMIC_GUID（「最后更新时刻」TTL 载荷）已删除 —— 见下方
+// HookUpdateSubresource 的「为什么不标记」注释。**旧 GUID 数值故意不留在这里**：
+// 探针 probe/tloader-nv/probe.cpp 仍用同一个 GUID 数值读私有数据，它需要能读到
+// 「(none)」来证明新构建一个字节都没写；DLL 侧不再需要这个符号。
 static const GUID TL_HASH_GUID = {0x8a2f6d4e, 0x7c31, 0x4a9b, {0x9e, 0x1c, 0x2d, 0x5f, 0x8a, 0x0b, 0x3c, 0x71}};
-static const GUID TL_DYNAMIC_GUID = {0x9b3e7f5a, 0x8d42, 0x4bc1, {0xaf, 0x2d, 0x3e, 0x60, 0x9c, 0x1d, 0x4e, 0x82}};
 static const GUID TL_TRACKER_GUID = {0x2c4a8e60, 0x1d53, 0x4f9a, {0xb8, 0x4e, 0x7a, 0x2f, 0x6c, 0x09, 0xd5, 0x33}};
 
 // 释放跟踪器：经 SetPrivateDataInterface 挂到原纹理上，原纹理被销毁时
@@ -481,22 +484,24 @@ static bool GetResourceHash(ID3D11Resource *res, uint32_t *out)
     }
     return false;
 }
-static void MarkDynamic(ID3D11Resource *res)
-{
-    if (res) {
-        uint32_t v = 1;
-        res->SetPrivateData(TL_DYNAMIC_GUID, sizeof(v), &v);
-    }
-}
-static bool IsDynamic(ID3D11Resource *res)
-{
-    if (!res)
-        return false;
-    UINT size = sizeof(uint32_t);
-    uint32_t v = 0;
-    HRESULT hr = res->GetPrivateData(TL_DYNAMIC_GUID, &size, &v);
-    return SUCCEEDED(hr) && v != 0;
-}
+// ---------------------------------------------------------------------------
+// 「被 UpdateSubresource 更新过」这件事已经不记在任何地方（2026-11-23）
+// ---------------------------------------------------------------------------
+// 这里曾经有两代实现，均已删除，留记录是因为它们各自出过事：
+//   · <= 2.5.0.0：写 4 字节常量 1 =「永久动态」，绑定慢路径的 IsDynamic() 一读到就
+//     **永久**跳过该纹理的替换 —— D3D11 私有数据没有删除语义（SetPrivateData 只能
+//     覆盖），所以这个标记**不可撤销**。后果是「这张贴图的 mod 从此不生效」，且日志里
+//     没有任何痕迹（标记本身不打日志、绑定热路径又是无日志快速判定）。
+//     E1 证据：探针 G / G′ 两例（2026-11-22 22:15），更新后中心像素由绿变蓝
+//     `(0,255,0,255)` → `(0,0,255,255)`、私有数据 `dynamic=(none)` → `dynamic=1`，
+//     分属两个构建、同一探针，唯一变量是被测 DLL。
+//   · 2026-11-22：改成 8 字节 GetTickCount64 时间戳的 TTL 窗口（配置键
+//     update_suppress_ms），窗口过后自动恢复替换。**已回滚**，理由是实机实测
+//     （见 HookUpdateSubresource 上方）：该窗口在本游戏版本上命中 0 次，没有作用对象。
+//
+// 现在两条钩子（CopyResource 自 f07bb04、UpdateSubresource 自 2026-11-23）都**不写
+// 任何私有数据**，只做计数转发。因此本文件不再需要时间戳读写/窗口判定这组辅助函数，
+// 也不再需要 NowMs()。
 
 std::atomic<long> g_hook_ready{0};   // 双检锁用；必须严格原子（旧为 volatile long，非原子读）
 volatile long g_stats_created = 0;   // 已哈希的纹理数（**所有**带初始数据的纹理）
@@ -519,6 +524,20 @@ volatile bool g_observe_only = true; // 1=只记录匹配，0=真正替换
 // 见 AGENTS.md §二.4（volatile 不是同步原语）。此处是渲染线程自增、退出时读，
 // 用 relaxed 顺序即可（只要求不丢增量，不需要跨变量的可见性顺序）。
 std::atomic<long> copyresource_hit_calls{0};
+
+// 两个钩子的【总调用次数】（2026-11-23 新增；**保留**，见其用途）。
+// 口径：都是【累计】、都与 dst 是否在活跃集无关（计数在钩子第一行、无条件）。
+// 为什么值得留这两个整数：它们是「API 被调用了吗」的唯一直接答案，而这个问题在
+// 2026-11-23 的实机实测里一锤定音 —— `upd_calls=166018`（107 秒）而当时用于「命中
+// 替换集」的计数为 0 ⇒ 证明 UpdateSubresource 与可替换纹理是两个不相交的集合，
+// TTL 抑制功能因此被回滚。没有 upd_calls 这个数，只看到「命中 0 次」就无法区分
+//   ① 游戏从不调用 UpdateSubresource；
+//   ② 游戏频繁调用，但目标纹理都不在替换集。
+// 两者对「要不要保留这个钩子」给出相反结论，所以这一对计数必须留着。
+// ⚠️ 代价**未量化**：实测该 API 约 1550 次/秒，每次一个 relaxed 原子自增；若需要
+// 具体帧数影响，必须用无诊断构建 + 外部帧时间工具（AGENTS.md §二.5 禁止热路径计时探针）。
+std::atomic<long> g_update_subresource_calls{0};
+std::atomic<long> g_copy_resource_calls{0};
 
 // ---------------------------------------------------------------------------
 // 原始函数指针
@@ -735,6 +754,56 @@ ID3D11ShaderResourceView *CreateReplacementSRV(uint32_t hash,
 }
 
 // ---------------------------------------------------------------------------
+// 诊断：导出游戏纹理哈希（配置键 dump_hashes，2026-11-22 新增）
+// ---------------------------------------------------------------------------
+// 为什么需要它：本 DLL 的**每一条** `hash=` 日志行（[HIT]/[srv]/[skip]/[fail]/[bind]/[upd]）
+// 都出现在 `matched && ov` 之后，**没命中 mod 的哈希被直接丢弃**（HookCreateTexture2D 里
+// CalcTexture2DDescHash 算完只在命中分支用）。于是 Mods 目录为空时**拿不到任何游戏纹理
+// 哈希** —— 想造一个最小 mod 做端到端验证都无从下手；报告者那类「mod 装了不生效」也
+// 无法定案（他的 `hashed=7205 matched=42` 到底是哈希不匹配还是别的原因，没有数据能回答）。
+//
+// ⚠️ 为什么这**不是** AGENTS.md §二.5 禁止的「热路径探针」（本条目的硬性要求之一）：
+//   · HookCreateTexture2D 是**每次创建纹理**调用一次，不是每帧 / 每 draw —— 同一张纹理只在
+//     加载时创建一次，之后逐帧走的是 HookSetShaderResourcesCommon。量级参照：报告者实测
+//     47 秒 hashed=7205（一局几千行）。渲染线程上确实会发生（哈希在渲染线程同步算），
+//     但那是「每个资源一次」，不是「每帧一次」。
+//   · §二.5 的红线是「每帧/每 draw 加计时探针」（每 draw 2×QueryPerformanceCounter + 4 个
+//     原子操作，80,000 draw/s 时吃掉 7~8% 帧数）；本条**不做任何计时**，只打一行日志。
+//   · 而且**默认关闭**：dump_hashes=0 时连去重容器都不碰（见调用点，取锁之前就 return）。
+//
+// 去重：同一张纹理在不同场景会被反复创建，重复行只是噪音；诊断要问的是「这个游戏版本里
+// 有哪些**不同**的纹理哈希」，故每个不同 hash 只导出一行。
+// 写法照同文件既有的 g_bind_logged（见 HookSetShaderResourcesCommon 上方）：**static**（内部链接）
+// + 专用 std::mutex + `insert().second` 判首次。
+// （2026-11-23：原注释还并列引用了 g_upd_logged，它随 [upd] recovered 日志一起删除 ——
+//   引用一个已不存在的符号会让注释指错地方，故同步收敛为单一出处。）
+// 容器取 unordered_set 而不是 g_bind_logged 的 std::set：本处规模可达数万，只做插入/判重，
+// 不需要有序遍历，平均 O(1) 优于 O(log n)。
+static std::mutex g_hash_dump_mutex;
+static std::unordered_set<uint32_t> g_hash_dump_logged;
+
+// 前置条件：调用方已确认 g_dump_hashes != 0。本函数**故意不做**该判断 ——
+// 判断必须发生在**取锁之前**（条目 §六.1：不能为了一行不打的日志去抢一把全局锁）。
+static void DumpTextureHash(uint32_t hash, const D3D11_TEXTURE2D_DESC *desc)
+{
+    if (!desc)
+        return;
+    {
+        // 锁只保护集合本身。日志必须放在锁**外**：log_write 内部还要取自己的 g_mutex，
+        // 且在渲染线程上做 fflush（AGENTS.md §二.4「不要在持锁期间做 I/O」）。
+        std::lock_guard<std::mutex> lk(g_hash_dump_mutex);
+        if (!g_hash_dump_logged.insert(hash).second)
+            return; // 这个 hash 已经导出过
+    }
+    // 格式口径（条目 §4.4）：fmt / usage 用 DXGI_FORMAT / D3D11_USAGE 的**枚举数值**，
+    // 不是字符串 —— 数值稳定，可直接写进 DDS 的 DX10 头（dds_loader 的口径同源）。
+    // 前导 [hash] 便于 Select-String 抽取；行内必须含 hash/宽/高/格式，否则不足以合成 mod。
+    TL_LOG(L"[hash] 0x%08X %ux%u fmt=%d mips=%u usage=%d",
+           hash, desc->Width, desc->Height, (int)desc->Format, desc->MipLevels,
+           (int)desc->Usage);
+}
+
+// ---------------------------------------------------------------------------
 // Hook: CreateTexture2D — 计算哈希、登记替换纹理
 // ---------------------------------------------------------------------------
 
@@ -784,6 +853,14 @@ static HRESULT STDMETHODCALLTYPE HookCreateTexture2D(
         // 移到判定之前，让它真正表示"已哈希的纹理数"，
         // 从而 `created - matched` 就是"哈希了但没命中"的数量。
         InterlockedIncrement(&g_stats_created);
+        // 纹理哈希导出（2026-11-22，配置键 dump_hashes）：算完 hash、查 override **之前**。
+        // 放在这里是因为「没命中 mod 的哈希」正是要导出的对象 —— 放到 FindOverride 之后
+        // 就只剩下命中项，等于把本功能的目的（看这个游戏版本有哪些哈希）废掉。
+        // **零副作用**（条目 §六.1）：dump_hashes=0 时这里只多一次 relaxed 原子读，
+        // 不取 g_hash_dump_mutex、不查 g_hash_dump_logged、不产生任何字符串/日志 —— 判断在取锁之前。
+        // 为什么用 relaxed：它只在 DllMain 里写一次、之后被渲染线程读，只要求「读到 0 或读到 1」。
+        if (::tloader::g_dump_hashes.load(std::memory_order_relaxed))
+            DumpTextureHash(hash, pDesc);
         const TextureOverrideEntry *ov = nullptr;
         bool matched = FindOverride(g_overrides, hash, &ov);
 
@@ -962,6 +1039,14 @@ static void STDMETHODCALLTYPE HookSetShaderResourcesCommon(
     ID3D11ShaderResourceView **views =
         (ID3D11ShaderResourceView **)_malloca(sizeof(void *) * NumViews);
     memcpy(views, ppShaderResourceViews, sizeof(void *) * NumViews);
+    // 2026-11-23：这里原本有一段 TTL 抑制判定（窗口值 + 本帧 GetTickCount64 + 逐 slot
+    // 读私有数据 + 恢复时清零并打 [upd] 日志），随 update_suppress_ms 一起删除。
+    // 删它的依据是实机实测：该 API 107 秒被调用 166,018 次，命中替换集 **0 次**，
+    // 因此「游戏会更新一张已被替换的纹理」这个前提在本游戏版本上不成立，这整段
+    // 从来没有执行过有效分支（只承担了每 slot 一次 GetPrivateData 的代价）。
+    // 现在的语义回到最简单的一条：hash 命中就替换，不看这张纹理是否被更新过。
+    // 为什么这不会退回到「永久失效」：判断依据不再是任何资源级标记，而是「有没有命中
+    // 替换表」—— 替换表由 mod 驱动，与游戏怎么写纹理无关。
     for (UINT i = 0; i < NumViews; i++) {
         ID3D11ShaderResourceView *srv = views[i];
         if (!srv)
@@ -972,9 +1057,6 @@ static void STDMETHODCALLTYPE HookSetShaderResourcesCommon(
             continue;
         uint32_t hash = 0;
         if (!GetResourceHash(res, &hash))
-            hash = 0;
-        // 动态纹理（创建后被 UpdateSubresource 更新过）跳过替换，避免闪烁
-        if (hash && IsDynamic(res))
             hash = 0;
         if (hash) {
             // 一次锁内判定：条目存在且纹理已加载 → 建 SRV；
@@ -1068,8 +1150,47 @@ static void STDMETHODCALLTYPE Hook_CS(ID3D11DeviceContext *t, UINT a, UINT b,
 static SetShaderResources_t const g_stage_hooks[6] = {Hook_PS, Hook_VS, Hook_GS, Hook_HS, Hook_DS, Hook_CS};
 
 // ---------------------------------------------------------------------------
-// Hook: UpdateSubresource — 标记动态纹理（创建后被更新的，动画/飘带模拟等）
+// Hook: UpdateSubresource —— 只计数，**不改任何替换行为**（2026-11-23 重写）
 // ---------------------------------------------------------------------------
+//
+// ---- 为什么删掉 TTL 抑制（回滚的决定依据是实机实测，不是推测）----
+// 2026-11-22 曾把它改成「TTL 抑制」：把最后一次更新时间戳写进原纹理私有数据，
+// 绑定慢路径在窗口 (update_suppress_ms) 内跳过替换、窗口过后自动恢复。
+// 2026-11-23 实机（原神，`update_suppress_ms=5000`，8 张 2048×2048 场景贴图已替换）实测：
+//   [stat] hashed=28019 matched=19 bound=11732 active=8 upd_suppressed=0 upd_recovered=0
+//          upd_calls=166018 copy_calls=37054          （107 秒）
+// ⇒ 游戏 107 秒调用 UpdateSubresource **166,018 次**（约 1550 次/秒），
+//   其中命中替换集 **0 次**。该功能**没有作用对象**。
+// 机制原因（唯一哈希入口，见 HookCreateTexture2D）：只有**带初始数据**的纹理才被哈希、
+// 才会进替换集（它们是加载期创建的静态纹理）；而游戏用 UpdateSubresource 更新的纹理
+// 是运行期创建、无初始数据的，从没被哈希过 ⇒ 两个集合不相交。
+//
+// ---- 为什么不标记（三条理由）----
+// 1. **不标记 ⇒ 替换在更新之后保持**。旧的 MarkDynamic 走 SetPrivateData 打在**原纹理**
+//    上，而 D3D11 私有数据没有删除语义（只能覆盖、不能删）⇒ 标记**不可撤销**，绑定路径
+//    的 IsDynamic() 于是**永久**跳过该纹理 ⇒ 替换永久失效。这正是探针 G / G′ 测到的缺陷
+//    （G = HEAD 测得蓝、G′ = 2.2.0 测得蓝；`f07bb04` 只修了 CopyResource 一处）。
+//    删掉标记是**唯一**能保证「更新之后替换仍在」的形态。
+// 2. **实测该分支从不命中**：166,018 次调用、0 次命中替换集 ⇒ 标记与否对画面**零影响**，
+//    但「不标记」避免了永久失效的潜在风险。即使将来某个游戏/场景真的会更新被替换的纹理，
+//    不标记的后果也只是「短暂显示过期内容」，而不是「这张贴图的 mod 永久不生效」。
+// 3. 与 `f07bb04` 对 CopyResource 的取舍一致：**内容可能过期 ≪ 替换永久失效**。
+//    同一产品两处同类事件不该给相反的取舍 —— 而 HEAD 时期恰恰就是相反的。
+//
+// ---- 与 `f07bb04` 的关系 ----
+// `f07bb04` 只把 CopyResource 那条路径改成「不标记」，UpdateSubresource 这条一直是
+// 旧形态（永久标记）。本条把它对齐，两条路径现在同构：钩子只计数、零行为改动。
+//
+// ---- 保留钩子的唯一理由 ----
+// 低成本判别「实机上这条路径到底会不会发生」（计数见 g_update_subresource_calls）。
+// 它**不影响任何替换行为**，也不写任何私有数据。
+//
+// ⚠️ 2026-11-23 实测限制（诚实记录，未变）：本钩子只覆盖
+// ID3D11DeviceContext::UpdateSubresource。UpdateSubresource1（ID3D11DeviceContext1）与
+// CopySubresourceRegion **未 hook** ⇒ 走这两条入口的写入连计数都拿不到。
+// 游戏是否用到它们**未核实**（缺游戏侧调用证据）。
+// ⚠️ 计数本身的 CPU 代价**未量化**：实测约 1550 次/秒，每次一个 relaxed 原子自增。
+// 要量化必须用无诊断构建 + 外部帧时间工具（AGENTS.md §二.5 禁止在热路径加计时探针）。
 
 typedef void(STDMETHODCALLTYPE *UpdateSubresource_t)(ID3D11DeviceContext *,
     ID3D11Resource *, UINT, const D3D11_BOX *, const void *, UINT, UINT);
@@ -1084,21 +1205,11 @@ static void STDMETHODCALLTYPE HookUpdateSubresource(
     UINT SrcRowPitch,
     UINT SrcDepthPitch)
 {
-    // 若该资源是活跃替换资源（已被我们替换），之后又被更新 → 标记为动态，
-    // SetShaderResources 慢路径会跳过替换避免闪烁。
-    // 先无锁判断是否为空：空则（替换未启用）直接跳过，零开销。
-    if (pDstResource && g_activeCount != 0) {
-        if (ActiveContains(pDstResource)) {
-            uint32_t h = 0;
-            std::lock_guard<std::mutex> lk(g_lock);
-            if (GetResourceHash(pDstResource, &h)) {
-                MarkDynamic(pDstResource);
-                // 动态纹理永不替换（慢路径 IsDynamic 跳过）：标记后移出活跃数组，
-                // 后续 UpdateSubresource 不再命中（幂等，销毁时 tracker 再移除无害）
-                ActiveRemove(pDstResource);
-            }
-        }
-    }
+    // 只计数，不改行为（2026-11-23）。
+    // 计数放在最前、无条件：它回答「这个 API 被调用了吗」，与配置无关（本钩子现在
+    // 也没有任何配置键）。删掉其它判定之后，AGENTS.md §二.6 的「最便宜的检查放最前」
+    // 自然满足 —— 这里只剩一次 relaxed 原子自增加一次转发。
+    g_update_subresource_calls.fetch_add(1, std::memory_order_relaxed);
     g_real_update_subresource(This, pDstResource, DstSubresource, pDstBox,
                               pSrcData, SrcRowPitch, SrcDepthPitch);
 }
@@ -1158,6 +1269,9 @@ static void STDMETHODCALLTYPE HookCopyResource(
     ID3D11Resource *pDstResource,
     ID3D11Resource *pSrcResource)
 {
+    // 无条件计数（2026-11-23）：与 upd_calls 同口径 —— 总调用次数，与 dst 是否在活跃集无关。
+    // 下面 copyresource_hit_calls 是「命中活跃集」的次数，两者相除才知道命中率。
+    g_copy_resource_calls.fetch_add(1, std::memory_order_relaxed);
     // 先无锁判空（替换未启用时零开销）。本分支**不再**标记动态、也不再移出活跃数组：
     // 见上方注释 —— 那个标记不可撤销，会让该纹理永久失去替换。
     // 这里只累计 copyresource_hit_calls，口径见其声明处：**仅** ActiveContains 通过才计，
@@ -1307,7 +1421,7 @@ static void HookContext(ID3D11DeviceContext *context)
     DetourUpdateThread(GetCurrentThread());
     for (int i = 0; i < 6; i++)
         DetourAttach(&(PVOID &)g_real_ssr[i], g_stage_hooks[i]);
-    // UpdateSubresource：标记动态纹理
+    // UpdateSubresource：只计数（2026-11-23 起不写私有数据、不改行为，见其上方注释）
     g_real_update_subresource = (UpdateSubresource_t)vtbl->UpdateSubresource;
     DetourAttach(&(PVOID &)g_real_update_subresource, HookUpdateSubresource);
     // CopyResource：同上（2026-09-23 补，见 HookCopyResource 的说明）
@@ -2266,11 +2380,30 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             }
         }
         ParseVramThreshold(dir);
+        // 2026-11-23：原先这里读 update_suppress_ms（UpdateSubresource 的 TTL 抑制窗口）。
+        // 该键已删除 —— 实机实测其前提不成立（166,018 次调用、0 次命中替换集），
+        // 详见 HookUpdateSubresource 上方的「为什么删掉 TTL 抑制」。
+        // 删除后的兼容性：旧用户的 ini 里可能仍留着这一行，它会被当成**未知键**忽略
+        // （ini 解析只按名字取值，不认识的键不报错、不影响其它键）。
+        // dump_hashes（2026-11-22 新增）：纹理哈希导出开关，0 = 关（默认），1 = 每个不同 hash 导出一行。
+        // 为什么用 IniBool 而不是 IniInt：它是纯布尔语义（条目 §4.5「取值域 0/1」），
+        // 与同文件 observe_only / async_load 一致（IniBool 认 1/true/yes/on，缺键取默认）。
+        // 为什么默认必须是 0：诊断默认关（§二.5）；且**存量用户升级拿不到这个键**
+        // （Apply-PackageUpdate.ps1 保留用户 ini、不补新键）⇒ 代码默认值就是线上唯一行为。
+        //  ⇒ 因此 [cfg ] 行**必须**打印它：它是「键被读到」的唯一可见处。
+        ::tloader::g_dump_hashes.store(IniBool(dir, L"dump_hashes", false) ? 1 : 0,
+                                      std::memory_order_relaxed);
         TL_LOG(L"[cfg ] log_level=%d vram_threshold_pct=%d vram_threshold_bytes=%llu max_texture_side=%d gdds_enabled=%d async_load=%d",
                ::tloader::g_log_level, ::tloader::g_vram_threshold_pct,
                (unsigned long long)::tloader::g_vram_threshold_bytes,
                ::tloader::g_max_texture_side, ::tloader::g_gdds_enabled,
                ::tloader::g_async_load);
+        // 2026-11-23：原 `[cfg ] update_suppress_ms=%d` 单独一行随该键一起删除。
+        // 保留「单独一行」这个形态给 dump_hashes 的理由不变（下面两行仍是独立 TL_LOG）。
+        // dump_hashes 同样**单独一行**：拼进上面那行会超过 140 字符（AGENTS.md §二.1 目标 ≤120）。
+        // 它也是「存量用户拿不到这个键」场景下唯一能看到取值的行 —— grep 一行即可确认。
+        TL_LOG(L"[cfg ] dump_hashes=%d",
+               ::tloader::g_dump_hashes.load(std::memory_order_relaxed));
 
         // 扫描 Mods 目录：优先用 ini 里的 mods_dir；未配置时默认 DLL 所在目录的
         // Mods 子目录（不存在则自动创建空的，用户把 mod 放进去即可）。
@@ -2364,6 +2497,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         //   observe   = g_observe_only【**当前状态**】—— 1=只记录匹配、不真正替换；
         //               它是配置值、整局恒定，故当前值即整局口径。
         //
+        // 2026-11-23：原「TTL 抑制路径」的两个字段（upd_suppressed / upd_recovered）
+        // 随 update_suppress_ms 一起删除，配套的 [upd] recovered 限流日志也一并删除。
+        // 原因见 HookUpdateSubresource 上方：实机 166,018 次调用、0 次命中替换集，
+        // 该路径没有作用对象。**这两个字段的删除不影响下面任何判据** —— 它们是
+        // 「抑制发生过几次」，与「替换是否生效」无关。
+        // 要读「UpdateSubresource 这个 API 被调用了吗」，用行尾的 upd_calls。
+        //
+        // ⚠️ 2026-11-23 口径复原（受 TTL 回滚影响）：2026-11-22 曾因删掉 HookUpdateSubresource
+        //   里的 ActiveRemove 而在此补一段「被抑制过的纹理留在活跃集 ⇒ copy_hits 变浊」。
+        //   现钩子已不再碰活跃集（既不标记也不移出），**该补充说明随之作废**：
+        //   copy_hits 的口径回到与改动前完全一致，下面四个前置条件即为完整的判据。
+        //
         // ⚠️ 读 copy_hits=0 时必须先排除三种「本来就不会计数」的情形，否则会把
         //   「替换没启用」读成「这条路径没发生」。前置条件一律用【累计】字段判，
         //   **不要**用 active（见上：退出时为 0 不代表没生效）：
@@ -2374,10 +2519,40 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         //   只有 observe=0 且 overflow=0 且 matched>0 且 bound>0 时，copy_hits=0 才
         //   说明本局该路径**未发生**（≠「不是这个机制」，仍需查其他原因）。
         // 注：observe 用 (int) 显式转换传入 varargs，使口径一眼可见。
+        //
+        // 2026-11-22 末尾再追加一个字段（纹理哈希导出，配置键 dump_hashes）：
+        //   hashes_unique = g_hash_dump_logged.size()【**当前状态·退出时刻快照**】—— 本进程内
+        //                **不同**纹理哈希的个数，也就是日志里 `[hash]` 行的条数。
+        //                ⚠️ 它**同时受配置影响**：dump_hashes=0（默认）时去重容器根本不填
+        //                ⇒ 恒为 0，**这本身就是「默认零副作用」的证据**，不是「本局没有纹理」。
+        //                要读「本局到底哈希了多少个不同纹理」，必须先在 ini 里开 dump_hashes=1。
+        //                与 `hashed=` 的关系：hashed 是**次数**（含同一纹理的重复创建），
+        //                hashes_unique 是**不同哈希个数**；hashed > hashes_unique 是正常现象，
+        //                且此时 `[hash]` 行数必须 = hashes_unique（不是 hashed）—— 这是去重判据。
+        //
+        // 2026-11-23 末尾再追加两个字段（钩子总调用次数）：
+        //   upd_calls  = g_update_subresource_calls【**累计**】—— UpdateSubresource 钩子的
+        //                **总调用次数**，与 dst 是否在活跃集无关（计数在钩子第一行、无条件）。
+        //   copy_calls = g_copy_resource_calls【**累计**】—— 同型。
+        //   ⚠️ 这两个数**不是**「命中替换集的次数」，那是 copy_hits（UpdateSubresource 侧
+        //   自 2026-11-23 起不再有对应的命中计数 —— 它随 TTL 一起删除，实测该侧命中恒 0）。
+        //   存在的唯一目的：区分实机上两种相反的世界 ——
+        //     upd_calls==0      ⇒ 游戏**从不**调用该 API；
+        //     upd_calls>0       ⇒ 调用了（此时再看同行的 matched/bound/copy_hits 判它是否
+        //                          触及过替换集；2026-11-23 实测为 166018 次而命中 0 次）。
+        // 只**追加**在行尾，既有字段的语义与顺序一律不动。
+        // 取 size() 必须持 g_hash_dump_mutex（写方在渲染线程），且**在 g_lock 之外**取：
+        // 虽然 DumpTextureHash 从不取 g_lock（不构成环），但没有必要把两把锁叠在一起。
+        size_t hashes_unique = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_hash_dump_mutex);
+            hashes_unique = g_hash_dump_logged.size();
+        }
         {
             std::lock_guard<std::mutex> lk(g_lock);
             TL_LOG(L"[stat] hashed=%ld matched=%ld bound=%ld cache_entries=%u cache_MB=%u "
-                   L"bind_log_suppressed=%llu copy_hits=%ld active=%ld overflow=%ld observe=%d",
+                   L"bind_log_suppressed=%llu copy_hits=%ld active=%ld overflow=%ld observe=%d "
+                   L"hashes_unique=%zu upd_calls=%ld copy_calls=%ld",
                    g_stats_created, g_stats_matched, g_stats_bound,
                    (unsigned)g_replacements.size(),
                    (unsigned)(g_cacheBytesTotal.load(std::memory_order_relaxed) / (1024ull * 1024ull)),
@@ -2385,7 +2560,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
                    copyresource_hit_calls.load(std::memory_order_relaxed),
                    g_activeCount.load(std::memory_order_relaxed),
                    g_activeOverflow.load(std::memory_order_relaxed),
-                   (int)g_observe_only);
+                   (int)g_observe_only,
+                   hashes_unique,
+                   g_update_subresource_calls.load(std::memory_order_relaxed),
+                   g_copy_resource_calls.load(std::memory_order_relaxed));
         }
         // 进程退出：统一释放全局持久化的替换缓存（正常运行时不随原纹理销毁，
         // 退出时一次清空；进程卸载后驱动侧资源由系统回收，此处显式 Release）

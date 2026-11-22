@@ -127,6 +127,7 @@ cmake --build build --config Release
 mods_dir =                      ; Mods 根目录；留空 = DLL 同目录 Mods（自动创建空的）
 observe_only = 0                ; 1=只记录哈希匹配不替换；0=真正替换（默认）
 log_level = 1                   ; 0=仅关键 1=常规（默认） 2=详细（每次运行覆盖上次日志）
+dump_hashes = 0                 ; 1=每个不同纹理哈希导出一行 `[hash] 0x.. WxH fmt=.. mips=.. usage=..`（Mods 为空时拿游戏哈希写 mod）；0=关（默认）
 vram_threshold =                ; 显存危急阈值；留空=按显存容量自适应（4GB→20%...24GB→13%）
 max_texture_side = 0            ; 替换纹理最大边长；0=不限制（默认）
 gdds_enabled = 1                ; 1=启用 GDDS（DirectStorage GPU 解压，默认）；0=禁用

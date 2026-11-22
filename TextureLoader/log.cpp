@@ -28,6 +28,9 @@ int g_max_texture_side = 0;
 int g_gdds_enabled = 1;          // 默认启用 GDDS（DirectStorage GPU 解压）
 int g_async_load = 1;            // 默认异步（后台线程）；N 卡在 AttachToDevice 时自动切同步
 int g_async_load_explicit = 0;   // 0=未显式设置（按 GPU 厂商自动调整）
+// 默认 0 = 不导出任何纹理哈希（见 log.h 的说明与 TextureLoader.cpp 的 [cfg] 行）。
+// 诊断类开关默认关：发布构建里它一个字节都不写、一把锁都不取，行为等价于没有这个功能。
+std::atomic<int> g_dump_hashes{0};
 
 // 真正打开日志文件。**只允许在非 DllMain 上下文调用**（见 log_init 的说明）。
 // 调用方须持有 g_mutex。

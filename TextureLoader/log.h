@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // log.h — 轻量线程安全日志（写 DLL 同目录 TextureLoader.log）
 #pragma once
+#include <atomic>
 #include <string>
 #include <cstdint>
 
@@ -34,6 +35,17 @@ extern int g_max_texture_side;     // 替换纹理最大边长（像素）；0=�
 extern int g_gdds_enabled;         // 1=启用 GDDS（DirectStorage GPU 解压）；0=禁用（.gdds 跳过）
 extern int g_async_load;           // 1=异步加载（后台线程建纹理）；0=同步（渲染线程建纹理，N 卡驱动规避）
 extern int g_async_load_explicit;  // 1=用户 ini 显式设置 async_load（不再按 GPU 厂商自动调整）
+// 纹理哈希导出（2026-11-22 新增，配置键 dump_hashes）。
+//   0（**默认**）= 关：HookCreateTexture2D 里连去重容器都不碰（**取锁之前**就 return）；
+//   1 = 每个**不同的**纹理哈希在日志里导出一次，形如
+//       `[hash] 0x91E6EA3D 256x256 fmt=78 mips=1 usage=0`。
+// 为什么必须是独立布尔键、不能复用 log_level 等级：TL_LOG_IF 是**单调包含**的
+// （`g_log_level >= level` 才输出），把导出挂在等级 3 上会同时打开等级 2 的 `[bind]` ——
+// 那条路径有实测的日志风暴（140 秒 899,670 行，为此代码里专门有 g_bind_log_suppressed
+// 计数器与「每 hash 首次」限流）。独立键才能只开导出、不开风暴。
+// 用途：所有既有 `hash=` 日志行都在 `matched && ov` 之后，**没命中 mod 的哈希被直接丢弃**，
+// 于是 Mods 目录为空时拿不到任何游戏纹理哈希，连「造一个最小 mod 做端到端验证」都无从下手。
+extern std::atomic<int> g_dump_hashes;
 } // namespace tloader
 
 #define TL_LOG(...) ::tloader::log_write(__VA_ARGS__)
