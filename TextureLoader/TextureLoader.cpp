@@ -2552,9 +2552,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         }
         {
             std::lock_guard<std::mutex> lk(g_lock);
+            // 行尾附「口径自述」段（AGENTS.md §五.6：结论行里每个数字都要写清是窗口/累计/当前状态）。
+            // 用 '|' 分隔而不是改字段名：前半段 key=value 保持原样，既有 grep 与历史日志仍可比。
             TL_LOG(L"[stat] hashed=%ld matched=%ld bound=%ld cache_entries=%u cache_MB=%u "
                    L"bind_log_suppressed=%llu copy_hits=%ld active=%ld overflow=%ld observe=%d "
-                   L"hashes_unique=%zu upd_calls=%ld copy_calls=%ld",
+                   L"hashes_unique=%zu upd_calls=%ld copy_calls=%ld "
+                   L"|schema 累计={hashed matched bound bind_log_suppressed copy_hits overflow "
+                   L"upd_calls copy_calls} 当前={cache_entries cache_MB active hashes_unique} "
+                   L"配置={observe} · active=0 不代表未生效（原纹理销毁时会移出活跃集），"
+                   L"判「本局生效过」用 matched>0 且 bound>0",
                    g_stats_created, g_stats_matched, g_stats_bound,
                    (unsigned)g_replacements.size(),
                    (unsigned)(g_cacheBytesTotal.load(std::memory_order_relaxed) / (1024ull * 1024ull)),
