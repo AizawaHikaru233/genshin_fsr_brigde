@@ -120,6 +120,10 @@ reconcile-threeway-gap.md
 # 规范：先写条目再动手；结果必须基于实测；失败与被证伪的结论必须留档。
 DEV-CHANGELOG.local.md
 *.local.md
+# CHANGELOG.md：面向 AI 会话上下文的进度记录（压缩后先重读、改动即时追加）。
+# 与上面几份同类 —— 属「改动历史」，按 AGENTS.md §一.7 不入库，仓库历史只以 commit 为准。
+# 放在仓库根目录只是因为全局约定要求该路径，不代表随仓库分发。
+CHANGELOG.md
 
 # 交接/计划/报告类文档、开发者改动历史（不进入仓库——历史以 commit 为准）
 docs/
