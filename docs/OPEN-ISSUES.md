@@ -587,44 +587,39 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 - **独立 NGX 摘要块不做**：把 `BACKEND :` 与 DLSS 版本并入现有行已覆盖主要痛点，独立块与
   焦点块内容重复。
 
-## 7. NGX 后端启动期崩溃缺乏可归因现场（两条 upstream issue 未结案）
+## 7. 随包分发的 OptiScaler 二进制在启动期缺线程 TLS 槽导致崩溃（upstream issue 未结案）
 
 **现状**
 
-- 上游仓库有两条 open issue 报告崩溃，本仓库均**未能复现**，也未定位到确切的崩溃指令：
-  - 「NVNGX 启动即退出」：把超分输入切成 `Ffx12Backend=ngx` 后，游戏在窗口出现前静默退出；切回 `native` 正常。用户提供的 `Dx11FsrBridge.log` 为 **0 字节**。
-  - 「OptiScaler 0xc0000005 @0x3e87a」：崩溃发生在随包分发的 OptiScaler 二进制内，与桥无关。
-- 已排除的说法（**不要重新提出**）：「日志 0 字节 ⇒ 崩在 `blog::init()` 之前 ⇒ 与 NGX 无关」。
-  实测：`BridgeLogger` 全程不 flush，只有 writer 线程关闭文件时才 flush；`std::ofstream` 缓冲约 4090 字节。
-  写 <4000 B 后硬杀进程，磁盘上确实是 0 字节；写 ≥4090 B 则落盘 4183 B。
-  本机正常会话到 `hooked CreateSwapChainForHwnd` 累计仅约 2054 B，首次越过 4096 B 是在首次 draw 的 NGX 段。
-  ⇒ 0 字节日志的真实含义是「崩在日志器初始化之后、累计日志不足约 4 KB 之前」，这个窗口**覆盖** swapchain 钩子安装与 NGX 初始化早期。
-- 已完成的加固：`NgxBackend.cpp` 的 8 个厂商函数指针中，6 个已加 SEH 守卫（init/release/create/eval/get_caps/destroy）。
-  `g_shutdown` / `g_req` 只有绑定与 `note()` 登记，**无任何调用点**，故不存在第 7、8 个裸调用。
+- 上游另一条 open issue（2.5.0、Windows 11 Insider、RTX 3080）：启用 OptiScaler 后启动即 `0xc0000005`，
+  事件日志故障模块 `OptiScaler.dll`、模块内偏移 `0x3e87a`；该 DLL 的 SHA-256 与发布包内那份逐字节相同，
+  即不是被替换或改过的版本。
+- 该偏移的指令是 `48 8B 04 C8`（`mov rax, [rax+rcx*8]`），按 `gs:[0x58]` 索引线程 TLS 数组
+  ⇒ 崩在 **`gs:[0x58]` 自身为空**，即该线程没有 TLS 数组；不是「索引越界」。
+  同一 DLL 的静态 TLS 模板 `+0x14` 初值是 `0x80000000`，不是 `-2`（报告者实验里把 `-2` 写进去，那是合成值）。
+- 报告者用以临时启动的 35 字节原地补丁落在指令边界上（`0x3E866..0x3E888`，收在 `jle` 末尾），
+  但本仓库**不发布**上游二进制的十六进制补丁：组件链靠上游官方 SHA-256 锁定与校验，
+  打补丁会让校验链失效，且每次上游发版都要重算地址。
+- 已向报告者提出、**尚未答复**的判别项：只把 `StreamlineSpoofing` 设为 `false`、不打补丁，是否足够
+  —— 这一条决定 TLS 路径是唯一触发点，还是两个触发点之一。
 
 **影响**
 
-- 两条 issue 都无法给出「已修复」的结论。SEH 守卫把「进程直接消失且无现场」改成「该功能失败并可归因」，
-  这是无论如何都正确的行为改变，但**不是**对该崩溃的证明。
-- 若真实成因在厂商 DLL 内部对状态的破坏（而非调用点 AV），SEH 只能把进程从崩溃变成「功能失效」，
-  用户侧可能表现为 DLSS 不生效而游戏能进。
+- 本仓库无法修复：崩溃发生在第三方二进制内部。
+- 桥的两条加载路线都是 `LoadLibrary`，且桥先于 OptiScaler 载入，并会在每个模块加载完成时改写其
+  `LoadLibrary*` / `GetProcAddress` 导入表 —— 但**没有任何证据**把这件事与缺 TLS 槽联系起来。
+  这是开放问题：既不能当结论，也不能反过来当成「已排除」。
 
 **推进需要**
 
-1. 让报告者提供 Windows 事件日志 `Application Error` / `BEX64` 条目里的**故障模块名与故障偏移** ——
-   这一条能直接区分崩溃发生在桥内、厂商 DLL 内还是 OptiScaler 内。
-2. 确认 `payload\Bridge\Dx11FsrBridge.log` 是**存在且 0 字节**，还是**根本不存在**（两者结论相反）。
-3. 确认 `payload\Bridge\ngx\` 下是否存在 `nvngx.log`（存在说明已走到 appinit 步骤，崩溃更晚）。
-4. 在能复现的机器上抓 `.dmp`（WER LocalDumps 即可），提供 `ExceptionAddress` 与栈。
-5. 拿到上述任一条后，按 §8.4 把结论从 E0 提升；在此之前任何「已修复」的说法都不成立。
+1. 等报告者回答上面的 `StreamlineSpoofing` 判别项。
+2. 若要继续下推，应报给上游 OptiScaler 仓库，并附：`0x3E87A` 的指令语义、静态 TLS 模板 `+0x14` 的初值、
+   两个 TLS 回调的 RVA（`0x3349FC` / `0x335074`）。
+3. 不要把「桥注入导致 TLS 缺失」当作结论 —— 现有证据只支持「该二进制在这个线程状态下会空索引」。
 
 **相关代码位置**
 
-- `Dx11FsrBridge/NgxBackend.cpp`：六个 SEH 守卫 wrapper 及三处调用点（`guarded_get_caps` / `guarded_destroy`）、
-  `ensure_init` 第 7 步、`ensure_query_params`、`release_query_params`
-- `Dx11FsrBridge/BridgeLogger.cpp`：`writer_loop` 的 flush 时机（只在收到停止信号后 flush）
-- `Dx11FsrBridge/Dx11FsrBridge.cpp`：`initialize()` 里 `load_config` → `ffx12::preload` → `blog::init` 的顺序；
-  `install_swapchain_hooks` → `clone_and_patch_vtable`
+- 触发点不在本仓库代码内。桥侧只有注入与导入表改写（`Dx11FsrBridge/Dx11FsrBridge.cpp` 的模块加载钩子）。
 
 ---
 
@@ -657,6 +652,30 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 ---
 
 ## 已解决
+
+### issue #19「NVNGX 启动即静默退出」（2026-11-23）
+
+**解决提交**：`970c5e0`《fix(bridge): 修正 k_idx_set_hdr_metadata 槽号（39 → 40）》、`87de7f6`《fix(bridge): 交换链等对象的 vtable 克隆长度改按原表实际长度》、`ecc12f7`《fix(bridge): vtable 长度探测先验证槽位可读再解引用》、`12841a5`《fix(bridge): 交换链原函数改为按原 vtable 登记，消除跨类尾调》。
+
+**结论**：报告者实测确认崩溃消失（两个交换链类各 `registered=7`，未出现 `swapchain_original_vtable_unavailable`）。**未在报告者机器上复现**；根因由「独立探针复现同类崩溃 + 现场寄存器与返回地址逐项一致」得出。
+
+**两个独立缺陷（按报告者命中的顺序）**
+
+1. 克隆长度按公开接口项数（`IDXGISwapChain4` = 41）而不是原表实际长度。实测（Windows 11 26300 / RTX 4070 SUPER）交换链原表有 242 个连续代码槽；克隆用 `VirtualAlloc` 提交整页并清零 ⇒ 41 之后全是 0；DXGI 在引用计数归零时读其中一个深层槽（该机 `dxgi.dll` 10.0.26100.9818 上是槽 44）⇒ `RIP=0`。
+   独立探针验证（只加载 `d3d11.dll`，无游戏、无 OptiScaler、探针自身不装钩）：克隆 41 槽 → 崩溃（`ExceptionCode 0xC0000005`、`ExceptionAddress 0x0`、`RBP=0x0000000100000001`、`[rsp]=dxgi.dll+0x3A23B`）；克隆 64 / 128 槽 → 存活。
+2. 七个「原函数」指针是**全局单例**，第一个交换链类填满后不再更新 ⇒ 第二个类把自己的 `this` 传进第一个类的函数体，按错的对象头布局读 `[this+8]`（实测该值为 0）⇒ 在 `dxgi.dll` 内空读。改为按原 vtable 登记后消失。
+
+**已证伪的说法（不要重新提出）**
+
+- 「0 字节 `Dx11FsrBridge.log` ⇒ 崩在日志器初始化之前 ⇒ 与 NGX 无关」。实测 `BridgeLogger` 只在 writer 线程关闭文件时 flush，`std::ofstream` 缓冲约 4090 字节 ⇒ 0 字节日志只说明「崩在日志器初始化之后、累计不足约 4 KB 之前」，**不定位**崩溃点。该日志已改为定期 flush（`36d3ea4`），此判据此后不再成立。
+- 「短 vtable 已被排除」：当时只核了 OptiScaler 是否实现满 41 个槽，没核 41 这个数本身对不对。
+
+**未验证**
+
+- 崩溃未在报告者机器上复现；上面第 1 条的「槽 44」是维护者机器上 `dxgi.dll` 的读数，换一个 `dxgi.dll` 版本偏移会变。
+- 报告者在 `fix19c`（`12841a5`）上 draw 钩子一次都没触发，在 `fix19d`（相对前者只多 67 行日志、0 行删除）上 DLSS 正常介入。两者代码只差日志 ⇒ **不能记为代码修复**，也未解释；最可能是该采集窗口内没有经过被挂钩槽位的 draw。`fix19d` 日志里三条 `vtable_clone_result what=context … action=installed` 的 `requested_slots=149` / `detected_slots=302` / `patches=12` 与实现一致。
+
+**相关代码位置**：`Dx11FsrBridge/Dx11FsrBridge.cpp` 的 `clone_and_patch_vtable`、`cloned_vtable_capacity`、`k_idx_set_hdr_metadata`、七个 `g_original_*_by_vtable` 表。
 
 ### NGX 后端的画面与平台验证（2026-11-13）
 
