@@ -1284,7 +1284,7 @@ static void STDMETHODCALLTYPE HookCopyResource(
             // **不能**每次命中都打 —— 本钩子可能每帧命中多次，而 log.cpp 每行 fflush，
             // 那就是渲染线程上每秒上万次写盘系统调用（同文件 [bind] 行 2026-09-24 的实测教训）。
             if (n == 1 || (n % 1024) == 0)
-                TL_LOG(L"[copy] CopyResource hit on replacement dst: n=%ld (cumulative, not call count)", n);
+                TL_LOG_IF(1, L"[copy] CopyResource hit on replacement dst: n=%ld (cumulative, not call count)", n);
         }
     }
     g_real_copy_resource(This, pDstResource, pSrcResource);
