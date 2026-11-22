@@ -150,6 +150,7 @@ $logSection = @(
     'rotate_keep=2',
     'queue_capacity=8192',
     '; flush_interval_ms: 定期 flush 间隔（毫秒）。0 = 关闭（只在退出时 flush）；非 0 钳制到 [200, 10000]；默认 500',
+    ';   超过 9 位的数字回落 500 并告警 log_flush_interval_too_long（写太长不会静默生效）',
     'flush_interval_ms=500',
     'compat_prefix=0',
     '',
