@@ -6362,17 +6362,47 @@ static std::size_t cloned_vtable_capacity(void **source, std::size_t public_meth
 bool clone_and_patch_vtable(void *instance, std::size_t method_count,
     const std::vector<std::pair<std::size_t, void *>> &patches, const char *what)
 {
+    // 2026-11-22（消除取证盲区）：issue #19 报告者（Ffx12Backend=ngx）超分完全不生效，
+    // 且日志里 draw_indexed_hook_active 恒 0 命中；而 context / device 两条安装路径
+    // **成功时没有任何日志，收到 nullptr 时静默 return**，于是「钩子没装上」与
+    // 「钩子装上了但没走到」这两条根因分支无法区分。
+    // 下面这条 vtable_clone_result 是**统一对账出口**：每次调用恰好产出 1 条（含全部
+    // 提前返回路径），字段顺序固定且全部出现，据此可对账每个实例的每条安装路径。
+    // ⚠ 这里在日志等级闸门之前求值 instance_text：本函数只在设备/交换链创建期被调用
+    // （每进程个位数次），不在每帧/每 draw 热路径上，故不触发 AGENTS.md §三 #9 的热路径代价。
+    const char *what_text = what != nullptr ? what : "unknown";
+    const std::size_t requested_slots = method_count;
+    const std::string instance_text = instance == nullptr
+        ? std::string("null")
+        : hex64(reinterpret_cast<std::uintptr_t>(instance));
+    std::size_t detected_slots = 0;
+    std::size_t patch_count = 0;
+
     if (instance == nullptr)
+    {
+        LOG_WARN(blog::cat::hook, std::string("vtable_clone_result what=") + what_text +
+            " instance=" + instance_text +
+            " requested_slots=" + std::to_string(requested_slots) +
+            " detected_slots=0 patches=0 action=skip_no_instance");
         return false;
+    }
 
     std::lock_guard lock(g_vtable_mutex);
     if (g_cloned_vtables.contains(instance))
+    {
+        LOG_INFO(blog::cat::hook, std::string("vtable_clone_result what=") + what_text +
+            " instance=" + instance_text +
+            " requested_slots=" + std::to_string(requested_slots) +
+            " detected_slots=0 patches=0 action=skip_already_cloned");
         return true;
+    }
 
     void ***object = reinterpret_cast<void ***>(instance);
     void **source = *object;
     // 按**原 vtable 实际长度**克隆，而不是按公开接口项数 —— 见 cloned_vtable_capacity 注释。
     method_count = cloned_vtable_capacity(source, method_count, what);
+    detected_slots = method_count;
+    patch_count = patches.size();
 
     // 2026-11-20（补丁越界）：克隆长度现在是**探测**出来的，可能比调用方以为的短 ——
     // 探测在「目标指针不指向可执行页」处就停（vtable 里出现数据指针、或包装实现自建的短表）。
@@ -6405,17 +6435,35 @@ bool clone_and_patch_vtable(void *instance, std::size_t method_count,
     }
     if (patch_high_water > method_count)
     {
+        // 现有 WARN 原样保留：patch_high_water 是定位「哪个补丁越界」的唯一信号，不动它。
+        // 下面再补一条 vtable_clone_result 作为统一对账出口（每次调用恰好 1 行），两者并存。
         LOG_WARN(blog::cat::hook, std::string("vtable_patch_out_of_range what=") + what +
             " instance=" + hex64(reinterpret_cast<std::uintptr_t>(instance)) +
             " detected_slots=" + std::to_string(method_count) +
             " patch_high_water=" + std::to_string(patch_high_water) +
             " action=skip_clone");
+        LOG_WARN(blog::cat::hook, std::string("vtable_clone_result what=") + what_text +
+            " instance=" + instance_text +
+            " requested_slots=" + std::to_string(requested_slots) +
+            " detected_slots=" + std::to_string(detected_slots) +
+            " patches=" + std::to_string(patch_count) +
+            " action=skip_patch_out_of_range");
         return false;
     }
 
     void **clone = reinterpret_cast<void **>(VirtualAlloc(nullptr, sizeof(void *) * method_count, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (clone == nullptr)
+    {
+        // VirtualAlloc 失败此前只有「返回 false」这一个外部可见行为，与「补丁越界」在调用方看来
+        // 完全一样；对账出口必须把这两种放弃安装的原因区分开，否则日志无法归因。
+        LOG_WARN(blog::cat::hook, std::string("vtable_clone_result what=") + what_text +
+            " instance=" + instance_text +
+            " requested_slots=" + std::to_string(requested_slots) +
+            " detected_slots=" + std::to_string(detected_slots) +
+            " patches=" + std::to_string(patch_count) +
+            " action=skip_alloc_failed");
         return false;
+    }
 
     std::memcpy(clone, source, sizeof(void *) * method_count);
     for (const auto &[index, value] : patches)
@@ -6424,6 +6472,12 @@ bool clone_and_patch_vtable(void *instance, std::size_t method_count,
     *object = clone;
     g_cloned_vtables[instance] = clone;
     g_original_vtables[instance] = source;
+    LOG_INFO(blog::cat::hook, std::string("vtable_clone_result what=") + what_text +
+        " instance=" + instance_text +
+        " requested_slots=" + std::to_string(requested_slots) +
+        " detected_slots=" + std::to_string(detected_slots) +
+        " patches=" + std::to_string(patch_count) +
+        " action=installed");
     return true;
 }
 
@@ -14920,7 +14974,15 @@ void STDMETHODCALLTYPE hooked_clear_dsv(ID3D11DeviceContext *context, ID3D11Dept
 void install_context_hooks(ID3D11DeviceContext *context)
 {
     if (context == nullptr)
+    {
+        // 2026-11-22（消除取证盲区）：issue #19 的 context 钩子是否装上，此前是唯一没有
+        // 任何日志可证的分支 —— 这里静默 return，而 context 上的 draw / draw_indexed /
+        // om_set_render_targets 正是渲染接管的主功能钩子。
+        // 注意：D3D11CreateDevice 的 ppImmediateContext 允许传 nullptr（合法用法），
+        // 所以这不是「必然的错误」；但它恰恰是缺的那条证据，故用 WARN（每进程最多几次）。
+        LOG_WARN(blog::cat::hook, "hook_install_skipped what=context reason=null_instance");
         return;
+    }
 
     void **vtable = *reinterpret_cast<void ***>(context);
     if (g_original_vs_set_constant_buffers == nullptr)
@@ -15200,7 +15262,12 @@ HRESULT STDMETHODCALLTYPE hooked_create_compute_shader(ID3D11Device *device, con
 void install_device_hooks(ID3D11Device *device)
 {
     if (device == nullptr)
+    {
+        // 2026-11-22（消除取证盲区）：同 install_context_hooks —— device 路径上的
+        // create_buffer / create_pixel_shader 同样没有别的安装证据可查。
+        LOG_WARN(blog::cat::hook, "hook_install_skipped what=device reason=null_instance");
         return;
+    }
 
     void **vtable = *reinterpret_cast<void ***>(device);
     if (g_original_create_buffer == nullptr)
