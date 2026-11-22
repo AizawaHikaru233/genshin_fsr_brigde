@@ -4795,9 +4795,12 @@ void load_config()
                                 [](wchar_t c) { return c >= L'0' && c <= L'9'; });
                 if (!all_digits || flush_too_long)
                 {
+                    // 归因按**成因**而不是按条件优先级：一个"又长又非纯数字"的值（如 20 个
+                    // 'x'）真正的成因是内容非法，不是长度 —— 报 too_long 会把人引到
+                    // "写短一点就好了"的错误方向。故内容非法优先。
                     g_config.logging.pending_warnings.push_back(
-                        std::string(flush_too_long ? "log_flush_interval_too_long value="
-                                                   : "log_flush_interval_unparsed value=") +
+                        std::string(!all_digits ? "log_flush_interval_unparsed value="
+                                                : "log_flush_interval_too_long value=") +
                         narrow(flush_value) + " fallback=500");
                 }
                 else
