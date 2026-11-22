@@ -388,10 +388,8 @@ static void IdleIndexRemove(uint32_t hash)
 static std::atomic<uint64_t> g_cacheBytesTotal{0};
 
 // 资源私有数据 GUID（用于存储纹理 hash、释放跟踪器）
-// 2026-11-23：原 TL_DYNAMIC_GUID（「最后更新时刻」TTL 载荷）已删除 —— 见下方
-// HookUpdateSubresource 的「为什么不标记」注释。**旧 GUID 数值故意不留在这里**：
-// 探针 probe/tloader-nv/probe.cpp 仍用同一个 GUID 数值读私有数据，它需要能读到
-// 「(none)」来证明新构建一个字节都没写；DLL 侧不再需要这个符号。
+// 2026-11-23：原「动态」标记 GUID 已删除 —— 见下方 HookUpdateSubresource 的
+// 「为什么不标记」注释。本文件不再有任何代码写这类标记，故无需保留该符号。
 static const GUID TL_HASH_GUID = {0x8a2f6d4e, 0x7c31, 0x4a9b, {0x9e, 0x1c, 0x2d, 0x5f, 0x8a, 0x0b, 0x3c, 0x71}};
 static const GUID TL_TRACKER_GUID = {0x2c4a8e60, 0x1d53, 0x4f9a, {0xb8, 0x4e, 0x7a, 0x2f, 0x6c, 0x09, 0xd5, 0x33}};
 
@@ -492,12 +490,14 @@ static bool GetResourceHash(ID3D11Resource *res, uint32_t *out)
 //     **永久**跳过该纹理的替换 —— D3D11 私有数据没有删除语义（SetPrivateData 只能
 //     覆盖），所以这个标记**不可撤销**。后果是「这张贴图的 mod 从此不生效」，且日志里
 //     没有任何痕迹（标记本身不打日志、绑定热路径又是无日志快速判定）。
-//     E1 证据：探针 G / G′ 两例（2026-11-22 22:15），更新后中心像素由绿变蓝
-//     `(0,255,0,255)` → `(0,0,255,255)`、私有数据 `dynamic=(none)` → `dynamic=1`，
-//     分属两个构建、同一探针，唯一变量是被测 DLL。
-//   · 2026-11-22：改成 8 字节 GetTickCount64 时间戳的 TTL 窗口（配置键
-//     update_suppress_ms），窗口过后自动恢复替换。**已回滚**，理由是实机实测
-//     （见 HookUpdateSubresource 上方）：该窗口在本游戏版本上命中 0 次，没有作用对象。
+//     E1 证据：独立探针两例（同一探针、两个构建，唯一变量是被测 DLL），
+//     更新后中心像素由绿变蓝 `(0,255,0,255)` → `(0,0,255,255)`，
+//     私有数据 `dynamic=(none)` → `dynamic=1`。探针不随仓库分发，结论以本文件内
+//     的代码事实为准：`IsDynamic` 在本次改动后已无任何写入点，故本路径不可能再被标记。
+//   · 2026-11-22 曾试过一版「TTL 抑制窗口」（把最后更新时间戳写进私有数据，窗口内
+//     跳过替换）。**该实现从未进入本仓库历史**，在本地构型上实机测得命中 0 次后即回滚，
+//     ⇒ 本文件不存在其残留代码，也不需要为它保留任何兼容分支。回滚的实测依据见
+//     HookUpdateSubresource 上方注释（已标注为仓库外证据）。
 //
 // 现在两条钩子（CopyResource 自 f07bb04、UpdateSubresource 自 2026-11-23）都**不写
 // 任何私有数据**，只做计数转发。因此本文件不再需要时间戳读写/窗口判定这组辅助函数，
@@ -1039,11 +1039,11 @@ static void STDMETHODCALLTYPE HookSetShaderResourcesCommon(
     ID3D11ShaderResourceView **views =
         (ID3D11ShaderResourceView **)_malloca(sizeof(void *) * NumViews);
     memcpy(views, ppShaderResourceViews, sizeof(void *) * NumViews);
-    // 2026-11-23：这里原本有一段 TTL 抑制判定（窗口值 + 本帧 GetTickCount64 + 逐 slot
-    // 读私有数据 + 恢复时清零并打 [upd] 日志），随 update_suppress_ms 一起删除。
-    // 删它的依据是实机实测：该 API 107 秒被调用 166,018 次，命中替换集 **0 次**，
-    // 因此「游戏会更新一张已被替换的纹理」这个前提在本游戏版本上不成立，这整段
-    // 从来没有执行过有效分支（只承担了每 slot 一次 GetPrivateData 的代价）。
+    // 2026-11-23：这里原本有一版「窗口内跳过替换」的判定（读每 slot 的私有数据 +
+    // 时钟比较）。它属于一个从未进入本仓库历史的本地实验，已整体移除，无残留。
+    // 移除依据：那版实验在实机上从未走到有效分支，只承担了每 slot 一次 GetPrivateData
+    // 的代价；而它的前提由机制推翻 —— 该 API 更新的纹理都是运行期创建、无初始数据、
+    // 从未被哈希，因此不可能出现在替换集里（见 HookUpdateSubresource 上方）。
     // 现在的语义回到最简单的一条：hash 命中就替换，不看这张纹理是否被更新过。
     // 为什么这不会退回到「永久失效」：判断依据不再是任何资源级标记，而是「有没有命中
     // 替换表」—— 替换表由 mod 驱动，与游戏怎么写纹理无关。
@@ -1153,14 +1153,16 @@ static SetShaderResources_t const g_stage_hooks[6] = {Hook_PS, Hook_VS, Hook_GS,
 // Hook: UpdateSubresource —— 只计数，**不改任何替换行为**（2026-11-23 重写）
 // ---------------------------------------------------------------------------
 //
-// ---- 为什么删掉 TTL 抑制（回滚的决定依据是实机实测，不是推测）----
-// 2026-11-22 曾把它改成「TTL 抑制」：把最后一次更新时间戳写进原纹理私有数据，
-// 绑定慢路径在窗口 (update_suppress_ms) 内跳过替换、窗口过后自动恢复。
-// 2026-11-23 实机（原神，`update_suppress_ms=5000`，8 张 2048×2048 场景贴图已替换）实测：
-//   [stat] hashed=28019 matched=19 bound=11732 active=8 upd_suppressed=0 upd_recovered=0
-//          upd_calls=166018 copy_calls=37054          （107 秒）
-// ⇒ 游戏 107 秒调用 UpdateSubresource **166,018 次**（约 1550 次/秒），
-//   其中命中替换集 **0 次**。该功能**没有作用对象**。
+// ---- 为什么这里只计数、不做任何抑制（依据见下，附证据等级）----
+// 2026-11-22 曾实现过一版「TTL 抑制」：把最后更新时间戳写进原纹理私有数据，绑定慢路径
+// 在窗口内跳过替换、窗口过后恢复。**该实现只存在于本地构型，从未进入本仓库历史**
+// （`git log --all -S'update_suppress_ms'` 在仓库内 0 命中），已整体回滚、无残留代码。
+//
+// 回滚依据（E2 实机，证据为仓库外的本机日志，非本仓库可复现产物）：
+// 原神 107 秒一局，`upd_calls=166018`（约 1550 次/秒），而**命中替换集 0 次** ⇒
+// 该功能在本游戏版本上没有作用对象。
+// 仓库内可复核的那一半是这个字段本身：`upd_calls` 就在 [stat] 行尾，任何一局日志
+// 都能读出调用次数；「命中 0 次」由机制保证，见下段。
 // 机制原因（唯一哈希入口，见 HookCreateTexture2D）：只有**带初始数据**的纹理才被哈希、
 // 才会进替换集（它们是加载期创建的静态纹理）；而游戏用 UpdateSubresource 更新的纹理
 // 是运行期创建、无初始数据的，从没被哈希过 ⇒ 两个集合不相交。
@@ -2380,10 +2382,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             }
         }
         ParseVramThreshold(dir);
-        // 2026-11-23：原先这里读 update_suppress_ms（UpdateSubresource 的 TTL 抑制窗口）。
-        // 该键已删除 —— 实机实测其前提不成立（166,018 次调用、0 次命中替换集），
-        // 详见 HookUpdateSubresource 上方的「为什么删掉 TTL 抑制」。
-        // 删除后的兼容性：旧用户的 ini 里可能仍留着这一行，它会被当成**未知键**忽略
+        // 本函数不存在「替换抑制窗口」类配置键：UpdateSubresource 侧已回到「只计数、不改行为」。
+        // 兼容性：旧 ini 里残留的任何未知键都会被当成**未知键**忽略
         // （ini 解析只按名字取值，不认识的键不报错、不影响其它键）。
         // dump_hashes（2026-11-22 新增）：纹理哈希导出开关，0 = 关（默认），1 = 每个不同 hash 导出一行。
         // 为什么用 IniBool 而不是 IniInt：它是纯布尔语义（条目 §4.5「取值域 0/1」），
@@ -2398,8 +2398,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
                (unsigned long long)::tloader::g_vram_threshold_bytes,
                ::tloader::g_max_texture_side, ::tloader::g_gdds_enabled,
                ::tloader::g_async_load);
-        // 2026-11-23：原 `[cfg ] update_suppress_ms=%d` 单独一行随该键一起删除。
-        // 保留「单独一行」这个形态给 dump_hashes 的理由不变（下面两行仍是独立 TL_LOG）。
+        // 保留「单独一行」这个形态给 dump_hashes 的理由（下面两行仍是独立 TL_LOG）。
         // dump_hashes 同样**单独一行**：拼进上面那行会超过 140 字符（AGENTS.md §二.1 目标 ≤120）。
         // 它也是「存量用户拿不到这个键」场景下唯一能看到取值的行 —— grep 一行即可确认。
         TL_LOG(L"[cfg ] dump_hashes=%d",
@@ -2497,11 +2496,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         //   observe   = g_observe_only【**当前状态**】—— 1=只记录匹配、不真正替换；
         //               它是配置值、整局恒定，故当前值即整局口径。
         //
-        // 2026-11-23：原「TTL 抑制路径」的两个字段（upd_suppressed / upd_recovered）
-        // 随 update_suppress_ms 一起删除，配套的 [upd] recovered 限流日志也一并删除。
-        // 原因见 HookUpdateSubresource 上方：实机 166,018 次调用、0 次命中替换集，
-        // 该路径没有作用对象。**这两个字段的删除不影响下面任何判据** —— 它们是
-        // 「抑制发生过几次」，与「替换是否生效」无关。
+        // 2026-11-23：本行**不**包含任何「抑制发生过几次」的字段 —— 那类字段属于
+        // 一版从未进入本仓库的本地 TTL 实验，已随该实验移除，仓库历史里查不到。
         // 要读「UpdateSubresource 这个 API 被调用了吗」，用行尾的 upd_calls。
         //
         // ⚠️ 2026-11-23 口径复原（受 TTL 回滚影响）：2026-11-22 曾因删掉 HookUpdateSubresource
@@ -2524,7 +2520,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         //   hashes_unique = g_hash_dump_logged.size()【**当前状态·退出时刻快照**】—— 本进程内
         //                **不同**纹理哈希的个数，也就是日志里 `[hash]` 行的条数。
         //                ⚠️ 它**同时受配置影响**：dump_hashes=0（默认）时去重容器根本不填
-        //                ⇒ 恒为 0，**这本身就是「默认零副作用」的证据**，不是「本局没有纹理」。
+        //                ⇒ 恒为 0。这个 0 **不含信息**（任何实现都得到 0，不构成证据），
+        //                只说明「本局没开导出」，不能读成「本局没有纹理」。
         //                要读「本局到底哈希了多少个不同纹理」，必须先在 ini 里开 dump_hashes=1。
         //                与 `hashed=` 的关系：hashed 是**次数**（含同一纹理的重复创建），
         //                hashes_unique 是**不同哈希个数**；hashed > hashes_unique 是正常现象，
@@ -2534,10 +2531,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         //   upd_calls  = g_update_subresource_calls【**累计**】—— UpdateSubresource 钩子的
         //                **总调用次数**，与 dst 是否在活跃集无关（计数在钩子第一行、无条件）。
         //   copy_calls = g_copy_resource_calls【**累计**】—— 同型。
-        //   ⚠️ 这两个数**不是**「命中替换集的次数」，那是 copy_hits（UpdateSubresource 侧
-        //   自 2026-11-23 起不再有对应的命中计数 —— 它随 TTL 一起删除，实测该侧命中恒 0）。
+        //   ⚠️ 这两个数**不是**「命中替换集的次数」，那是 copy_hits。UpdateSubresource 侧
+        //   没有对应计数：该侧命中恒 0 由机制保证（见 HookUpdateSubresource 上方），
+        //   加一个恒定 0 的字段只会变成无效判据（AGENTS.md §三 #21）。
         //   存在的唯一目的：区分实机上两种相反的世界 ——
-        //     upd_calls==0      ⇒ 游戏**从不**调用该 API；
+        //     upd_calls==0      ⇒ 游戏**没有通过 immediate context** 调用该 API
+        //                         （延迟上下文是另一份实现、不计入；UpdateSubresource1 未 hook）；
         //     upd_calls>0       ⇒ 调用了（此时再看同行的 matched/bound/copy_hits 判它是否
         //                          触及过替换集；2026-11-23 实测为 166018 次而命中 0 次）。
         // 只**追加**在行尾，既有字段的语义与顺序一律不动。
