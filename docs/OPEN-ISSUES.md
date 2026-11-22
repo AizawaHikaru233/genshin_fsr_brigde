@@ -5,7 +5,7 @@
 > **改动历史不在这里**：某段代码为什么是现在这样，用 `git log` / `git blame` 查。
 > 条目关闭后直接删除；要留结论就移入文末「已解决」，并注明解决它的提交。
 
-最后更新：2026-11-22
+最后更新：2026-11-18
 
 ---
 
@@ -653,71 +653,6 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 **相关代码位置**
 
 - `Dx11FsrBridge/NgxBackend.cpp`：`g_params->Get` / `p->Set` 的调用点、`query_dlss_optimal_range` 里传入的回调
-
----
-
-## 9. TextureLoader：经 `CopyResource` 覆写的纹理会长期显示（可能已过期的）替换贴图
-
-**现状**
-
-- `TextureLoader` 曾经在 `ID3D11DeviceContext::CopyResource` 的钩子里对目标纹理调用「标记动态」（资源级
-  `SetPrivateData`），本意是「内容被游戏改写了 ⇒ 别再用替换贴图，避免画面与游戏状态不一致」。
-  该标记**不可撤销**（D3D11 私有数据没有删除语义），于是绑定热路径的 `IsDynamic()` 检查从此对该纹理
-  永久为真、**永久跳过替换**。失效形态是「这张贴图的 mod 彻底不生效」，比它想避免的「画面不跟手」更重。
-- 2026-11-22 起该钩子**不再标记动态、也不再移出活跃数组**，只保留一次计数
-  （`copyresource_hit_calls`）。于是本条描述的是**现在**的行为：被 `CopyResource` 覆写过的纹理**仍然**
-  会使用替换贴图，即使原纹理内容已经被游戏改写、替换贴图因此可能不再对应当前游戏状态。
-- 这是**有意取舍**，不是遗漏：两种失效里选了较轻的一种（内容可能过期 ≪ mod 整体失效）。
-  取舍理由与实测依据写在代码注释里（`TextureLoader.cpp` 的 `HookCopyResource` 上方）。
-- 钩子**暂时保留**只为一次性判别「实机上这条路径到底会不会发生」——保留它才回答得出这个问题；
-  判别完成后应删除（见「推进需要」）。
-
-**影响**
-
-- 只影响**已被替换**且**之后又被 `CopyResource` 覆写**的纹理，且只在纹理替换工具（TextureLoader）
-  启用时存在。表现为：该处贴图显示的是 mod 图，而不是游戏此刻真正想显示的内容。
-- 反方向的影响已经消除：不会再出现「某张贴图的 mod 无缘无故永远不生效」。
-- 对不装纹理 Mod 的玩家无影响（替换功能未启用时钩子第一道判空即返回）。
-
-**推进需要**
-
-1. **实机确认该路径是否真的发生**（这是本条唯一的未决问题）。判据是退出时 `[stat]` 行里的
-   `copy_hits=`，但**必须先排除三种「本来就不会计数」的情形**，否则会把「替换没启用」
-   读成「这条路径没发生」：
-   - `[stat]` 行**缺失** ⇒ 本局无结论（该行在卸载钩子之后打印，崩溃或强杀时整行不出现）；
-   - 行在，但 `observe=1`（只记录不替换）⇒ 替换根本没启用、活跃集恒空 ⇒ `copy_hits=0`
-     **不构成任何证据**；
-   - 行在，但 `overflow>0` ⇒ 有条目被静默丢弃、活跃集不完整 ⇒ 同样不构成证据；
-   - 行在，但 `matched=0` 或 `bound=0` ⇒ 本局没命中过替换 / 从未绑定替换 SRV
-     ⇒ 同样不构成证据；
-   - 行在，`observe=0` 且 `overflow=0` 且 `matched>0` 且 `bound>0`，而 `copy_hits=0`
-     ⇒ 本局该路径**未发生**（≠「不是这个问题」，其他原因仍要查）；
-   - 行在、`copy_hits>0`，且实机目视该处贴图**仍为 Mod 内容** ⇒ 本条的影响确实存在。
-   ⚠️ **不要用 `active=` 当这个前置条件**：它是退出时刻的快照，而原纹理销毁时
-   `ReplacementTracker` 会调 `ActiveRemove`，所以「替换全程生效」的一局在退出时也可能读到
-   `active=0`（实测：`bound>0` 与 `active=0` 同时出现）。该字段存在的意义只是让读日志的人
-   知道退出那一刻活跃集里还剩多少，不能用来推断运行期状态。要证明「替换在该局生效过」，
-   用【累计】字段 `matched>0` 且 `bound>0`。
-
-2. 拿到上述结论后，按「保留钩子的唯一目的已达成」处理：**以单独提交删除该 `CopyResource` 钩子**
-   （`DetourAttach` / `DetourDetach` / 函数指针全局 / typedef / `[ok  ] hooked CopyResource` 日志行 /
-   上面的计数与 `[stat]` 里的 `copy_hits` 字段），**同时回退 `TextureLoader/ARCHITECTURE.md` 里
-   新增的那一行**（否则文档会描述一个已经不在的钩子）。
-   ⚠️ 删除时**必须保留**镜像 vtable 结构体里的 `CopyResource` 成员声明：删掉它会让其后成员整体左移，
-   `vtbl->UpdateSubresource` 将指向 `CopyResource`，**编译通过但 Detours 静默挂错函数**。
-3. 若届时想保留这条判别力，改用诊断构建或外部 D3D11 捕获，不要再次把它放进常驻钩子。
-
-**相关代码**
-
-- `TextureLoader/TextureLoader.cpp`：`HookCopyResource`（含其上方注释：保留钩子却不标记动态的理由、
-  失效形态、以及「Usage 字段参与 `CalcTexture2DDescHash` 的 CRC-32C，改 Usage 会改哈希」这条对账陷阱）、
-  `copyresource_hit_calls`（计数及其口径注释）、`MarkDynamic` / `IsDynamic`、
-  `HookUpdateSubresource`（**仍**标记动态，未受本次改动影响）、
-  退出时的 `[stat]` 行（`copy_hits=` / `active=` / `overflow=` / `observe=`）、
-  `D3D11DeviceContextVtblMirror` 的 `CopyResource` 成员
-- `TextureLoader/ARCHITECTURE.md` §1「Hook 面」表格里 `CopyResource` 那一行（删除钩子时一并回退）
-- 实测方法不在仓库内：用独立的 D3D11 探针做 GPU 像素读回对照（含「修复前 / 修复后」两个构建的 A/B
-  与「不做 CopyResource」的对照），结论已并入本节与代码注释。
 
 ---
 
