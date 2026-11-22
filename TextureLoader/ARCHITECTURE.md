@@ -111,7 +111,48 @@ D3D11 共享纹理（SHARED|SHARED_NTHANDLE）
 GPU 解压不可用（无 D3D12 / `dstorage.dll` 缺失 / 驱动过旧）→ 回退 CPU DDS 路径
 （`.dds` 扩展名）；GDDS 依赖 DirectStorage，缺失时按失败记录日志。
 
-## 6. 目录文件索引
+## 6. 日志口径：怎么正确读 `[HIT]` / `[srv]` / `[stat]`
+
+> `log_level=1`（默认）下，替换相关只打三种行。**它们的计数不可互相当替身**。
+
+| 行 | 打印时机 | 计数含义 |
+|---|---|---|
+| `[HIT ]` | **加载完成**、替换纹理已写进缓存条目之后 | 本进程**载入缓存**的替换数 |
+| `[srv ]` | **绑定时刻**首次为该 hash 创建 SRV 时（`CreateReplacementSRV` 内） | 本进程**实际建过 SRV** 的替换数 |
+
+负载格式：`[HIT] tex hash=0x… replaced dds=…`；
+`[srv] hash=0x… origFmt=… texFmt=… viewFmt=… hr=… mips=…`。
+
+两行都是**每条 hash 只打一次**：`[HIT]` 的守卫是「条目里还没有 texture」，
+`[srv]` 在已有 srv 时直接 AddRef 返回、不再创建也不再打。
+
+**关键关系：`[srv]` ⊂ `[HIT]`，恒成立。**
+
+- `[srv]` 只由 `SetShaderResources` 的绑定路径调用 `CreateReplacementSRV` 产生；
+  `[HIT]` 在加载完成时就打了，**早于**任何绑定。
+- ⇒ 某纹理「加载完了，但本局再没被绑定过」⇒ **只有 `[HIT]` 没有 `[srv]`**。
+  差值 = 「已加载但本局未绑定」的数量，**不构成任何缺陷证据**。
+- 实测例证：同一 hash 在两局里可以一局有 `[srv]`（加载后 1ms 就绑定）、另一局没有
+  （加载后到退出都没再绑定）。**所以两行条数不等是正常的，不要据此判「替换失败」。**
+- 判「覆盖率」用 `[HIT]` 的 hash 集合，**不要**用 `[srv]` 条数当替换总数。
+
+### 6.1 `[stat]` 行的 `|schema` 段
+
+行尾 `|schema 累计={…} 当前={…} 配置={…}` 是字段口径自述，**读任何数字前先读它**：
+
+- **累计**（进程内不清零）：`hashed matched bound bind_log_suppressed copy_hits overflow
+  upd_calls copy_calls`
+- **当前状态（退出时刻快照）**：`cache_entries cache_MB active hashes_unique`
+- **配置值**：`observe`
+
+⚠️ 最容易读错的是 `active`：原纹理销毁时 `ReplacementTracker` 会调 `ActiveRemove`，
+所以**一局里替换全程生效、退出时仍可能读到 0**（实测 `bound>0` 与 `active=0` 共存）。
+判「本局是否生效过」要用同行的 `matched>0` 且 `bound>0`，**不要**用 `active`。
+
+⚠️ `hashes_unique` 同时受配置影响：`dump_hashes=0`（默认）时去重容器根本不填 ⇒ 恒为 0，
+这个 0 **不含信息**。要读「本局哈希了多少个不同纹理」，必须先在 ini 里开 `dump_hashes=1`。
+
+## 7. 目录文件索引
 
 ```
 TextureLoader.cpp      — 主逻辑：hook、替换链路、异步加载、显存淘汰、VEH 崩溃记录

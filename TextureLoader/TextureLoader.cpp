@@ -724,6 +724,12 @@ ID3D11ShaderResourceView *CreateReplacementSRV(uint32_t hash,
                hash, (int)origDesc->Format, (int)tdesc.Format, (int)viewFmt, (unsigned)hr,
                origDesc->Texture2D.MipLevels, tdesc.MipLevels);
     } else {
+        // **不可达分支**，保留仅为防御：唯一调用点（SetShaderResources 绑定路径）始终传
+        // `&origDesc`（栈上局部变量的地址），故 `if (origDesc)` 恒为真。
+        // ⚠️ 2026-11-23 曾在这里加过一行 [srv] 诊断日志，一次都没打印出来 —— 因为本支根本
+        // 走不到；当时还据此推断「[srv] 比 [HIT] 少几行是因为走了这支」，结论是错的
+        // （真实原因是 [HIT] 在加载完成时打、[srv] 在绑定时打，见 ARCHITECTURE.md §6）。
+        // 要动这里，先确认还有第二个调用点。
         hr = g_device->CreateShaderResourceView(tex, nullptr, &srv);
     }
 
