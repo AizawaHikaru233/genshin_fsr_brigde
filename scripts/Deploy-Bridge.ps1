@@ -136,6 +136,8 @@ $configValues = [ordered]@{
     # 必须在这里写：Add-LogSection 只在**没有** [Log] 段时才补整段，
     # 而已部署的 ini 都已有 [Log] 段 → 段内的新键永远不会被补上（实测 queue_capacity 缺失）。
     'queue_capacity'            = '8192'
+    # 0 = 关闭定期 flush（回到旧行为）；非 0 钳制到 [200, 10000]。默认 500。
+    'flush_interval_ms'         = '500'
 }
 $logSection = @(
     '[Log]',
@@ -147,6 +149,8 @@ $logSection = @(
     'max_file_kb=16384',
     'rotate_keep=2',
     'queue_capacity=8192',
+    '; flush_interval_ms: 定期 flush 间隔（毫秒）。0 = 关闭（只在退出时 flush）；非 0 钳制到 [200, 10000]；默认 500',
+    'flush_interval_ms=500',
     'compat_prefix=0',
     '',
     '[Log.Categories]',
@@ -174,7 +178,7 @@ function Set-IniValue {
         # 文件最后 → 之后所有新键都落进 [Log.Categories] 段，被当成"分类名=等级"。
         # 实测后果：queue_capacity / Ffx12PresentProbe 落进 [Log.Categories]，
         # 日志里出现 `categories=...,Ffx12PresentProbe=ERROR`，而桥**从未读到这两个键**。
-        $section = if ($Key -in @('level','to_file','to_debugger','truncate_on_start','max_file_kb','rotate_keep','queue_capacity','compat_prefix','debugger_max_per_sec')) { '[Log]' } else { '[Dx11FsrBridge]' }
+        $section = if ($Key -in @('level','to_file','to_debugger','truncate_on_start','max_file_kb','rotate_keep','queue_capacity','flush_interval_ms','compat_prefix','debugger_max_per_sec')) { '[Log]' } else { '[Dx11FsrBridge]' }
         $sectionStart = -1
         $sectionEnd = $out.Count
         for ($i = 0; $i -lt $out.Count; ++$i) {
@@ -338,7 +342,7 @@ if ($appliedCount -eq 0) {
 if (-not $Rollback) {
     Write-Host ""
     Write-Host "校验清单（下次采集时先看这几行）:" -ForegroundColor Cyan
-    Write-Host "  1. logger effective level=... categories=... file=... queue_capacity=...  ← 日志器生效确认"
+    Write-Host "  1. logger effective level=... flush_interval_ms=... categories=... file=... queue_capacity=...  ← 日志器生效确认"
     Write-Host "  2. swapchain_hook_decision install=1 present=.. controls=.. color=..      ← 交换链钩子决策（本轮修复）"
     Write-Host "  3. hooked D3D11CreateDevice / rtv_bind_target                            ← D3D11 钩子是否装上"
     Write-Host "  4. transparent_jitter_installed ... force=1                              ← 透明队列抖动修复是否生效（正式功能）"

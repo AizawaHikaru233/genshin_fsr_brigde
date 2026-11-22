@@ -14,6 +14,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -65,6 +66,22 @@ std::ofstream g_file;
 std::atomic<std::uint64_t> g_max_file_bytes { 0 };
 std::atomic<std::uint32_t> g_rotate_keep { 2 };
 std::uint64_t g_bytes_written = 0;
+
+// ---- 定期 flush（把"强杀丢尾部"的最坏窗口从"整个缓冲填满的时间"压到一个周期）----
+// 背景：此前全文件只有两处**显式** flush，都在收尾路径（writer 线程退出、shutdown 兜底）。
+// 而收缩尾那段路径**实测从未执行**（23/23 份日志末字节非换行、transparent_jitter_stats 0/23），
+// 故进程被杀时，缓冲区里的行（MSVC ofstream 的缓冲大小属实现定义，本项目未实测，此处按
+// 业界常见的约 4KB 估算量级）会整段丢失。定期 flush 就是补这个缺口。
+//
+// 挂点在 writer_loop 的写入临界区内（已持 g_file_mutex）：不新增取锁、不碰 g_queue_mutex，
+// 因此渲染线程完全不受影响（push() 仍只入队）。判定放在"每写一行"处而不是"队列空闲"处，
+// 是因为日志越密集越应该尽快落盘 —— 崩溃前恰恰是日志密集期。
+//
+// 间隔语义：0 = 关闭（回退到旧行为）。非 0 由 load_config 钳到 [200, 10000]。
+std::atomic<std::uint32_t> g_flush_interval_ms { 500 };
+// 只在持有 g_file_mutex 时读写：init() 在锁内初始化，writer_loop() 在锁内判定/更新。
+// （shutdown() 的收尾 flush 不经过它——那是最后一道防线，与定期 flush 无关，故不读也不写。）
+std::uint64_t g_last_flush_ms = 0;
 
 std::atomic<bool> g_to_debugger { false };
 std::atomic<std::uint32_t> g_debugger_max_per_sec { 200 };
@@ -172,6 +189,21 @@ void debugger_sink(const std::string &line)
     OutputDebugStringA("\n");
 }
 
+// 「shutdown 兜底是否被削弱」的观测通道：OutputDebugStringW。
+// ⚠️ 为什么不能用本模块自己的日志：shutdown() 第一件事就是 g_active.exchange(false)，
+// 而 enabled() 首行是 `if (!g_active) return false` ⇒ 此后任何 LOG_* 一行都不会产生；
+// 且 writer 已 close 文件 ⇒ 文件通道同样已关闭。故这里必须走 DETACH 安全的 ODS：
+// 不取本模块锁、不碰 CRT 流。（本文件 log_open_failed 那处已有同型先例。）
+// ⚠️ 必须挂在 [Log] to_debugger 门控下：ODS 在有 debug monitor 在场时要与 DBWIN_BUFFER_READY
+// 事件握手，理论上可等待 —— 这与"卸载期不得阻塞"的红线同类。加了门控后，生产退出路径
+// （to_debugger 默认 0）**零新增调用**，风险归零；验收该判据的那次运行打开该键即可观测。
+void debugger_marker(const wchar_t *text)
+{
+    if (!g_to_debugger.load(std::memory_order_relaxed))
+        return;
+    OutputDebugStringW(text);
+}
+
 // 后台写线程：唯一碰文件的地方。
 // 退出时由本线程自己 close 文件（而不是让 shutdown 抢先 close），
 // 否则 shutdown 的 flush/close 会与这里正在进行的 << 并发操作同一个 ofstream。
@@ -201,6 +233,31 @@ void writer_loop()
             {
                 g_file << line << "\n";
                 g_bytes_written += line.size() + 1;
+                // 定期 flush（已在 g_file_mutex 临界区内，不新增取锁、不碰 g_queue_mutex）。
+                // 顺序：flush 在 rotate_locked() **之前** —— rotate 内部会 close()，先把
+                // 已写的行落盘，再走"关闭 + 改名前 + 重开"的轮转，语义上不会有行跨过轮转丢失。
+                // 判定算在锁内做一次 now_ms()（GetTickCount64；单次取值的开销**未实测**，
+                // 按公开资料属数十 ns 量级 —— 此为推算，不是本项目的实测结论），且只在写线程上，
+                // 渲染线程零新增开销。
+                //
+                // ⚠️ 轮转后**不**重置 g_last_flush_ms —— 这是有意的取舍，不是漏项：
+                //   rotate_locked() 返回 void，拿不到"是否轮转"的信号；不重置的后果只是
+                //   "对刚打开的空流多调一次 flush()"，而空缓冲的 flush 是 no-op，无害。
+                //   为它去改 rotate_locked() 的签名或引入隐式契约（g_bytes_written==0）
+                //   会把一个无害的近似变成两条需要维护的约定，收益为负。
+                {
+                    const std::uint32_t flush_interval = g_flush_interval_ms.load(std::memory_order_relaxed);
+                    if (flush_interval != 0)
+                    {
+                        const std::uint64_t now = now_ms();
+                        if (now - g_last_flush_ms >= flush_interval)
+                        {
+                            g_file.flush();
+                            // 必须紧邻 flush 之后更新：否则声明了 flush 却没做，闸门会失效。
+                            g_last_flush_ms = now;
+                        }
+                    }
+                }
                 rotate_locked();
             }
         }
@@ -439,6 +496,19 @@ void init(const Config &config)
         g_size = 0;
     }
 
+    // 定期 flush 的状态：**写线程启动之前、持锁状态下**初始化（判据"距上次 flush 是否
+    // 超过一个周期"以 g_last_flush_ms 为基准，留 0 会让首个周期内必然立刻 flush；
+    // 而写线程启动后再改它就产生了竞态）。
+    // 放在 to_file 分支**之外**：to_file=0 时没有文件可 flush、机制本就不生效，但
+    // log_effective_config 的回显仍应报告 ini 里配置的值 —— 否则回显会显示一个死默认，
+    // 而 log_effective_config 存在的意义正是"配置到底生效成什么"。
+    // 0（关闭）原样写入：钳制已在 load_config 完成，这里不再二次钳制（否则 `0` 会被夹走）。
+    {
+        std::lock_guard<std::timed_mutex> lock(g_file_mutex);
+        g_flush_interval_ms.store(config.flush_interval_ms, std::memory_order_relaxed);
+        g_last_flush_ms = now_ms();
+    }
+
     if (config.to_file)
     {
         g_directory = config.directory_w;
@@ -510,17 +580,45 @@ void shutdown()
     // 而 writer 线程可能正持 g_file_mutex 卡在轮转的 MoveFileExW/DeleteFileW 上。
     // 阻塞等待就等于把主线程钉死在 loader lock 里——"窗口关了、进程不退出"的形态之一。
     // 拿不到锁就直接放弃收尾（文件句柄交 OS 回收），绝不阻塞退出。
-    if (g_writer_stopped.load(std::memory_order_acquire))
+    // 兜底收尾的**观测**（诊断用，零行为改动）。
+    //
+    // ⚠️ 这里为什么只能走 OutputDebugStringW：shutdown() 第一件事就是 g_active.exchange(false)，
+    //   而 enabled() 首行是 `if (!g_active) return false` ⇒ 此后任何 LOG_* / blog::write 都
+    //   一行也产生不出来；且 writer 此前已 close 文件 ⇒ 文件通道同样已关。在此处写日志是死代码。
+    //   ODS 不取本模块锁、不碰 CRT 流，是 DETACH 安全的通道；且已挂 [Log] to_debugger 门控
+    //   （见 debugger_marker），生产退出路径（默认 to_debugger=0）零新增调用。
+    //
+    // ⚠️ 观测点必须在 `if (g_writer_stopped)` **之外**：否则最关键的那条分支
+    //   （守卫为假 ⇒ 兜底整段被跳过）反而观测不到。同时记录三个值，使各情形可区分：
+    //     writer_stopped=0                                ⇒ 兜底整段被跳过（真失败路径）
+    //     writer_stopped=1, lock_ok=0                     ⇒ try_lock_for(50ms) 失败
+    //     writer_stopped=1, lock_ok=1, file_open=0        ⇒ 无文件可兜底（正常退出的**常态**：
+    //                                                       writer 已在自己那里 flush + close）
+    //     writer_stopped=1, lock_ok=1, file_open=1        ⇒ **异常**：writer 正常收尾时自己关了
+    //                                                       文件，正常流程不该出现
+    const bool writer_stopped = g_writer_stopped.load(std::memory_order_acquire);
+    bool lock_ok = false;
+    int file_open = -1;   // -1 = 未知（拿不到锁就无从得知，不能写成 0 冒充"文件没开"）
+    if (writer_stopped)
     {
         std::unique_lock<std::timed_mutex> lock(g_file_mutex, std::defer_lock);
         if (lock.try_lock_for(std::chrono::milliseconds(50)))
         {
-            if (g_file.is_open())
+            lock_ok = true;
+            file_open = g_file.is_open() ? 1 : 0;
+            if (file_open == 1)
             {
                 g_file.flush();
                 g_file.close();
             }
         }
+    }
+    {
+        wchar_t marker[128] {};
+        if (std::swprintf(marker, std::size(marker),
+                          L"blog_shutdown_exit writer_stopped=%d lock_ok=%d file_open=%d",
+                          writer_stopped ? 1 : 0, lock_ok ? 1 : 0, file_open) > 0)
+            debugger_marker(marker);
     }
 }
 
@@ -562,10 +660,17 @@ void log_effective_config()
         std::lock_guard<std::timed_mutex> lock(g_file_mutex);
         file_open = g_file.is_open();
     }
-    char buf[320] {};
+    // ⚠️ 新字段必须**前置**（紧跟 level=），不能追加到末尾：
+    // categories= 的长度由用户 ini 决定，可达数百字符；若把 flush_interval_ms 放在末尾，
+    // 缓冲填满时被截掉的**恰恰是它** ⇒ 校验看着"键没生效"，实际是日志被截断（假失败）。
+    // 缓冲同时从 320 提到 512，给 categories 与新增字段都留出余量。
+    char buf[512] {};
     std::snprintf(buf, sizeof(buf),
-                  "logger effective level=%s categories=%s file_open=%d file=%s queue_capacity=%zu",
-                  level_name(level()), cats.empty() ? "(none)" : cats.c_str(),
+                  "logger effective level=%s flush_interval_ms=%u categories=%s file_open=%d file=%s "
+                  "queue_capacity=%zu",
+                  level_name(level()),
+                  g_flush_interval_ms.load(std::memory_order_relaxed),
+                  cats.empty() ? "(none)" : cats.c_str(),
                   file_open ? 1 : 0, file_open ? "ok" : "(OPEN FAILED)",
                   g_queue_capacity);
     write(Level::Info, cat::config, buf);

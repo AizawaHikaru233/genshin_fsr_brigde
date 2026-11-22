@@ -80,6 +80,12 @@ struct Config
     std::uint64_t max_file_bytes = 16ull * 1024 * 1024; // 0 = 不轮转
     std::uint32_t rotate_keep = 2;
     std::uint32_t queue_capacity = 8192;
+    // 定期 flush 间隔（ms）。**0 = 关闭**定期 flush（回退到旧行为：只在收尾路径 flush）。
+    // 非 0 时由 load_config 钳制到 [200, 10000]；`0` 必须在钳制**之前**短路，
+    // 否则会被夹成下限 —— 那样"关掉定期 flush"的回退路径与负对照判据会同时失效。
+    // 为什么下限不是更小：判定发生在"每写一行"处，但 flush 的实际最小间隔受日志到达
+    // 节奏限制；200 与写线程的 200ms 轮询同量级，写成 50 只会让人误以为 50ms 就生效。
+    std::uint32_t flush_interval_ms = 500;
     std::uint32_t debugger_max_per_sec = 200; // 调试器 sink 限流，防拖慢游戏
     bool compat_prefix_categories = false;    // 旧 log_line 行按前缀归类（过渡开关）
 };

@@ -47,6 +47,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <deque>
 #include <filesystem>
@@ -163,6 +164,12 @@ struct Config
         // 异步写队列容量（条）。此前 Config::queue_capacity 从未被读取，
         // 环形队列硬编码 16384，该字段是死配置。
         std::uint32_t queue_capacity = 8192;
+        // 定期 flush 间隔（ms）。**0 = 关闭**（回退到"只在收尾路径 flush"的旧行为）。
+        // 非 0 钳制到 [200, 10000]；0 必须在钳制**之前**短路，见 load_config 的读取点。
+        // 默认 500：这是**有意偏离**"默认值 = 改动前行为"的通用约定 —— 本项修复的就是
+        // "进程被杀时缓冲里若干行整段丢失"，默认 0 等于缺陷原样保留、改动无意义。
+        // 该偏离的可接受性建立在"flush_interval_ms=0 的回退路径可靠"之上。
+        std::uint32_t flush_interval_ms = 500;
         std::vector<std::pair<std::string, blog::Level>> categories;
         // load_config() 在 blog::init() **之前**执行，此时日志器还是关闭状态，
         // 配置解析期的告警会被直接丢弃（"日志撒谎"的同类问题：报告了等于没报告）。
@@ -4730,6 +4737,63 @@ void load_config()
             static_cast<std::uint32_t>(
                 GetPrivateProfileIntW(L"Log", L"queue_capacity", 8192, config_path.c_str())),
             1024u, 262144u);
+        // 定期 flush 间隔（ms）。默认 500；**0 = 关闭**（回退到旧行为），非 0 钳到 [200, 10000]。
+        //
+        // ⚠️ 三条都不能省（实现差异见下方三条注释）：
+        //  ① `0` 必须在钳制**之前**短路 —— 若写成 `clamp(v, 200, 10000)`，用户写 0 会被
+        //     静默夹成 200，于是"关掉定期 flush"的回退路径与负对照判据**同时失效**，
+        //     而现象是"看着已关闭、其实每 200ms 还在 flush"，没有任何报错。
+        //  ② 不用 GetPrivateProfileIntW：它对无法解析的值返回 0（实测：`abc` ⇒ 0），
+        //     而 0 在本键里**是有语义的值** ⇒ 手滑写错会被静默解读成"关闭本功能"。
+        //     改用 GetPrivateProfileStringW + 严格解析，解析失败回落 500 并走既有
+        //     pending_warnings 范式（同型先例 log_level_unparsed）。
+        //  ③ 用 wcstoul 而不是 std::stoul：本文件在**发布构建里没有 /EHsc**（见 CMakeLists），
+        //     stoul 抛出的 std::invalid_argument 会直接 terminate —— 一个手写的 ini 值就能
+        //     把游戏打死。wcstoul 不抛异常。
+        //
+        // 语义分界（**推算，未实测**；下列分界由解析规则直接推得，不是实测结论）：
+        //   · 键缺失              ⇒ 静默 500（ini 里不写这个键是合法的，发布模板会写）
+        //   · 纯十进制、0         ⇒ 0（关闭）
+        //   · 纯十进制、1..10000  ⇒ 原值；<200 ⇒ 200
+        //   · 纯十进制、>10000    ⇒ 10000（格式正确、仅超范围 ⇒ 钳制而非回落）
+        //   · 其它（空/符号/abc/x10/尾随垃圾）⇒ 500 + `log_flush_interval_unparsed` 告警
+        {
+            // 哨兵用不可能出现在 ini 里的控制字符：区分"键缺失"（正常，静默用默认）与
+            // "键存在但值为空"（写了没填，属手滑，值得告警）。两者若都用默认值判定，
+            // 空值要么被静默吞掉、要么把"没写这个键"也一起报警。
+            const wchar_t *const k_missing = L"\x01";
+            wchar_t flush_text[32] {};
+            GetPrivateProfileStringW(L"Log", L"flush_interval_ms", k_missing, flush_text,
+                                     static_cast<DWORD>(std::size(flush_text)), config_path.c_str());
+            const std::wstring flush_value(flush_text);
+            std::uint32_t parsed_interval = 500;
+            if (flush_value != k_missing)
+            {
+                // 只接受纯十进制数字：空串、"abc"、"500ms"、"0x10"、"-1"、" 500" 一律算解析失败。
+                // （wcstoul 会接受符号与前导空白，故先用字符集把这类输入挡掉，再交给它做数值转换。）
+                const bool all_digits =
+                    !flush_value.empty() &&
+                    std::all_of(flush_value.begin(), flush_value.end(),
+                                [](wchar_t c) { return c >= L'0' && c <= L'9'; });
+                if (!all_digits)
+                {
+                    g_config.logging.pending_warnings.push_back(
+                        std::string("log_flush_interval_unparsed value=") + narrow(flush_value) +
+                        " fallback=500");
+                }
+                else
+                {
+                    wchar_t *end = nullptr;
+                    const unsigned long raw = std::wcstoul(flush_value.c_str(), &end, 10);
+                    // 位数过多会溢出到 ULONG_MAX（errno=ERANGE）；它仍是"格式正确但超范围"，
+                    // 故与 10001 同样按上限钳制，而不是当成垃圾值回落默认。
+                    parsed_interval = static_cast<std::uint32_t>(raw > 10000ul ? 10000ul : raw);
+                }
+            }
+            // 0 = 关闭，原样保留；非 0 才钳制。
+            g_config.logging.flush_interval_ms =
+                (parsed_interval == 0) ? 0u : std::clamp<std::uint32_t>(parsed_interval, 200u, 10000u);
+        }
 
         // 分类覆盖：[Log.Categories] 段，每行 category=level
         wchar_t section[4096] {};
@@ -16753,6 +16817,7 @@ void initialize()
             static_cast<std::uint64_t>(g_config.logging.max_file_kb) * 1024ull;
         log_cfg.rotate_keep = g_config.logging.rotate_keep;
         log_cfg.queue_capacity = g_config.logging.queue_capacity;
+        log_cfg.flush_interval_ms = g_config.logging.flush_interval_ms;
         log_cfg.compat_prefix_categories = g_config.logging.compat_prefix_categories;
         blog::init(log_cfg);
         for (const auto &entry : g_config.logging.categories)
