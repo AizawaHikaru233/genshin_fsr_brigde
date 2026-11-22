@@ -507,6 +507,18 @@ volatile bool g_observe_only = true; // 1=只记录匹配，0=真正替换
 // 与 `g_stats_matched` **恒等** —— 是日志说谎（"created" 从未反映哈希量）。
 // 已移到哈希之后、判定之前。`created - matched` = 哈希了但未命中。
 
+// HookCopyResource 命中计数（2026-11-22）。**口径必须与 [stat] 行一起读**：
+//   · 仅当 dst 当前位于活跃替换集（ActiveContains 通过）时才自增；未通过不计；
+//   · **不是** CopyResource 的调用总次数，也**不是**被触及的纹理数 ——
+//     同一条资源每帧被拷贝一次就重复计入一次；
+//   · 属**累计**计数（进程生命周期内单调递增，不在任何地方清零）。
+// 用途：判别「实机上这条路径到底会不会发生」。它是判定是否保留该钩子的唯一依据，
+// 所以口径必须窄 —— 计宽了就回答不了这个问题。见 docs/OPEN-ISSUES.md。
+// 为什么用 std::atomic 而不是同区域的 volatile long + InterlockedIncrement：
+// 见 AGENTS.md §二.4（volatile 不是同步原语）。此处是渲染线程自增、退出时读，
+// 用 relaxed 顺序即可（只要求不丢增量，不需要跨变量的可见性顺序）。
+std::atomic<long> copyresource_hit_calls{0};
+
 // ---------------------------------------------------------------------------
 // 原始函数指针
 // ---------------------------------------------------------------------------
@@ -1091,19 +1103,51 @@ static void STDMETHODCALLTYPE HookUpdateSubresource(
 }
 
 // ---------------------------------------------------------------------------
-// Hook: CopyResource — 与 UpdateSubresource 同理标记动态纹理
+// Hook: CopyResource —— 保留钩子，但**不再**标记动态（2026-11-22，有意取舍）
 // ---------------------------------------------------------------------------
 //
-// ⚠️ 2026-09-23：原实现**只** hook 了 `UpdateSubresource`，
-// 于是"创建时带初始数据（被我们哈希并替换）、之后由游戏用 `CopyResource`
-// 覆写内容"的纹理不会被标记为动态 ⇒ 替换纹理**过期**（画面与游戏状态不一致），
-// 且这种不一致只在特定角色/特效上出现，很难归因。
+// 钩子保留的唯一目的：低成本判别「实机上这条路径到底会不会发生」（计数见
+// copyresource_hit_calls）。它**不再**影响任何替换行为。
 //
-// 为什么**不**同时 hook `Map`/`Unmap`：纹理经 `Map` 更新要求
-// `D3D11_USAGE_DYNAMIC`/`STAGING`，而 `HookCreateTexture2D` 只对**带初始数据**
-// 的纹理算哈希 —— 这类纹理极少同时满足；反观 `Map`/`Unmap` 是**极热路径**
-// （每帧大量常量缓冲/顶点缓冲都走它），为覆盖罕见情形而给它加一次线性扫描不划算。
-// 该限制在此显式记录（"补 hook 或文档明确限制"两条路，此处各取一半）。
+// ---- 为什么保留钩子，却不再 MarkDynamic ----
+// 2026-09-23 加这个钩子的意图是防「替换纹理过期」：纹理创建时被我们哈希并替换，
+// 之后游戏用 CopyResource 覆写它的内容；若不标记动态，绑定时仍会替换
+// ⇒ 画面与游戏状态不一致。该意图本身没错，错的是选的手段：
+// MarkDynamic() 经 SetPrivateData 把标记打在**原纹理**上，而 D3D11 的私有数据
+// **不可撤销**（SetPrivateData 只能覆盖，没有删除语义），绑定慢路径的 IsDynamic()
+// 于是**永久**跳过该纹理的替换。结果与意图正好相反：不是「不再过期」，
+// 而是**替换被永久放弃**。
+//
+// ---- 失效形态 ----
+// 该原纹理从第一次 CopyResource 起就不再被替换，直到这张纹理被销毁重建为止。
+// 玩家看到的就是「这张贴图的 mod 不生效」。
+// 而日志里**没有任何痕迹**：MarkDynamic 只写资源私有数据、本身不打日志，绑定热路径
+// 又是无日志的快速判定 —— 这正是该问题长期被误判成「N 卡驱动的纹理创建/上载时机」的原因。
+//
+// ---- 与 25678cc 的原注释相反，这是【有意】取舍，不要改回去 ----
+// 原注释断言「不标记动态 ⇒ 替换过期」。该断言的前提成立，但它默认了「过期」比
+// 「永久不替换」轻；实测结论相反：过期只是内容不跟手，永久不替换是 mod 整体失效。
+// 可验证依据（同一台机器、同一份 Mod、GPU 像素读回，A/B 两个构建）：
+//   · 含本钩子（HEAD 2.5.0.0）：CopyResource 之后读回**游戏原色** ⇒ 替换丢失；
+//   · 无本钩子（2.2.0）：同样操作后读回 **mod 颜色** ⇒ 替换保持；
+//   · 对照：不做 CopyResource 时两个构建都保持替换；observe_only=1 时不替换
+//     ⇒ 读回链路本身不是「恒绿」，红色确实来自替换丢失。
+// 复现步骤、逐例数据与「计数为 0 的三态解释」见 docs/OPEN-ISSUES.md 的
+// TextureLoader 条目。若要重新引入「跳过替换」，必须改用**可撤销**的判据
+// （例如按内容版本号在有限时间内过期），不能再用不可撤销的资源级标记。
+//
+// ---- 注意：想按 desc 对账时，Usage 会改哈希 ----
+// CalcTexture2DDescHash() 对**整个** D3D11_TEXTURE2D_DESC 做 CRC-32C
+//（texture_hash.cpp：crc32c_hw(data_hash, pDesc, sizeof(D3D11_TEXTURE2D_DESC))），
+// Usage 字段就在被哈希的范围内 ⇒ 「改 Usage 再比哈希」必然对不上：同一张纹理
+// 的 IMMUTABLE 与 DEFAULT 哈希并不相同（实测 0x63EAE7C3 / 0x91E6EA3D）。
+// 要对账只能用**实际提交创建时的那份 desc** 重算。
+//
+// 为什么**不**同时 hook `Map`/`Unmap`（沿用 2026-09-23 的结论，未变）：
+// 纹理经 `Map` 更新要求 `D3D11_USAGE_DYNAMIC`/`STAGING`，而 `HookCreateTexture2D`
+// 只对**带初始数据**的纹理算哈希 —— 这类纹理极少同时满足；反观 `Map`/`Unmap` 是
+// **极热路径**（每帧大量常量缓冲/顶点缓冲都走它），为覆盖罕见情形而给它加一次
+// 线性扫描不划算。该限制在此显式记录。
 
 typedef void(STDMETHODCALLTYPE *CopyResource_t)(ID3D11DeviceContext *,
     ID3D11Resource *, ID3D11Resource *);
@@ -1114,16 +1158,19 @@ static void STDMETHODCALLTYPE HookCopyResource(
     ID3D11Resource *pDstResource,
     ID3D11Resource *pSrcResource)
 {
-    // 与 HookUpdateSubresource 同构：先无锁判空（替换未启用时零开销），
-    // 命中活跃替换资源才进锁查 hash、标记动态并移出活跃数组。
+    // 先无锁判空（替换未启用时零开销）。本分支**不再**标记动态、也不再移出活跃数组：
+    // 见上方注释 —— 那个标记不可撤销，会让该纹理永久失去替换。
+    // 这里只累计 copyresource_hit_calls，口径见其声明处：**仅** ActiveContains 通过才计，
+    // 不是 CopyResource 调用总数、也不是被触及的纹理数（同一资源每帧可重复计入）。
     if (pDstResource && g_activeCount != 0) {
         if (ActiveContains(pDstResource)) {
-            uint32_t h = 0;
-            std::lock_guard<std::mutex> lk(g_lock);
-            if (GetResourceHash(pDstResource, &h)) {
-                MarkDynamic(pDstResource);
-                ActiveRemove(pDstResource);
-            }
+            // relaxed 即可：只要求增量不丢，不需要与其他变量建立可见性顺序（AGENTS.md §二.4）。
+            const long n = copyresource_hit_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+            // 限流：首次与每 1024 次各打一行（与 ActiveAdd 的 dropped 同写法）。
+            // **不能**每次命中都打 —— 本钩子可能每帧命中多次，而 log.cpp 每行 fflush，
+            // 那就是渲染线程上每秒上万次写盘系统调用（同文件 [bind] 行 2026-09-24 的实测教训）。
+            if (n == 1 || (n % 1024) == 0)
+                TL_LOG(L"[copy] CopyResource hit on replacement dst: n=%ld (cumulative, not call count)", n);
         }
     }
     g_real_copy_resource(This, pDstResource, pSrcResource);
@@ -2298,17 +2345,47 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         // 但从未被任何地方读取**（write-only 死存储）。于是上一批
         // "修正 g_stats_created 语义（原来与 matched 恒等）" 的改动
         // **没有任何可观测效果，也无法验收**。把汇总打出来，三个计数才有意义：
-        //   hashed  = 带初始数据、被哈希过的纹理数
-        //   matched = 其中命中 mod 覆盖的
-        //   bound   = 替换 SRV 实际被绑定的次数
+        //   hashed  = 带初始数据、被哈希过的纹理数【累计】
+        //   matched = 其中命中 mod 覆盖的【累计】
+        //   bound   = 替换 SRV 实际被绑定的次数【累计】
         //   hashed - matched = 哈希了但没命中（判断 mod 覆盖范围的关键量）
+        //
+        // 2026-11-22 追加的四个字段，各自口径必须连同本行一起读（AGENTS.md §五.6）：
+        //   copy_hits = copyresource_hit_calls【累计】—— 仅当 CopyResource 的 dst
+        //               当时位于活跃替换集时才计（见其声明处）；**不是** CopyResource
+        //               调用总次数，**不是**被触及的纹理数（同一资源每帧可重复计入）。
+        //   active    = g_activeCount【**当前状态·退出时刻快照**】—— 此刻活跃替换资源
+        //               的条目数。⚠️ 它**不是**「本局是否有过活跃替换」的证据：原纹理
+        //               销毁时 ReplacementTracker 会调 ActiveRemove，所以一局里替换全程
+        //               生效、退出时仍可能读到 0（实测：bound>0 与 active=0 共存）。
+        //               要证明「替换在该局生效过」，用同行的【累计】字段 matched>0 且 bound>0。
+        //   overflow  = g_activeOverflow【累计】—— activeArr(4096) 写满而**静默丢弃**
+        //               的登记次数，进程内不清零。
+        //   observe   = g_observe_only【**当前状态**】—— 1=只记录匹配、不真正替换；
+        //               它是配置值、整局恒定，故当前值即整局口径。
+        //
+        // ⚠️ 读 copy_hits=0 时必须先排除三种「本来就不会计数」的情形，否则会把
+        //   「替换没启用」读成「这条路径没发生」。前置条件一律用【累计】字段判，
+        //   **不要**用 active（见上：退出时为 0 不代表没生效）：
+        //   observe=1 ⇒ 替换根本没启用（ActiveAdd 只在非 observe-only 分支调用）
+        //     ⇒ copy_hits 必然 0，**不构成任何证据**；
+        //   overflow>0 ⇒ 有条目被静默丢弃、活跃集不完整 ⇒ 不构成证据；
+        //   matched=0 或 bound=0 ⇒ 本局没命中过替换 / 从未绑定替换 SRV ⇒ 不构成证据。
+        //   只有 observe=0 且 overflow=0 且 matched>0 且 bound>0 时，copy_hits=0 才
+        //   说明本局该路径**未发生**（≠「不是这个机制」，仍需查其他原因）。
+        // 注：observe 用 (int) 显式转换传入 varargs，使口径一眼可见。
         {
             std::lock_guard<std::mutex> lk(g_lock);
-            TL_LOG(L"[stat] hashed=%ld matched=%ld bound=%ld cache_entries=%u cache_MB=%u bind_log_suppressed=%llu",
+            TL_LOG(L"[stat] hashed=%ld matched=%ld bound=%ld cache_entries=%u cache_MB=%u "
+                   L"bind_log_suppressed=%llu copy_hits=%ld active=%ld overflow=%ld observe=%d",
                    g_stats_created, g_stats_matched, g_stats_bound,
                    (unsigned)g_replacements.size(),
                    (unsigned)(g_cacheBytesTotal.load(std::memory_order_relaxed) / (1024ull * 1024ull)),
-                   (unsigned long long)g_bind_log_suppressed.load(std::memory_order_relaxed));
+                   (unsigned long long)g_bind_log_suppressed.load(std::memory_order_relaxed),
+                   copyresource_hit_calls.load(std::memory_order_relaxed),
+                   g_activeCount.load(std::memory_order_relaxed),
+                   g_activeOverflow.load(std::memory_order_relaxed),
+                   (int)g_observe_only);
         }
         // 进程退出：统一释放全局持久化的替换缓存（正常运行时不随原纹理销毁，
         // 退出时一次清空；进程卸载后驱动侧资源由系统回收，此处显式 Release）

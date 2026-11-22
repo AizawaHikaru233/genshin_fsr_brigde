@@ -52,6 +52,9 @@ SharedResources/ReShade/runtime/ReShade32.dll
 # Local research trees and diagnostic artifacts are not release sources
 experiments/
 external/
+# probe/：独立诊断探针（EXE 源码 + 构建产物 + 运行输出）。按 AGENTS.md §一.7，
+# 探针证据不入库；结论要么进 docs/OPEN-ISSUES.md，要么进 commit message。
+probe/
 GIDx11Probe/
 GIDx11Trace/
 GenericFsrGpuProbe/

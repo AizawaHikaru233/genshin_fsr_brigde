@@ -34,6 +34,7 @@
 | `ID3D11Device::CreateTexture2D` | 对带初始数据的纹理计算 3DMigoto 兼容哈希；命中则登记替换（refcount++、挂 ReplacementTracker、登记活跃数组、丢异步加载队列） |
 | `ID3D11DeviceContext::PSSetShaderResources` / `VS` / `GS` / `HS` / `DS` / `CS` | 六个阶段统一替换（飘带/布料在 VS/CS 采样，只换 PS 会导致阶段间数据不一致） |
 | `ID3D11DeviceContext::UpdateSubresource` | 被替换后的纹理若再被更新 → 标记动态，绑定慢路径跳过（避免闪烁） |
+| `ID3D11DeviceContext::CopyResource` | 保留钩子**仅累计计数**（`copyresource_hit_calls`，判定该路径在实机是否发生），**不**标记动态、**不**移出活跃数组：这个标记不可撤销，会让纹理永久失去替换。失效形态与取舍理由见 `TextureLoader.cpp` 中 `HookCopyResource` 上方注释，未决事项见 `docs/OPEN-ISSUES.md` |
 
 ## 2. 哈希算法（3DMigoto 兼容，逐字移植）
 
