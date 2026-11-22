@@ -53,6 +53,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iterator> // std::size（flush_interval_ms 的截断检测用）
 #include <mutex>
 #include <new> // std::nothrow（RouteSnapshot 发布用：分配失败不能抛异常穿出设备创建 hook）
 #include <optional>
@@ -4757,14 +4758,21 @@ void load_config()
         //   · 纯十进制、1..10000  ⇒ 原值；<200 ⇒ 200
         //   · 纯十进制、>10000    ⇒ 10000（格式正确、仅超范围 ⇒ 钳制而非回落）
         //   · 其它（空/符号/abc/x10/尾随垃圾）⇒ 500 + `log_flush_interval_unparsed` 告警
+        //   · 超长（≥63 宽字符，会被 GetPrivateProfileStringW 截断）⇒ 500 +
+        //     `log_flush_interval_too_long` 告警（不静默截断后照用，见 flush_truncated）
         {
             // 哨兵用不可能出现在 ini 里的控制字符：区分"键缺失"（正常，静默用默认）与
             // "键存在但值为空"（写了没填，属手滑，值得告警）。两者若都用默认值判定，
             // 空值要么被静默吞掉、要么把"没写这个键"也一起报警。
             const wchar_t *const k_missing = L"\x01";
-            wchar_t flush_text[32] {};
-            GetPrivateProfileStringW(L"Log", L"flush_interval_ms", k_missing, flush_text,
-                                     static_cast<DWORD>(std::size(flush_text)), config_path.c_str());
+            wchar_t flush_text[64] {};
+            const DWORD flush_copied =
+                GetPrivateProfileStringW(L"Log", L"flush_interval_ms", k_missing, flush_text,
+                                         static_cast<DWORD>(std::size(flush_text)), config_path.c_str());
+            // 截断检测：返回值达到缓冲上限 -1 说明原值可能更长，此时 flush_text 是被**静默
+            // 截断**的前缀。不检测的话，一个超长但数字合法的写法（如 40 个 '0' + "500"）
+            // 会被截成合法数字并原样应用，既不告警也不回落 —— 用户改了值却不知道没生效。
+            const bool flush_truncated = (flush_copied >= std::size(flush_text) - 1);
             const std::wstring flush_value(flush_text);
             std::uint32_t parsed_interval = 500;
             if (flush_value != k_missing)
@@ -4775,11 +4783,12 @@ void load_config()
                     !flush_value.empty() &&
                     std::all_of(flush_value.begin(), flush_value.end(),
                                 [](wchar_t c) { return c >= L'0' && c <= L'9'; });
-                if (!all_digits)
+                if (!all_digits || flush_truncated)
                 {
                     g_config.logging.pending_warnings.push_back(
-                        std::string("log_flush_interval_unparsed value=") + narrow(flush_value) +
-                        " fallback=500");
+                        std::string(flush_truncated ? "log_flush_interval_too_long value="
+                                                    : "log_flush_interval_unparsed value=") +
+                        narrow(flush_value) + " fallback=500");
                 }
                 else
                 {
