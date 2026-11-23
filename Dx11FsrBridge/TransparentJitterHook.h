@@ -49,6 +49,8 @@
 //   失败原因的 `reason` 由调用方记录（见 install 的 out_reason）。
 //   **刻意没有任何每帧 / 首次观测 / 心跳日志** —— 那三样是调查期临时产物，
 //   在正式版里既刷屏又没有新信息（观测计数仍可用下面的 API 读到）。
+//   （2026-11-23：心跳由桥侧 FSR2 dispatch 路径输出，标签 `periodic=1`；本模块自身仍只在
+//   install / shutdown 两处输出。）
 //
 // 定位方式（**不写死 RVA** —— 国服/国际服是两份不同构建，写死地址是客户端专用的）：
 //   ① 锚点 = `FFX_FSR2.ConfigureJitteredProjectionMatrix`，由既有的

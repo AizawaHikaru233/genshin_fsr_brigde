@@ -13761,6 +13761,65 @@ bool try_fsr2_translation_draw(
                             hex64(reinterpret_cast<std::uint64_t>(motion_tex)) +
                             " out=" + hex64(draw_out_ptr));
                     }
+                    // 2026-11-23（运行期会话汇总 · 二次定位）：原先挂在 `hooked_present`，但实测
+                    //   26/26 份日志 `present frame=` 为 0、且每份都有 d3d11 create 导入扫描失败的告警
+                    //   ⇒ 本游戏的注入方式下 Present 钩子从不安装，那条路径是死代码。
+                    //   FSR2 dispatch 成功路径每帧都在跑（`ffx12_result` 稳定输出可证），故心跳落在这里。
+                    //   为什么先看 `dcount` 再取时钟：避免每帧都调 GetTickCount64；1024 次才碰一次时钟。
+                    //   `hooked_present` 里的同款输出已删 —— 否则在能挂上 Present 的环境里会重复打两行。
+                    //   口径（AGENTS.md §五.6，逐项自明；不要按「这些全是累计值」读）：
+                    //     *_total      —— 进程内**累计**计数，从不重置，不是窗口值、也不是速率；
+                    //     saw_*_sticky —— **粘性布尔**（一度见过，之后恒为真），不是计数；
+                    //     dispatch_total —— 本 TU 的 FFX2 dispatch 成功**累计**次数（即 dcount）；
+                    //     period_s=30  —— **名义下限**：只在 dcount 命中 1024 倍数时评估一次，
+                    //                     dispatch 慢或本局从未跑满 1024 次时实际间隔更长/不出；
+                    //                     首条只要 uptime ≥ 30 s 且命中倍数即发 ⇒ 它**不是**实测秒数；
+                    //     has_obs=0    —— 本会话尚未观测过 jitter 钩子；此时 last_value **无意义**（填 0）。
+                    //                     `calls_total=0` 是同一件事的一侧：jitter 观测点从未被调用
+                    //                     （与「钩子没装上」是两回事，后者看 `transparent_jitter_installed` 行）；
+                    //     last_value   —— 最近一次观测到的**原始值**（uint8_t 原始字节，通常 0/1）。
+                    //   ⚠️ 帧号字段已省略：本游戏 Present 钩子不安装 ⇒ `g_state.frame_index` 恒 0，
+                    //     给出帧号只会误导（原 last_obs_frame / present_frame 已删）。
+                    //   读值顺序：计数与粘性布尔**先**取，last_observation() **最后**取 —— 反过来会打出
+                    //     calls_total=1 却 has_obs=0 的自相矛盾行（先读的那批早于观测点）。
+                    //   ⚠️ 字段**非原子快照**：各字段是逐条 relaxed 读，极端竞态下一次 setter 调用可能落在
+                    //     两次读之间 ⇒ 罕见地出现 calls_total=0 而 saw_true_sticky=1（或 overridden > calls）。
+                    //     这个窗口可接受：纳秒级、每个字段在其读取瞬间都为真、下一条行自纠 —— **不要当 bug 查**。
+                    static std::atomic_uint64_t last_jitter_heartbeat_tick { 0 };
+                    if (transparent_jitter::active() && (dcount & 1024ull - 1ull) == 0)
+                    {
+                        const ULONGLONG heartbeat_now = GetTickCount64();
+                        std::uint64_t last_hb = last_jitter_heartbeat_tick.load(std::memory_order_relaxed);
+                        if (heartbeat_now - last_hb >= 30000 &&
+                            last_jitter_heartbeat_tick.compare_exchange_strong(
+                                last_hb, heartbeat_now, std::memory_order_relaxed))
+                        {
+                            const std::uint64_t calls_total_now = transparent_jitter::observed_count();
+                            const std::uint64_t overridden_total_now = transparent_jitter::overridden_count();
+                            const bool saw_false_sticky_now = transparent_jitter::saw_false();
+                            const bool saw_true_sticky_now = transparent_jitter::saw_true();
+                            std::uint8_t last_value = 0;
+                            // camera / frame 两个出参都不取（传 nullptr）：本行不输出它们，取了就是「取了不用」。
+                            const bool has_obs =
+                                transparent_jitter::last_observation(&last_value, nullptr, nullptr);
+                            // 最坏长度实算 216 字符 = **217 字节含 NUL**（3 个 %llu 各取 u64 满 20 位 = 60，
+                            // last_value 取 uint8_t 满值 255 记 3 位，其余 3 个 %d 各 1 位）⇒ 320 余 103。
+                            // 截断是**静默**的（snprintf 只返回应写长度，日志照常输出半行），故不留这个风险。
+                            char heartbeat_buf[320] {};
+                            std::snprintf(heartbeat_buf, sizeof(heartbeat_buf),
+                                "transparent_jitter_stats periodic=1 period_s=30"
+                                " calls_total=%llu overridden_total=%llu saw_false_sticky=%d"
+                                " saw_true_sticky=%d has_obs=%d last_value=%d dispatch_total=%llu",
+                                static_cast<unsigned long long>(calls_total_now),
+                                static_cast<unsigned long long>(overridden_total_now),
+                                saw_false_sticky_now ? 1 : 0,
+                                saw_true_sticky_now ? 1 : 0,
+                                has_obs ? 1 : 0,
+                                static_cast<int>(has_obs ? last_value : 0),
+                                static_cast<unsigned long long>(dcount));
+                            LOG_INFO(blog::cat::probe, std::string(heartbeat_buf));
+                        }
+                    }
                     // 首次成功时上报实际 FSR 版本（含降级结果）
                     {
                         static std::atomic_bool focus_logged { false };
@@ -17155,7 +17214,8 @@ void initialize()
         }
         // 成功时**不在这里再打一行**：模块自己打的 `transparent_jitter_installed ...`
         // 已经含定位来源 / setter RVA / 调用点静态常量 / 是否强制 —— 那是本功能在正式版里
-        // 唯一的常驻安装日志（逐帧观测行与心跳行已移除，见 TransparentJitterHook.h）。
+        // 唯一的常驻安装日志（**本模块**的逐帧观测行与心跳行已移除；运行期心跳由桥侧
+        // FSR2 dispatch 路径输出，标签 `periodic=1`，见 TransparentJitterHook.h）。
     }
     else
     {

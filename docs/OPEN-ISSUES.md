@@ -658,6 +658,83 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 
 ---
 
+## 9. 本游戏的退出路径不执行 `DllMain(DLL_PROCESS_DETACH)` 与 CRT `atexit`
+
+**现状**
+
+- 桥 DLL 由启动器**运行时注入**（不是静态导入）。实测（2026-11-23，一局约 1 分 34 秒）：
+  进程结束时 `DllMain(DLL_PROCESS_DETACH)` 与 CRT `atexit` 处理器**都没有执行**。
+- 判据（任一命中即说明 DETACH 期代码跑过）：日志里出现 **不含 `periodic=` 的** `transparent_jitter_stats` 行、
+  `[SHUTDOWN]`、`uninstall_hooks`、`blog_shutdown`。**26 份历史日志里这几项各 0 命中**，而每一份都有安装期行。
+  ⚠️ **必须排除 `periodic=1` 的行**：该前缀另有**运行期心跳**输出（标签 `periodic=1`，字段为
+  `period_s` / `calls_total` / `overridden_total` / `saw_*_sticky` / `has_obs` / `last_value` / `dispatch_total`，
+  由 FSR2 dispatch 成功路径每 30 秒发一次）。心跳与退出路径无关，把它当判据会得到**必然为真**的假阳性。
+- 同一局的侧车诊断 trace 也停在安装期，`DETACH` 阶段一行都没有；同时**没有**错误通道记录
+  ⇒ 是「没执行」，不是「执行了但写入失败」。
+- 启动器日志里没有结束游戏/终止进程的记录，也没有崩溃记录 ⇒ 是**游戏自己在退出时终止进程**，
+  这是带自我保护的游戏面对注入型 DLL 时的常见做法。
+
+**影响**
+
+- **任何放在 DETACH / `atexit` 里的代码在本游戏上等于死代码**，包括：
+  - `transparent_jitter::shutdown()` 的会话汇总行 —— 该功能上线以来日志里从未出现过；
+  - `DetourDetach` 的钩子摘除（进程即将结束，不影响运行；但「卸载钩子」这条路径从未被执行过，
+    任何依赖它的推断都不成立）；
+  - `blog::shutdown()` 的收尾（日志结尾不是它刷出来的，而是靠周期性 flush）。
+- 因此**不能用「退出时打一行汇总」作为任何功能的观测手段** —— 看起来最自然的位置恰好不执行。
+
+**推进需要**
+
+- 会话级统计必须改成**运行期低频输出**（心跳），不能依赖退出路径。
+- 若确实需要在退出时做事，必须先证明哪种退出方式会执行 DETACH。已知它并非**永远**不执行
+  （有过一次记录到 DETACH 期的运行）⇒ 排查任何「退出时没生效」的问题时，
+  **必须先确认这次退出到底走没走到 DETACH**，不能假设。
+
+**相关代码位置**
+
+- `Dx11FsrBridge/Dx11FsrBridge.cpp`：`DllMain` 的 `DLL_PROCESS_DETACH` 分支、`hooked_present`
+- `Dx11FsrBridge/TransparentJitterHook.cpp`：`shutdown()`
+- `Dx11FsrBridge/BridgeLogger.cpp`：`blog::shutdown()`
+
+---
+
+## 10. 桥的 `Present` 钩子在本游戏的启动方式下从不执行
+
+**现状**
+
+- 实测 **26/26 份日志**里 `present frame=` 出现 **0 次**（该行是 `[INFO]` 级、`[core]` 分类，
+  日志级别为 `INFO` 时会写出，所以不是被等级挡掉的）。
+- 同一份日志里 **26/26** 都有 `warning no d3d11 create import hooks found; possible reasons:
+  already-created device, GetProcAddress path, or module loaded later`（启动器在设备创建后注入）。
+- 但交换链 vtable **确实被打了补丁**：`vtable_clone_result what=swapchain … patches=7 action=installed`。
+- 仓库只钩了 `k_idx_present = k_swapchain_base_methods + 0`（即 `IDXGISwapChain::Present`），
+  **全仓库没有 `Present1` 的处理**。若游戏调用 `IDXGISwapChain1::Present1`（不同 vtable 槽位），
+  本钩子就永远不会被调用。
+
+**影响**
+
+- **所有挂在 Present 路径上的功能都是死代码**（本游戏上），包括：`present frame=` 日志、
+  `present_probe`、`fsr2_runtime_status`、`tone_map_hdr_backbuffer_to_sdr`、`flush_final_scene_probe`、
+  `poll_final_scene_snapshot`、异步交叠（`async_upscale`）等。
+- **`g_state.frame_index` 恒为 0**（它只在 Present 钩子里自增）⇒ 任何拿它当帧号的字段（含
+  `TransparentJitterHook` 的 `last_frame`）都恒为 0，看起来像"功能没跑"，实际是**帧号来源失效**。
+- 推论：**不要把需要确定性执行的东西放在 Present 路径上**。会话汇总一次就栽在这里
+  （放在 Present 里的心跳在实机上一行都没出来）。
+
+**推进需要**
+
+- 先**证实**游戏到底调哪个：在交换链 vtable 的 `Present` 与 `Present1` 两个槽位分别下钩并各自打一条
+  一次性日志（或在 `hooked_present` 里打一条**不受等级门控**的探针）。**在证伪 `Present1` 假设之前，
+  不要据此改架构**。
+- 若确认是 `Present1`：需要同时钩两个槽位，或改在二者共同的下游（如游戏的 FFX2 dispatch 路径）取帧号。
+- 帧号来源修复前，任何依赖帧号的判据都应改用**调用计数**（`TransparentJitterHook` 已有 `calls` 回退，
+  但它只在 `frame_provider` 为空时才生效，而 provider 恒非空 ⇒ 回退从来不走）。
+
+**相关代码位置**
+
+- `Dx11FsrBridge/Dx11FsrBridge.cpp`：`k_idx_present`、`hooked_present`、`g_state.frame_index` 的自增点、
+  `transparent_jitter_frame()`
+- `Dx11FsrBridge/TransparentJitterHook.cpp`：`frame_provider` 的取值与「无 provider 时回退到 `calls`」分支
 ## 已解决
 
 ### issue #19「NVNGX 启动即静默退出」（2026-11-23）

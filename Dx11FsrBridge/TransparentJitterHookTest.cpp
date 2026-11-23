@@ -321,7 +321,7 @@ void run_install_tests()
     for (int i = 0; i < 1000; ++i)
         flag(&noisy_camera, false);
     CHECK(g_line_count == lines_before_noise,
-          "log: 1000 次调用**不产生任何新日志行**（心跳行与每帧观测行已移除）");
+          "log: 1000 次调用**不产生任何新日志行**（**本模块**的心跳行与每帧观测行已移除）");
     CHECK(!any_line_has("jitter_flag value="),
           "log: 旧格式逐次观测行 (jitter_flag value=...) 已彻底消失");
 
