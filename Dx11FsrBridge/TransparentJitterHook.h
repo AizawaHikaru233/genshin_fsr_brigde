@@ -94,6 +94,31 @@ struct Config
 using LogSink = void (*)(const char *line);
 void set_log_sink(LogSink sink);
 
+// 2026-11-23（诊断探针）：本模块的**第二**出口，只服务于"为什么 shutdown 的 stats 行没出现"。
+//
+// 为什么不能直接用日志出口：要判的正是日志系统本身（blog::enabled 首行
+// `if (!g_active) return false`）。用日志观测日志 = 循环论证 —— 没有输出既可能是
+// "没执行"，也可能是"没通道"。这个出口把"走到哪一步"写进侧车文件，与日志通道无关。
+//
+// 为什么不直接调侧车写函数：本 TU 刻意**不依赖 BridgeLogger、也不依赖 TjTraceProbe**
+// （单测只编译 TransparentJitterHook.cpp + Windows API）。以函数指针注入，
+// **未注入时全部埋点是空操作** ⇒ 单测与任何不注入的调用方行为完全不变。
+//
+// 参数含义：stage 是静态字符串；a/b 按 int、c/d 按 unsigned long long，
+// 由注入方决定怎么落盘（当前实现见 Dx11FsrBridge.cpp 的 tj_probe_sink()）。
+using ProbeSink = void (*)(const char *stage, int a, int b, unsigned long long c, unsigned long long d);
+void set_probe_sink(ProbeSink sink);
+
+// 2026-11-23（诊断探针 / 审核 R4）：日志出口**当前是否已注册**（一次原子读）。
+// 为什么需要它：注册埋点原先写死 `sink=1`，而 `step=before` 那条发生在 set_log_sink **之前**，
+// 彼时出口实为 nullptr ⇒ 那个字段读出来是假的。宁可真读一次，也不要一个恒为 1 的"测量值"。
+bool has_log_sink();
+
+// ⚠️ ProbeSink 的实现方（Dx11FsrBridge.cpp）**读不到**本模块匿名命名空间里的
+// g_active / g_target / g_stub / g_log_sink —— 那些量在 TransparentJitterHook.cpp 内部。
+// 因此数值一律由**本 TU 在调用那一刻自己取好**再传进来（a/b 按 int、c/d 按 uint64），
+// 每个埋点的字段顺序在 TransparentJitterHook.cpp 的调用点就地写明（判读表据此对齐）。
+
 // 帧号来源（由调用方注入；为空则退回本模块自己的调用计数）。
 using FrameProvider = std::uint64_t (*)();
 void set_frame_provider(FrameProvider provider);

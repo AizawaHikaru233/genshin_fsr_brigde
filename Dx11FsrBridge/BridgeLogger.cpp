@@ -3,6 +3,9 @@
 // ============================================================================
 
 #include "BridgeLogger.h"
+// 2026-11-23（诊断探针）：侧车 trace 写入单元。本头不依赖 windows.h / 任何桥的头，
+// 故可以直接包含（本 TU 刻意只依赖 BridgeLogger.h，见文件顶部说明）。
+#include "TjTraceProbe.h"
 
 #include <windows.h>
 
@@ -546,8 +549,25 @@ void init(const Config &config)
 
 void shutdown()
 {
+    // 2026-11-23（诊断探针）：blog 侧的三条时间戳。要判的是 transparent_jitter_stats 为什么
+    // 没落盘，而 stats 是经 LOG_INFO(probe) 走的 —— 若本函数在它之前把 g_active 置 false，
+    // enabled() 首行就会把那一行吞掉，且日志里看不出任何异常。故这里必须留下落盘级证据。
+    //
+    // ⚠️ 如实标注：这**不是纯格式改动**。对下面那条 if 做了两件事：
+    //    ① 展开成大括号块（原为单语句块，无大括号）；
+    //    ② 在提前返回分支**内部新增一条** tjtrace::write。
+    //    判据文本与 return 语句逐字未变（git diff -U0 无删除行），但控制流块内已多一条语句。
+    //    新增语句只写侧车文件：不改返回值、不改是否 return、不改任何既有状态。
     if (!g_active.exchange(false, std::memory_order_relaxed))
+    {
+        // 这条路径说明 shutdown 被调了第二次（DllMain(DETACH) 与 atexit 都调本函数）。
+        tjtrace::write("blog_shutdown_already_inactive", nullptr, nullptr, nullptr, nullptr, nullptr,
+                       nullptr);
         return;
+    }
+    // exchange 返回 true ⇒ 本次调用真的拿到了"从活到死"的转换，此后的日志全部被吞。
+    // 这一行与 tj_shutdown_enter 谁先谁后，直接决定 stats 那一行还有没有机会落盘。
+    tjtrace::write("blog_shutdown_enter", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     // 两阶段停机：
     //   1) 等 writer 把队列排空（最多 500ms）；
     //   2) 置 g_alive=false 通知 writer 收尾并**由它自己关闭文件**，
@@ -624,6 +644,18 @@ void shutdown()
                           writer_stopped ? 1 : 0, lock_ok ? 1 : 0, file_open) > 0)
             debugger_marker(marker);
     }
+    // 2026-11-23（诊断探针）：函数末尾（debugger_marker 之后）—— 与上面的 ODS 同一组值，
+    // 但走侧车文件而不受 [Log] to_debugger 门控（生产默认 0，ODS 那条永远看不到）。
+    // 这三个值的含义见上方注释里的四种组合；判读 G5 时看它：
+    //   writer_stopped=1 lock_ok=1 file_open=0 是正常退出的常态。
+    // 2026-11-23（审核 R2）：额外带上 dropped= —— 队列满时 push 丢最旧并只给 g_dropped +1，
+    // 而 trace 原本看不到这个计数器 ⇒「sink 返回了 + 日志里没有 stats」既可能是"入队后没落盘"，
+    // 也可能是"入队时就被丢了"。带上它就能分开：dropped=0 ⇒ 不是被丢的（收敛到 G5）；
+    // dropped>0 ⇒ 两种都还在。这里只多一次 relaxed 原子读，不取锁、不分配。
+    tjtrace::write("blog_shutdown_exit", nullptr, nullptr, nullptr, nullptr, nullptr,
+                   "writer_stopped=%d lock_ok=%d file_open=%d dropped=%llu",
+                   writer_stopped ? 1 : 0, lock_ok ? 1 : 0, file_open,
+                   static_cast<unsigned long long>(g_dropped.load(std::memory_order_relaxed)));
 }
 
 bool compat_prefix_enabled()

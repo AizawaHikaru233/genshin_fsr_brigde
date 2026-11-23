@@ -26,6 +26,12 @@
 #include "Fsr2InputDump.h"
 #include "BridgeLogger.h"
 #include "PerfProbe.h"
+// 2026-11-23（诊断探针）：侧车 trace 写入单元（只用 kernel32、**常态不取锁**、不碰 CRT 流）。
+// （2026-11-23 / 审核 R5 残留：不写成绝对的"不取锁" —— 若进程曾调 `setlocale`，UCRT 的
+//  `snprintf` 会取 `__acrt_locale_lock`。例外与依据见 TjTraceProbe.h 顶部"纪律"第 2 条。）
+// 独立 TU 的理由见 TjTraceProbe.h 顶部：本文件 / BridgeLogger.cpp / TransparentJitterHook.cpp
+// 三方都要写 trace，而其中 BridgeLogger.cpp 刻意不 include 桥的头。
+#include "TjTraceProbe.h"
 // 旧方案（On12 引导 / FSR2 翻译层）已移除，不再编译。
 //
 // 【本文件中的 `B1xx` 编号】= 本项目历次变更批次的编号（`B103`…`B109`）；
@@ -16782,8 +16788,99 @@ void transparent_jitter_log(const char *line)
 {
     if (line == nullptr)
         return;
+    // 2026-11-23（诊断探针）：拆 "sink 有没有被调用" 与 "日志闸门有没有放行"。
+    // 必须先于 LOG_INFO 写 —— LOG_INFO 之后写就只能观测到"它执行过了"，观测不到"它被吞了"。
+    //
+    // 2026-11-23（DETACH 红线修正）：这里**刻意不调** blog::enabled()。
+    //   它在 `bool enabled(Level, std::string_view)` 里、`g_has_cat_overrides` 为真的分支中
+    //   取 `std::lock_guard<std::mutex> lock(g_cat_mutex)`（**阻塞式**）。
+    //   ⚠️ 口径（2026-11-23 三次更正：`$logSection` 里**有**分类覆盖，但脚本从不把它写进去）：
+    //   · **发布包**：Dx11FsrBridge.package.ini 的 [Log.Categories] 是**空段**（该段标题即
+    //     文件末行）；
+    //   · **部署脚本**：`$logSection` 模板里确有 `[Log.Categories]` / `probe=debug` /
+    //     `upscale=debug`，**但** `Add-LogSection` 开头有守卫
+    //     （`if ($text -match '(?m)^\s*\[Log\]\s*$') { return $false }`）
+    //     —— 目标 ini 已有 `[Log]` 就什么都不插；而部署流程是**先** `Set-IniValue` 填 `[Log]` 键
+    //     （段缺失时它自己会建出 `[Log]`），**再** `Add-LogSection` ⇒ **正常 ini 上**轮到它时
+    //     `[Log]` 已存在 ⇒ **脚本实际不会写入这些分类覆盖**。
+    //   （唯一例外：ini 已含 `queue_capacity` / `flush_interval_ms` 却**缺 `[Log]` 段头**
+    //     ⇒ `Set-IniValue` 不建段，`Add-LogSection` 会真的插入整段（含分类覆盖）—— 畸形 ini；
+    //     结论不变。）
+    //   ⇒ **两条默认路径都不写**分类覆盖；它只可能来自**手写或旧版遗留**的 ini。
+    //   但只要它存在，`g_has_cat_overrides` 即为真，`enabled()` 在 DETACH 期**就会取**
+    //   `g_cat_mutex`（阻塞式）。
+    //   **结论不变且更强**：不能依赖"默认是空的"去调用 `blog::enabled()`，必须假定它可能取锁。
+    //   （不写行号：行号会随文件漂移，符号锚点才是可复现的检索依据。）
+    //   本行的调用链在 DETACH 期（DllMain(DETACH) → transparent_jitter::shutdown → sink），
+    //   与 Dx11FsrBridge.cpp DETACH 分支开头的红线（"不得阻塞式取锁"，否则进程退不掉）直接冲突。
+    //   ⇒ 只记两个**无锁可读**的量：blog::active() 与 blog::level()，它们正是 enabled() 的
+    //     前两个判据。分类覆盖层本行**不测**，故字段写 enabled=unknown
+    //     （如实标注，不要把它读成"未启用"）。
+    //
+    // ⚠️ 契约（改 BridgeLogger 的人必读）：本处依赖 `blog::active()` / `blog::level()`
+    //    保持**无锁原子读**。若将来给它们加了锁（或加了任何分配/等待），本行必须同步改成
+    //    侧车直读（或改在 ATTACH 期缓存），否则 DETACH 期会阻塞取锁 —— 正是本探针要防的
+    //    "进程退不掉"形态。
+    //   附（2026-11-23 / 审核 R3 更正）：G4「被日志等级闸门吞掉」只在**会话早期**被旁证排除
+    //   —— 同局 [probe] 分类写出过 3 行，但那 3 行全在启动后 0.1 秒内（927 行里的第 6/8/9 行）。
+    //   G4 的实质是"**退出时刻**分类闸门是否放行"，早期写出证明不了退出期 ⇒ **退出期未证**。
+    //   这正是 AGENTS.md §三 #21「把旁证当结论」的形态，故不能写成"已排除"。
+    //   本行只能给 blog_active：分类覆盖层 g_cat_levels 只能锁内读，DETACH 期取锁会踩穿红线。
+    tjtrace::write("tj_sink_called", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    const int probe_blog_active = blog::active() ? 1 : 0;
+    const int probe_blog_level = static_cast<int>(blog::level());
+    // 2026-11-23（诊断探针 / 审核 R8）：不再把整段日志正文塞进 line=。
+    // 本行以空格分界，而日志正文里全是空格 ⇒ 后面的字段会被读成顶层字段。
+    // 改成只记**短标签**：行首是 transparent_jitter_installed / _stats 之一（这是唯二来源）。
+    // 仍然不建 std::string、不取堆锁：前缀逐字节比较即可。
+    // 长度一律用 sizeof(...) - 1 这个**编译期常量**（2026-11-23 / 审核 R5 顺带项）：
+    // 原先写死 28 / 24，将来谁把字面量改短而忘了改数字，strncmp 就会越过字面量的结尾读到
+    // 相邻内存 —— 那种错误编译器不会报，只会表现为"标签偶尔判错"。
+    constexpr std::size_t k_installed_prefix = sizeof("transparent_jitter_installed") - 1;
+    constexpr std::size_t k_stats_prefix = sizeof("transparent_jitter_stats") - 1;
+    const char *line_tag = "other";
+    if (std::strncmp(line, "transparent_jitter_installed", k_installed_prefix) == 0)
+        line_tag = "installed";
+    else if (std::strncmp(line, "transparent_jitter_stats", k_stats_prefix) == 0)
+        line_tag = "stats";
+    tjtrace::write("tj_sink_gate", "enabled=unknown", nullptr, nullptr, nullptr, nullptr,
+                   "blog_active=%d level=%d line_tag=%s", probe_blog_active, probe_blog_level, line_tag);
     LOG_INFO(blog::cat::probe, std::string(line));
 }
+
+// 2026-11-23（诊断探针）：TransparentJitterHook 的 ProbeSink 实现 —— 把
+// (stage, a, b, c, d) 转成一行具名字段写进侧车。**字段名由这里的 switch 决定**，
+// 因为钩子 TU 拿不到侧车接口（也不该依赖它）；各 stage 的槽位含义见
+// TransparentJitterHook.cpp 的调用点，两处必须同步改（写在注释里提醒）。
+//
+// 为什么逐 stage 映射而不是统一打 a=/b=/c=/d=：判读表要能一眼看出"哪个判据为真"，
+// 而 a=/b= 这种字段名在判断时还得回头查调用点，等于把二义性搬到了判读环节。
+// 2026-11-23（诊断探针 / 审核 MINOR-3）：本函数体整段被宏门控。
+// 为什么：未门控时 OFF 构建里仍会留下本文件的 3 个 stage 字面量（tj_shutdown_enter /
+// _early2 / _pre_sink）与一串 strcmp，虽不违反发布红线（无 I/O、无锁、无分配），
+// 但会让"调用点全部是内联空实现 ⇒ 零残留"这句话读起来像假的。门控后本文件的字面量
+// 全部消失；TransparentJitterHook.cpp 里那批 if (auto p = g_probe_sink.load()) 的实参
+// 仍会保留 —— 如实记在 CMakeLists 的注释里，不再声称"一行不留"。
+#if defined(DX11FSRBRIDGE_TJ_TRACE_PROBE)
+void tj_probe_sink(const char *stage, int a, int b, unsigned long long c, unsigned long long d)
+{
+    if (stage == nullptr)
+        return;
+    if (std::strcmp(stage, "tj_shutdown_enter") == 0)
+        tjtrace::write(stage, nullptr, nullptr, nullptr, nullptr, nullptr, "active=%d sink=%d", a, b);
+    else if (std::strcmp(stage, "tj_shutdown_early2") == 0)
+        tjtrace::write(stage, nullptr, nullptr, nullptr, nullptr, nullptr, "target=%d stub=%d", a, b);
+    else if (std::strcmp(stage, "tj_shutdown_pre_sink") == 0)
+        tjtrace::write(stage, nullptr, nullptr, nullptr, nullptr, nullptr,
+                       "sink=%d calls=%llu overridden=%llu", a, c, d);
+    else
+        // 其余 stage 本就是"纯时间戳"（含义全在 stage 名里）：tj_shutdown_early1 /
+        // tj_sink_return / tj_restore_begin / tj_restore_done / tj_shutdown_post_sink /
+        // tj_sink_from_install / tj_sink_from_shutdown。
+        // 不给它们硬塞 a=/b= —— 两个恒为 0 的字段只会让人以为那里有数据。
+        tjtrace::write(stage, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+}
+#endif // DX11FSRBRIDGE_TJ_TRACE_PROBE
 
 std::uint64_t transparent_jitter_frame()
 {
@@ -17007,6 +17104,14 @@ void initialize()
     // 这是**正式功能**（修透明队列物件边缘硬阶梯），不该依赖实验性翻译层宏
     //（否则某些构建里"ini 里设了没用"）。
     // `TransparentJitter=0` 时**连 sink 都不注册**、不碰任何游戏内存 ⇒ 零开销。
+    //
+    // 2026-11-23（诊断探针 / 审核 MAJOR-10）：**无条件**先记一条配置事实，放在 if **外面**。
+    // 为什么必须在外面：`set_probe_sink()` 在 if **里面**，而 `transparent_jitter::shutdown()`
+    // 在 DETACH 里**无条件**调用 ⇒ `TransparentJitter=0` 时 trace 里根本不会有
+    // `tj_shutdown_enter`，判读表那条"detach_enter 后无 tj_shutdown_enter ⇒ 卡死"就会
+    // 把"功能被用户关掉"读成"卡死"。有了本行，判读时先看它就能区分。
+    tjtrace::write("tj_config", nullptr, nullptr, nullptr, nullptr, nullptr,
+                   "transparent_jitter=%d", g_config.transparent_jitter ? 1 : 0);
     if (g_config.transparent_jitter)
     {
         const std::uint64_t jitter_base = reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
@@ -17021,7 +17126,21 @@ void initialize()
         jitter_cfg.camera_rva = jitter_detected.detected ? jitter_detected.camera : g_config.ffx12_camera_rva;
         jitter_cfg.image_size = main_module_image_size();
         jitter_cfg.anchor_source = jitter_detected.detected ? "feature" : "config";
+        // 2026-11-23（诊断探针）：注册前后各一条 —— 把"注册动作执行过"与"注册之后 sink 确实非空"
+        // 分开记。step=before/after 是同一 stage 的两条，靠字段区分（同名两条一模一样会读成重复行）。
+        // 2026-11-23（诊断探针 / 审核 R4）：sink 字段**真读**，不写死。
+        // step=before 这条发生在 set_log_sink 之前 ⇒ 此处应为 sink=0；若读到 1，说明有别处
+        // 先注册过（那本身就是一条值得知道的事实）。
+        tjtrace::write("tj_sink_registered", "step=before", nullptr, nullptr, nullptr, nullptr,
+                       "sink=%d", transparent_jitter::has_log_sink() ? 1 : 0);
         transparent_jitter::set_log_sink(&transparent_jitter_log);
+        // 2026-11-23（诊断探针）：ProbeSink 的注入也放在这里 —— 它必须早于任何 shutdown 调用，
+        // 且与日志 sink 同时就位，这样"日志 sink 有、探针 sink 没有"这种半残状态不会出现。
+#if defined(DX11FSRBRIDGE_TJ_TRACE_PROBE)
+        transparent_jitter::set_probe_sink(&tj_probe_sink);
+#endif
+        tjtrace::write("tj_sink_registered", "step=after", nullptr, nullptr, nullptr, nullptr,
+                       "sink=%d", transparent_jitter::has_log_sink() ? 1 : 0);
         transparent_jitter::set_frame_provider(&transparent_jitter_frame);
         const char *jitter_reason = nullptr;
         if (!transparent_jitter::install(jitter_base, jitter_cfg, &jitter_reason))
@@ -17121,7 +17240,13 @@ void final_shutdown()
 {
     std::call_once(g_final_shutdown_once, []()
         {
+            // 2026-11-23（诊断探针）：atexit 路径的进入/退出。与 detach_enter /
+            // blog_shutdown_enter 三条时间线合起来，回答"atexit 到底在 DETACH 之前还是之后跑"
+            // —— 若它先跑，blog::shutdown() 会把 g_active 置 false，DETACH 里的
+            // transparent_jitter::shutdown() 打 stats 时就会被 enabled() 首行挡掉。
+            tjtrace::write("atexit_final_enter", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
             blog::shutdown();
+            tjtrace::write("atexit_final_exit", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         });
 }
 
@@ -17134,6 +17259,15 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
+        // 2026-11-23（诊断探针）：ATTACH 的第一行先落 trace —— 它是 DETACH 探针的对照组：
+        // 只有先证明"这次会话注入过、且 trace 文件确实能写"，后续缺席才能被判读成
+        // "没走到那一步"，而不是"探针从来没工作过"。截断旧文件，保证本会话从零开始记。
+        // 侧车通道与日志通道完全独立（见 TjTraceProbe.h），故此处不依赖 blog 是否已 init。
+        // 先把本模块句柄交给侧车：trace 必须落在**本 DLL** 所在目录（= Dx11FsrBridge.log 同级），
+        // 而不是进程主模块（YuanShen.exe）目录。ATTACH 时句柄就在手边，不必去取 loader lock。
+        tjtrace::set_module(module);
+        tjtrace::reset();
+        tjtrace::write("tj_attach", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         g_module = module;
         DisableThreadLibraryCalls(module);
         initialize_once();
@@ -17145,6 +17279,9 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID reserved)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        // 2026-11-23（诊断探针）：DETACH 体第一行。本行有输出 = DETACH 确实被调用过；
+        // 与 atexit_final_* 的时间戳合起来，可核对"DETACH 体在前、atexit 在后"这一顺序。
+        tjtrace::write("detach_enter", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         // 这里**只做 loader-lock 安全的事**：
         //   - il2cpp_callsite::shutdown()：VirtualProtect/VirtualFree + 清实例表
         //     （后者用 `try_lock`，拿不到就放弃 —— 见其内部注释）；

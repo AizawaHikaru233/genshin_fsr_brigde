@@ -120,9 +120,40 @@ if(NOT EXISTS "${FFX_API_INCLUDE_ROOT}/ffx_api.h" OR
         "(init OptiScaler-src submodule external/FidelityFX-SDK-v2, or pass -DFFX_SDK_KIT_ROOT=...)")
 endif()
 
+# 2026-11-23（诊断探针 / 审核 R7）：侧车 trace 探针的**构建期门控**。
+#
+# 为什么必须门控：AGENTS.md §二.5「诊断默认关」、§四.E「生产应为关」。本探针会在**每个用户**
+# 的游戏目录里留 `_tj-trace.txt` / `_tj-trace.err` —— 从本树直接打发布包就会变成所有用户都带上。
+# 默认 OFF ⇒ 发布构建里 TjTraceProbe.cpp 不进编译、tjtrace::write 全部是头文件里的内联空实现
+# （见 TjTraceProbe.h），产物里连 `_tj-trace.txt` 这个宽字符串都不会有。
+#
+# ⚠️ 残留如实交代（2026-11-23 / 审核 MINOR-3）：OFF 构建**不是**"一行不留"——实测 11 个 stage
+#   字面量留在产物里（21 个里剩 11 个；ON 构建 21/21 全在）。逐条归属：
+#     · 10 个来自 TransparentJitterHook.cpp：`if (auto p = g_probe_sink.load()) p("tj_...")` 那批
+#       调用点仍会编译（g_probe_sink 恒 nullptr ⇒ 空转；每次 shutdown 约 20 次原子读 + 少量分支）；
+#     · 1 个（`tj_sink_gate`）来自 Dx11FsrBridge.cpp 的 `transparent_jitter_log()` —— 它的
+#       `tj_sink_called` 字面量被编译器折掉了，但 `tj_sink_gate` 连同 `enabled=unknown` /
+#       `line_tag=%s` 那串格式字面量留下了（实跑实测，不是推测）。
+#   它们不产生任何 I/O、不取锁、不分配，故不违反 §二.5 的发布红线；但**不要**把它说成零残留。
+#   已宏门控的部分（确实消失）：`tj_probe_sink()` 函数体、`set_probe_sink()` 调用、整个
+#   TjTraceProbe.cpp（`_tj-trace.txt` / `_tj-trace.err` 宽串、`phase=`、`dropped=%llu` 均查不到）。
+# 排查时打开：`-DDX11FSRBRIDGE_TJ_TRACE_PROBE=ON`。
+option(DX11FSRBRIDGE_TJ_TRACE_PROBE
+    "Compile the transparent-jitter sidecar trace probe (_tj-trace.txt/_tj-trace.err) - keep OFF for release" OFF)
+
 add_library(Dx11FsrBridge SHARED
     Dx11FsrBridge.cpp
     BridgeLogger.cpp
+    # 2026-11-23（诊断探针）：侧车 trace 写入单元（只用 kernel32、**常态不取锁**、不碰 CRT 流）。
+    # （不写成绝对的"不取锁"：进程曾调 setlocale 时 UCRT 的 snprintf 会取 __acrt_locale_lock；
+    #  例外与依据见 TjTraceProbe.h 顶部"纪律"第 2 条。）
+    # 独立 TU 的理由见 TjTraceProbe.h 顶部：Dx11FsrBridge.cpp / BridgeLogger.cpp /
+    # TransparentJitterHook.cpp 三方都要写 trace，而 BridgeLogger.cpp 刻意不 include 桥的头。
+    # ⚠️ 刻意**不**加进 TransparentJitterHookTest 的源列表。诚实表述：这**不是**链接层保证
+    #    ——g_probe_sink 定义在 TransparentJitterHook.cpp，而测试 target 编译了那个 TU，
+    #    静态初始化必然发生。真正的保证是**调用约定**：测试从不调用 set_probe_sink，
+    #    故 g_probe_sink 保持初值 nullptr，所有 if (auto p = g_probe_sink.load()) 分支都空转。
+    #    2026-11-23（审核 R7）：本 TU 改为**由 option 门控**，见下方 target_sources。
     Dx11FsrBridge.rc
     RenderScaleMenu.cpp
     Fsr2FamilyTakeover.cpp
@@ -139,6 +170,17 @@ add_library(Dx11FsrBridge SHARED
 # 源码文件本身**保留在仓库里**（不删），靠本开关切换。
 if(DX11FSRBRIDGE_DIAGNOSTICS_ON)
     target_sources(Dx11FsrBridge PRIVATE Fsr2InputDump.cpp)
+endif()
+
+# 侧车 trace 探针：**只在显式打开时**进源列表并定义宏（默认 OFF ⇒ 一行都不编译）。
+# 与 DX11FSRBRIDGE_DIAGNOSTICS 刻意解耦：那个开关带的是 PerfProbe/Fsr2InputDump 那一批，
+# 本探针要能单独开关（它写的是进程退出期的落盘证据，与帧内诊断无关）。
+if(DX11FSRBRIDGE_TJ_TRACE_PROBE)
+    target_sources(Dx11FsrBridge PRIVATE TjTraceProbe.cpp)
+    target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_TJ_TRACE_PROBE=1)
+    message(STATUS "Dx11FsrBridge: 侧车 trace 探针 **参与编译**（DX11FSRBRIDGE_TJ_TRACE_PROBE=1）")
+else()
+    message(STATUS "Dx11FsrBridge: 侧车 trace 探针 **排除出编译**（发布构建；调用点为空实现）")
 endif()
 
 # 诊断开关宏：只有打开时才定义（发布构建**不定义** ⇒ 所有

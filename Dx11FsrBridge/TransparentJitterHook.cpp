@@ -53,6 +53,9 @@ static_assert(k_bool_head_len >= k_patch_len, "bool setter 签名必须覆盖被
 // 日志出口与帧号来源（由调用方注入；默认空 → 只计数）
 std::atomic<LogSink> g_log_sink { nullptr };
 std::atomic<FrameProvider> g_frame_provider { nullptr };
+// 2026-11-23（诊断探针）：侧车 trace 的第二出口（见头文件 ProbeSink 说明）。
+// 默认 nullptr ⇒ 所有埋点是空操作，单测与不注入的调用方零行为差异。
+std::atomic<ProbeSink> g_probe_sink { nullptr };
 
 // 安装状态
 std::uint8_t *g_target = nullptr;
@@ -362,6 +365,16 @@ void set_log_sink(LogSink sink)
     g_log_sink.store(sink, std::memory_order_release);
 }
 
+void set_probe_sink(ProbeSink sink)
+{
+    g_probe_sink.store(sink, std::memory_order_release);
+}
+
+bool has_log_sink()
+{
+    return g_log_sink.load(std::memory_order_relaxed) != nullptr;
+}
+
 void set_frame_provider(FrameProvider provider)
 {
     g_frame_provider.store(provider, std::memory_order_release);
@@ -446,6 +459,11 @@ bool install(std::uint64_t exe_base, const Config &cfg, const char **out_reason)
                       static_cast<unsigned>(setter_rva), callsite_imm,
                       static_cast<unsigned>(cfg.camera_rva), cfg.force ? 1 : 0,
                       cfg.anchor_source != nullptr ? cfg.anchor_source : "unknown");
+        // 2026-11-23（诊断探针 / 审核 R1）：本组 sink 的**前导行**。
+        // 没有它的话，"有 tj_sink_called/tj_sink_gate、其后无 tj_sink_return"在**正常跑完**的
+        // 一局里也成立（install 期这一组本来就不会有 return 行），判读表会把正常局读成崩溃。
+        if (auto p = g_probe_sink.load(std::memory_order_acquire))
+            p("tj_sink_from_install", 0, 0, 0ull, 0ull);
         sink(line);
     }
     return true;
@@ -453,14 +471,34 @@ bool install(std::uint64_t exe_base, const Config &cfg, const char **out_reason)
 
 void shutdown()
 {
+    // 2026-11-23（诊断探针）：入口埋点。active **必须在下面的 exchange 之前读** ——
+    // exchange 之后它恒为 false，读出来的就不是"进来时是什么"了。
+    if (auto p = g_probe_sink.load(std::memory_order_acquire))
+        p("tj_shutdown_enter", g_active.load(std::memory_order_acquire) ? 1 : 0,
+          g_log_sink.load(std::memory_order_acquire) != nullptr ? 1 : 0, 0ull, 0ull);
     if (!g_active.exchange(false, std::memory_order_acq_rel))
+    {
+        // 2026-11-23（诊断探针）：G1 —— 进来时 active 已经是 false（多半是重复 shutdown）。
+        if (auto p = g_probe_sink.load(std::memory_order_acquire))
+            p("tj_shutdown_early1", 0, 0, 0ull, 0ull);
         return;
+    }
     if (g_target == nullptr || g_stub == nullptr)
+    {
+        // 2026-11-23（诊断探针）：G2 —— active 曾是 true，但 target/stub 已被清空。
+        if (auto p = g_probe_sink.load(std::memory_order_acquire))
+            p("tj_shutdown_early2", g_target != nullptr ? 1 : 0, g_stub != nullptr ? 1 : 0, 0ull, 0ull);
         return;
+    }
 
     // ⚠️ 校验后还原：只有当前字节**仍是我们写入的那条 jmp** 时才还原。
     // 若期间有别的插件在我们的跳转之上又写了补丁，盲目还原会把**对方的**补丁抹掉
     //（对方的钩子静默失效，且表现为"用了本桥之后另一个插件就不工作了"）。
+    // 2026-11-23（诊断探针 / MAJOR-8 A-变体）：还原段**之前**。
+    // 这一段（memcmp + VirtualProtect + memcpy + 刷指令缓存）此前没有任何探针，
+    // 而它恰恰可能抛 SEH、或卡在 VirtualProtect 上 —— 无输出时无法与"还没走到"区分。
+    if (auto p = g_probe_sink.load(std::memory_order_acquire))
+        p("tj_restore_begin", 0, 0, 0ull, 0ull);
     std::uint8_t expected[k_patch_len] {};
     build_jmp_patch(expected, k_patch_len, g_stub);
     if (std::memcmp(g_target, expected, k_patch_len) == 0)
@@ -477,6 +515,11 @@ void shutdown()
     // ⚠️ 刻意**不** VirtualFree stub：还原只能阻止"新的"跳入，无法排除此刻已有线程
     // 正执行在 stub 内（FreeLibrary 不终止其他线程）⇒ 释放会让它们跳进已解除映射的
     // 内存而崩溃。stub 仅 96 字节，泄漏远优于崩溃。（与 Il2CppCallSiteHook 同一处置。）
+    // 2026-11-23（诊断探针 / MAJOR-8 A-变体）：还原段（memcmp / VirtualProtect / memcpy /
+    // 刷指令缓存）**之后**、两指针清空**之前**。与 tj_restore_begin 成对：只有 begin 没有 done
+    // ⇒ 卡在还原段里（SEH 或 VirtualProtect 挂住），而不是"没走到这里"。
+    if (auto p = g_probe_sink.load(std::memory_order_acquire))
+        p("tj_restore_done", 0, 0, 0ull, 0ull);
     g_target = nullptr;
     g_stub = nullptr;
 
@@ -485,6 +528,12 @@ void shutdown()
     // 放在 force 复位**之前**读，语义与运行期一致。
     const std::uint64_t calls = g_calls.load(std::memory_order_relaxed);
     const std::uint64_t overridden = g_overridden.load(std::memory_order_relaxed);
+    // 2026-11-23（诊断探针）：G3 / G5 的分界 —— 走到这里说明既没提前返回、也没卡住，
+    // 下面的"有没有 stats 行"只剩"sink 是否为空"与"日志闸门/writer 是否放行"两种解释。
+    // 字段顺序见判读表：sink=1 却有 stats 行缺失 ⇒ 看 tj_sink_called / tj_sink_gate。
+    if (auto p = g_probe_sink.load(std::memory_order_acquire))
+        p("tj_shutdown_pre_sink", g_log_sink.load(std::memory_order_relaxed) != nullptr ? 1 : 0, 0,
+          static_cast<unsigned long long>(calls), static_cast<unsigned long long>(overridden));
     if (const LogSink sink = g_log_sink.load(std::memory_order_relaxed))
     {
         char line[224] {};
@@ -495,8 +544,21 @@ void shutdown()
                       g_saw_false.load(std::memory_order_relaxed) ? 1 : 0,
                       g_saw_true.load(std::memory_order_relaxed) ? 1 : 0,
                       static_cast<unsigned long long>(g_last_frame.load(std::memory_order_relaxed)));
+        // 2026-11-23（诊断探针 / 审核 R1）：本组 sink 的**前导行**。判读只看**最后一条**
+        // tj_sink_gate，它前面应是本行（install 那一组前面是 tj_sink_from_install）。
+        if (auto p = g_probe_sink.load(std::memory_order_acquire))
+            p("tj_sink_from_shutdown", 0, 0, 0ull, 0ull);
         sink(line);
+        // 2026-11-23（诊断探针 / MAJOR-8 B）：sink **返回**了。
+        // 有 tj_sink_gate 而没有本行 ⇒ sink 没返回（崩在 LOG_INFO 的入队路径 / 被阻塞）；
+        // 有本行而日志里仍无 stats ⇒ sink 返回过，问题在 blog 侧（G4/G5）。
+        if (auto p = g_probe_sink.load(std::memory_order_acquire))
+            p("tj_sink_return", 0, 0, 0ull, 0ull);
     }
+    // 2026-11-23（诊断探针）：sink 调用**之后**。本行有、而上面的 tj_sink_called 没有 ⇒
+    // sink 回调根本没进到 transparent_jitter_log()（函数指针不对 / 被换掉了）。
+    if (auto p = g_probe_sink.load(std::memory_order_acquire))
+        p("tj_shutdown_post_sink", 0, 0, 0ull, 0ull);
 
     // force 状态复位：还原后 stub 已不可达，"强制开着"这个残留状态会误导下一个读者
     //（以及误报给结论）。init 侧会按 ini 重新安装。
