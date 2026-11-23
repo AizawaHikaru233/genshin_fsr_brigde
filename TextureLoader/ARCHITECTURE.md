@@ -33,8 +33,7 @@
 | `D3D11CreateDevice` / `D3D11CreateDeviceAndSwapChain` | 设备就绪时 `AttachToDevice`：挂 device/context vtable、启动后台线程 |
 | `ID3D11Device::CreateTexture2D` | 对带初始数据的纹理计算 3DMigoto 兼容哈希；命中则登记替换（refcount++、挂 ReplacementTracker、登记活跃数组、丢异步加载队列） |
 | `ID3D11DeviceContext::PSSetShaderResources` / `VS` / `GS` / `HS` / `DS` / `CS` | 六个阶段统一替换（飘带/布料在 VS/CS 采样，只换 PS 会导致阶段间数据不一致） |
-| `ID3D11DeviceContext::UpdateSubresource` | **只计数，不改任何替换行为**（2026-11-23）：钩子自增 `upd_calls` 后直接转发，不写私有数据、不碰活跃集、不看任何配置。旧的 `MarkDynamic`+`ActiveRemove`（把纹理永久排除出替换）已删除 —— 它与 `f07bb04` 修掉的 `CopyResource` 缺陷同型。与 `CopyResource` 同构的「只计数」形态已足够：实机一局 107 秒内该 API 被调用 16.6 万次而命中替换集 0 次（`upd_calls` 可从任意一局 `[stat]` 行复核） |
-| `ID3D11DeviceContext::CopyResource` | 保留钩子**仅累计计数**（`copyresource_hit_calls`，判定该路径在实机是否发生），**不**标记动态、**不**移出活跃数组：这个标记不可撤销，会让纹理永久失去替换。失效形态与取舍理由见 `TextureLoader.cpp` 中 `HookCopyResource` 上方注释 |
+| `ID3D11DeviceContext::UpdateSubresource` | **只计数，不改任何替换行为**（2026-11-23）：钩子自增 `upd_calls` 后直接转发，不写私有数据、不碰活跃集、不看任何配置。旧的 `MarkDynamic`+`ActiveRemove`（把纹理永久排除出替换）已删除 —— 它与 `f07bb04` 修掉的 `CopyResource` 私有数据缺陷同型。「只计数、零行为改动」这一形态已被实测证明够用：实机一局 107 秒内该 API 被调用 16.6 万次而命中替换集 0 次（`upd_calls` 可从任意一局 `[stat]` 行复核） |
 
 ## 2. 哈希算法（3DMigoto 兼容，逐字移植）
 
@@ -43,6 +42,11 @@
 - 描述哈希：`CalcTexture2DDescHash = crc32c_hw(data_hash, desc, sizeof(D3D11_TEXTURE2D_DESC))`
 - `texture_hash=0`（GIMI 默认）→ v1.2.1 兼容路径：`length_v12 = W*H*ArraySize`，
   ≤ length 走 v1.2.1 全缓冲 CRC，否则 v1.2.11+ 跳行 padding
+- ⚠️ **想按 desc 对账时：`Usage` 会改哈希。** `CalcTexture2DDescHash` 对**整个**
+  `D3D11_TEXTURE2D_DESC` 做 CRC-32C（`texture_hash.cpp`：
+  `crc32c_hw(data_hash, pDesc, sizeof(D3D11_TEXTURE2D_DESC))`），`Usage` 就在被哈希的范围内
+  ⇒ 「改 `Usage` 再比哈希」必然对不上：同一张纹理的 `IMMUTABLE` 与 `DEFAULT` 哈希并不相同
+  （实测 `0x63EAE7C3` / `0x91E6EA3D`）。对账只能用**实际提交创建时的那份 desc** 重算。
 
 与 mod 作者预生成的 `hash=` 逐字一致，无需运行时学习。
 
@@ -140,8 +144,7 @@ GPU 解压不可用（无 D3D12 / `dstorage.dll` 缺失 / 驱动过旧）→ 回
 
 行尾 `|schema 累计={…} 当前={…} 配置={…}` 是字段口径自述，**读任何数字前先读它**：
 
-- **累计**（进程内不清零）：`hashed matched bound bind_log_suppressed copy_hits overflow
-  upd_calls copy_calls`
+- **累计**（进程内不清零）：`hashed matched bound bind_log_suppressed overflow upd_calls`
 - **当前状态（退出时刻快照）**：`cache_entries cache_MB active hashes_unique`
 - **配置值**：`observe`
 
@@ -151,6 +154,23 @@ GPU 解压不可用（无 D3D12 / `dstorage.dll` 缺失 / 驱动过旧）→ 回
 
 ⚠️ `hashes_unique` 同时受配置影响：`dump_hashes=0`（默认）时去重容器根本不填 ⇒ 恒为 0，
 这个 0 **不含信息**。要读「本局哈希了多少个不同纹理」，必须先在 ini 里开 `dump_hashes=1`。
+
+**引用旧构建的 `copy_hits=0` 时的四个前置条件**（`TextureLoader.cpp` 的删除说明按本段引用 §6.1）：
+
+`copy_hits` 是**旧构建**的字段（2026-11-23 随 `CopyResource` 钩子删除，见
+`TextureLoader.cpp` 中「这里曾经是 CopyResource 钩子」那段说明）。它的谓词是
+「dst 已在活跃数组 `g_activeArr` 登记」，而绑定慢路径**逐项替换**看的是私有数据 hash +
+`g_replacements` 条目、**不逐项查活跃数组** ⇒ 两者只是**有边界的等价**：只在活跃数组无丢弃、
+且 tracker 全部挂载成功时才重合。故 `copy_hits=0` 只有在下述四条**同时**成立时才说明
+「该路径本局未命中替换」，否则不构成证据：
+
+- `observe=0` —— 替换真的启用了（`ActiveAdd` 只在非 observe-only 分支调用）；
+- `overflow=0` —— `g_activeArr` 没有静默丢弃，活跃集完整；
+- `matched>0` 且 `bound>0` —— 本局确实命中过替换、且绑定过替换 SRV。
+
+四条都用**累计**字段判，**不要**用 `active`（见上：退出时为 0 不代表没生效）。
+⚠️ 还有一条**无计数可查**的前提：`SetPrivateDataInterface`（tracker 挂载）全部成功 ——
+该失败路径目前无计数、无日志，所以这四条只能证明「可观测的前置条件全满足」。
 
 ## 7. 目录文件索引
 
