@@ -144,7 +144,7 @@ GPU 解压不可用（无 D3D12 / `dstorage.dll` 缺失 / 驱动过旧）→ 回
 
 行尾 `|schema 累计={…} 当前={…} 配置={…}` 是字段口径自述，**读任何数字前先读它**：
 
-- **累计**（进程内不清零）：`hashed matched bound bind_log_suppressed overflow upd_calls`
+- **累计**（进程内不清零）：`hashed matched bound bind_log_suppressed overflow upd_calls hash_fail tracker_fail`
 - **当前状态（退出时刻快照）**：`cache_entries cache_MB active hashes_unique`
 - **配置值**：`observe`
 
@@ -155,7 +155,8 @@ GPU 解压不可用（无 D3D12 / `dstorage.dll` 缺失 / 驱动过旧）→ 回
 ⚠️ `hashes_unique` 同时受配置影响：`dump_hashes=0`（默认）时去重容器根本不填 ⇒ 恒为 0，
 这个 0 **不含信息**。要读「本局哈希了多少个不同纹理」，必须先在 ini 里开 `dump_hashes=1`。
 
-**引用旧构建的 `copy_hits=0` 时的四个前置条件**（`TextureLoader.cpp` 的删除说明按本段引用 §6.1）：
+**引用旧构建的 `copy_hits=0` 时的判据**（`TextureLoader.cpp` 的删除说明按本段引用 §6.1）：
+下面四条是**必要条件子集**；2026-11-23 起还可观测到两条补充前提（见段末），四条 + 那两条才构成完整判据。
 
 `copy_hits` 是**旧构建**的字段（2026-11-23 随 `CopyResource` 钩子删除，见
 `TextureLoader.cpp` 中「这里曾经是 CopyResource 钩子」那段说明）。它的谓词是
@@ -169,8 +170,16 @@ GPU 解压不可用（无 D3D12 / `dstorage.dll` 缺失 / 驱动过旧）→ 回
 - `matched>0` 且 `bound>0` —— 本局确实命中过替换、且绑定过替换 SRV。
 
 四条都用**累计**字段判，**不要**用 `active`（见上：退出时为 0 不代表没生效）。
-⚠️ 还有一条**无计数可查**的前提：`SetPrivateDataInterface`（tracker 挂载）全部成功 ——
-该失败路径目前无计数、无日志，所以这四条只能证明「可观测的前置条件全满足」。
+
+⚠️ 两条补充前提（**从 2026-11-23 起可观测**，读同一行的两个新字段即可）：
+
+- `tracker_fail=0` —— `SetPrivateDataInterface`（tracker 挂载）全部成功。
+  该失败计入累计字段 `g_trackerAttachFail`，并触发首次/每 1024 次一行 `[warn]`。
+  ⚠️ 此判据以 `observe=0` 为前提 —— `observe=1` 时根本不做挂载，该字段是空真。
+
+- `hash_fail=0` 覆盖**另一条**同型前提：`SetPrivateData(TL_HASH_GUID)` 写入 hash 成功。
+  它失败时该资源没有 hash ⇒ `GetResourceHash` 恒 false ⇒ **该纹理全或无地永不替换**
+  （`tracker_fail` 的失效则是**条件性**的：仍可能在与活跃替换资源同批绑定时被替换）。
 
 ## 7. 目录文件索引
 

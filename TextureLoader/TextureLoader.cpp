@@ -130,6 +130,15 @@ std::mutex g_activeMutex;           // 写互斥（低频）；读方不取锁
 std::atomic<long> g_activeOverflow{0};
 std::atomic<long> g_repSrvOverflow{0};
 
+// 私有数据写入失败计数（2026-11-23）：与 g_activeOverflow 同型 —— 都是「静默失效」的取证点。
+//   g_hashSetFail      = SetResourceHash() 的 SetPrivateData(TL_HASH_GUID) 失败次数【累计】
+//   g_trackerAttachFail = SetPrivateDataInterface(TL_TRACKER_GUID) 失败次数【累计】
+// 正常机器上两者恒为 0；一旦非 0，说明该纹理的替换会失效（后果见 HookCreateTexture2D 内两处分支），
+// 而在此之前这类失败**不打任何日志**、[stat] 里也没有痕迹。
+// 打日志一律走「首次 + 每 1024 次」限流（同 ActiveAdd）：热路径每行 fflush 会拖住渲染线程。
+std::atomic<long> g_hashSetFail{0};
+std::atomic<long> g_trackerAttachFail{0};
+
 static void ActiveAdd(ID3D11Resource *res)
 {
     if (!res)
@@ -464,10 +473,15 @@ public:
 };
 
 // 通过 SetPrivateData 存储/读取纹理 hash（随资源消亡，杜绝裸指针复用误替换）
-static void SetResourceHash(ID3D11Resource *res, uint32_t hash)
+// 2026-11-23（私有数据失败可见性）：返回值改为 HRESULT 并**由调用方检查**。
+// 为什么现在才检查：原实现丢弃 SetPrivateData 的结果 —— 一旦它失败，该资源上就没有
+// TL_HASH_GUID，绑定慢路径 GetResourceHash 返回 false ⇒ hash=0 ⇒ 该纹理**永不替换**，
+// 而日志、[stat] 都没有任何痕迹（与 g_activeOverflow 注释里那类「静默失效」同型）。
+static HRESULT SetResourceHash(ID3D11Resource *res, uint32_t hash)
 {
-    if (res)
-        res->SetPrivateData(TL_HASH_GUID, sizeof(hash), &hash);
+    if (!res)
+        return E_POINTER;
+    return res->SetPrivateData(TL_HASH_GUID, sizeof(hash), &hash);
 }
 static bool GetResourceHash(ID3D11Resource *res, uint32_t *out)
 {
@@ -859,7 +873,15 @@ static HRESULT STDMETHODCALLTYPE HookCreateTexture2D(
         if (matched && ov) {
             {
                 std::lock_guard<std::mutex> lk(g_lock);
-                SetResourceHash(*ppTexture2D, hash);
+                const HRESULT hrs = SetResourceHash(*ppTexture2D, hash);
+                // 失败 ⇒ 资源上没有 TL_HASH_GUID ⇒ 慢路径 GetResourceHash 恒 false ⇒ hash=0
+                // ⇒ 该纹理**永不替换**。限流告警（同 ActiveAdd：首次 + 每 1024 次）。
+                if (FAILED(hrs)) {
+                    const long failCnt = ++g_hashSetFail;
+                    if (failCnt == 1 || (failCnt % 1024) == 0)
+                        TL_LOG(L"[warn] SetPrivateData(TL_HASH_GUID) failed hr=0x%08lX — this texture will NEVER be replaced; failures=%ld (cumulative)",
+                               (unsigned long)hrs, failCnt);
+                }
             }
             InterlockedIncrement(&g_stats_matched);
             if (g_observe_only) {
@@ -888,6 +910,31 @@ static HRESULT STDMETHODCALLTYPE HookCreateTexture2D(
                         it->second.refcount--;
                     delete tr;
                 }
+                // 2026-11-23（私有数据失败可见性）：挂载失败的后果必须留痕，否则表现为
+                // 「有时生效有时不生效」、不查计数根本发现不了：没有 tracker ⇒ 该纹理不进活跃集
+                // ⇒ 单独绑定时 anyHit=false 直接透传 ⇒ **mod 静默不生效**；只有与另一个活跃替换
+                // 资源在**同一次** SetShaderResources 调用里被绑定时，才经慢路径按 hash 被替换。
+                // 限流告警（同 ActiveAdd：首次 + 每 1024 次）。以下只增加计数与日志，回退动作与替换决策不变。
+                if (FAILED(thr)) {
+                    const long failCnt = ++g_trackerAttachFail;
+                    if (failCnt == 1 || (failCnt % 1024) == 0)
+                        TL_LOG(L"[warn] SetPrivateDataInterface(TL_TRACKER_GUID) failed hr=0x%08lX — texture not registered in active set; replacement only when co-bound with an active resource; failures=%ld (cumulative)",
+                               (unsigned long)thr, failCnt);
+                }
+                // ---------------------------------------------------------------------------
+                // 为什么**不**在这里补一次 ActiveAdd（本次只补可见性，不改策略）
+                // ---------------------------------------------------------------------------
+                // 1) 槽位泄漏 ⇒ 最终全局失效：没有 tracker 就没有 ActiveRemove，该资源在 g_activeArr
+                //    里的槽位**永不释放**。数组上限 kMaxActiveResources=4096，占满后 ActiveAdd 对
+                //    **所有**后续纹理都丢弃（g_activeOverflow 自增后 return）⇒ 全部替换静默失效 ——
+                //    这比「少数纹理不生效」严重得多。
+                // 2) 热路径退化：g_activeCount 恒 >0 且长期偏大，绑定路径的 anyHit 预扫与
+                //    ActiveContains 线性扫描成本上升（该路径 93 万次/秒级别调用，见
+                //    ARCHITECTURE.md §4「紧凑活跃数组替代 unordered_set」）。
+                // 另外澄清一个容易想反的点：遗留的陈旧指针**不会**造成错误替换 —— 慢路径按该资源
+                // 自己私有数据里的 hash 判定（HookSetShaderResourcesCommon 慢路径的 GetResourceHash + g_replacements.find），
+                // 不查活跃数组；hash=0 直接跳过，最多多走一次慢路径。
+                // ⇒ 现有「不进活跃集」是正确的安全取舍，缺的只是可见性（g_trackerAttachFail + [stat]）。
                 if (SUCCEEDED(thr)) {
                     ActiveAdd(*ppTexture2D);
                 }
@@ -1229,8 +1276,9 @@ static void STDMETHODCALLTYPE HookUpdateSubresource(
 // ⇒ 反例（代码可证，不需要实机）：纹理成功 `SetResourceHash`、替换条目也建好了，但
 //    `ActiveAdd` 被跳过。成因有二，两个都在本文件里：
 //    (a) `g_activeArr`(4096) 写满被丢弃 —— 有计数（`g_activeOverflow`，见 `ActiveAdd`）；
-//    (b) `SetPrivateDataInterface` 失败（见 `HookCreateTexture2D`）—— 该失败路径**无计数、
-//        无日志**，只回退 refcount 并 delete tracker。
+//    (b) `SetPrivateDataInterface` 失败（见 `HookCreateTexture2D`）—— 回退 refcount 并
+//        delete tracker，不进活跃集。该失败从 2026-11-23 起**有痕迹**：累计计数
+//        `g_trackerAttachFail`（`[stat]` 的 `tracker_fail=`）+ 首次/每 1024 次一行 `[warn]`。
 //    这类纹理不在活跃集 ⇒ `copy_hits` 不计；但只要它与任一活跃资源在**同一次**
 //    SetShaderResources 调用里被绑定，anyHit 即为真、进慢路径，它照样按 hash 被替换
 //    ⇒ 一旦发生丢弃或挂载失败，两个判据**必然分叉**。
@@ -1238,8 +1286,10 @@ static void STDMETHODCALLTYPE HookUpdateSubresource(
 //    这正是 ARCHITECTURE.md §6.1 那四个前置条件（observe=0 / overflow=0 / matched>0 /
 //    bound>0）存在的理由：只有它们同时成立，`copy_hits=0` 才能读成「该路径本局未命中替换」。
 //    ⚠️ 本局（同一份 E2 日志）实测满足这四个条件，所以上面 `copy_hits=0` 的**结论在本局成立**；
-//    但不能因此写成「无条件恒等 / 不存在盲区」—— 它是有前置条件的等价。另需诚实注明：
-//    (b) 那条路径无计数可查，故这四个条件只能证明「可观测的前置条件全满足」。
+//    但不能因此写成「无条件恒等 / 不存在盲区」—— 它是有前置条件的等价。
+//    另需注明：2026-11-23 起 (b) 那条路径**也可观测**了 —— 读同一行的
+//    `tracker_fail=0`（并有 `hash_fail=0` 覆盖 hash 写入侧），即可确认「跟踪器全部挂载成功」，
+//    于是「四个前置条件 + tracker_fail==0 + hash_fail==0」构成完整的判据，不再是不可知项。
 //
 // 结论不变：钩子只为一次性判别而存在 —— 留着就是给每个玩家多付一次 DetourAttach，
 // 外加每次 CopyResource 一次原子自增，却不再回答任何问题。
@@ -2471,6 +2521,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         //                         （延迟上下文是另一份实现、不计入；UpdateSubresource1 未 hook）；
         //     upd_calls>0       ⇒ 调用了（此时再看同行的 matched/bound 判它是否触及过
         //                          替换集；2026-11-23 实测为 166018 次而命中 0 次）。
+        // 2026-11-23 末尾再追加两个字段（私有数据失败可见性）：
+        //   hash_fail    = g_hashSetFail【**累计**】—— SetResourceHash() 的
+        //                  SetPrivateData(TL_HASH_GUID) 失败次数。失败 ⇒ 该纹理永不替换。
+        //   tracker_fail = g_trackerAttachFail【**累计**】—— SetPrivateDataInterface(TL_TRACKER_GUID)
+        //                  失败次数。失败 ⇒ 该纹理不进活跃集 ⇒ 单独绑定时 mod 静默不生效。
+        //   ⚠️ 两者都是**失败次数**（正常机器上应为 0），不是成功次数；进程内不清零。
+        //   非 0 时日志里必有对应 [warn] 行（首次 + 每 1024 次限流）给出 HRESULT。
+        //   ⚠️ 两者的**失效强度不同**，别混读：hash_fail>0 ⇒ 该纹理**全或无地永不替换**
+        //   （没有 hash ⇒ GetResourceHash 恒 false）；tracker_fail>0 的失效是**条件性**的 ——
+        //   该纹理不进活跃集，单独绑定时透传，但有别的活跃替换资源在**同一次**
+        //   SetShaderResources 里被绑定时，慢路径仍会按 hash 替换它（表现为「有时生效」）。
         // 只**追加**在行尾，既有字段的语义与顺序一律不动。
         // 取 size() 必须持 g_hash_dump_mutex（写方在渲染线程），且**在 g_lock 之外**取：
         // 虽然 DumpTextureHash 从不取 g_lock（不构成环），但没有必要把两把锁叠在一起。
@@ -2486,9 +2547,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             // copy_hits/copy_calls 属有意变更（其余字段一律不动，故旧日志的前半段与本构建不再逐字相同）。
             TL_LOG(L"[stat] hashed=%ld matched=%ld bound=%ld cache_entries=%u cache_MB=%u "
                    L"bind_log_suppressed=%llu active=%ld overflow=%ld observe=%d "
-                   L"hashes_unique=%zu upd_calls=%ld "
+                   L"hashes_unique=%zu upd_calls=%ld hash_fail=%ld tracker_fail=%ld "
                    L"|schema 累计={hashed matched bound bind_log_suppressed overflow "
-                   L"upd_calls} 当前={cache_entries cache_MB active hashes_unique} "
+                   L"upd_calls hash_fail tracker_fail} 当前={cache_entries cache_MB active hashes_unique} "
                    L"配置={observe} · active=0 不代表未生效（原纹理销毁时会移出活跃集），"
                    L"判「本局生效过」用 matched>0 且 bound>0",
                    g_stats_created, g_stats_matched, g_stats_bound,
@@ -2499,7 +2560,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
                    g_activeOverflow.load(std::memory_order_relaxed),
                    (int)g_observe_only,
                    hashes_unique,
-                   g_update_subresource_calls.load(std::memory_order_relaxed));
+                   g_update_subresource_calls.load(std::memory_order_relaxed),
+                   g_hashSetFail.load(std::memory_order_relaxed),
+                   g_trackerAttachFail.load(std::memory_order_relaxed));
         }
         // 进程退出：统一释放全局持久化的替换缓存（正常运行时不随原纹理销毁，
         // 退出时一次清空；进程卸载后驱动侧资源由系统回收，此处显式 Release）
