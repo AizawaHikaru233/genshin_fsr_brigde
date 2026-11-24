@@ -79,7 +79,14 @@ void set_cross_key_reuse(bool on);
 void set_provider_mode(int mode);                           // NgxProvider（0=auto 1=nvidia 2=external）
 
 // ---- 查询 ----
-bool active();          // 已成功初始化且 available==1
+// 语义 = NgxBackend.cpp 里 active() 的实际判据：已初始化 **且** available **且** 未全局放手。
+// 2026-11-24（T3b）：本行原写「已成功初始化且 available==1」，漏了 !g_release_all ——
+//   注释与代码不符，按 AGENTS.md §二.2 修正（不是本次改动引入的错，但同一函数族必须一起说清）。
+// ★ 本函数**不**看守卫粘滞位（ngxguard::ngx_guard_tripped()）：「初始化好了且没被全局放手」
+//   与「NGX 参数袋已不可信」是两件不同的事实（AGENTS.md §五.1），合并会让 active() 变成
+//   半个 should_release_all()；且 active() 全仓 0 个调用者，早退判据统一走 should_release_all()
+//   （SDS §0.1 第 3 条：active() 的代码一行不动）。
+bool active();
 bool available();       // 最近一次探测结果
 bool passthrough();
 // 当前是否允许跨 key 复用（返回下游消费者读到的**同一个值**，见 NgxCrossKeyReuse）。
@@ -99,8 +106,11 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
               std::uint64_t instance_key);
 
 // ---- fail-open 信号（D9 两道拦截共用）----
-// 只读 std::atomic<bool> g_release_all；不碰容器、不取任何锁。
-// 进程内一旦为 true 不再回落。语义是"全局放手"，不是"任一实例"。
+// 只读**两个** std::atomic<bool>（g_release_all + ngxguard 的守卫粘滞位）；不碰容器、不取任何锁。
+// 进程内一旦为 true 不再回落（粘滞位同样单向、不可恢复）。语义是"全局放手 **或** 参数袋不可用"，
+// 不是"任一实例"：任一实例/任一次厂商崩溃都要让全局放行原生上采样。
+// 2026-11-24（T3b / 决策：粘滞位独立、不置 g_release_all）：语义由"全局放手"扩展为上面这句，故本注释同步改 ——
+//   否则就是"注释撒谎"。扩展**不**碰 g_release_all 本身（那会永久静默 release_all reason=… 归因行）。
 bool should_release_all();
 
 } // namespace ngx

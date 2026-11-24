@@ -14209,7 +14209,9 @@ bool try_fsr2_translation_draw(
 #if defined(DX11FSRBRIDGE_ENABLE_NGX)
         // ★ T-6 第一道 fail-open gate（SDS §3.3.3 / D9）：NGX 全局放手时放行累积 draw，
         //   否则原生 FSR2 的输入缺失 ⇒ 画面冻在最后一帧（2026-09-28 实机冻屏回归的机理）。
-        //   should_release_all() 只读一个 std::atomic<bool>，不碰容器、不取锁。
+        //   should_release_all() 只读**两个** std::atomic<bool>（g_release_all + NGX 守卫粘滞位），
+        //   不碰容器、不取锁。2026-11-24（T3b）：语义扩为"全局放手 **或** 参数袋不可用"，
+        //   本行注释原写"只读一个 std::atomic<bool>"，同步改（AGENTS.md §二.2）。
         if (release_untagged_accumulate || ngx::should_release_all())
             return false;
 #else
@@ -14502,8 +14504,11 @@ bool fsr2_family_should_skip_draw(ID3D11DeviceContext *context)
     //   NGX 全局放手时关闭「跳过原生 FSR2 3-draw 预处理 pass」的许可。
     //   本门在 draw 钩子里**每 draw** 调用一次，且物理上取不到 ffx12::g_mutex
     //   （它在 Ffx12Backend.cpp 的匿名命名空间内、Ffx12Backend.h 里查不到），
-    //   故只能读 ngx::should_release_all() —— 它只读一个 std::atomic<bool>，
-    //   不碰容器、不取任何锁。语义必须是「全局」：任一实例失败都要关掉全局 family skip，
+    //   故只能读 ngx::should_release_all() —— 它只读**两个** std::atomic<bool>（g_release_all
+    //   + NGX 守卫粘滞位），不碰容器、不取任何锁。
+    //   2026-11-24（T3b / 决策：粘滞位独立、不置 g_release_all）：本行原写"只读一个 std::atomic<bool>"；谓词已扩为
+    //   "全局放手 **或** 参数袋不可用"，注释同步（AGENTS.md §二.2）。
+    //   语义必须是「全局」：任一实例失败都要关掉全局 family skip，
     //   否则正常实例继续被 skip 而失败实例不出图 ⇒ 冻屏。
     //   ⚠️ 必须早于下方 cached_ps 热点块（那块每次 draw 都要 PSGetShader）。
     if (ngx::should_release_all())
