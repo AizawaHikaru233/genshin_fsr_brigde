@@ -64,7 +64,7 @@
 #include "Ffx12Backend.h" // ffx12::FrameInput / ffx12::backend()
 #include "Ffx12ShaderSource.h" // g_depth_extract_hlsl / g_motion_decode_d11_hlsl
 #include "NgxBackend.h"
-// ★ 2026-11-24（T3b / OPEN-ISSUES §8）：NGX 参数袋 SEH 守卫的粘滞位（ngxguard::ngx_guard_tripped()）。
+// ★ 2026-11-24（T3b）：NGX 参数袋 SEH 守卫的粘滞位（ngxguard::ngx_guard_tripped()）。
 //   should_release_all() 的第二个输入来自这里；守卫本身（9 个包装 + 3 个计数）全在该 header 内，
 //   本 TU 只用它的三个只读访问器。为什么日志不放进那个 header：它必须是 POD-only（C2712），
 //   而拼串要 std::string ⇒ 日志一律留在本文件（SDS §7 / S5）。
@@ -635,7 +635,7 @@ namespace log_throttle_slot
 // 2026-11-17：EvalCrash 是 GPU 厂商 DLL 在 EvaluateFeature 里抛出的结构化异常。
 //   它发生在**每帧**的 eval 路径上（设备被打断后可连续多帧），故必须走本闸门；
 //   但它同时是"NGX 运行时已经不可用"的唯一证据，同槽的"前 8 条必打"保证首现不丢。
-// 2026-11-24（T3a / OPEN-ISSUES §8）：VtGuardTrip 是 NGX **参数袋**（NVSDK_NGX_Parameter 虚表）
+// 2026-11-24（T3a）：VtGuardTrip 是 NGX **参数袋**（NVSDK_NGX_Parameter 虚表）
 //   被 SEH 守卫接住异常时的命中行。它也落在每 dispatch 十几条调用的路径上（守卫一旦
 //   命中，后续调用全部短路），故同样必须走闸门 —— 否则粘滞置位后一次 dispatch 就能刷
 //   十几条。★ 短路（gr.skipped）**不走本槽、也不打任何行**：粘滞后每 dispatch 十几条
@@ -928,7 +928,7 @@ void log_ngx_error_throttled(const wchar_t *fmt, ...)
 
 
 // ============================================================================
-// 2026-11-24（T3a / OPEN-ISSUES §8）：NGX 参数袋 SEH 守卫的**日志**（SDS §7 的三种行）
+// 2026-11-24（T3a）：NGX 参数袋 SEH 守卫的**日志**（SDS §7 的三种行）
 // ============================================================================
 // 【为什么宏在本文件、而不在 NgxParamGuard.h】
 //   ① 那个 header 必须 POD-only：包装器体内有 __try，含 std::string 的函数在 /EHsc 下
@@ -2204,7 +2204,7 @@ static bool ensure_init(ID3D11Device *dev)
     g_params = params;
 
     // ---- 第 8 步：SuperSampling.Available ----
-    // 2026-11-24（T2a / OPEN-ISSUES §8）：改走 SEH 守卫。键名、出参、判据都不动 ——
+    // 2026-11-24（T2a）：改走 SEH 守卫。键名、出参、判据都不动 ——
     //   avail 是 int，故只能是 get_i32（params.h:68 Get(const char*, int*)）；
     //   写成 get_u32 会静默调到另一个重载，且编译零告警（SDS §2.2b）。
     //   一个函数体只声明一个出参局部量，本批改写共用它（SDS §2.4）。
@@ -2273,7 +2273,7 @@ static bool ensure_init(ID3D11Device *dev)
                   g_provider_kind,
                   g_entry_module_path.empty() ? L"(unknown)" : g_entry_module_path.c_str());
 
-    // 2026-11-24（T3a / OPEN-ISSUES §8）：`armed` 一次性正向行的发射点**已从本段移到 ensure_init 入口**。
+    // 2026-11-24（T3a）：`armed` 一次性正向行的发射点**已从本段移到 ensure_init 入口**。
     // ★ 为什么移走（2026-11-24 代码审核，**功能缺陷**不是风格问题）：
     //   放在这里时，本函数内**在 armed 之后**还有 **7 条**早退（reason ≈ provider 阶段判定 / no_appdata /
     //   init_crash / init / get_caps_crash / no_params / unavailable）——**任一条命中，armed 永不出现**。
@@ -2333,7 +2333,7 @@ static bool ensure_init(ID3D11Device *dev)
 // 而不是悄悄落到 void* 重载上（Ffx12CameraNear 那类教训：NGX 参数表里根本没有
 // FFX12 时代的那些名字，Set 时被静默丢弃，而 Set 返回 void，无从检测）。
 //
-// 2026-11-24（T2a / OPEN-ISSUES §8，SDS §2.4）：签名加出参 NgxGuardResult *gr。
+// 2026-11-24（T2a，SDS §2.4）：签名加出参 NgxGuardResult *gr。
 //   ★ 为什么必须加：守卫命中时调用方若拿不到失败信息，就无法归因、也无从知道 sticky
 //     置位的那一次是哪一处引起的 —— 等于静默丢失失败信息（SDS §2.4）。
 //   ★ 为什么外壳保持 inline 且**不写 __try**：外壳只做类型转换 + 转发，体内没有需要栈展开
@@ -2869,7 +2869,7 @@ static bool query_dlss_optimal_range(NVSDK_NGX_Parameter *p,
     if (p == nullptr || out == nullptr)
         return false;
 
-    // 2026-11-24（T2a / OPEN-ISSUES §8）：本函数的 12 处虚表调用 + 1 处厂商回调共用这一个出参。
+    // 2026-11-24（T2a）：本函数的 12 处虚表调用 + 1 处厂商回调共用这一个出参。
     //   SDS §2.4：必须复用同一个局部量，不要每个调用点各声明一个。
     NgxGuardResult gr {};
 
@@ -3088,7 +3088,7 @@ static int resolve_create_quality(std::uint32_t render_w, std::uint32_t render_h
 static void apply_render_preset(int v)
 {
     if (v <= 0) return;
-    // 2026-11-24（T2b / OPEN-ISSUES §8）：本函数 6 处虚表写入改走 SEH 守卫（SDS §8.1 实测就是 6 处，
+    // 2026-11-24（T2b）：本函数 6 处虚表写入改走 SEH 守卫（SDS §8.1 实测就是 6 处，
     //   不是历史误记的 14 —— 另 8 处在 create_feature）。
     //   v 是形参 int ⇒ set_i32（params.h:59）。★ 不能写 set_u32：int 会隐式转 unsigned，
     //   静默调到另一个槽且编译零告警（SDS §2.2b 的裁决）。
@@ -3335,12 +3335,12 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
         }
     }
 
-    // 2026-11-24（T2a / OPEN-ISSUES §8）：本函数所有参数袋写入共用一个出参（SDS §2.4：复用同一
+    // 2026-11-24（T2a）：本函数所有参数袋写入共用一个出参（SDS §2.4：复用同一
     //   个局部量）。T2a 只接了下面 4 处 set_tex；T2b 的 8 处 Set 会继续复用这一个 gr。
     NgxGuardResult gr {};
 
     // 1. Width / Height
-    // 2026-11-24（T2b / OPEN-ISSUES §8）：本函数剩余的 8 处虚表写入改走 SEH 守卫。
+    // 2026-11-24（T2b）：本函数剩余的 8 处虚表写入改走 SEH 守卫。
     //   inst.rw/rh/dw/dh 都是 std::uint32_t（NgxInstance:269-270）⇒ unsigned int 重载
     //   （params.h:58）⇒ set_u32。写成 set_i32 会静默改槽、编译零告警（SDS §2.2b）。
     ngxguard::set_u32(g_params, NVSDK_NGX_Parameter_Width, inst.rw, &gr);
@@ -3380,7 +3380,7 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     ngxguard::set_u32(g_params, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, flags, &gr);
     NGX_VT_GUARD_LOG(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, gr);
     // 6. 四个纹理（走 set_tex，杜绝传视图）
-    // 2026-11-24（T2a / OPEN-ISSUES §8）：4 处调用补 &gr。外壳只做类型转换 + 转发，虚表调用在
+    // 2026-11-24（T2a）：4 处调用补 &gr。外壳只做类型转换 + 转发，虚表调用在
     //   ngxguard::set_tex 里被 __try 包住（SDS §2.4）；日志放在调用点侧、__try 之外。
     set_tex(g_params, NVSDK_NGX_Parameter_Color,         inst.color.Get(),  &gr);
     NGX_VT_GUARD_LOG(NVSDK_NGX_Parameter_Color, gr);
@@ -4344,7 +4344,7 @@ static void diag_check_create_params(const NgxInstance &inst)
         g_release_all.store(true, std::memory_order_relaxed);
     };
 
-    // 2026-11-24（T2b / OPEN-ISSUES §8）：5 处回读改走 SEH 守卫，共用一个出参（SDS §2.4）。
+    // 2026-11-24（T2b）：5 处回读改走 SEH 守卫，共用一个出参（SDS §2.4）。
     //   w/h/ow/oh 是 unsigned int ⇒ get_u32（params.h:67）；pq 是 int ⇒ get_i32（params.h:68）。
     // ★ 判据与返回行为**一字不动**：原先是「Get 失败 || 值不等」两条件同处一个 if 的短路，
     //   这里只是把 Get 提到 if 之前取回 rc，条件表达式与短路顺序保持原样。
@@ -5066,7 +5066,7 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
                      static_cast<int>(mdesc.Format));
     }
 
-    // 2026-11-24（T2a 收口 / OPEN-ISSUES §8）：本函数所有参数袋写入共用一个出参（SDS §2.4：复用同一个
+    // 2026-11-24（T2a 收口）：本函数所有参数袋写入共用一个出参（SDS §2.4：复用同一个
     //   局部量，不要每个调用点各声明一个）。
     //   ★ 为什么 T2a 就要加它、而不是等 T2c：`set_tex` 的第 4 参**没有默认值**了 —— 默认值会
     //     制造一条静默未接线的路径（漏传时编译不报错、日志没有行、计数没有痕迹）。故本批把
@@ -5083,7 +5083,7 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     set_tex(g_params, NVSDK_NGX_Parameter_Output,        inst.output.Get(), &gr);
     NGX_VT_GUARD_LOG(NVSDK_NGX_Parameter_Output, gr);
     // 5：jitter —— **像素单位，直接透传**（不乘 render_w、不加 0.5，D4）
-    // 2026-11-24（T2c / OPEN-ISSUES §8）：dispatch 最后 12 处虚表写入改走 SEH 守卫，全部复用 T2a 在
+    // 2026-11-24（T2c）：dispatch 最后 12 处虚表写入改走 SEH 守卫，全部复用 T2a 在
     //   本函数**参数段**声明的同一个 `NgxGuardResult gr {}`（SDS §2.4：不要每个调用点各声明一个）。
     // ★ 重载逐个查证（SDS §2.2b 为权威）：`in` 是 `const ffx12::FrameInput &`（`dispatch` 的形参），
     //   jitter_x/jitter_y/motion_scale_x/motion_scale_y/pre_exposure/frame_time_delta_ms 都是
@@ -5324,7 +5324,7 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
 // ============================================================================
 // 只读两个 std::atomic<bool>；不碰容器、不取任何锁（硬约束，见 SDS §3.3.3）。
 //
-// ★ 2026-11-24（T3b / OPEN-ISSUES §8，决策：粘滞位独立、不置 g_release_all）：本谓词原先只表示「全局放手（g_release_all）」，
+// ★ 2026-11-24（T3b，决策：粘滞位独立、不置 g_release_all）：本谓词原先只表示「全局放手（g_release_all）」，
 //   现在扩展为「全局放手 **或** NGX 参数袋已被证实不可用（ngxguard 的粘滞位）」。
 //   两者对**调用方**的含义相同：不要再让 NGX 接管，放行原生上采样。
 //

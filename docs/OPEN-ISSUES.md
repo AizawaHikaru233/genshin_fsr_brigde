@@ -5,7 +5,7 @@
 > **改动历史不在这里**：某段代码为什么是现在这样，用 `git log` / `git blame` 查。
 > 条目关闭后直接删除；要留结论就移入文末「已解决」，并注明解决它的提交。
 
-最后更新：2026-11-18
+最后更新：2026-11-24
 
 ---
 
@@ -661,87 +661,7 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 
 ---
 
-## 8. NGX 后端仍有厂商代码调用未加 SEH 守卫
-
-**现状**
-
-- 已加守卫的只是 6 个**函数指针**调用点（`guarded_init_ext` / `guarded_release` / `guarded_create` /
-  `guarded_eval` / `guarded_get_caps` / `guarded_destroy`）。同一批厂商 DLL 还有三类调用**未加守卫**：
-  - `g_params->Get(...)` —— `NVSDK_NGX_Parameter` 的虚表调用（读参数）
-  - `p->Set(...)` —— 同上，写参数
-  - 最优设置回调 `cb(p)` —— `NGX_DLSS_GET_OPTIMAL_SETTINGS` 传入的函数指针，由厂商实现回调
-- 这三类与已守卫的六处同属「第三方实现不在本进程控制之下」，AV 同样会带走进程。
-- **精确范围**：受影响的虚表调用源行为 **45 处**（31 个 `Set` + 14 个 `Get`），
-  另有 **1 处**厂商回调 `cb(p)`，合计 **46 处受守卫调用**。分布于 `ensure_init`(1) /
-  `query_dlss_optimal_range`(12 虚调 + 1 回调) / `apply_render_preset`(6) / `create_feature`(8) /
-  `diag_check_create_params`(5) / `dispatch`(12)，以及 `set_tex` 定义体内 1 处（其 9 个调用点因此受益）。
-
-**影响**
-
-- 与上一节同形：进程直接消失、现场不可归因。区别只是它们此前不在那条 issue 的分析路径上，未被一并加固。
-- `Get/Set` 可能落在每帧路径上，加守卫前必须先判断是否真的每帧调用。
-
-**调用频率（已确认）**
-
-- 默认配置下 **16 次/dispatch**（不是「每帧」——`dispatch` 同帧可被多次调用）：
-  11 处无条件 `Set` + 1 处受 `g_dt_enabled`（默认 true）守卫 + 4 处 `set_tex`；
-  `NgxUseReactiveMask=1` 时再加 1 处。
-- `query_dlss_optimal_range` 的 12 处虚调 + 1 处回调按 **display 尺寸缓存**，每个尺寸只跑一次。
-- `apply_render_preset` 的 6 处受 `g_render_preset`（默认 0）守卫 ⇒ 默认配置下一次都不执行。
-
-**推进需要**
-
-- 调用频率已确认（见上），守卫形态定为「按方法类型抽 9 个 `inline __declspec(noinline)` 的 POD-only 包装」，
-  外加 1 个厂商回调包装；命中后置**进程级粘滞位**并让 `should_release_all()` 返回真，从而降级到原生上采样。
-- 需要独立探针或故障注入来证明守卫有效（本项目没有覆盖渲染主链的自动化测试）。
-  ⇒ 已用 E1 探针完成：三种坏 vtable 形态在**有无 `/EHsc` 两种构型**下均被接住，
-  异常码 `0xC0000005`，进程存活；正对照不进 `__except`。
-- ⚠️ **关于「必须实测帧数」这一条，已按实际测量结果调整**：
-  生产头（`inline __declspec(noinline)` 包装）实测净成本 **+1.31 ns/次**。
-  `dispatch` 内受守卫的厂商调用是 **16 次**（**12 处直接调用 + 4 处无条件 `set_tex`**；
-  另 1 处 `set_tex`（`DLSS_Input_Bias_Current_Color_Mask`）与 1 处 `FrameTimeDeltaInMsec` 带条件，
-  **上限 17 次**）⇒ **每次 dispatch 约 21 ns（0.021 µs）**，
-  占 60 fps 帧预算 **0.00013%**、240 fps 帧预算 **0.0005%**
-  ⇒ **任何游戏内 A/B 帧数对比都会落在噪声里**，测出「无差异」只证明「测不出来」，
-  不能证明「代价可忽略」（与 §二.5 同型的陷阱）。
-  ⇒ 验收改用**无量纲比值**：守卫成本不得使单次调用翻倍，即 `(C0−A0)/A0 < 1.0`。
-  **生产头实测 `+0.91`（min 口径）/ `+0.66`（median 口径）⇒ 通过，但属边界通过**
-  （20 次独立运行中有 3 次越过 1.0；原因是基线 A0 用的是「立刻返回」的桩，仅 1.4 ns，
-  而真实 NGX `Get`/`Set` 要做哈希查找，远贵于此 ⇒ 实机相对开销远小于此比值）。
-  ⚠️ **不要引用早期原型的 `+28.0%`**：那是 `__try` **内联在循环体**里的形态，
-  与生产的 `noinline` 包装差约 3.6 倍（原型 `+0.345 ns` vs 生产 `+1.31 ns`）。
-  游戏内只做**功能回归**（本局是否降级），帧数 A/B 如执行则如实标 `NOT VERIFIED`。
-
-**已知限制（不是缺陷，是设计边界）**
-
-- 守卫命中后采用**进程级粘滞位**：一旦置位，本进程不再尝试 NGX 参数袋，
-  `should_release_all()` 随即为真 ⇒ `dispatch` 早退、fail-open gate 放行原生上采样。
-- 该粘滞位**不可恢复**（与 `g_release_all` 的既有语义一致）：
-  **一次瞬时的厂商 DLL 异常会导致本局永久退回原生上采样，直到重启游戏**。
-- 恢复能力本次**不做**：恢复条件需要实机证据才能判定，且不能是设备生命周期事件
-  （重建设备不会让厂商实现变得可靠）。将来若要加，应给粘滞位单独加恢复条件，
-  而**不要**去动不可逆的 `g_release_all`。
-
-**已知语义变化：守卫会吞掉厂商抛的 C++ 异常**
-
-- 守卫的 `__except(EXCEPTION_EXECUTE_HANDLER)` 过滤器在 C++ EH **之前**运行，
-  因此厂商代码抛出的 C++ 异常（异常码 **`0xE06D7363`**）**也会被接住**，
-  与访问冲突（`0xC0000005`）走同一条降级路径。
-- **改动前的行为更糟**：生产 Release **未启用 `/EHsc`**（`CMakeLists.txt` 只在 Debug 下加），
-  厂商抛出的 C++ 异常无人接 ⇒ 直接 `terminate` ⇒ 进程消失。
-  ⇒ 改动后是「降级到原生上采样」，改动前是「崩溃」，**方向是改善而非退化**。
-- 但这是一次**真实的语义变化**，必须记录：厂商若依赖「异常能传到调用方」来做流程控制，
-  该依赖在本进程内将不再成立。目前没有任何证据表明 NGX 有此依赖（仅代码阅读，未实证）。
-- 日志里 `ex=0xE06D7363` 与 `ex=0xC0000005` **必须分开呈现**，不得笼统写「访问冲突」——
-  前者可能是厂商正常的参数校验，后者是厂商真的踩了非法内存，处置优先级不同。
-
-**相关代码位置**
-
-- `Dx11FsrBridge/NgxBackend.cpp`：`g_params->Get` / `p->Set` 的调用点、`query_dlss_optimal_range` 里传入的回调
-
----
-
-## 9. 本游戏的退出路径不执行 `DllMain(DLL_PROCESS_DETACH)` 与 CRT `atexit`
+## 8. 本游戏的退出路径不执行 `DllMain(DLL_PROCESS_DETACH)` 与 CRT `atexit`
 
 **现状**
 
@@ -781,7 +701,7 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 
 ---
 
-## 10. 桥的 `Present` 钩子在本游戏的启动方式下从不执行
+## 9. 桥的 `Present` 钩子在本游戏的启动方式下从不执行
 
 **现状**
 
@@ -818,7 +738,72 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 - `Dx11FsrBridge/Dx11FsrBridge.cpp`：`k_idx_present`、`hooked_present`、`g_state.frame_index` 的自增点、
   `transparent_jitter_frame()`
 - `Dx11FsrBridge/TransparentJitterHook.cpp`：`frame_provider` 的取值与「无 provider 时回退到 `calls`」分支
+
+---
+
 ## 已解决
+
+### NGX 参数袋（`NVSDK_NGX_Parameter` 虚表）厂商调用补 SEH 守卫（2026-11-24）
+
+**解决提交**：`b87c859`《fix(bridge): NGX 参数袋的厂商虚表调用补 SEH 保护》
+
+**结论**：新增 `Dx11FsrBridge/NgxParamGuard.h`，提供 9 个 POD-only 的 `inline __declspec(noinline)` 包装
+（4 类 `Set`：u32/i32/f32/纹理；4 类 `Get`：u32/i32/f32/void*；外加 1 个 DLSS 最优设置回调包装），
+46 处调用改走包装（31 个 `Set`、14 个 `Get`、1 处回调）。
+「9 个包装」是**定义数**（`kGuardWrapperCount`）；链进产物的只有 **8 个** —— `get_f32` 的唯一调用点
+在 `if (sharpness_out != nullptr)` 内，而它的唯一调用方传 `nullptr`，整块被编译器消除（**不是**漏了一个）。
+命中后置**进程级粘滞位**，并让 `should_release_all()` 返回真 ⇒ 降级到原生上采样，
+而不是让访问违例带走整个游戏进程。
+
+**证据**
+
+- E1（独立探针）：三种坏 vtable 形态（全槽 `0x10`）在**有无 `/EHsc` 两种构型**下均被接住，
+  异常码 `0xC0000005`，进程存活；正对照不进 `__except`。
+- 产物确证：8 个实际链进产物的包装在 `.pdata` 全部带 `EHANDLER`，处理器 RVA 指向
+  `__C_specific_handler` ⇒ `__try` 确实编进了二进制，不只是「编译通过」。
+- E2（真实会话）：约 100 秒 / 6244 帧的一局里 `ngx_vt_guard armed wrappers=9` **恰好一条**、
+  `trip`/`state` **各 0 条**；其余功能标记（`init ok=1`、`create_feature ok=1`、
+  `release_all`=0、`set_mismatch`=0）与改动前逐项一致。
+
+**成本（`dispatch` 路径）**
+
+- 生产头实测净增 **+1.31 ns/次**。
+- `dispatch` 内受守卫的厂商调用是 **16 次** = 11 处无条件 `Set` + 1 处受 `g_dt_enabled`（默认 true）
+  守卫 + 4 处无条件 `set_tex`；`NgxUseReactiveMask=1` 时再加 1 处，**上限 17 次**。
+- ⇒ 每次 `dispatch` 约 **21 ns** —— **不是每帧**：`dispatch` 同帧可被多次调用。
+  按 60 fps 帧预算计占 **0.00013%**、按 240 fps 计占 0.0005%
+  ⇒ **任何游戏内 A/B 帧数对比都会落在噪声里**，测出「无差异」只证明「测不出来」。
+- 故验收改用无量纲比值 `(C0−A0)/A0 < 1.0`：实测 min 口径 **+0.91**、median 口径 **+0.66**，
+  属边界通过（20 次独立运行中 3 次越过 1.0；原因是基线 A0 用的是「立刻返回」的桩，仅 1.4 ns，
+  而真实 NGX `Get`/`Set` 要做哈希查找，远贵于此 ⇒ 实机相对开销远小于此比值）。
+- ⚠️ **不要引用早期原型的 `+28.0%`**：那是 `__try` 内联在循环体里的形态，与生产的 `noinline`
+  包装差约 3.6 倍（原型 +0.345 ns vs 生产 +1.31 ns）。
+
+**其余调用点的执行频率（已确认，仍然成立）**
+
+- `query_dlss_optimal_range` 的 12 处虚调 + 1 处回调按 **display 尺寸缓存**，每个尺寸只跑一次。
+- `apply_render_preset` 的 6 处受 `g_render_preset`（默认 0）守卫 ⇒ 默认配置下一次都不执行。
+- `set_tex` 的 **9 个调用点**（`create_feature` 4 + `dispatch` 5）另经定义体内那 1 处包装受益，
+  所以「按调用点数」会得到 54 —— **46 是受守卫的厂商调用数，不是调用点数**。
+
+**已知边界（设计取舍，不是缺陷）**
+
+- 粘滞位**不可恢复**：一次瞬时的厂商异常会让本局**永久**退回原生上采样，直到重启游戏。
+  与既有的 `g_release_all` 语义一致；恢复条件需要实机证据才能判定，本次不做。
+  ⚠️ 将来若要加恢复能力，应给粘滞位**单独**加条件，**不要**去动不可逆的 `g_release_all`。
+- 守卫的 `__except` 过滤器在 C++ EH **之前**运行 ⇒ 厂商抛出的 C++ 异常（异常码 `0xE06D7363`）
+  也会被接住，与访问冲突走同一条降级路径。**改动前更糟**：Release 未启用 `/EHsc`，
+  这类异常无人接 ⇒ `terminate` ⇒ 进程消失。方向是改善，但这是**真实的语义变化**，必须记录。
+  目前没有任何证据表明 NGX 依赖「异常能传到调用方」做流程控制（仅代码阅读，未实证）。
+- 日志里 `ex=0xE06D7363` 与 `ex=0xC0000005` 必须**分开呈现**：前者可能是厂商正常的参数校验，
+  后者是厂商真的踩了非法内存，处置优先级不同。
+
+**相关代码位置**
+
+- `Dx11FsrBridge/NgxParamGuard.h`：9 个包装与粘滞位本体
+- `Dx11FsrBridge/NgxBackend.cpp`：46 处受守卫调用点（`ensure_init` 1 / `query_dlss_optimal_range` 12+1 /
+  `apply_render_preset` 6 / `create_feature` 8 / `diag_check_create_params` 5 / `dispatch` 12）、
+  `set_tex` 定义体内的 1 处、`should_release_all()`
 
 ### issue #19「NVNGX 启动即静默退出」（2026-11-23）
 
