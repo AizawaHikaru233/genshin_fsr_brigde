@@ -768,6 +768,30 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 
 ---
 
+## 11. Draw 路径的 PS 门控：新 shader 首次出现时可能漏掉 ~1 秒的上采样
+
+**现状**：2026-11-27 起，`inspect_target_upscaler_draw_on_demand` 在任何 COM 调用之前用
+「当前绑定的 Pixel Shader 指针」做门控：只放行**曾经识别成功过**的 PS，未学习过的 PS 按
+`stride=64` 抽样放行（命中即学习）。白名单空（冷启动）或拿不到 PS 时一律放行。
+
+**影响**：白名单里只有主路径的 PS 时，若游戏在某个场景里换用**另一个** PS 跑同一套 TAAU
+参数（代码注释记录的"技能等不同 shader"场景），该场景下目标绘制要被抽中才进内省
+⇒ 最坏约 64 帧（≈1 秒）没有上采样，之后学习完成即恢复正常。
+这是**一次性**代价（每个 shader 每进程一次），但表现为短暂的画面突变。
+
+**推进需要什么**：
+- 在门控里加一条「每个未知 key 首次出现时无条件放行一次」的就近环形表
+  （例如 8 条，未命中即记录并放行，之后才按 stride 抽样）——可把上述 1 秒窗口压到 1 帧；
+- 同时加一个 `first_sight` 计数进漏斗行，便于判断"到底有多少个不同 PS 在跑"；
+- 用 `perf_probe_funnel_draw` 的一行做验收：`ps_gate=… via_canary=` 持续为 0 说明门控没在
+  误杀；若 `via_canary` 反复增长，说明 stride 偏大。
+
+**相关代码位置**：`Dx11FsrBridge/PerfProbe.h` 的 PS 门控段（`ps_gate_admit` / `ps_gate_learn` /
+`PsGateSnapshot`）；`Dx11FsrBridge/Dx11FsrBridge.cpp` 的 `g_on_demand_ps_key`、
+`hooked_ps_set_shader` 的 on-demand 分支、`inspect_target_upscaler_draw_on_demand` 的门控与两处学习点。
+
+---
+
 ## 已解决
 
 ### NGX 参数袋（`NVSDK_NGX_Parameter` 虚表）厂商调用补 SEH 守卫（2026-11-24）

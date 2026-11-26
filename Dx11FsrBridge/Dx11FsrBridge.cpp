@@ -771,6 +771,10 @@ std::atomic_uint32_t g_texture_trace_count = 0;
 // target_jitter_pixels 依赖它的 g_buffer_snapshots 内容读取 TAA 抖动。
 std::atomic_uint64_t g_trace_ps_cb0_key = 0;
 std::atomic_uint64_t g_current_ps_hash = 0;
+// 2026-11-27：on-demand 模式下 `hooked_ps_set_shader` 直接透传、不维护 `g_current_ps_hash`
+// （那样要保持原有开销/行为），但 PS 门控需要一个"当前 PS 是谁"的廉价影子。
+// 这里只存**原始指针**（不做哈希查找、不进锁）——门控只拿它和自己学到的集合比。
+std::atomic_uint64_t g_on_demand_ps_key = 0;
 std::atomic_uint64_t g_mode2_fast_target_ps_hash = 0;
 std::atomic_uint64_t g_mode2_fast_target_ps_key = 0;
 std::mutex g_replacement_mutex;
@@ -8595,6 +8599,13 @@ void STDMETHODCALLTYPE hooked_ps_set_shader(ID3D11DeviceContext *context, ID3D11
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
     {
+        // 2026-11-27：只多存一个指针（1 次 relaxed store），供 on-demand 路径的 PS 门控做
+        // 无锁前置过滤。**不**在这里查 shader 哈希表、不进锁、不维护 g_state 镜像
+        // —— 那条路径的既有开销与语义一点不变（下面两个 early-return 分支同理）。
+        // ⚠️ 已知局限（未验证）：这是**一个全局**影子。若同一渲染线程上交替驱动多个
+        //    immediate context（本游戏未观测到），抓取时可能读到另一个 context 的 PS；
+        //    那种情形的后果是"该 draw 被门控误拒" ⇒ 靠 canary 抽样 + 学习自愈。
+        g_on_demand_ps_key.store(reinterpret_cast<std::uint64_t>(shader), std::memory_order_relaxed);
         g_original_ps_set_shader(context, shader, class_instances, class_instances_count);
         return;
     }
@@ -8890,10 +8901,50 @@ struct UpscalerPathCacheEntry
     std::uint32_t output_w = 0;
     std::uint32_t output_h = 0;
     std::uint32_t output_fmt = 0;
-    std::uint64_t last_hit_tick = 0;
 };
-std::mutex g_upscaler_path_cache_mutex;
-std::unordered_map<std::uint64_t, UpscalerPathCacheEntry> g_upscaler_path_cache;
+
+// 2026-11-27（热路径去锁）：正缓存从「unordered_map + 每-draw 加锁遍历」改成
+//   **写侧定长数组 + 读侧 TLS 副本**：
+//   - 写侧只在**识别成功**时重建（每帧至多一次），持 `g_upscaler_path_cache_mutex`；
+//     写完把 `g_upscaler_path_cache_version` +1（release）作为发布信号。
+//   - 读侧（快路径）先比版本号，**相等就直接用本线程副本**——零锁、零原子竞争；
+//     只有版本变了才取一次锁刷新副本（每线程、每次重建一次）。
+//   为什么这样是安全的：副本里存的是"布局 + 值指纹"，命中后仍要用当前实际的 RTV/SRV
+//   重新算指纹并比对（见 `try_upscaler_path_cache_fast`）⇒ 读到旧副本最多是**未命中**，
+//   不会把错误的布局当成命中。
+constexpr std::size_t k_upscaler_path_cache_slots = 8;
+struct UpscalerPathCacheSlot
+{
+    std::uint64_t fingerprint = 0;
+    UpscalerPathCacheEntry entry;
+};
+std::mutex g_upscaler_path_cache_mutex;   // 只保护写侧与读侧刷新（不在每-draw 路径上）
+UpscalerPathCacheSlot g_upscaler_path_cache[k_upscaler_path_cache_slots] {};
+std::uint32_t g_upscaler_path_cache_count = 0;    // 写侧计数（持锁访问）
+std::uint32_t g_upscaler_path_cache_cursor = 0;   // 淘汰游标（FIFO，见写侧注释）
+std::atomic<std::uint64_t> g_upscaler_path_cache_version { 0 };
+
+struct UpscalerPathCacheSnapshot
+{
+    std::uint64_t version = 0;
+    std::uint32_t count = 0;
+    UpscalerPathCacheSlot slots[k_upscaler_path_cache_slots] {};
+};
+thread_local UpscalerPathCacheSnapshot t_upscaler_path_cache;
+
+// 取锁刷新本线程副本（只在版本变化时调用一次）。
+// ★ 顺序：**先读版本、再拷内容**。反过来（拷完再读版本）可能把"比实际内容更新"的版本号
+//   写进副本 ⇒ 下一轮版本相等、不再刷新，副本就永远落后一次写入（只会造成未命中，
+//   但属于"能修就修"的自证不一致）。先读版本最坏是下一轮多刷一次，方向安全。
+void refresh_upscaler_path_cache_snapshot()
+{
+    std::lock_guard lock(g_upscaler_path_cache_mutex);
+    const std::uint64_t version = g_upscaler_path_cache_version.load(std::memory_order_relaxed);
+    t_upscaler_path_cache.count = g_upscaler_path_cache_count;
+    for (std::uint32_t i = 0; i < g_upscaler_path_cache_count; ++i)
+        t_upscaler_path_cache.slots[i] = g_upscaler_path_cache[i];
+    t_upscaler_path_cache.version = version;
+}
 
 std::uint64_t upscaler_path_fingerprint(
     const std::array<ResourceInfo, 7> &inputs,
@@ -8941,10 +8992,15 @@ std::optional<TargetUpscalerDrawInfo> try_upscaler_path_cache_fast(
     if (out0.resource_key == 0)
         return std::nullopt;
 
-    std::lock_guard lock(g_upscaler_path_cache_mutex);
-    for (auto &[fingerprint, entry] : g_upscaler_path_cache)
+    // 2026-11-27：热路径**不加锁**——版本号没变就直接读本线程副本（见缓存声明处的说明）。
+    const std::uint64_t cache_version = g_upscaler_path_cache_version.load(std::memory_order_acquire);
+    if (t_upscaler_path_cache.version != cache_version)
+        refresh_upscaler_path_cache_snapshot();
+
+    for (std::uint32_t slot_index = 0; slot_index < t_upscaler_path_cache.count; ++slot_index)
     {
-        (void)fingerprint;
+        const UpscalerPathCacheSlot &slot = t_upscaler_path_cache.slots[slot_index];
+        const UpscalerPathCacheEntry &entry = slot.entry;
         if (entry.output_w != out0.width || entry.output_h != out0.height ||
             entry.output_fmt != static_cast<std::uint32_t>(out0.format))
             continue; // output 段不匹配：跳过（避免按旧布局读 SRV）
@@ -8977,7 +9033,7 @@ std::optional<TargetUpscalerDrawInfo> try_upscaler_path_cache_fast(
         mix_info(depth);
         mix_info(out0);
         mix_info(out1);
-        if (h != fingerprint)
+        if (h != slot.fingerprint)
             continue;
 
         TargetUpscalerDrawInfo info;
@@ -8992,7 +9048,8 @@ std::optional<TargetUpscalerDrawInfo> try_upscaler_path_cache_fast(
         info.output_rtv_slot = entry.output_rtv_slot;
         info.color_resource_key = color.resource_key;
         info.motion_resource_key = motion.resource_key;
-        entry.last_hit_tick = GetTickCount64();
+        // 命中不再回写 `last_hit_tick`：读的是线程副本，写回传不回写侧。淘汰策略因此
+        // 明确为 FIFO（见写侧注释），不再假装是 LRU。
         return info;
     }
     return std::nullopt;
@@ -9327,6 +9384,30 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     if (context == nullptr)
         return std::nullopt;
 
+    // =======================================================================
+    // 【正式功能】PS 门控（2026-11-27）：**在任何 COM 调用之前**用当前绑定的 Pixel Shader
+    //   指针淘汰"从未被识别成功过"的 Pass。
+    //
+    //   为什么这一级能省大钱：下面紧接着的 `OMGetRenderTargets(2)`、`PSGetShaderResources(0,7)`、
+    //   `PSGetConstantBuffers(0,1)` 与 RTV[0] 的 `GetResource+QI+GetDesc` 是每帧 ~数百次
+    //   的真实开销；而它们之前的判据只有 `element_count == 3`（B109）。本门控只花
+    //   一次 acquire 读 + 至多 8 次指针比较，就能把绝大多数非目标 Pass 挡在这里。
+    //
+    //   判据来源是**学习**而不是硬编码哈希：本函数所在的 on-demand 路径有一条明确的设计
+    //   约束（见本函数头"不做任何 shader hash 过滤"）——技能等场景会用**不同的** shader
+    //   跑同一套 TAAU 参数，硬门控会直接砍掉它们。学习型门控只拒绝"从未成功过"的 PS；
+    //   没见过的 PS 按 canary 抽样放行，一旦成功立刻进白名单（详见 PerfProbe.h 的 PS 门控段）。
+    //
+    //   fail-open 三处：拿不到当前 PS（key==0）、门控已停用、白名单为空（冷启动）⇒ 一律放行。
+    // =======================================================================
+    const std::uint64_t on_demand_ps_key = g_on_demand_ps_key.load(std::memory_order_relaxed);
+    const perf_probe::PsGateAdmit ps_admit = perf_probe::ps_gate_admit(on_demand_ps_key);
+    if (!ps_admit.admitted)
+        return std::nullopt;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    perf_funnel.mark(perf_probe::FunnelStage::after_ps_gate);
+#endif
+
     // 诊断：候选 draw（3 顶点）识别失败限量记录（5s 一次），定位 UI 切换后桥接掉线环节
     //
     // ⚠️ 2026-09-27（B105 性能修复）：**先过闸门，再拼字符串**。
@@ -9514,6 +9595,14 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         perf_probe::note_identified_total();
 #endif
+        // PS 门控：这条快路径也是"识别成功"⇒ 把当前 PS 记进白名单。返回 true 表示
+        // 白名单刚被挤爆、门控已停用（一次性告警，之后一律走原路径）。
+        if (perf_probe::ps_gate_note_identified(on_demand_ps_key, ps_admit.canary))
+        {
+            LOG_DEBUG(blog::cat::upscale, "ps_gate_disabled reason=overflow key=" +
+                hex64(on_demand_ps_key) + " learned=" +
+                std::to_string(perf_probe::read_ps_gate().learned));
+        }
         register_cb0_for_jitter(constant_buffer);
         release_bound_views();
         return fast_info;
@@ -9725,11 +9814,20 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::note_identified_total();
 #endif
+    // PS 门控：完整识别成功 = 这个 PS 也算目标（含"技能等不同 shader"那种变体）。
+    if (perf_probe::ps_gate_note_identified(on_demand_ps_key, ps_admit.canary))
+    {
+        LOG_DEBUG(blog::cat::upscale, "ps_gate_disabled reason=overflow key=" +
+            hex64(on_demand_ps_key) + " learned=" +
+            std::to_string(perf_probe::read_ps_gate().learned));
+    }
 
     g_trace_ps_cb0_key.store(constant_buffer_key, std::memory_order_relaxed);
     register_cb0_for_jitter(constant_buffer);
 
-    // 正缓存写入（仅识别成功路径——值语义指纹，UI 切换/地址复用无关）
+    // 正缓存写入（仅识别成功路径——值语义指纹，UI 切换/地址复用无关）。
+    // 2026-11-27：写侧是**唯一事实源**；重建完把版本号 +1（release）发布给读侧，
+    // 各线程下次调用时刷新自己的 TLS 副本（见缓存声明处）。
     {
         std::lock_guard lock(g_upscaler_path_cache_mutex);
         UpscalerPathCacheEntry entry;
@@ -9741,17 +9839,37 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         entry.output_w = outputs[0].width;
         entry.output_h = outputs[0].height;
         entry.output_fmt = static_cast<std::uint32_t>(outputs[0].format);
-        entry.last_hit_tick = GetTickCount64();
         const std::uint64_t fingerprint = upscaler_path_fingerprint(inputs, outputs, *identified);
-        if (g_upscaler_path_cache.size() >= 8)
+        bool replaced = false;
+        for (std::uint32_t i = 0; i < g_upscaler_path_cache_count; ++i)
         {
-            auto oldest = g_upscaler_path_cache.begin();
-            for (auto it = g_upscaler_path_cache.begin(); it != g_upscaler_path_cache.end(); ++it)
-                if (it->second.last_hit_tick < oldest->second.last_hit_tick)
-                    oldest = it;
-            g_upscaler_path_cache.erase(oldest);
+            if (g_upscaler_path_cache[i].fingerprint != fingerprint)
+                continue;
+            g_upscaler_path_cache[i].entry = entry;
+            replaced = true;
+            break;
         }
-        g_upscaler_path_cache[fingerprint] = entry;
+        if (!replaced)
+        {
+            if (g_upscaler_path_cache_count < k_upscaler_path_cache_slots)
+            {
+                g_upscaler_path_cache[g_upscaler_path_cache_count].fingerprint = fingerprint;
+                g_upscaler_path_cache[g_upscaler_path_cache_count].entry = entry;
+                ++g_upscaler_path_cache_count;
+            }
+            else
+            {
+                // 满了：FIFO 覆盖。原实现按 `last_hit_tick` 淘汰（近似 LRU），但命中路径
+                // 已不再回写时间戳（读侧是线程副本，写回传不回写侧）⇒ 那个字段只剩
+                // "写入时刻"的语义，继续按它选只是变相的 FIFO，故显式改成 FIFO。
+                const std::uint32_t victim =
+                    g_upscaler_path_cache_cursor % k_upscaler_path_cache_slots;
+                g_upscaler_path_cache[victim].fingerprint = fingerprint;
+                g_upscaler_path_cache[victim].entry = entry;
+                ++g_upscaler_path_cache_cursor;
+            }
+        }
+        g_upscaler_path_cache_version.fetch_add(1, std::memory_order_release);
     }
 
     static std::atomic_bool identified_logged { false };

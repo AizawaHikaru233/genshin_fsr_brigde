@@ -193,6 +193,7 @@ enum class Counter : std::uint32_t
 enum class FunnelStage : std::uint32_t
 {
     entry = 0,        // 进入内省函数（= 被抽样到的调用数）
+    after_ps_gate,    // PS 门控之后（2026-11-27 增）：未学习过的 PS 在这一级被拒
     after_om,         // OMGetRenderTargets(2) 返回后
     after_prescreen,  // 双 RTV 预筛通过
     after_ps_query,   // PSGetShaderResources(0,7) + PSGetConstantBuffers(0,1) 返回后
@@ -552,7 +553,7 @@ inline const char *const k_counter_names[k_counter_count] = {
 constexpr std::size_t k_funnel_count = static_cast<std::size_t>(FunnelStage::count);
 
 inline const char *const k_funnel_names[k_funnel_count] = {
-    "entry", "after_om", "after_prescreen", "after_ps_query", "after_fast_path",
+    "entry", "after_ps_gate", "after_om", "after_prescreen", "after_ps_query", "after_fast_path",
     "fast_hit", "after_cb", "after_viewport", "after_output",
     "fixed_ok", "dynamic_ok", "identified"
 };
@@ -1663,8 +1664,8 @@ enum class Segment : std::uint32_t { present = 0, il2cpp_observer, draw_hook, di
     interop_submit, finish_wait, finish_copy, count };
 enum class Counter : std::uint32_t { virtual_protect = 0, flush_instruction_cache, sleep, wait_single_object,
     config_read, file_probe, count };
-enum class FunnelStage : std::uint32_t { entry = 0, after_om, after_prescreen, after_ps_query, after_fast_path,
-    fast_hit, after_cb, after_viewport, after_output, fixed_ok, dynamic_ok, identified, count };
+enum class FunnelStage : std::uint32_t { entry = 0, after_ps_gate, after_om, after_prescreen, after_ps_query,
+    after_fast_path, fast_hit, after_cb, after_viewport, after_output, fixed_ok, dynamic_ok, identified, count };
 enum class FrameSource : std::uint32_t { upscale = 0, present };
 
 inline void configure(bool, std::uint32_t, std::uint32_t) {}
@@ -2060,6 +2061,249 @@ inline DrawEntryFilterSnapshot read_draw_entry_filter()
     return snapshot;
 }
 
+// ===========================================================================
+// PS 门控（2026-11-27）：在 `OMGetRenderTargets` / `PSGetShaderResources` **之前**，
+// 用当前绑定的 Pixel Shader 指针淘汰"不是目标 FSR2 pass"的绘制。
+//
+// 【为什么这一级值得加】
+//   `inspect_target_upscaler_draw_on_demand` 每帧约 490 次调用（B107/B109 记录的实测口径）。
+//   B109 的 `element_count != 3` 已挡掉 92.2%，但剩下的每条调用仍要付
+//   `OMGetRenderTargets(2) + 2×Release`、`PSGetShaderResources(0,7)`、`PSGetConstantBuffers(0,1)`
+//   以及 RTV[0] 的 `GetResource + QI + GetDesc`。本门控只用一次比较就把它们挡在**任何 COM 调用之前**。
+//
+// 【为什么是"学习"而不是硬编码 hash】
+//   on-demand 路径有一条明确的设计约束（见 `inspect_target_upscaler_draw_on_demand` 的函数头）：
+//   **不做 shader hash 过滤**，因为"技能等使用不同 shader 的 TAAU 路径同样能被识别"。
+//   硬门控会直接砍掉那类路径 ⇒ 功能回归。所以这里只把**识别成功过的 PS** 记进白名单；
+//   没见过的 PS 走 canary 抽样放行，它一旦也被识别成功就立刻进白名单。
+//
+// 【冷启动】白名单为空时**一律放行**：此刻没有任何证据可以拒绝，硬抽样只会把第一帧的
+//   识别概率压到 1/N（表现为"上采样开头闪一下"）。第一条识别成功之后门控才真正生效。
+//
+// 【自我证伪（与 B109 同构）】
+//   canary 放行的调用照原路径走完整内省；其中若有识别成功且该 PS 不在白名单 ⇒ 立即学习，
+//   并计入 `learned_via_canary`（这个数持续 >0 说明门控一直在误杀，该把 stride 调小或关掉）。
+//   白名单满（8 个）⇒ **一次性停用**本门控并记下挤爆它的 key ⇒ fail-open 回原路径。
+//   停用是单向闩锁，永不复位（与 B109 的 `disabled` 同纪律）。
+//
+// 【诚实标注】本门控没有实测数据证明"门控开/关下同一绘制的识别结果一致"；它依赖的是
+//   结构性事实（只拒绝**从未识别成功过**的 PS）+ canary 的持续取证。收益也**未做帧数 A/B**，
+//   能给的只有"每帧少做多少次 COM 调用"这类可数的调用次数，见 `FunnelStage::after_ps_gate`。
+//
+// 【开销】冷启动/命中：1 次 acquire 载入 + 最多 8 次 64 位比较（顺序扫描）；
+//   未命中：再加 1 次 relaxed `fetch_add`（canary 序号）。**全程无锁、无 COM**。
+// ===========================================================================
+
+struct PsGateAdmit
+{
+    bool admitted = true;
+    bool canary = false;   // true = 未学习过的 PS 被抽样放行（给门控自己取证）
+};
+
+namespace detail
+{
+// 白名单槽位：8 个足以覆盖"主路径 + 技能/特殊场景"的少量变体；溢出即停用（fail-open）。
+inline constexpr std::size_t k_ps_gate_slots = 8;
+inline std::atomic_uint64_t g_ps_gate_keys[k_ps_gate_slots] {};
+inline std::atomic<std::uint32_t> g_ps_gate_count { 0 };
+inline std::atomic_bool g_ps_gate_disabled { false };
+inline std::atomic<std::uint32_t> g_ps_gate_stride { 64 };
+inline std::atomic_uint64_t g_ps_gate_sequence { 0 };            // canary 抽样序号（非区间计数）
+inline std::atomic_uint64_t g_ps_gate_skipped { 0 };             // 区间：被门控拒掉的调用数
+inline std::atomic_uint64_t g_ps_gate_canary { 0 };              // 区间：被抽样放行的调用数
+inline std::atomic_uint64_t g_ps_gate_learned { 0 };             // 区间：新学到的 PS 数
+inline std::atomic_uint64_t g_ps_gate_learned_via_canary { 0 };  // 区间：经 canary 才学到的 PS 数
+inline std::atomic<std::uint32_t> g_ps_gate_disable_reason { 0 }; // 0=none 1=overflow
+inline std::atomic_uint64_t g_ps_gate_disable_key { 0 };
+} // namespace detail
+
+// 门控状态名（写进汇总/漏斗行；`cold` = 还没有任何白名单条目）。
+inline const char *ps_gate_state_name()
+{
+    if (detail::g_ps_gate_disabled.load(std::memory_order_relaxed))
+        return "disabled";
+    return detail::g_ps_gate_count.load(std::memory_order_relaxed) != 0 ? "on" : "cold";
+}
+
+inline const char *ps_gate_disable_reason_name(std::uint32_t reason)
+{
+    switch (reason)
+    {
+    case 1: return "overflow";
+    default: return "none";
+    }
+}
+
+// 门控判据**不跟** ini（本轮没有新增配置键）：stride 固定 64。
+// 这个 setter 只给单测用（也留作以后真要加 ini 键时的唯一入口）。
+inline void configure_ps_gate(std::uint32_t canary_stride)
+{
+    detail::g_ps_gate_stride.store(canary_stride, std::memory_order_relaxed);
+}
+
+inline std::uint32_t ps_gate_canary_stride()
+{
+    return detail::g_ps_gate_stride.load(std::memory_order_relaxed);
+}
+
+inline bool ps_gate_contains(std::uint64_t key)
+{
+    const std::uint32_t count = detail::g_ps_gate_count.load(std::memory_order_acquire);
+    const std::uint32_t limit = count < detail::k_ps_gate_slots ? count : detail::k_ps_gate_slots;
+    for (std::uint32_t i = 0; i < limit; ++i)
+    {
+        if (detail::g_ps_gate_keys[i].load(std::memory_order_relaxed) == key)
+            return true;
+    }
+    return false;
+}
+
+// 学习一个 PS 指针。返回 true = **本次调用刚刚把门控停用**（调用方据此打一次告警）。
+// ⚠️ 并发下两个线程可能同时写同一槽位、CAS 只让一个成功 ⇒ 失败那一方的 key 丢失，
+// 它下一轮会被 canary 再次放行并重新学习 —— 丢一次学习是安全的（只会退回慢路径），
+// 而"丢一次拒绝"才会漏目标，所以这个方向是刻意的。
+inline bool ps_gate_learn(std::uint64_t key)
+{
+    if (key == 0 || detail::g_ps_gate_disabled.load(std::memory_order_relaxed))
+        return false;
+    if (ps_gate_contains(key))
+        return false;
+    std::uint32_t count = detail::g_ps_gate_count.load(std::memory_order_relaxed);
+    if (count >= detail::k_ps_gate_slots)
+    {
+        bool expected = false;
+        if (detail::g_ps_gate_disabled.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+        {
+            detail::g_ps_gate_disable_reason.store(1, std::memory_order_relaxed);
+            detail::g_ps_gate_disable_key.store(key, std::memory_order_relaxed);
+            return true;
+        }
+        return false;
+    }
+    detail::g_ps_gate_keys[count].store(key, std::memory_order_relaxed);
+    if (detail::g_ps_gate_count.compare_exchange_strong(count, count + 1, std::memory_order_release))
+        detail::g_ps_gate_learned.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+// 识别成功处调用：把这个 PS 记进白名单；`canary == true` 说明它是抽样放行后才成功的
+// （即门控本来会误杀它）⇒ 单独计数，供现场判断 stride 是否偏大。
+// 返回 true = 本次调用刚刚停用了门控（调用方打一次告警）。
+inline bool ps_gate_note_identified(std::uint64_t ps_key, bool canary)
+{
+    if (ps_key == 0 || detail::g_ps_gate_disabled.load(std::memory_order_relaxed))
+        return false;
+    if (ps_gate_contains(ps_key))
+        return false;
+    if (canary)
+        detail::g_ps_gate_learned_via_canary.fetch_add(1, std::memory_order_relaxed);
+    return ps_gate_learn(ps_key);
+}
+
+// **门控判据**（每次内省调用一次，零 COM、零锁）：
+//   - 拿不到当前 PS（`key == 0`：钩子没覆盖 / PSSetShader(nullptr)）⇒ 放行（fail-open）；
+//   - 门控已停用 / 白名单为空（冷启动）⇒ 放行；
+//   - PS 已在白名单 ⇒ 放行；
+//   - 否则按 stride 抽样：抽中 ⇒ 放行并标 `canary`；未抽中 ⇒ `admitted = false`。
+inline PsGateAdmit ps_gate_admit(std::uint64_t ps_key)
+{
+    PsGateAdmit result;
+    if (ps_key == 0)
+        return result;
+    if (detail::g_ps_gate_disabled.load(std::memory_order_relaxed))
+        return result;
+    if (detail::g_ps_gate_count.load(std::memory_order_acquire) == 0)
+        return result;   // 冷启动：没有任何证据 ⇒ 一律放行
+    if (ps_gate_contains(ps_key))
+        return result;
+    const std::uint32_t stride = detail::g_ps_gate_stride.load(std::memory_order_relaxed);
+    if (stride == 0)
+    {
+        detail::g_ps_gate_skipped.fetch_add(1, std::memory_order_relaxed);
+        result.admitted = false;
+        return result;
+    }
+    if (stride > 1)
+    {
+        const std::uint64_t sequence =
+            detail::g_ps_gate_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((sequence % stride) != 0)
+        {
+            detail::g_ps_gate_skipped.fetch_add(1, std::memory_order_relaxed);
+            result.admitted = false;
+            return result;
+        }
+    }
+    detail::g_ps_gate_canary.fetch_add(1, std::memory_order_relaxed);
+    result.canary = true;
+    return result;
+}
+
+// 门控快照（汇总/漏斗行用；区间计数在 snapshot 里读走即复位）。
+struct PsGateSnapshot
+{
+    std::uint32_t stride = 0;
+    std::uint32_t learned = 0;
+    bool disabled = false;
+    std::uint32_t disable_reason = 0;
+    std::uint64_t disable_key = 0;
+    std::uint64_t skipped = 0;
+    std::uint64_t canary = 0;
+    std::uint64_t learned_now = 0;          // 本区间新学到的 PS 数
+    std::uint64_t learned_via_canary = 0;   // 本区间经 canary 才学到的 PS 数
+};
+
+inline void fill_ps_gate_state(PsGateSnapshot &out)
+{
+    out.stride = detail::g_ps_gate_stride.load(std::memory_order_relaxed);
+    out.learned = detail::g_ps_gate_count.load(std::memory_order_relaxed);
+    out.disabled = detail::g_ps_gate_disabled.load(std::memory_order_relaxed);
+    out.disable_reason = detail::g_ps_gate_disable_reason.load(std::memory_order_relaxed);
+    out.disable_key = detail::g_ps_gate_disable_key.load(std::memory_order_relaxed);
+}
+
+// flush 用：读走并复位区间计数（**必须无条件调用**，否则残值串到下一区间）。
+inline PsGateSnapshot snapshot_ps_gate()
+{
+    PsGateSnapshot snapshot;
+    fill_ps_gate_state(snapshot);
+    snapshot.skipped = detail::g_ps_gate_skipped.exchange(0, std::memory_order_relaxed);
+    snapshot.canary = detail::g_ps_gate_canary.exchange(0, std::memory_order_relaxed);
+    snapshot.learned_now = detail::g_ps_gate_learned.exchange(0, std::memory_order_relaxed);
+    snapshot.learned_via_canary =
+        detail::g_ps_gate_learned_via_canary.exchange(0, std::memory_order_relaxed);
+    return snapshot;
+}
+
+// 单测/诊断用：只读，不动任何计数。
+inline PsGateSnapshot read_ps_gate()
+{
+    PsGateSnapshot snapshot;
+    fill_ps_gate_state(snapshot);
+    snapshot.skipped = detail::g_ps_gate_skipped.load(std::memory_order_relaxed);
+    snapshot.canary = detail::g_ps_gate_canary.load(std::memory_order_relaxed);
+    snapshot.learned_now = detail::g_ps_gate_learned.load(std::memory_order_relaxed);
+    snapshot.learned_via_canary =
+        detail::g_ps_gate_learned_via_canary.load(std::memory_order_relaxed);
+    return snapshot;
+}
+
+// 复位白名单与闩锁（单测用；设备重建时也可调 —— 旧设备的 PS 指针已失效）。
+inline void ps_gate_reset()
+{
+    for (std::size_t i = 0; i < detail::k_ps_gate_slots; ++i)
+        detail::g_ps_gate_keys[i].store(0, std::memory_order_relaxed);
+    detail::g_ps_gate_count.store(0, std::memory_order_relaxed);
+    detail::g_ps_gate_disabled.store(false, std::memory_order_relaxed);
+    detail::g_ps_gate_sequence.store(0, std::memory_order_relaxed);
+    detail::g_ps_gate_skipped.store(0, std::memory_order_relaxed);
+    detail::g_ps_gate_canary.store(0, std::memory_order_relaxed);
+    detail::g_ps_gate_learned.store(0, std::memory_order_relaxed);
+    detail::g_ps_gate_learned_via_canary.store(0, std::memory_order_relaxed);
+    detail::g_ps_gate_disable_reason.store(0, std::memory_order_relaxed);
+    detail::g_ps_gate_disable_key.store(0, std::memory_order_relaxed);
+}
+
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
 // 单测/诊断读取（不影响计数）。
 inline std::uint64_t read_shape_calls(std::uint64_t packed)
@@ -2295,6 +2539,8 @@ inline void flush_now()
         detail::g_funnel_identified_total.exchange(0, std::memory_order_relaxed);
     // B109 入口过滤器：区间计数同样**无条件**读走（配置与自我证伪闩锁不复位）。
     const DrawEntryFilterSnapshot entry_filter = snapshot_draw_entry_filter();
+    // PS 门控：同上，区间计数无条件读走（白名单与停用闩锁本身不复位）。
+    const PsGateSnapshot ps_gate = snapshot_ps_gate();
 
     // 每段：calls / 每帧 µs / max µs，并复位
     std::uint64_t calls[detail::k_segment_count] {};
@@ -2435,7 +2681,9 @@ inline void flush_now()
                 "perf_probe_funnel_draw ms=%.0f calls=%llu sampled=%llu stride=%u"
                 " | views=%llu views_per_call=%.2f identified_total=%llu"
                 " | entry_filter=%s canary_stride=%u skip=%llu canary=%llu non3_id=%llu"
-                " disable_ec=%u disable_entry=%s |",
+                " disable_ec=%u disable_entry=%s"
+                " | ps_gate=%s stride=%u learned=%u skip=%llu canary=%llu learned_now=%llu"
+                " via_canary=%llu disable_reason=%s |",
                 elapsed_ms,
                 static_cast<unsigned long long>(funnel_calls),
                 static_cast<unsigned long long>(funnel_sampled),
@@ -2451,7 +2699,15 @@ inline void flush_now()
                 static_cast<unsigned long long>(entry_filter.canary),
                 static_cast<unsigned long long>(entry_filter.non3_identified),
                 static_cast<unsigned>(entry_filter.disable_element_count),
-                draw_entry_kind_name(entry_filter.disable_entry));
+                draw_entry_kind_name(entry_filter.disable_entry),
+                ps_gate_state_name(),
+                static_cast<unsigned>(ps_gate.stride),
+                static_cast<unsigned>(ps_gate.learned),
+                static_cast<unsigned long long>(ps_gate.skipped),
+                static_cast<unsigned long long>(ps_gate.canary),
+                static_cast<unsigned long long>(ps_gate.learned_now),
+                static_cast<unsigned long long>(ps_gate.learned_via_canary),
+                ps_gate_disable_reason_name(ps_gate.disable_reason));
             std::string funnel_text = funnel_line;
             for (std::size_t i = 0; i < detail::k_funnel_count; ++i)
             {
@@ -2684,6 +2940,9 @@ inline void reset_for_test()
     detail::g_entry_filter_disable_entry.store(static_cast<std::uint32_t>(DrawEntryKind::unknown),
                                                std::memory_order_relaxed);
     detail::g_entry_filter_disable_at_ms.store(0, std::memory_order_relaxed);
+    // PS 门控：白名单 + 停用闩锁 + 区间计数一起复位（同 B109 的理由：单测要干净起点）。
+    // ⚠️ 但 **不复位 stride**：它对应 ini/默认值，属"配置"而不是"运行期状态"。
+    ps_gate_reset();
     for (std::size_t i = 0; i < detail::DrawShapeMark::k_observed_capacity; ++i)
     {
         detail::g_draw_shape_mark.observed_keys[i].store(0, std::memory_order_relaxed);

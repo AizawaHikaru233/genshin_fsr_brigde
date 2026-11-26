@@ -1490,6 +1490,92 @@ void test_draw_entry_filter_canary()
 // success reports the element count of that draw, and a single non-3 identification must
 // disable the filter permanently and loudly. After that every draw takes the original path
 // again -- fail-open, so the worst case is the old (slower) behaviour, never a lost target.
+// 2026-11-27: the PS gate (learned whitelist + canary + fail-open). It runs before any COM
+// call on the draw path, so its whole contract is "which decisions are allowed":
+//   1. cold start (empty whitelist) admits everything -- no evidence, no rejection;
+//   2. a learned PS is admitted and is not a canary;
+//   3. an unknown PS follows the stride: 0 => reject, N => 1/N sampled as canary;
+//   4. key==0 (no shadow value: PSSetShader not observed) is never rejected;
+//   5. a whitelist overflow disables the gate exactly once and records why.
+void test_ps_gate_cold_start_and_learning()
+{
+    perf_probe::reset_for_test();
+    perf_probe::configure_ps_gate(0);   // strictest: unknown keys are rejected
+
+    for (int i = 0; i < 4; ++i)
+    {
+        const perf_probe::PsGateAdmit admit = perf_probe::ps_gate_admit(0xAAAA);
+        CHECK(admit.admitted, "ps gate: cold start admits every key");
+        CHECK(!admit.canary, "ps gate: a cold-start admission is not a canary");
+    }
+    CHECK(perf_probe::read_ps_gate().skipped == 0, "ps gate: cold start records no skip");
+    CHECK(std::strcmp(perf_probe::ps_gate_state_name(), "cold") == 0, "ps gate: state is cold");
+
+    perf_probe::ps_gate_note_identified(0xAAAA, false);
+    CHECK(perf_probe::read_ps_gate().learned == 1, "ps gate: learning fills one slot");
+    CHECK(std::strcmp(perf_probe::ps_gate_state_name(), "on") == 0, "ps gate: state is on");
+    CHECK(perf_probe::ps_gate_admit(0xAAAA).admitted, "ps gate: a learned key is admitted");
+    CHECK(!perf_probe::ps_gate_admit(0xAAAA).canary, "ps gate: a learned key is not a canary");
+    CHECK(!perf_probe::ps_gate_admit(0xBBBB).admitted,
+          "ps gate: an unknown key is rejected when the stride is 0");
+    CHECK(perf_probe::read_ps_gate().skipped == 1, "ps gate: the skip counter follows");
+
+    // key==0 = no shadow value (PSSetShader never observed on this context) => fail-open.
+    CHECK(perf_probe::ps_gate_admit(0).admitted, "ps gate: an absent PS key is admitted");
+}
+
+void test_ps_gate_canary_and_overflow()
+{
+    perf_probe::reset_for_test();
+    perf_probe::configure_ps_gate(4);
+    perf_probe::ps_gate_note_identified(0x1000, false);   // whitelist must be non-empty
+
+    std::uint64_t admitted = 0;
+    for (int i = 0; i < 12; ++i)
+    {
+        const perf_probe::PsGateAdmit admit = perf_probe::ps_gate_admit(0x2000);
+        if (admit.admitted)
+        {
+            ++admitted;
+            CHECK(admit.canary, "ps gate: a sampled admission is flagged as a canary");
+        }
+    }
+    CHECK(admitted == 3, "ps gate: stride 4 over 12 unknown-key draws admits 3");
+    perf_probe::PsGateSnapshot snapshot = perf_probe::read_ps_gate();
+    CHECK(snapshot.canary == 3, "ps gate: the canary counter matches the admissions");
+    CHECK(snapshot.skipped == 9, "ps gate: the other 9 unknown-key draws are skipped");
+
+    // Canary-driven learning is the self-falsification evidence: this key WOULD have been
+    // dropped, and it got identified anyway => learn it and count it.
+    perf_probe::ps_gate_note_identified(0x2000, true);
+    snapshot = perf_probe::read_ps_gate();
+    CHECK(snapshot.learned == 2, "ps gate: a canary-identified key is learned");
+    CHECK(snapshot.learned_via_canary == 1, "ps gate: it is counted as learned_via_canary");
+    CHECK(perf_probe::ps_gate_admit(0x2000).admitted, "ps gate: the newly learned key is admitted");
+
+    // Overflow: 8 slots. The 9th distinct key disables the gate once (fail-open) and records
+    // the key that overflowed, so the field log can tell "many variants" from "pointer drift".
+    perf_probe::reset_for_test();
+    perf_probe::configure_ps_gate(0);
+    bool just_disabled = false;
+    for (std::uint64_t key = 1; key <= 8; ++key)
+        just_disabled = perf_probe::ps_gate_note_identified(key, false) || just_disabled;
+    CHECK(!just_disabled, "ps gate: filling exactly 8 slots does not disable");
+    CHECK(perf_probe::read_ps_gate().learned == 8, "ps gate: all 8 slots are used");
+    CHECK(!perf_probe::ps_gate_admit(0x9999).admitted, "ps gate: a 9th key is still rejected");
+    CHECK(perf_probe::ps_gate_note_identified(0x9999, false),
+          "ps gate: the 9th key reports the one-shot disable");
+    snapshot = perf_probe::read_ps_gate();
+    CHECK(snapshot.disabled, "ps gate: the gate is disabled after overflow");
+    CHECK(snapshot.disable_reason == 1, "ps gate: the disable reason is overflow");
+    CHECK(snapshot.disable_key == 0x9999, "ps gate: the overflowing key is recorded");
+    CHECK(std::strcmp(perf_probe::ps_gate_state_name(), "disabled") == 0,
+          "ps gate: the state name is disabled");
+    CHECK(perf_probe::ps_gate_admit(0x9999).admitted, "ps gate: disabled => every draw is admitted");
+    CHECK(!perf_probe::ps_gate_note_identified(0x9998, false),
+          "ps gate: a disabled gate never reports a second disable");
+}
+
 void test_draw_entry_filter_failsafe_fail_open()
 {
     perf_probe::reset_for_test();
@@ -1913,6 +1999,31 @@ void bench_probe_cost()
     std::printf("probe_self_cost_ns   entry_filter_off=%.2f  entry_filter_count3=%.2f"
                 "  entry_filter_reject=%.2f\n",
                 entry_filter_off_ns, entry_filter_three_ns, entry_filter_reject_ns);
+
+    // PS 门控（2026-11-27）两条分支：已学习命中（稳态最热的一支）与未学习被拒
+    // （多一次 canary 序号 + 一次 skip 计数）。这两条都在**任何 COM 调用之前**，
+    // 所以它们的绝对值必须显著低于一次视图读取（B104 微基准 ≈53 ns/次）。
+    perf_probe::reset_for_test();
+    perf_probe::configure_ps_gate(64);
+    perf_probe::ps_gate_note_identified(0x1111, false);
+    QueryPerformanceCounter(&begin);
+    for (int i = 0; i < iterations; ++i)
+        perf_probe::ps_gate_admit(0x1111);
+    QueryPerformanceCounter(&end);
+    const double ps_gate_hit_ns = static_cast<double>(end.QuadPart - begin.QuadPart) * to_ns / iterations;
+
+    perf_probe::reset_for_test();
+    perf_probe::configure_ps_gate(0);   // 0 = 不打 canary：未学习的一律拒（最贵的一支）
+    perf_probe::ps_gate_note_identified(0x1111, false);
+    QueryPerformanceCounter(&begin);
+    for (int i = 0; i < iterations; ++i)
+        perf_probe::ps_gate_admit(0x2222);
+    QueryPerformanceCounter(&end);
+    const double ps_gate_reject_ns = static_cast<double>(end.QuadPart - begin.QuadPart) * to_ns / iterations;
+    std::printf("probe_self_cost_ns   ps_gate_hit=%.2f  ps_gate_reject=%.2f\n",
+                ps_gate_hit_ns, ps_gate_reject_ns);
+    CHECK(ps_gate_hit_ns < 1000.0, "probe self cost: a PS gate hit stays below 1 us");
+    CHECK(ps_gate_reject_ns < 1000.0, "probe self cost: a PS gate reject stays below 1 us");
     std::printf("=> per frame (10 timed segments): %.2f ns  == %.5f us\n",
                 scope_enabled_ns * 10.0, scope_enabled_ns * 10.0 / 1000.0);
     // Sanity bound only: a single scope must stay far below 10 us. A failure here
@@ -1955,6 +2066,8 @@ int main()
     test_draw_shape_mark_is_free_when_disabled();
     test_draw_entry_filter_admits_only_three();
     test_draw_entry_filter_canary();
+    test_ps_gate_cold_start_and_learning();
+    test_ps_gate_canary_and_overflow();
     test_draw_entry_filter_failsafe_fail_open();
     test_draw_entry_filter_off_records_falsification();
     test_draw_entry_filter_line();
