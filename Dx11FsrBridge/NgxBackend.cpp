@@ -292,6 +292,11 @@ struct NgxInstance
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_src_srv;  // motion CS 的 t0，固定 R10G10B10A2_UNORM
     ID3D11Texture2D *depth_src_last  = nullptr;   // ★ 裸指针，**不是 ComPtr**（只做身份比对，**不做 Release**）
     ID3D11Texture2D *motion_src_last = nullptr;   // ★ 同上。只做身份比对，**不做 Release**（纹理归游戏）
+    // 两条输入纹理的尺寸（建视图时记下；0 = 未知）。
+    // 合并派发要求两者同尺寸：合并后两条路径共用同一个 id.xy，尺寸不同时小的一侧会被
+    // 大的一侧拖着去读别处；分成两次派发时各自按自己的纹理边界，语义才等价。
+    UINT depth_src_w = 0, depth_src_h = 0;
+    UINT motion_src_w = 0, motion_src_h = 0;
 
     // ---- b0 常数缓冲（16 B，两条 CS 共用）----
     Microsoft::WRL::ComPtr<ID3D11Buffer> cb;
@@ -454,6 +459,9 @@ PFN_NGX_GetFeatureRequirements   g_req        = nullptr;
 // T-2 只声明；ensure_shaders 是 T-4 的交付物。
 Microsoft::WRL::ComPtr<ID3D11ComputeShader> g_depth_cs;
 Microsoft::WRL::ComPtr<ID3D11ComputeShader> g_motion_cs;
+// 合并变体（2026-11-27）：深度提取 + motion 默认解码一次派发。
+// 为空（编译/建对象失败）时每帧自动退回上面两条独立 CS —— 它是可选优化，不是必需资源。
+Microsoft::WRL::ComPtr<ID3D11ComputeShader> g_merged_cs;
 bool g_shaders_ready = false;
 bool g_shader_compile_failed = false;     // 编译输入不变；进程生命周期锁存，不因设备重建清除
 bool g_shader_object_failed = false;      // CreateComputeShader 设备对象失败；shutdown_all 后允许新设备重试
@@ -3658,6 +3666,9 @@ static void release_pool_resources(NgxInstance &inst)
     // ---- 输入侧 SRV 与身份缓存（depth_src_last / motion_src_last 是裸指针，只置空不 Release）----
     inst.depth_src_srv.Reset(); inst.motion_src_srv.Reset();
     inst.depth_src_last = nullptr;  inst.motion_src_last = nullptr;
+    // 尺寸缓存与身份缓存同生命周期：0 = 未知 ⇒ 合并派发在视图重建前一律拒绝合并
+    inst.depth_src_w = inst.depth_src_h = 0;
+    inst.motion_src_w = inst.motion_src_h = 0;
 
     // ★★ 必须同步复位 cb 的缓存判据（SDS §3.12.3 规则 2 明文要求「cb + 3 UAV + 3 SRV」——
     //   SDS 早期把 SRV 数误记为 4，实际只有 color_srv + depth_src_srv + motion_src_srv 这 3 个，
@@ -4052,6 +4063,47 @@ static bool ensure_shaders()
         }
     }
 
+    // 合并变体（2026-11-27）：深度提取 + motion 默认解码，一次派发写完三张 UAV。
+    // ★ 失败**不锁存、不返回 false**：上面两条独立 CS 都还在，缺它只是每帧退回两次派发。
+    //   若把它算进 g_shader_compile_failed / g_shader_object_failed，等于用一个可选优化
+    //   把整个 NGX 后端判死 —— 动作强度超过证据强度（§五.1）。
+    {
+        ID3DBlob *code = nullptr, *err = nullptr;
+        const HRESULT hr = D3DCompile(ffx12::g_depth_motion_merged_hlsl,
+                                      sizeof(ffx12::g_depth_motion_merged_hlsl) - 1,
+                                      "ngx_depth_motion_merged", nullptr, nullptr,
+                                      "main", "cs_5_0", 0, 0, &code, &err);
+        if (FAILED(hr) || !code)
+        {
+            log_ngx_error(L"ngx_core compile fail stage=merged hr=0x%08X (退回两次派发)",
+                          static_cast<unsigned>(hr));
+            if (err)
+            {
+                OutputDebugStringA(static_cast<const char *>(err->GetBufferPointer()));
+                err->Release();
+            }
+            if (code) code->Release();
+        }
+        else
+        {
+            if (err)
+            {
+                err->Release();
+                err = nullptr;
+            }
+            const HRESULT hr2 = g_device->CreateComputeShader(
+                code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_merged_cs);
+            code->Release();
+            code = nullptr;
+            if (FAILED(hr2))
+            {
+                g_merged_cs.Reset();
+                log_ngx_error(L"ngx_core create_cs fail stage=merged hr=0x%08X (退回两次派发)",
+                              static_cast<unsigned>(hr2));
+            }
+        }
+    }
+
     g_shaders_ready = true;
     return true;
 }
@@ -4084,6 +4136,9 @@ static bool ensure_depth_src_srv(const ffx12::FrameInput &in, NgxInstance &inst)
     DXGI_FORMAT srv_fmt = DXGI_FORMAT_R32_FLOAT;
     D3D11_TEXTURE2D_DESC dtd {};
     in.depth->GetDesc(&dtd);
+    // 尺寸供合并判据用（本函数反正每帧已经取过 desc，多存两个整数不额外花代价）
+    inst.depth_src_w = dtd.Width;
+    inst.depth_src_h = dtd.Height;
     switch (dtd.Format)
     {
         case DXGI_FORMAT_R24G8_TYPELESS:
@@ -4132,6 +4187,11 @@ static bool ensure_motion_src_srv(const ffx12::FrameInput &in, NgxInstance &inst
     if (!inst.motion_src_srv || inst.motion_src_last != in.motion)
     {
         inst.motion_src_srv.Reset();
+        // 尺寸供合并判据用（只在纹理换了时才取一次 desc）
+        D3D11_TEXTURE2D_DESC mdd {};
+        in.motion->GetDesc(&mdd);
+        inst.motion_src_w = mdd.Width;
+        inst.motion_src_h = mdd.Height;
         D3D11_SHADER_RESOURCE_VIEW_DESC srv {};
         srv.Format        = DXGI_FORMAT_R10G10B10A2_UNORM;   // 固定
         srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -4243,6 +4303,36 @@ static void dispatch_motion_cs(ID3D11DeviceContext *ctx, NgxInstance &inst)
     ctx->CSSetShaderResources(0, 1, mn_srvs);
     ID3D11Buffer *mn_cbs[1] = { nullptr };
     ctx->CSSetConstantBuffers(0, 1, mn_cbs);
+    ctx->CSSetShader(nullptr, nullptr, 0);
+}
+
+// §3.6.3 合并 CS（2026-11-27）：深度提取 + motion 默认解码一次派发（1 CS / 2 SRV / 1 CB / 3 UAV）。
+// 比两次派发少 1 次 Dispatch 与约一半的槽位切换。前提由调用方判定（第 8 步）：
+// 合并 CS 可用、两条 t0 视图都在、且两条输入同尺寸。
+static void dispatch_merged_cs(ID3D11DeviceContext *ctx, NgxInstance &inst)
+{
+    ctx->CSSetShader(g_merged_cs.Get(), nullptr, 0);
+    // ★ 槽序不可换：t0 = 游戏深度（格式三分支），t1 = 游戏 motion（固定 R10G10B10A2_UNORM）
+    ID3D11ShaderResourceView *srvs[2] = { inst.depth_src_srv.Get(), inst.motion_src_srv.Get() };
+    ctx->CSSetShaderResources(0, 2, srvs);
+    // ★ b0 = {depth_scale, flip}：upload_cb 一次写两个值，合并变体按 x/y 各取所需。
+    //   独立的 motion CS 只声明了 g_flip ⇒ 读的是 b0.x，与 upload_cb 写 {depth, flip} 的
+    //   布局对不上（默认 depth_scale=1.0 时才碰巧等价）。这处既有错位不在本次范围内，
+    //   合并路径读 b0.y，天然绕开它。
+    ID3D11Buffer *cbs[1] = { inst.cb.Get() };
+    ctx->CSSetConstantBuffers(0, 1, cbs);
+    // ★ 槽序不可换：u0 = 提取深度（R32），u1 = 解码 motion（R16G16），u2 = reactive（R8）
+    ID3D11UnorderedAccessView *uavs[3] = { inst.depth_uav.Get(), inst.motion_uav.Get(),
+                                           inst.reactive_uav.Get() };
+    ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
+
+    ctx->Dispatch((inst.rw + 7u) / 8u, (inst.rh + 7u) / 8u, 1u);
+
+    // ---- 解绑（成对；CB 与上面两条独立 CS 同口径，不解绑）----
+    ID3D11UnorderedAccessView *null_uavs[3] = { nullptr, nullptr, nullptr };
+    ctx->CSSetUnorderedAccessViews(0, 3, null_uavs, nullptr);
+    ID3D11ShaderResourceView *null_srvs[2] = { nullptr, nullptr };
+    ctx->CSSetShaderResources(0, 2, null_srvs);
     ctx->CSSetShader(nullptr, nullptr, 0);
 }
 
@@ -4453,6 +4543,7 @@ void shutdown_all()
     //    新设备上值得重试一次 ⇒ 清。
     g_depth_cs.Reset();
     g_motion_cs.Reset();
+    g_merged_cs.Reset();
     g_shaders_ready = false;
     g_shader_object_failed = false;
 
@@ -5015,19 +5106,32 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     //   但它们的 t1/颜色通道读的是 inst.color —— 见 §3.7.1 约束 1 的澄清。
     ctx->CopyResource(inst.color.Get(), in.color);
 
-    // ---- 第 8 步：深度提取 CS（§3.6.1）----
+    // ---- 第 8 步：深度提取 + motion 解码（§3.6.1 / §3.6.2 / §3.6.3）----
     if (!ensure_depth_src_srv(in, inst))
         return false;
     // 2026-11-17（PR A / A3）：depth_scale 不再硬编码 —— 接 g_depth_scale（默认 1.0，
     //   与改动前等价）。原神 reverse-z 值域约 [0, 0.03]，是否要放大需实机 A/B。
-    //   flip 仍恒 1.0：motion 解码段用 b0.y，深度段不用，保持原语义。
+    //   flip 仍恒 1.0（写在 b0.y；合并变体读 b0.y。独立的 motion CS 读的是 b0.x ——
+    //   那处既有错位见 §3.6.3 的注）。
     upload_cb(ctx, inst, g_depth_scale, 1.0f);
-    dispatch_depth_cs(ctx, inst);
-
-    // ---- 第 9 步：motion 解码 CS（§3.6.2）----
     if (!ensure_motion_src_srv(in, inst))
         return false;
-    dispatch_motion_cs(ctx, inst);
+    // 2026-11-27：两条 CS 的调度结构完全一致（[numthreads(8,8,1)] + 整数坐标 Load、无采样器），
+    //   故默认配置下合并成**一次**派发。任一前提不成立就退回原来的两次派发，行为与合并前相同：
+    //     · 合并 CS 编译/建对象成功（失败不锁存，只是退回）；
+    //     · 两条 t0 视图都在（上面两个 ensure_* 都返回 true）；
+    //     · 两条输入同尺寸（合并后共用同一套 id.xy；0 = 未知 ⇒ 拒绝合并）。
+    const bool same_size = inst.depth_src_w != 0 && inst.depth_src_w == inst.motion_src_w &&
+                           inst.depth_src_h == inst.motion_src_h;
+    if (g_merged_cs && inst.cb && same_size)
+    {
+        dispatch_merged_cs(ctx, inst);
+    }
+    else
+    {
+        dispatch_depth_cs(ctx, inst);
+        dispatch_motion_cs(ctx, inst);
+    }
 
     // ---- 第 10 步：写 §3.9.1 的十四行逐帧参数（协议 A：**不重写创建期七项**，§3.9.1a）----
     // ★★ 顺序硬约束（§3.7.1 约束 2）：本步绑的是 inst.* 的**资源**，第 7-9 步写入的是这些

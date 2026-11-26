@@ -58,4 +58,37 @@ void main(uint3 id : SV_DispatchThreadID)
 }
 )";
 
+// 合并变体（2026-11-27）：深度提取 + motion 平方解码在一次派发里完成。
+//   t0 = 游戏深度，t1 = 游戏 motion；u0 = 提取后的深度，u1 = 解码 motion，u2 = reactive。
+//   b0 只有一份 cbuffer（原 DepthParams / MotionParams 合并）：x=depth_scale，y=flip。
+// 为什么只合并"默认解码"这一种：Ffx12MotionDecode=0（RAW）与 Ffx12MotionDeadzone=1
+//   是诊断开关，命中时仍走上面两份字符串的两次派发 —— 合并变体只服务于生产默认路径，
+//   这样诊断开关的行为与合并前逐位相同，不会被"顺手"改掉。
+// ★ 公式同源（三处）：本字符串的 depth_scale 乘法、平方解码 `-sign(d)*(4.0*d*d)*g_flip`
+//   与 reactive 取 `c.b`，必须与 g_depth_extract_hlsl / g_motion_decode_d11_hlsl 的对应行
+//   逐字一致；改公式必须三处同时改并在两条后端都复测。
+inline constexpr char g_depth_motion_merged_hlsl[] = R"(
+cbuffer MergedParams : register(b0)
+{
+    float g_depth_scale;
+    float g_flip;
+    float2 g_pad;
+};
+Texture2D<float4> in_depth : register(t0);
+Texture2D<float4> in_mv : register(t1);
+RWTexture2D<float> out_depth : register(u0);
+RWTexture2D<float2> out_mv : register(u1);
+RWTexture2D<float> out_reactive : register(u2);
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    out_depth[id.xy] = in_depth.Load(int3(id.xy, 0)).x * g_depth_scale;
+    float4 c = in_mv.Load(int3(id.xy, 0));
+    float2 d = c.rg - 0.498039;
+    float2 mv = -sign(d) * (4.0 * d * d) * g_flip;
+    out_mv[id.xy] = mv;
+    out_reactive[id.xy] = c.b; // motion B 通道（bits 20..29）= reactive 源（历史第 62 轮实证）
+}
+)";
+
 } // namespace ffx12

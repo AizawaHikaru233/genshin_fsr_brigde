@@ -5,7 +5,7 @@
 > **改动历史不在这里**：某段代码为什么是现在这样，用 `git log` / `git blame` 查。
 > 条目关闭后直接删除；要留结论就移入文末「已解决」，并注明解决它的提交。
 
-最后更新：2026-11-24
+最后更新：2026-11-27
 
 ---
 
@@ -738,6 +738,33 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 - `Dx11FsrBridge/Dx11FsrBridge.cpp`：`k_idx_present`、`hooked_present`、`g_state.frame_index` 的自增点、
   `transparent_jitter_frame()`
 - `Dx11FsrBridge/TransparentJitterHook.cpp`：`frame_provider` 的取值与「无 provider 时回退到 `calls`」分支
+
+---
+
+## 10. NGX 路径的独立 motion 解码 CS 读错 b0 槽位（把 `depth_scale` 当成了 `flip`）
+
+**现状**：`NgxBackend.cpp` 的 `upload_cb()` 每个实例只维护一份 16 B 常数缓冲，写入布局是
+`{depth_scale, flip, 0, 0}`（`b0.x = depth_scale`、`b0.y = flip`），调用点注释也一直声称
+「flip 在 b0.y」。但独立 motion 解码 CS 用的 HLSL（`Ffx12ShaderSource.h` 的
+`g_motion_decode_d11_hlsl`）里 `MotionParams` 只声明了一个 `float g_flip` ⇒ 它实际读的是 **b0.x**，
+也就是 `depth_scale`。用 `fxc /Fc` 反查编译产物可确认：`g_flip` 的 offset 是 0（不是 4）。
+
+**影响**：`NgxDepthScale=1.0`（默认）时 `depth_scale == flip == 1.0`，两者数值相同 ⇒ 症状被掩盖。
+一旦把 `NgxDepthScale` 调成非 1（该键自 2026-11-17 起可配），motion 矢量会被乘上 `depth_scale`
+⇒ 运动幅度错误 ⇒ 动态场景糊/拖影，而日志没有任何异常（`mv_decode=1` 照常打印）。
+2026-11-27 起默认走合并派发（`dispatch_merged_cs`，读 `b0.y`，取值正确），因此在
+**合并派发不可用**（合并 CS 编译失败 / 两条输入不同尺寸 / 合并 b0 未建成）**且** `NgxDepthScale != 1`
+的组合下才会暴露。两套路径对同一个参数取不同值，这个状态本身也需要消除。
+
+**推进需要什么**：
+- 先定 ABI 方向：把独立 motion CS 的 `g_flip` 挪到 `b0.y` 最干净，但必须同时改
+  `Ffx12Backend.cpp` 的两次派发路径（它把 flip 写在 `b0.x`），即两份既有 HLSL 加两处上传点一起动；
+  另一个办法是让 `upload_cb` 另写一份 `b0.x = flip`，但那会与深度 CS 抢同一个槽位，不可行。
+- 改完两条后端都要复测：`Ffx12MotionDecode=1` 的平方解码方向，以及 `NgxDepthScale` 取 1.0 / 2.0 的画面。
+
+**相关代码位置**：`Dx11FsrBridge/NgxBackend.cpp` 的 `upload_cb()`、`dispatch_motion_cs()`、
+`dispatch_merged_cs()`；`Dx11FsrBridge/Ffx12Backend.cpp` 的 `dispatch_gpu_shared()`（两次派发段）；
+`Dx11FsrBridge/Ffx12ShaderSource.h` 的 `g_motion_decode_d11_hlsl` 与 `g_depth_motion_merged_hlsl`。
 
 ---
 

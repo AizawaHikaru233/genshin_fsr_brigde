@@ -200,14 +200,27 @@ struct InstanceRes
     ComPtr<ID3D11UnorderedAccessView> reactive_share_uav;
     ComPtr<ID3D11ShaderResourceView> depth_src_srv;  // 游戏深度 SRV（按纹理缓存）
     ID3D11Texture2D *depth_src_last = nullptr;
+    // 两条输入纹理的尺寸（建视图时记下；0 = 未知）。
+    // 合并派发要求两者同尺寸：合并不是"两个 Load 各自越界读 0"，而是共用同一个 id.xy，
+    // 尺寸一致时结果与两次派发逐像素相同，不一致时小的一侧会被大的一侧拖着读别处。
+    UINT depth_src_w = 0, depth_src_h = 0;
     ComPtr<ID3D11ShaderResourceView> motion_src_srv; // 游戏 motion SRV（按纹理缓存）
     ID3D11Texture2D *motion_src_last = nullptr;
+    UINT motion_src_w = 0, motion_src_h = 0;
     // ---- b0 常数缓冲：depth 提取写 b0.x=g_depth_scale，motion 解码写 b0.x=g_motion_flip ----
     // 两个"已上传值"缓存必须各自一份：共用一个变量时两个值不同就会每帧互相判定"变了"
     // 而反复上传（比不缓存更糟）。NaN 哨兵保证首帧必定上传一次。
     ComPtr<ID3D11Buffer> motion_cb;
     float cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();
     float cb_uploaded_flip = std::numeric_limits<float>::quiet_NaN();
+    // ---- 合并变体的 b0（2026-11-27）：{g_depth_scale, g_flip, 0, 0} ----
+    // 为什么不与上面的 motion_cb 共用：两条路径的"已上传值"缓存会互相失配 —— 合并路径
+    // 写的是 {depth, flip}，而独立 motion 路径把 flip 放在 b0.x；共用同一缓冲时，合并路径
+    // 刚写完、独立 motion 路径判"flip 没变"就跳过上传 ⇒ 它读到的 b0.x 是 depth_scale。
+    // 多 16 B 缓冲，比"两条路径互相置 NaN 失效"那种耦合安全（后者任一处漏置就是静默错值）。
+    ComPtr<ID3D11Buffer> merged_cb;
+    float merged_cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();
+    float merged_cb_uploaded_flip = std::numeric_limits<float>::quiet_NaN();
     // ---- 输出落地格式（UAV 不能用 TYPELESS；按本实例的输出纹理定）----
     DXGI_FORMAT output_enc_format = DXGI_FORMAT_R8G8B8A8_UNORM;
     // ---- 本实例最近一次输入格式（供诊断如实上报，避免全局镜像互相覆盖）----
@@ -351,6 +364,9 @@ ComPtr<ID3D11ComputeShader> g_depth_extract_cs;
 ComPtr<ID3D11ComputeShader> g_motion_decode_cs;   // D3D11 decode compute
 ComPtr<ID3D11ComputeShader> g_motion_decode_dz_cs; // 静止死区变体
 ComPtr<ID3D11ComputeShader> g_motion_raw_cs;       // 不解码变体（Ffx12MotionDecode=0 时选用）
+// 合并变体（2026-11-27）：深度提取 + motion 默认解码一次派发（省 1 次 Dispatch 与一半状态切换）。
+// 为空时每帧自动退回上面两条独立派发 —— 它是可选优化，不是必需资源。
+ComPtr<ID3D11ComputeShader> g_depth_motion_cs;
 bool g_motion_deadzone = false;                  // =true 用死区变体（微小 motion 归零）
 // P2 诊断（**默认关**，由桥的 Ffx12SingleInstanceDiag 打开）：池重建 / context 重建留痕。
 // 上限 32 条：g_sdk_messages 是 8192 字符的累积缓冲，不设上限会把其它消息挤掉。
@@ -1625,6 +1641,28 @@ bool ensure_pool(const FrameInput &input, SdkContext &sc)
             r.cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();
             r.cb_uploaded_flip = std::numeric_limits<float>::quiet_NaN();
         }
+        // 合并变体的 b0（2026-11-27）：与 motion_cb 同规格，只服务合并派发。
+        // ★ 建不出来**不影响**建池成功：它只值"少一次派发"，缺它就每帧自动退回两次派发
+        //   （两条独立路径仍在）。为可选优化把整池判失败，等于用一个可选项换掉整条 FSR 路径。
+        if (!r.merged_cb)
+        {
+            D3D11_BUFFER_DESC mgb {};
+            mgb.ByteWidth = 16;
+            mgb.Usage = D3D11_USAGE_DEFAULT;
+            mgb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            const float mgb_init[4] = {1.0f, 1.0f, 0.0f, 0.0f};   // 中性值：depth_scale=1、flip=+1
+            D3D11_SUBRESOURCE_DATA mgb_data { mgb_init, 0, 0 };
+            if (FAILED(g_d11dev->CreateBuffer(&mgb, &mgb_data, &r.merged_cb)) || !r.merged_cb)
+            {
+                r.merged_cb.Reset();
+                sdk_note(L"merged cb create failed stage=pool (退回两次派发)");
+            }
+            else
+            {
+                r.merged_cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();
+                r.merged_cb_uploaded_flip = std::numeric_limits<float>::quiet_NaN();
+            }
+        }
         // FFX 输出格式映射（UAV 不能用 TYPELESS 格式，须用 typed 变体；与
         // ensure_output_landing_resources 同规则）。资源本体保持游戏 Typeless 以便
         // D3D11 CopyResource(游戏输出 ← 共享输出) 格式一致。
@@ -1936,11 +1974,31 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     const std::uint64_t t_prep_start = qpc_us();
 
     // ---- ① D3D11 侧：深度提取（CS）＋ 输入 GPU 拷贝 ----
+    // 2026-11-27：两条 CS 的调度结构完全一致（`[numthreads(8,8,1)]` + 整数坐标 Load，无采样器），
+    //   故默认配置下合并成**一次**派发：t0 深度 / t1 motion → u0 深度 / u1 motion / u2 reactive。
+    //   合并的前提全是结构性的（不靠猜），任一条不成立就走本段末尾的两次派发：
+    //     · 两条输入都在，且三个 UAV + 合并用 b0 齐备；
+    //     · motion 当前选中的是**默认平方解码**变体（RAW / 死区是诊断开关，行为保持不变）；
+    //     · 两张输入纹理同尺寸（合并后共用同一套 id.xy，尺寸不同就不再等价）。
+    // 变体选择（让 Ffx12MotionDecode 真正生效——此前它是空开关）：
+    //   decode_motion=false → raw 变体（不解码）；true 且 deadzone → dz 变体；否则 decode
+    ID3D11ComputeShader *motion_cs = nullptr;
+    if (!g_decode_motion && g_motion_raw_cs)
+        motion_cs = g_motion_raw_cs.Get();
+    else if (g_motion_deadzone && g_motion_decode_dz_cs)
+        motion_cs = g_motion_decode_dz_cs.Get();
+    else
+        motion_cs = g_motion_decode_cs.Get();   // 可能为 nullptr（编译失败时）
+    const bool motion_is_default = motion_cs != nullptr && motion_cs == g_motion_decode_cs.Get();
+
+    // ---- 深度 t0 视图（按纹理缓存；重建时顺手记下尺寸，供合并判据）----
+    bool depth_ready = false;
     if (input.depth && g_depth_extract_cs && r.depth_share_uav)
     {
         if (!r.depth_src_srv || r.depth_src_last != input.depth)
         {
             r.depth_src_srv.Reset();
+            r.depth_src_w = r.depth_src_h = 0;   // 0 = 未知 ⇒ 拒绝合并
             // 按深度纹理实际格式选视图（绑定深度曾全 0；
             // DSV 深度可能为 D24 族或 D32 族——Load().x 统一得到 0..1）
             DXGI_FORMAT srv_fmt = DXGI_FORMAT_R32_FLOAT;
@@ -1968,6 +2026,8 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
                         srv_fmt = DXGI_FORMAT_R32_FLOAT;
                         break;
                 }
+                r.depth_src_w = td.Width;
+                r.depth_src_h = td.Height;
                 dtex->Release();
             }
             D3D11_SHADER_RESOURCE_VIEW_DESC srv {};
@@ -1978,41 +2038,20 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
                 r.depth_src_srv.Reset();
             r.depth_src_last = r.depth_src_srv ? input.depth : nullptr;
         }
-        if (r.depth_src_srv)
-        {
-            if (r.motion_cb)
-            {
-                // 复用 16B 常数缓冲（b0）：depth 提取用 g_depth_scale（XeSS 激活时归一化 [0,1]）
-                if (r.cb_uploaded_depth != g_depth_scale)
-                {
-                    const float dscale[4] = {g_depth_scale, 0.0f, 0.0f, 0.0f};
-                    game_context->UpdateSubresource(r.motion_cb.Get(), 0, nullptr, dscale, 0, 0);
-                    r.cb_uploaded_depth = g_depth_scale;
-                }
-                ID3D11Buffer *cbs[] = {r.motion_cb.Get()};
-                game_context->CSSetConstantBuffers(0, 1, cbs);
-            }
-            game_context->CSSetShader(g_depth_extract_cs.Get(), nullptr, 0);
-            ID3D11ShaderResourceView *srvs[] = { r.depth_src_srv.Get() };
-            game_context->CSSetShaderResources(0, 1, srvs);
-            ID3D11UnorderedAccessView *uavs[] = { r.depth_share_uav.Get() };
-            game_context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
-            // 派发尺寸取**本实例**池尺寸（原先取全局镜像 ⇒ 多实例下会按别人尺寸派发）
-            game_context->Dispatch((r.rw + 7u) / 8u, (r.rh + 7u) / 8u, 1u);
-            ID3D11UnorderedAccessView *null_uavs[] = { nullptr };
-            game_context->CSSetUnorderedAccessViews(0, 1, null_uavs, nullptr);
-            ID3D11ShaderResourceView *null_srvs[] = { nullptr };
-            game_context->CSSetShaderResources(0, 1, null_srvs);
-            game_context->CSSetShader(nullptr, nullptr, 0);
-        }
+        depth_ready = r.depth_src_srv != nullptr;
     }
-    // D3D11 侧 motion 解码——游戏 motion（R10G10B10A2 平方编码）→
-    // 共享 R16G16_FLOAT。绕过原 D3D12 decode pass（金丝雀证实从不写 cvt）。
+    // ---- motion t0 视图（同尺寸记在 motion_src_w/h）----
+    // D3D11 侧 motion 解码——游戏 motion（R10G10B10A2 平方编码）→ 共享 R16G16_FLOAT。
+    // 绕过原 D3D12 decode pass（金丝雀证实从不写 cvt）。
+    bool motion_ready = false;
     if (input.motion && g_motion_decode_cs && r.motion_cvt_share_uav)
     {
         if (!r.motion_src_srv || r.motion_src_last != input.motion)
         {
             r.motion_src_srv.Reset();
+            r.motion_src_w = r.motion_src_h = 0;
+            D3D11_TEXTURE2D_DESC md {};
+            input.motion->GetDesc(&md);
             D3D11_SHADER_RESOURCE_VIEW_DESC srv {};
             srv.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
             srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -2020,42 +2059,101 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
             if (FAILED(g_d11dev->CreateShaderResourceView(input.motion, &srv, &r.motion_src_srv)))
                 r.motion_src_srv.Reset();
             r.motion_src_last = r.motion_src_srv ? input.motion : nullptr;
-        }
-        if (r.motion_src_srv)
-        {
-            if (r.motion_cb)
+            if (r.motion_src_srv)
             {
-                if (r.cb_uploaded_flip != g_motion_flip)
-                {
-                    const float flip[4] = {g_motion_flip, 0.0f, 0.0f, 0.0f};
-                    game_context->UpdateSubresource(r.motion_cb.Get(), 0, nullptr, flip, 0, 0);
-                    r.cb_uploaded_flip = g_motion_flip;
-                }
-                ID3D11Buffer *cbs[] = {r.motion_cb.Get()};
-                game_context->CSSetConstantBuffers(0, 1, cbs);
+                r.motion_src_w = md.Width;
+                r.motion_src_h = md.Height;
             }
-            // 变体选择（让 Ffx12MotionDecode 真正生效——此前它是空开关）：
-            //   decode_motion=false → raw 变体（不解码）；true 且 deadzone → dz 变体；否则 decode
-            ID3D11ComputeShader *motion_cs = nullptr;
-            if (!g_decode_motion && g_motion_raw_cs)
-                motion_cs = g_motion_raw_cs.Get();
-            else if (g_motion_deadzone && g_motion_decode_dz_cs)
-                motion_cs = g_motion_decode_dz_cs.Get();
-            else
-                motion_cs = g_motion_decode_cs.Get();
-            game_context->CSSetShader(motion_cs, nullptr, 0);
-            ID3D11ShaderResourceView *srvs[] = { r.motion_src_srv.Get() };
-            game_context->CSSetShaderResources(0, 1, srvs);
-            // u0 = 解码 motion（R16G16），u1 = reactive（R8，motion B 通道）
-            ID3D11UnorderedAccessView *uavs[] = { r.motion_cvt_share_uav.Get(), r.reactive_share_uav.Get() };
-            game_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
-            game_context->Dispatch((r.rw + 7u) / 8u, (r.rh + 7u) / 8u, 1u);
-            ID3D11UnorderedAccessView *null_uavs[2] = { nullptr, nullptr };
-            game_context->CSSetUnorderedAccessViews(0, 2, null_uavs, nullptr);
-            ID3D11ShaderResourceView *null_srvs[] = { nullptr };
-            game_context->CSSetShaderResources(0, 1, null_srvs);
-            game_context->CSSetShader(nullptr, nullptr, 0);
         }
+        motion_ready = r.motion_src_srv != nullptr;
+    }
+
+    // ---- ①-a 合并派发（默认解码 + 同尺寸 → 一次写完三张 UAV）----
+    bool merged_done = false;
+    if (depth_ready && motion_ready && motion_is_default && g_depth_motion_cs && r.merged_cb &&
+        r.reactive_share_uav && r.depth_src_w != 0 && r.depth_src_w == r.motion_src_w &&
+        r.depth_src_h == r.motion_src_h)
+    {
+        // 两个参数一起上传：合并 b0 的 x=depth_scale、y=flip
+        if (r.merged_cb_uploaded_depth != g_depth_scale || r.merged_cb_uploaded_flip != g_motion_flip)
+        {
+            const float params[4] = {g_depth_scale, g_motion_flip, 0.0f, 0.0f};
+            game_context->UpdateSubresource(r.merged_cb.Get(), 0, nullptr, params, 0, 0);
+            r.merged_cb_uploaded_depth = g_depth_scale;
+            r.merged_cb_uploaded_flip  = g_motion_flip;
+        }
+        game_context->CSSetShader(g_depth_motion_cs.Get(), nullptr, 0);
+        ID3D11ShaderResourceView *msrvs[2] = { r.depth_src_srv.Get(), r.motion_src_srv.Get() };
+        game_context->CSSetShaderResources(0, 2, msrvs);
+        ID3D11Buffer *mcbs[1] = { r.merged_cb.Get() };
+        game_context->CSSetConstantBuffers(0, 1, mcbs);
+        // ★ 槽序不可换：u0 = 提取后的深度（R32），u1 = 解码 motion（R16G16），u2 = reactive（R8）
+        ID3D11UnorderedAccessView *muavs[3] = { r.depth_share_uav.Get(), r.motion_cvt_share_uav.Get(),
+                                                r.reactive_share_uav.Get() };
+        game_context->CSSetUnorderedAccessViews(0, 3, muavs, nullptr);
+        game_context->Dispatch((r.rw + 7u) / 8u, (r.rh + 7u) / 8u, 1u);
+        ID3D11UnorderedAccessView *null_uavs[3] = { nullptr, nullptr, nullptr };
+        game_context->CSSetUnorderedAccessViews(0, 3, null_uavs, nullptr);
+        ID3D11ShaderResourceView *null_srvs[2] = { nullptr, nullptr };
+        game_context->CSSetShaderResources(0, 2, null_srvs);
+        // CB 不解绑：与下面两条独立路径保持同一约定（历史口径，本次不改其语义）
+        game_context->CSSetShader(nullptr, nullptr, 0);
+        merged_done = true;
+    }
+
+    // ---- ①-b 退回两次派发（诊断变体 / 尺寸不同 / 合并资源缺失时的原路径）----
+    if (!merged_done && depth_ready)
+    {
+        if (r.motion_cb)
+        {
+            // 复用 16B 常数缓冲（b0）：depth 提取用 g_depth_scale（XeSS 激活时归一化 [0,1]）
+            if (r.cb_uploaded_depth != g_depth_scale)
+            {
+                const float dscale[4] = {g_depth_scale, 0.0f, 0.0f, 0.0f};
+                game_context->UpdateSubresource(r.motion_cb.Get(), 0, nullptr, dscale, 0, 0);
+                r.cb_uploaded_depth = g_depth_scale;
+            }
+            ID3D11Buffer *cbs[] = {r.motion_cb.Get()};
+            game_context->CSSetConstantBuffers(0, 1, cbs);
+        }
+        game_context->CSSetShader(g_depth_extract_cs.Get(), nullptr, 0);
+        ID3D11ShaderResourceView *srvs[] = { r.depth_src_srv.Get() };
+        game_context->CSSetShaderResources(0, 1, srvs);
+        ID3D11UnorderedAccessView *uavs[] = { r.depth_share_uav.Get() };
+        game_context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+        // 派发尺寸取**本实例**池尺寸（原先取全局镜像 ⇒ 多实例下会按别人尺寸派发）
+        game_context->Dispatch((r.rw + 7u) / 8u, (r.rh + 7u) / 8u, 1u);
+        ID3D11UnorderedAccessView *null_uavs[] = { nullptr };
+        game_context->CSSetUnorderedAccessViews(0, 1, null_uavs, nullptr);
+        ID3D11ShaderResourceView *null_srvs[] = { nullptr };
+        game_context->CSSetShaderResources(0, 1, null_srvs);
+        game_context->CSSetShader(nullptr, nullptr, 0);
+    }
+    if (!merged_done && motion_ready)
+    {
+        if (r.motion_cb)
+        {
+            if (r.cb_uploaded_flip != g_motion_flip)
+            {
+                const float flip[4] = {g_motion_flip, 0.0f, 0.0f, 0.0f};
+                game_context->UpdateSubresource(r.motion_cb.Get(), 0, nullptr, flip, 0, 0);
+                r.cb_uploaded_flip = g_motion_flip;
+            }
+            ID3D11Buffer *cbs[] = {r.motion_cb.Get()};
+            game_context->CSSetConstantBuffers(0, 1, cbs);
+        }
+        game_context->CSSetShader(motion_cs, nullptr, 0);
+        ID3D11ShaderResourceView *srvs[] = { r.motion_src_srv.Get() };
+        game_context->CSSetShaderResources(0, 1, srvs);
+        // u0 = 解码 motion（R16G16），u1 = reactive（R8，motion B 通道）
+        ID3D11UnorderedAccessView *uavs[] = { r.motion_cvt_share_uav.Get(), r.reactive_share_uav.Get() };
+        game_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+        game_context->Dispatch((r.rw + 7u) / 8u, (r.rh + 7u) / 8u, 1u);
+        ID3D11UnorderedAccessView *null_uavs[2] = { nullptr, nullptr };
+        game_context->CSSetUnorderedAccessViews(0, 2, null_uavs, nullptr);
+        ID3D11ShaderResourceView *null_srvs[] = { nullptr };
+        game_context->CSSetShaderResources(0, 1, null_srvs);
+        game_context->CSSetShader(nullptr, nullptr, 0);
     }
     if (input.color)
         game_context->CopyResource(r.tex_color.d11.Get(), input.color);
@@ -2324,6 +2422,12 @@ void release_instance_res(SdkContext &sc)
     // b0 缓存失效：缓冲已释放，重建后必须重新上传一次
     r.cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();
     r.cb_uploaded_flip = std::numeric_limits<float>::quiet_NaN();
+    r.merged_cb.Reset();
+    r.merged_cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();
+    r.merged_cb_uploaded_flip = std::numeric_limits<float>::quiet_NaN();
+    // 尺寸缓存一并归零：0 = 未知 ⇒ 合并派发会拒绝合并，直到下次建视图重新填上
+    r.depth_src_w = r.depth_src_h = 0;
+    r.motion_src_w = r.motion_src_h = 0;
     r.ctx_src.Reset();
     r.game_ctx4.Reset();
     r.ctx_wrong_device = false;
@@ -2535,6 +2639,37 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
                              blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
                              &g_motion_raw_cs)))
                 setup_ok = false;
+        }
+        // 合并变体（2026-11-27）：深度提取 + motion 默认解码，一次派发写完三张 UAV。
+        // ★ 编译/建对象失败**不置 setup_ok=false**：它只值"少一次派发"，缺了就每帧退回
+        //   上面两条独立派发（两条都还在）。为一个可选优化把整个 GPU 互操作判死，
+        //   等于让所有机器丢掉整条 FSR 预处理路径 —— 与 §五.1（动作强度 ≤ 证据强度）相反。
+        if (setup_ok)
+        {
+            ComPtr<ID3DBlob> blob, err;
+            const HRESULT chr = D3DCompile(g_depth_motion_merged_hlsl,
+                                           std::strlen(g_depth_motion_merged_hlsl),
+                                           "ffx12_depth_motion_merged", nullptr, nullptr,
+                                           "main", "cs_5_0", 0, 0, &blob, &err);
+            if (FAILED(chr) || !blob)
+            {
+                // 把编译器的原话塞进 sdk_msgs：否则"为什么退回两次派发"只能靠猜。
+                sdk_note(L"merged cs compile failed hr=0x%08X err=%S", static_cast<unsigned>(chr),
+                         (err && err->GetBufferPointer()) ? static_cast<const char *>(err->GetBufferPointer())
+                                                          : "(no message)");
+            }
+            else if (FAILED(g_d11dev->CreateComputeShader(
+                             blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+                             &g_depth_motion_cs)) ||
+                     !g_depth_motion_cs)
+            {
+                g_depth_motion_cs.Reset();
+                sdk_note(L"merged cs create failed stage=init (退回两次派发)");
+            }
+            else
+            {
+                sdk_note(L"merged cs ready: depth+mv 单次派发");
+            }
         }
         if (setup_ok)
         {
@@ -2774,6 +2909,7 @@ void shutdown()
     g_motion_decode_cs.Reset();
     g_motion_decode_dz_cs.Reset();
     g_motion_raw_cs.Reset();
+    g_depth_motion_cs.Reset();
     g_shared_fence.Reset();
     g_shared_fence11.Reset();
     g_d11_5.Reset();
@@ -2879,6 +3015,7 @@ void recover_device_removed_locked()
     g_motion_decode_cs.Reset();
     g_motion_decode_dz_cs.Reset();
     g_motion_raw_cs.Reset();
+    g_depth_motion_cs.Reset();
     g_gpu_interop_ready = false;
     g_shared_fence_value = 0;
     g_d12dev.Reset();
