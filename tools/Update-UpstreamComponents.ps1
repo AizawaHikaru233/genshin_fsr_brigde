@@ -381,7 +381,12 @@ $versions = [ordered]@{
     ffx         = $ffx
     renodx      = $renodx
 }
-$versions | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $versionsPath -Encoding UTF8
+# 2026-11-26（清单 BOM 事故）：`Set-Content -Encoding UTF8` 在 PowerShell 5.1 下写出的是「UTF-8 带 BOM」，
+# 而图形安装器用 serde_json 解析清单、不接受 BOM（报 expected value at line 1 column 1）⇒ 整份清单读不出来
+# ⇒ DLSS/ReShade 的联网下载永远失败关闭。故显式按「无 BOM 的 UTF-8」落盘，PS 5.1 与 pwsh 7 行为一致。
+# 末尾补换行：原先 Set-Content 会带行尾，WriteAllText 不会；少了它每次重生成都多出一处「\ No newline」空 diff。
+$versionsJson = ($versions | ConvertTo-Json -Depth 6) + [Environment]::NewLine
+[IO.File]::WriteAllText($versionsPath, $versionsJson, (New-Object System.Text.UTF8Encoding -ArgumentList $false))
 
 # 自检：清单里写的哈希必须与**刚落盘的文件**一致。
 # GUI 的下载校验、打包脚本的"清单 ↔ 包内实物"断言都以这份清单为准 ⇒ 这里不一致就立刻失败。

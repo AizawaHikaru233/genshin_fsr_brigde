@@ -45,6 +45,21 @@ fn candidates() -> Vec<PathBuf> {
     list
 }
 
+/// 解析清单文本，容忍 UTF-8 BOM。
+///
+/// 2026-11-26（清单 BOM 事故）：清单原先由 `Set-Content -Encoding UTF8` 生成，该参数在
+/// PowerShell 5.1 下写的是「UTF-8 **带** BOM」，而 `serde_json` 不接受 BOM（报
+/// `expected value at line 1 column 1`）⇒ `load()` 返回 None ⇒ `dlss_expectation()` /
+/// `reshade_expectation()` 全部 Err ⇒ 安装器的 DLSS/ReShade 联网下载**永远失败关闭**，
+/// 用户没有任何可恢复路径。生成端已改为无 BOM 落盘，这里再容忍一次：已经发出去的旧包
+/// 与被手工改过的清单都不该因此报废。
+///
+/// 容忍的只有 BOM；空串、截断 JSON 等坏内容仍必须报错（失败关闭的语义不变），
+/// 见下方 `parse_rejects_garbage`。
+fn parse(text: &str) -> Result<Manifest, serde_json::Error> {
+    serde_json::from_str(text.trim_start_matches('\u{feff}'))
+}
+
 /// 读包根清单；读不到返回 None（调用方据此失败关闭）。
 pub fn load() -> Option<Manifest> {
     for path in candidates() {
@@ -52,7 +67,7 @@ pub fn load() -> Option<Manifest> {
             continue;
         }
         match std::fs::read_to_string(&path) {
-            Ok(text) => match serde_json::from_str::<Manifest>(&text) {
+            Ok(text) => match parse(&text) {
                 Ok(manifest) => return Some(manifest),
                 Err(err) => {
                     crate::log::write(&format!("[verify] 清单解析失败 {}: {err}", path.display()))
@@ -109,4 +124,38 @@ pub fn reshade_expectation() -> Result<(String, String, Option<String>), String>
 /// 清单实际路径（日志/自检用）。
 pub fn manifest_path() -> Option<PathBuf> {
     candidates().into_iter().find(|p| p.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 与真实清单同形（键名 PascalCase），只留判定需要的字段。
+    const MANIFEST: &str = r#"{
+        "dlss": { "Tag": "v2.14.16", "Asset": "streamline.zip", "ArchiveSha256": "AA" },
+        "reshade": { "SetupUrl": "https://reshade.me/Setup.exe", "SetupSha256": "BB" }
+    }"#;
+
+    #[test]
+    fn parse_accepts_plain_manifest() {
+        let manifest = parse(MANIFEST).expect("无 BOM 的清单必须能解析");
+        assert!(manifest.dlss.is_some());
+        assert!(manifest.reshade.is_some());
+    }
+
+    #[test]
+    fn parse_accepts_bom_prefixed_manifest() {
+        // 回归用例：带 BOM 时 serde_json 直接报错 ⇒ 下载永远失败关闭（本次事故）。
+        let manifest = parse(&format!("\u{feff}{MANIFEST}")).expect("带 BOM 的清单必须能解析");
+        assert_eq!(manifest.dlss.unwrap().tag.as_deref(), Some("v2.14.16"));
+        assert_eq!(manifest.reshade.unwrap().setup_sha256.as_deref(), Some("BB"));
+    }
+
+    #[test]
+    fn parse_rejects_garbage() {
+        // 容忍 BOM ≠ 容忍坏内容：清单读不出来时仍要失败关闭，不许静默当成"空清单"。
+        assert!(parse("").is_err(), "空串必须报错");
+        assert!(parse("\u{feff}").is_err(), "只有 BOM 也必须报错");
+        assert!(parse("\u{feff}{\"dlss\":").is_err(), "截断的 JSON 必须报错");
+    }
 }
