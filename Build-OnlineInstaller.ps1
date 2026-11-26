@@ -662,22 +662,32 @@ function Build-FpsPackage {
 }
 
 function Assert-FufuInstallerVersionSynced {
-    # Lua 安装脚本里的 Version 不是"包内清单的副本"，而是宿主最终写进插件清单
-    # config.ini 的**权威值**：install.write_config(plugin_dir, 表) 拿整张表重渲染
-    # config.ini，会把包内随附的那份整份覆盖（包内写得对也没用）。
-    # 2026-10-16：2.3.1 升版只改了 config.ini，两个 Lua 仍写 2.3.0 ⇒ 安装/启动后
-    # 插件版本号被写回 2.3.0（用户实机复现）。这里与 Fufu DLL 同级做同步断言。
+    # 2026-11-27（用户要求）：两个 Lua 安装脚本**不再写版本号** —— 版本只由包内
+    # `FufuGraphicsPlugin/config.ini` 提供；`install.write_config` 不再拿一个字面量去
+    # 覆盖它（2.3.1 那次事故正是 Lua 里的旧版本号盖掉了包内清单）。
+    # 本函数因此**反过来**断言两件事：
+    #   ① 两个脚本里绝不能出现 `Version = "..."`（防止这条规则被悄悄改回去）；
+    #   ② 包内 `config.ini` 的 `Version` 必须等于本次包版本（唯一事实源）。
+    # ⚠️ 未验证：宿主的 `install.write_config` 在表里**没有** `Version` 键时，是保留
+    #   现有 config.ini 的该行、还是整份重渲染后丢掉该键。两种实现下"安装后插件显示的
+    #   版本"都可能不同，必须在装包后实地看一眼（见 docs/OPEN-ISSUES.md）。
     param([Parameter(Mandatory)][string]$Version)
     foreach ($name in @('Install-FufuPlugin.lua', 'Install-FufuPlugin-Marketplace.lua')) {
         $path = Join-Path $fufuSource $name
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "缺少 Fufu 安装脚本：$path" }
         $text = [IO.File]::ReadAllText($path)
-        $found = [regex]::Match($text, '(?m)^\s*Version\s*=\s*"([^"]*)"')
-        if (-not $found.Success) { throw "$name 里找不到 Version = `"x.y.z`" 行：$path" }
-        if ($found.Groups[1].Value -ne $Version) {
-            throw "$name 版本未同步：实际 $($found.Groups[1].Value)，期望 $Version" +
-                "（该值会在安装时被写进插件清单 config.ini，覆盖包内随附的那份）"
+        if ([regex]::IsMatch($text, '(?m)^\s*Version\s*=\s*"')) {
+            throw "$name 里出现了 Version = `"x.y.z`"：版本号只允许写在包内 config.ini，" +
+                "Lua 写版本会在安装时覆盖它（2026-11-27 起的规则）"
         }
+    }
+    $configPath = Join-Path $fufuSource 'config.ini'
+    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { throw "缺少 Fufu 插件清单：$configPath" }
+    $configText = [IO.File]::ReadAllText($configPath)
+    $found = [regex]::Match($configText, '(?m)^\s*Version\s*=\s*([0-9][0-9.]*)\s*$')
+    if (-not $found.Success) { throw "config.ini 里找不到 Version = x.y.z 行：$configPath" }
+    if ($found.Groups[1].Value -ne $Version) {
+        throw "config.ini 版本未同步：实际 $($found.Groups[1].Value)，期望 $Version"
     }
 }
 

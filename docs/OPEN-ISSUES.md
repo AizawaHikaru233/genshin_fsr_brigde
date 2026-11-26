@@ -792,6 +792,30 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 
 ---
 
+## 12. Fufu 插件清单的版本号来源改为「只由包内 config.ini 提供」后，宿主行为未实地验证
+
+**现状**：2026-11-27 起两个 Lua 安装脚本（`FufuGraphicsPlugin/Install-FufuPlugin.lua`、
+`Install-FufuPlugin-Marketplace.lua`）的 `install.write_config` 表里**不再有 `Version` 字段**，
+版本号只写在包内 `FufuGraphicsPlugin/config.ini`（打包时会按 `Version.cmake` 改写并由
+`Assert-FufuInstallerVersionSynced` 断言）。此前规则相反：Lua 必须跟着写同一个版本号，
+因为 `write_config` 会把表渲染进插件清单、覆盖包内的值（2.3.1 那次事故）。
+
+**影响 / 未知点**：宿主的 `install.write_config` 在表里**没有** `Version` 键时到底怎么处理，
+没有实测证据，有两种可能：
+- 保留清单现有那一行 ⇒ 安装后插件版本号 = 包内 `config.ini`（期望行为）；
+- 整份重渲染并丢掉该键 ⇒ 安装后插件清单里**没有** `Version`，宿主可能显示为空或未知版本。
+
+**推进需要什么**：用 2.5.1 的芙芙包在真实 FufuLauncher 上装一次，然后看宿主里该插件的版本号
+与插件目录下 `config.ini` 是否仍为 `2.5.1`。若版本号丢失，两个方案：
+① 由 `Build-OnlineInstaller.ps1` 在打包时把版本号写进 Lua（即回到旧规则，但要自动化，别再靠手改）；
+② 保留 Lua 的 `Version` 但改成由打包脚本注入，与 `config.ini` 同源改写。
+
+**相关代码位置**：`FufuGraphicsPlugin/Install-FufuPlugin.lua`、`Install-FufuPlugin-Marketplace.lua`
+的 `install.write_config` 表；`Build-OnlineInstaller.ps1` 的 `Assert-FufuInstallerVersionSynced`；
+`Version.cmake` 顶部的版本规则说明。
+
+---
+
 ## 已解决
 
 ### NGX 参数袋（`NVSDK_NGX_Parameter` 虚表）厂商调用补 SEH 守卫（2026-11-24）
