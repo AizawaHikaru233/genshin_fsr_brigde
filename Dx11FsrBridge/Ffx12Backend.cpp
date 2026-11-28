@@ -89,6 +89,17 @@ bool g_uses_on12_queue = false;   // 恒 false：On12 引导路径已移除（�
 // 画面交替）——安装器/芙芙启动器按显卡写入 ini Ffx12AsyncUpscale=0（RDNA2）或
 // =1（其他显卡）；此处缺省值为非 RDNA2 的默认。
 bool g_async_upscale = true;
+
+// ---- 输入颜色零拷贝（Ffx12ZeroCopy，opt-in，默认 0）----
+// 2026-11-28（Stage 1）：桥在 CreateTexture2D 钩子里给游戏颜色纹理注入
+// SHARED|SHARED_NTHANDLE(0x802)，这里在 dispatch 时直接打开、跳过输入 CopyResource。
+// g_zero_copy 只是"配置请求位"；能否用还要看后端/模式/设备（见 zero_copy_enabled()）。
+std::atomic_bool g_zero_copy { false };
+// 最近一次 dispatch 的输入零拷贝结果：由 dispatch_gpu_shared 每次写入、桥的低频日志读取
+// （与 dispatch 不同线程读取，用 atomic；字符串只存静态字面量，指针永不悬空）。
+std::atomic_bool g_zc_last_in { false };
+std::atomic_bool g_zc_last_in_cached { false };
+std::atomic<const char *> g_zc_reason { "off" };
 // 挂起的异步 FFX：P2 起 pending 槽**按实例**存放（见 InstanceRes::pending*）——
 // 原先的全局单槽会让甲实例的提交被乙实例的 dispatch 顺手落地，两路输出互相借道，
 // 而且 Present 前只能收一个实例。仍仅 g_async_upscale 时使用；由 dispatch（提交）、
@@ -165,6 +176,16 @@ struct SharedTex
     ComPtr<ID3D12Resource> d12;
     HANDLE handle = nullptr;
     std::uint32_t w = 0, h = 0;
+};
+
+// 输入颜色零拷贝缓存槽（2026-11-28，Stage 1）。
+// src 持引用有两个作用：① 作为缓存键（按指针判等）；② 防止游戏释放该纹理后地址被复用
+// —— 没有这条引用时"指针相等"不再等于"同一对象"，会拿旧的 D3D12 打开结果去读新纹理。
+struct ZcInput
+{
+    ComPtr<ID3D11Texture2D> src; // 游戏创建的颜色纹理（被 dispatch 读取的那张）
+    SharedTex tex;               // 同一纹理的 D3D12 打开结果（tex.d11 与 src 同对象）
+    std::uint64_t tick = 0;      // LRU：最近一次被 dispatch 使用的序号
 };
 
 // P2：每个 ffxContext（= 每个 instance_key）独占一整套 GPU 互操作资源。
@@ -245,6 +266,12 @@ struct InstanceRes
     // 或旧内容 —— 这是"另一路画面混进来"的另一种成因。这种实例一律 fail-open 放行游戏
     // 原生上采样（= P1 的安全回退语义），并只留一次明确日志（避免每帧刷屏）。
     bool ctx_wrong_device = false;
+    // ---- 2026-11-28：输入颜色零拷贝缓存（2 槽，按 ID3D11Texture2D* 判等，LRU by tick）----
+    // 为什么 2 槽：游戏同一实例的颜色纹理可能双缓冲交替（两张 RT 轮换），1 槽会每帧
+    // 重开共享句柄（CreateSharedHandle+OpenSharedHandle 是昂贵的 CPU 路径）；4 槽又会让
+    // 本实例白持更多游戏纹理引用（render 尺寸每张约 33MB@4K）且淘汰窗口过大。
+    std::array<ZcInput, 2> zc_inputs;
+    std::uint64_t zc_tick = 0;
 };
 
 // 每实例独立 FSR context（全部实例接管，防历史串流污染）
@@ -264,6 +291,9 @@ std::vector<SdkContext> g_sdk_ctxs;
 // 但实例槽位的 LRU 驱逐路径（ctx_for_key）必须先落地挂起帧、再整套释放该实例的资源。
 void release_instance_res(SdkContext &sc);
 bool finish_instance(SdkContext &sc);
+// 输入颜色零拷贝缓存释放（定义在 release_instance_res 之前；ensure_pool 的重建路径
+// 需要显式调用它，故此处提前声明）。
+void release_zc_inputs(InstanceRes &r);
 std::string g_version_name = "ffx12";
 // 实际匹配到的 provider 版本名（如 "4.1.1"/"4.0.2c"/"3.1.5"）——日志如实上报。
 std::string g_sdk_matched_name = "?";
@@ -907,6 +937,26 @@ void release_shared(SharedTex &st)
     st.w = st.h = 0;
 }
 
+// 输入颜色零拷贝（2026-11-28，Stage 1）：打开共享句柄后先建一次临时 typed SRV 验证。
+// 为什么需要：FFX 在 D3D12 侧把这张 TYPELESS(23) 纹理按 R10G10B10A2_UNORM(24) 读；
+// 若游戏纹理实际不可按该格式建视图（BindFlags 缺失 / 格式族不符 / 设备不是同一个），
+// 失败形态是"读到黑或花屏"而不是报错 —— 必须在建立缓存槽时先验一次、失败就回退拷贝。
+// 为什么在 D3D11 侧建：CreateShaderResourceView(D3D11) 返回 HRESULT 可判；D3D12 侧
+// 同名方法返回 void，只能靠 debug layer 才看得到失败。视图用完即释放（不缓存）。
+// 依据：GpuInteropProbe P4 —— bind=0x28 + 23/TYPELESS 开放后 typed SRV 读取 diff_bytes=0。
+bool zc_validate_typed_srv(ID3D11Texture2D *texture)
+{
+    if (texture == nullptr || !g_d11dev)
+        return false;
+    D3D11_SHADER_RESOURCE_VIEW_DESC desc {};
+    desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    desc.Texture2D.MostDetailedMip = 0;
+    desc.Texture2D.MipLevels = 1;
+    ComPtr<ID3D11ShaderResourceView> srv;
+    return SUCCEEDED(g_d11dev->CreateShaderResourceView(texture, &desc, &srv)) && srv != nullptr;
+}
+
 void release_motion_decode()
 {
     if (g_up_motion_cvt && g_up_motion_cvt_ptr)
@@ -1518,6 +1568,10 @@ bool ensure_pool(const FrameInput &input, SdkContext &sc)
     }
     // 先释放该实例的整套资源（内部会把挂起帧落地或丢弃；释放后尺寸键才归零）
     release_instance_res(sc);
+    // 尺寸变化必须让零拷贝缓存一起失效：旧的游戏颜色纹理尺寸已与 r.rw/rh 不符，
+    // 留着只会在下一个 dispatch 被 size 校验拒绝并白占两槽引用（release_instance_res
+    // 内部已调过一次，这里是幂等保险 —— 将来若重构 release 路径也不会漏）。
+    release_zc_inputs(sc.res);
     g_render_w = g_render_h = g_display_w = g_display_h = 0;
 
     // 池格式 = 输入纹理的实际格式（CopyResource 要求格式一致；游戏多为 TYPELESS）
@@ -2155,7 +2209,106 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
         game_context->CSSetShaderResources(0, 1, null_srvs);
         game_context->CSSetShader(nullptr, nullptr, 0);
     }
-    if (input.color)
+    // ---- 输入颜色零拷贝（2026-11-28，Stage 1，opt-in Ffx12ZeroCopy）----
+    // 命中时**跳过**下面这行 CopyResource：D3D12 直接读游戏自己创建的颜色纹理。
+    // 同步性依据（不改 fence 协议）：游戏写这张纹理的命令与本段 D3D11 命令在同一条
+    // immediate context 命令流里，步骤①末尾的 Signal(v1) 排在它们之后 ⇒ D3D12
+    // Wait(v1) 已保证颜色写入完成；同步模式下返回前的 D3D11 Wait(v2) 又挡住游戏
+    // 下一帧覆写同一张纹理（异步交叠不满足这一点，故 zero_copy_enabled() 要求同步）。
+    // 任何一步不成立都回落拷贝路径（fail-open）——绝不因零拷贝失败让本帧 dispatch 失败。
+    const bool zc_active = zero_copy_enabled();
+    ID3D12Resource *zc_color = nullptr;
+    bool zc_cache_hit = false;
+    const char *zc_reason = "off";
+    if (zc_active && input.color != nullptr)
+    {
+        D3D11_TEXTURE2D_DESC color_desc {};
+        input.color->GetDesc(&color_desc);
+        if ((color_desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) == 0)
+            zc_reason = "not_shared"; // 游戏这张纹理没走桥的注入（CreateTexture2D 前已存在/预算用尽）
+        else if (color_desc.Format != r.in_color_fmt)
+            zc_reason = "format";     // 与 FFX 的 R10G10B10A2_TYPELESS 假设不符
+        else if (color_desc.Width != r.rw || color_desc.Height != r.rh ||
+                 color_desc.MipLevels != 1 || color_desc.ArraySize != 1 ||
+                 color_desc.SampleDesc.Count != 1)
+            zc_reason = "size";       // 与 FFX renderSize/池尺寸不符（动态分辨率换档等）
+        else
+        {
+            ZcInput *entry = nullptr;
+            for (ZcInput &candidate : r.zc_inputs)
+            {
+                if (candidate.src.Get() == input.color)
+                {
+                    entry = &candidate;
+                    zc_cache_hit = true;
+                    break;
+                }
+            }
+            if (entry == nullptr)
+            {
+                // 选空槽；都满时淘汰 tick 最小（最久未用）的槽
+                entry = &r.zc_inputs[0];
+                for (ZcInput &candidate : r.zc_inputs)
+                {
+                    if (!candidate.src)
+                    {
+                        entry = &candidate;
+                        break;
+                    }
+                    if (candidate.tick < entry->tick)
+                        entry = &candidate;
+                }
+                // 复用槽前先清干净：否则旧的 D3D12 打开结果与游戏纹理引用都泄漏
+                if (entry->src)
+                {
+                    release_shared_nt(entry->tex);
+                    entry->src.Reset();
+                }
+                entry->src = input.color;
+                // open_shared_nt 读 tex.d11：同一对象再持一份引用（release_shared_nt 会一并释放）
+                entry->tex.d11 = entry->src;
+                entry->tex.w = input.render_w;
+                entry->tex.h = input.render_h;
+                if (!open_shared_nt(entry->tex))
+                {
+                    release_shared_nt(entry->tex);
+                    entry->src.Reset();
+                    entry->tick = 0;
+                    entry = nullptr;
+                    zc_reason = "open";
+                }
+                else if (!zc_validate_typed_srv(input.color))
+                {
+                    // 句柄能开但 typed 视图建不出来：用下去只会读到垃圾 ⇒ 清槽回退
+                    release_shared_nt(entry->tex);
+                    entry->src.Reset();
+                    entry->tick = 0;
+                    entry = nullptr;
+                    zc_reason = "srv";
+                }
+            }
+            if (entry != nullptr)
+            {
+                entry->tick = ++r.zc_tick;
+                zc_color = entry->tex.d12.Get();
+                zc_reason = "ok";
+            }
+        }
+    }
+    // 关着的时候（默认 0）连这三个原子写都不做：set_zero_copy(false) 已把值复位成 off，
+    // 这样「键=0」的每帧路径与改动前完全一致（§二.5：不在热路径上白加操作）。
+    if (zc_active)
+    {
+        g_zc_last_in.store(zc_color != nullptr, std::memory_order_relaxed);
+        g_zc_last_in_cached.store(zc_color != nullptr && zc_cache_hit, std::memory_order_relaxed);
+        g_zc_reason.store(zc_reason, std::memory_order_relaxed);
+    }
+    if (zc_color != nullptr)
+    {
+        // 诊断镜像指向"实际被 D3D12 读取"的纹理（原先指共享拷贝目标 r.tex_color.d11）
+        g_mirror_color_tex = input.color;
+    }
+    if (input.color != nullptr && zc_color == nullptr)
         game_context->CopyResource(r.tex_color.d11.Get(), input.color);
     // motion 不再拷贝进共享 raw 纹理——解码 CS 已直接读游戏纹理，
     // 解码结果（共享 R16G16）才是 FFX 的 motion 输入。
@@ -2226,7 +2379,8 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     // 共享输入统一先到 NON_PIXEL_SHADER_RESOURCE（FFX 将从这里再转自身需要的状态）
     // motion 输入 = 共享解码 R16G16（D3D11 CS 已解码）；raw motion 不再进 D3D12
     ID3D12Resource *inputs[4] = {};
-    inputs[0] = r.tex_color.d12.Get();
+    // 零拷贝命中时 inputs[0] = 游戏纹理的 D3D12 打开结果（上方已验证共享/格式/尺寸/可读）
+    inputs[0] = zc_color != nullptr ? zc_color : r.tex_color.d12.Get();
     inputs[1] = r.tex_depth_share.d12.Get();
     inputs[2] = r.tex_motion_cvt_share.d12.Get();
     if (input.use_reactive_mask && r.tex_reactive_share.d12)
@@ -2239,7 +2393,8 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     ffxDispatchDescUpscale dispatch {};
     dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
     dispatch.commandList = cmd;
-    dispatch.color = ffxApiGetResourceDX12(r.tex_color.d12.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    dispatch.color = ffxApiGetResourceDX12(
+        zc_color != nullptr ? zc_color : r.tex_color.d12.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
     dispatch.color.description.format = FFX_API_SURFACE_FORMAT_R10G10B10A2_TYPELESS;
     dispatch.depth = ffxApiGetResourceDX12(r.tex_depth_share.d12.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
     dispatch.depth.description.format = FFX_API_SURFACE_FORMAT_R32_FLOAT;
@@ -2385,6 +2540,25 @@ bool finish_instance(SdkContext &sc)
     return true;
 }
 
+// 释放某实例的输入颜色零拷贝缓存（2026-11-28，Stage 1）。
+// 为什么要单独清：槽里同时持有"D3D12 打开结果"和"游戏纹理引用"，而 InstanceRes 的其它
+// 纹理都是本后端自己创建的共享纹理，release_shared* 覆盖不到这两个字段 —— 漏掉就是
+// 每实例两张游戏纹理 + 两个 D3D12 资源永久泄漏。
+// 调用点：release_instance_res（LRU 驱逐 / 停机 / 设备移除）、ensure_pool 重建路径。
+void release_zc_inputs(InstanceRes &r)
+{
+    for (ZcInput &entry : r.zc_inputs)
+    {
+        // 诊断镜像可能正指向本槽的游戏纹理（zc 命中的那一帧会指过去），先摘掉再放引用
+        if (g_mirror_color_tex.Get() == entry.src.Get())
+            g_mirror_color_tex.Reset();
+        release_shared_nt(entry.tex);
+        entry.src.Reset();
+        entry.tick = 0;
+    }
+    r.zc_tick = 0;
+}
+
 // 释放某实例**整套** GPU 互操作资源（共享纹理 + 视图 + b0 + ctx4 + pending）。
 // 生命周期要点（最容易泄漏的地方）：
 //   · LRU 驱逐 / 上限 4 轮换时每个实例约 68MB（1080p render + 4K display），不释放
@@ -2400,6 +2574,8 @@ void release_instance_res(SdkContext &sc)
         if (!finish_instance(sc))
             drop_instance_pending(r);
     }
+    // 输入颜色零拷贝缓存：先放（内部会顺带摘掉指向游戏纹理的诊断镜像）
+    release_zc_inputs(r);
     // 诊断镜像若指向本实例的纹理，必须一起清掉（否则留下悬空指针）
     if (g_mirror_color_tex.Get() == r.tex_color.d11.Get())
         g_mirror_color_tex.Reset();
@@ -3284,10 +3460,51 @@ void set_instance_diag(bool enable)
     g_instance_diag_notes.store(0, std::memory_order_relaxed);
 }
 
+void set_zero_copy(bool enable)
+{
+    // 同 set_instance_diag：不加锁 —— 桥在 load_config 调用一次；厂商门禁不支持时启动期
+    // 再调一次 false。两次都实际早于首个 dispatch；即便并发也只写原子位，最坏一帧旧值。
+    g_zero_copy.store(enable, std::memory_order_relaxed);
+    if (!enable)
+    {
+        // 关掉时把"最近一次结果"同步复位，否则低频日志仍会显示上一轮 zc_in=1
+        g_zc_last_in.store(false, std::memory_order_relaxed);
+        g_zc_last_in_cached.store(false, std::memory_order_relaxed);
+        g_zc_reason.store("off", std::memory_order_relaxed);
+    }
+}
+
+bool zero_copy_enabled()
+{
+    // ★ 不取 g_mutex：dispatch_gpu_shared 在持有它时调用本函数，而它是 std::timed_mutex
+    //   （非递归）——这里再加锁会自锁。参与判断的配置值都是启动期写入、运行期只读的，
+    //   无锁读取不会读到"半初始化"的值（最坏是切换瞬间的一帧旧值，下帧即正确）。
+    // 为什么要求 native + 同步：ngx 后端根本不初始化 D3D12（无 g_d12dev/g_queue）；
+    // 异步交叠的 pending 会让游戏在 FFX 真正读这张纹理前就去渲染下一帧（覆写）。
+    return g_zero_copy.load(std::memory_order_relaxed) &&
+        g_backend == BackendKind::Native && !g_async_upscale &&
+        g_d12dev != nullptr && g_queue != nullptr;
+}
+
 bool async_upscale_enabled()
 {
     std::lock_guard<std::timed_mutex> lock(g_mutex);
     return g_async_upscale;
+}
+
+bool zero_copy_last_in()
+{
+    return g_zc_last_in.load(std::memory_order_relaxed);
+}
+
+bool zero_copy_last_in_cached()
+{
+    return g_zc_last_in_cached.load(std::memory_order_relaxed);
+}
+
+const char *zero_copy_reason()
+{
+    return g_zc_reason.load(std::memory_order_relaxed);
 }
 
 bool finish_pending()

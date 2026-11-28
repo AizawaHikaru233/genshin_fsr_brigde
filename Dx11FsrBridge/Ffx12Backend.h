@@ -180,6 +180,29 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
 //  - set_async_upscale(false)：dispatch 内提交+等待+拷贝（旧同步行为，可回退）
 void set_async_upscale(bool enable);
 bool async_upscale_enabled();
+
+// ---- 输入颜色零拷贝（Ffx12ZeroCopy，opt-in，默认 0）----
+// 2026-11-28（Stage 1）：桥在 `ID3D11Device::CreateTexture2D` 钩子里给游戏自己创建的颜色
+// 纹理注入 SHARED|SHARED_NTHANDLE(0x802)；后端在 dispatch 时用同一套 `open_shared_nt`
+// 直接打开它给 D3D12 用，**跳过输入 CopyResource**。只做输入颜色这一条，输出照旧拷贝
+// （输出侧有硬门/UAV 写，probe 判定 SKIP，不在本阶段范围内）。
+// 实际可用还要求后端是 native、同步模式（异步交叠会让游戏在 FFX 真正读这张纹理之前
+// 就渲染下一帧、覆写同一张纹理）、且 D3D12 设备/队列已就绪 —— 见 zero_copy_enabled()。
+// set_zero_copy：桥在 load_config 调用一次；厂商门禁不支持时启动期再调一次 false。
+// 两次都实际早于首个 dispatch；即便与 dispatch 并发也只写原子位，最坏一帧读到旧值。
+// 仅 NVIDIA（vendor 0x10DE）生效 —— 其它厂商与未识别厂商时本键等同 0（桥侧不注入）。
+void set_zero_copy(bool enable);
+// 当前是否**真正可用**（请求位 + native + 同步 + 设备/队列就绪）。
+// ⚠️ 内部不取 g_mutex：调用方 dispatch_gpu_shared 已持有它，而它是 std::timed_mutex
+// （非递归）—— 在这里再取会自锁。
+bool zero_copy_enabled();
+// 最近一次 dispatch 的输入零拷贝结果（供桥侧低频 ffx12_dispatch 行如实上报）：
+//   last_in       1 = 本帧颜色输入真的走了零拷贝（未发 CopyResource）
+//   last_in_cached 1 = 这一帧命中了缓存槽（0 = 新建/重开了共享句柄）
+//   reason        短原因串："ok" / "off" / "not_shared" / "format" / "size" / "srv" / "open"
+bool zero_copy_last_in();
+bool zero_copy_last_in_cached();
+const char *zero_copy_reason();
 // 完成挂起的异步 FFX（等 fence + 拷贝输出到 output_target）。无挂起时立即返回 true。
 // 由桥在 Present 前调用；dispatch 入口也会先 finish 上一帧（防异常路径堆积）。
 bool finish_pending();

@@ -391,6 +391,13 @@ struct Config
     // 默认开：GpuInteropProbe 已在本机字节级验证；不劫持游戏设备为 On12（进场前冻结根因）。
     bool ffx12_gpu_interop = true;
 #endif
+    // 2026-11-28（L2 #24② Stage 1：输入颜色零拷贝）：opt-in，默认 0 = 与改动前逐字节一致。
+    // 为什么字段放在 FSR2_TRANSLATION_EXPERIMENTAL 守卫**之外**：钩子谓词
+    // need_create_texture_hook() 在任何构建里都要读得到这个字段。
+    // 读取点（:4357-4359 的 GetPrivateProfileIntW + set_zero_copy）与 Ffx12AsyncUpscale 等键
+    // 一样在 FSR2_TRANSLATION_EXPERIMENTAL 段内；该宏关闭时整条 native/ffx12 链本就不编译，
+    // set_zero_copy 不会被调用、g_zero_copy 保持 false ⇒ 钩子不装，行为等同键=0。
+    bool ffx12_zero_copy = false;
     bool show_osd = false;
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     bool enable_similarity_probe = false;
@@ -1174,6 +1181,44 @@ std::mutex g_context_device_hook_mutex;
 std::unordered_set<std::uint64_t> g_context_device_hook_attempts;
 std::atomic_uint32_t g_native_ldr_final_target_candidate_count { 0 };
 std::atomic_uint32_t g_native_ldr_texture_create_observed_count { 0 };
+// ---- 输入颜色零拷贝（2026-11-28，L2 #24② Stage 1，opt-in Ffx12ZeroCopy）----
+// 这些计数器/配额放在这里而不是贴着钩子：桥的低频 ffx12_dispatch 行（本文件 14000 行附近）
+// 要用 g_zc_marked，不能引用"定义在它之后"的变量（C++ 要求先声明）。
+constexpr std::uint32_t k_zc_max_textures = 8;
+constexpr std::uint64_t k_zc_max_bytes = 256ull * 1024ull * 1024ull;
+std::atomic_uint32_t g_zc_marked { 0 };          // 注入成功（真正标记）的张数，低频日志用
+std::atomic_uint32_t g_zc_reserved { 0 };        // 预算已预留张数（含尚未 CreateTexture2D 的）
+std::atomic_uint64_t g_zc_reserved_bytes { 0 };  // 预算已预留字节数
+std::atomic_uint32_t g_zc_skipped { 0 };         // 因预算耗尽而放弃注入的次数
+std::atomic_uint32_t g_zc_create_fallbacks { 0 }; // 注入 create 失败、按原 desc 重试成功的次数
+std::atomic_bool g_zc_budget_exhausted_logged { false };
+// ---- 输入颜色零拷贝的厂商门禁（2026-11-28：未实测厂商一律 fail-closed；且门禁判定必须与后端开关同源）----
+// ① 为什么只允许 NVIDIA（0x10DE）：Stage 1 只在 RTX 4070 SUPER 上做过 E1 实测（probe
+//   `celia24_zc`：23/TYPELESS + 0x802 → D3D12 opened flags=0x21、typed SRV diff_bytes=0）。
+//   AMD / Intel 驱动对「D3D11 创建时注入 0x802 的游戏纹理能否被 D3D12 正确打开并按 typed
+//   SRV 读」没有证据，而失败形态是黑屏/花屏而不是报错 ⇒ 未实测厂商一律 fail-closed。
+// ② 为什么门禁放在注入条件里，而不是塞进 need_create_texture_hook()：
+//   install_device_hooks（:16563 / :16607）在 route_from_d3d11_device（:16566 / :16610）之前
+//   执行 ⇒ 安装钩子时 vendor 必然未知，谓词若掺厂商条件会永远为假、钩子永不安装；
+//   而且该谓词由 trace_texture_creates / native_ldr_final_target_unorm 共用，掺进去会连带
+//   废掉两个诊断键。Gate 必须晚于 vendor 落值（record_adapter_info），故放在纹理创建时判定。
+// ③ 为什么这里重复写 0x10DE：GpuBackendPick.h:55 已有同一判据（那里决定 auto 是否选 NGX）。
+//   抽公共常量要动那个头文件并让本文件 include 它 —— 超出本次改动范围，故刻意重复并在此注明。
+constexpr std::uint32_t k_zc_vendor_nvidia = 0x10DEu;
+std::atomic_uint32_t g_adapter_vendor { 0 };        // 首个成功路由的适配器厂商；0=未知(fail-closed)
+std::atomic_bool g_zc_vendor_gate_logged { false }; // 门禁行每进程一次
+std::atomic_bool g_zc_vendor_allowed { false };    // 门禁的粘滞结论；每进程只写一次
+// ④ 门禁结论必须是**粘滞位**（g_zc_vendor_allowed），注入判据与「关后端」只能同源：
+//   若每次注入时都重新调一次判定（旧实现是再算一遍 g_adapter_vendor == 0x10DE），两处独立
+//   求值会分歧 —— 门禁按「不支持」关了后端，而后续 vendor 又被另一个 device 的 route 覆盖成
+//   0x10DE 时，注入会重新打开 ⇒ 出现 zc_mark>0 但 zc_in=0 / zc_reason=off，违反「不支持厂商
+//   等同键=0（不注入）」；反过来则是 NVIDIA 上注入被挡、后端每帧空转。故结论只算一次、只写一次。
+// ⑤ 已知边界（以下都是 fail-closed＝最坏退回键=0，可接受）：
+//   · 先建 iGPU 设备的混合显卡机器上，门禁会按 iGPU 的 vendor 把 dGPU 上的零拷贝静默关掉；
+//     这与 Ffx12Backend=auto「只按首个 device 落位一次」的既有语义一致。
+//   · 纹理钩子若经 ensure_context_device_texture_hook 迟到安装、路由从未跑过，vendor 恒 0
+//     ⇒ 键=1 也等同键=0。
+//   · route 的 IDXGIDevice / GetAdapter / GetDesc 任一失败 ⇒ 不落 vendor ⇒ 同样 fail-closed。
 
 HRESULT WINAPI hooked_create_device_and_swapchain(
     IDXGIAdapter *adapter,
@@ -4335,6 +4380,13 @@ void load_config()
     // 设 0 回退旧同步行为（dispatch 内等待+拷贝）。
     ffx12::set_async_upscale(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12AsyncUpscale", 1, config_path.c_str()) != 0);
+    // 输入颜色零拷贝（2026-11-28，L2 #24② Stage 1）：1 = 游戏颜色纹理直接跨 API 共享、
+    // 跳过输入 CopyResource；0（默认）= 完全走既有拷贝路径（与改动前逐字节一致）。
+    // 默认值必须与发布 ini（Dx11FsrBridge.package.ini 的 Ffx12ZeroCopy=0）一致。
+    // ★ 无条件读取（不放进 #if DIAGNOSTICS）：这是发布版也要生效的键。
+    g_config.ffx12_zero_copy =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ZeroCopy", 0, config_path.c_str()) != 0;
+    ffx12::set_zero_copy(g_config.ffx12_zero_copy);
     ffx12::set_hdr_input(g_config.ffx12_hdr_input);
     // ---- D13 十键读取（SDS §3.13.1）+ 键 11 NgxCrossKeyReuse：紧邻 Ffx12Hdr 的读取点 ----
     // 此处 blog::init() 尚未执行 ⇒ 11 个 setter 只存值、一行日志都不打；
@@ -8725,9 +8777,22 @@ void STDMETHODCALLTYPE hooked_cs_set_constant_buffers(ID3D11DeviceContext *conte
     g_original_cs_set_constant_buffers(context, start_slot, count, buffers);
 }
 
+// 纹理钩子安装的统一谓词（2026-11-28，L2 #24② Stage 1）。
+// 为什么必须收敛成一个函数：旧实现在 3 处各写一遍条件（install_device_hooks 两处 +
+// ensure_context_device_texture_hook 一处）—— AGENTS.md §二.6 点名的历史 bug 就是
+// "外层放行、内层 return ⇒ 钩子静默不装"。而 trace_texture_creates 与
+// native_ldr_final_target_unorm 只在诊断构建里被读取（RELEASE_RUNTIME 下恒 false），
+// 于是发布版从来没装过 CreateTexture2D 钩子；零拷贝（Ffx12ZeroCopy）要在发布版生效，
+// 谓词里必须包含这个发布版读得到的键。
+bool need_create_texture_hook()
+{
+    return g_config.trace_texture_creates || g_config.native_ldr_final_target_unorm ||
+        g_config.ffx12_zero_copy;
+}
+
 void ensure_context_device_texture_hook(ID3D11DeviceContext *context)
 {
-    if (!g_config.native_ldr_final_target_unorm || context == nullptr)
+    if (!need_create_texture_hook() || context == nullptr)
         return;
 
     ID3D11Device *device = nullptr;
@@ -14117,6 +14182,15 @@ bool try_fsr2_translation_draw(
                             std::to_string(g_config.ffx12_camera_far) + "," +
                             std::to_string(sdk_in.camera_fov_vertical) +
                             " dt_ms=" + std::to_string(sdk_in.frame_time_delta_ms) +
+                            // 输入颜色零拷贝结果（2026-11-28，Stage 1）：zc_in=本帧是否真的
+                            // 跳过输入拷贝；zc_in_cache=是否命中后端 2 槽缓存（0 = 本帧重开了
+                            // 共享句柄）；zc_mark=桥累计注入成功张数（到 k_zc_max_textures 封顶）；
+                            // zc_reason=短原因串（ok/off/not_shared/format/size/srv/open）；
+                            // off 也覆盖「键=0 / 厂商门禁关闭 / 后端非 native / 异步交叠」。
+                            " zc_in=" + std::to_string(ffx12::zero_copy_last_in() ? 1 : 0) +
+                            " zc_in_cache=" + std::to_string(ffx12::zero_copy_last_in_cached() ? 1 : 0) +
+                            " zc_mark=" + std::to_string(g_zc_marked.load(std::memory_order_relaxed)) +
+                            " zc_reason=" + ffx12::zero_copy_reason() +
                             " version=" + ffx12::selected_version_name());
                         if (g_config.ffx12_camera_hook)
                         {
@@ -15375,6 +15449,89 @@ HRESULT STDMETHODCALLTYPE hooked_create_buffer(ID3D11Device *device, const D3D11
     return hr;
 }
 
+// ---- 输入颜色零拷贝（2026-11-28，L2 #24② Stage 1，opt-in Ffx12ZeroCopy）----
+// 桥这一侧只做一件事：给**游戏自己创建**的颜色纹理注入
+// D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE(0x802)，让
+// Ffx12Backend 能直接 OpenSharedHandle 读取它，从而跳过输入 CopyResource。
+// 为什么不复用后端自己建的 tex_color：那张是后端新建的落地纹理，游戏每帧必须
+// CopyResource 写进去 —— 零拷贝要省掉的正是这次拷贝，所以必须在源头（游戏纹理）上动手。
+
+// 预算硬上限（张数 + 字节）：注入的纹理由游戏持有、我们观测不到它的销毁时机，8 张 /
+// 256 MiB 足以覆盖同一时刻真正被读的一两张（双缓冲/双 RT），又不会随分辨率与重开局
+// 无限累积；到达上限后停止注入并计数，不再重试。常量与计数器见文件上方全局区
+// （k_zc_max_textures / g_zc_marked 等，日志行要先用）。
+// 预留一张纹理的预算。成功时 `index` = 第几张（1 基，用于日志与 INFO/DEBUG 分档）；
+// 调用方在注入的 CreateTexture2D 失败时必须调 zc_rollback_budget() 归还。
+bool zc_reserve_budget(std::uint64_t bytes, std::uint32_t &index)
+{
+    const std::uint32_t reserved = g_zc_reserved.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (reserved > k_zc_max_textures)
+    {
+        g_zc_reserved.fetch_sub(1, std::memory_order_relaxed);
+        return false;
+    }
+    std::uint64_t current = g_zc_reserved_bytes.load(std::memory_order_relaxed);
+    for (;;)
+    {
+        if (current + bytes > k_zc_max_bytes)
+        {
+            g_zc_reserved.fetch_sub(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (g_zc_reserved_bytes.compare_exchange_weak(current, current + bytes, std::memory_order_relaxed))
+            break;
+    }
+    index = reserved;
+    return true;
+}
+
+void zc_rollback_budget(std::uint64_t bytes)
+{
+    g_zc_reserved.fetch_sub(1, std::memory_order_relaxed);
+    g_zc_reserved_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+}
+
+// 预算耗尽的一次性留痕。没有这一行，日志里只会看到前 8 张 zc_mark、之后全是
+// zc_in=0，看起来像"零拷贝只生效了几张就坏了"——必须说明是预算封顶而不是失败。
+void zc_note_budget_skip()
+{
+    const std::uint32_t skipped = g_zc_skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!g_zc_budget_exhausted_logged.exchange(true, std::memory_order_relaxed))
+    {
+        LOG_INFO(blog::cat::core, "zc_budget_exhausted marked=" +
+            std::to_string(g_zc_marked.load(std::memory_order_relaxed)) +
+            " reserved=" + std::to_string(g_zc_reserved.load(std::memory_order_relaxed)) +
+            " reserved_bytes=" + std::to_string(g_zc_reserved_bytes.load(std::memory_order_relaxed)) +
+            " skipped=" + std::to_string(skipped) +
+            " limit_textures=" + std::to_string(k_zc_max_textures) +
+            " limit_bytes=" + std::to_string(k_zc_max_bytes));
+    }
+}
+
+// 注入候选判据（只对"最终要传下去的 desc"判定：native_ldr 改写后的 effective_desc）：
+// 每条都来自 GpuInteropProbe P4 验证过的边界（bind=0x28 + 23/TYPELESS 可跨 API 共享读）。
+bool zc_input_candidate(const D3D11_TEXTURE2D_DESC &candidate, std::uint32_t backbuffer_width)
+{
+    if (candidate.Usage != D3D11_USAGE_DEFAULT || candidate.CPUAccessFlags != 0 ||
+        candidate.MiscFlags != 0)
+        return false;
+    if (candidate.MipLevels != 1 || candidate.ArraySize != 1 || candidate.SampleDesc.Count != 1)
+        return false;
+    if (candidate.Format != DXGI_FORMAT_R10G10B10A2_TYPELESS)
+        return false;
+    if ((candidate.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)) !=
+        (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE))
+        return false;
+    if (candidate.Width < 1280 || candidate.Height < 720)
+        return false;
+    // 已知 backbuffer 尺寸时只认**渲染尺寸**那张。backbuffer 本身也常是 23/RTV|SRV，
+    // 宽度相同；把它也标了，后端会拿 backbuffer 当 FSR 输入（render==display 时
+    // 看不出错，一旦开渲染缩放就是错帧内容）。
+    if (backbuffer_width > 0 && candidate.Width >= backbuffer_width)
+        return false;
+    return true;
+}
+
 HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D3D11_TEXTURE2D_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial_data, ID3D11Texture2D **texture)
 {
     if (g_config.native_ldr_final_target_unorm && desc != nullptr)
@@ -15391,6 +15548,10 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
     }
     D3D11_TEXTURE2D_DESC effective_texture_desc {};
     const D3D11_TEXTURE2D_DESC *effective_desc = desc;
+    // 用独立 bool 记录"格式被 native_ldr 改写过"，不能再靠 effective_desc != desc 判断：
+    // 零拷贝注入也会让 create_desc != effective_desc，那个指针比较会把注入当成格式改写、
+    // 多打一条 native_ldr_final_target_created 假日志（日志口径必须自洽，AGENTS.md §五.6）。
+    bool native_ldr_format_changed = false;
     const bool final_target_bind_shape = desc != nullptr &&
         (desc->BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)) ==
             (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE) &&
@@ -15422,6 +15583,7 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
             effective_texture_desc = *desc;
             effective_texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             effective_desc = &effective_texture_desc;
+            native_ldr_format_changed = true;
             LOG_INFO(blog::cat::core, std::string("native_ldr_final_target_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM") +
                 " size=" + std::to_string(desc->Width) + "x" + std::to_string(desc->Height) +
                 " bind=" + hex64(desc->BindFlags));
@@ -15458,8 +15620,112 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
         }
     }
 #endif
-    const HRESULT result = g_original_create_texture_2d(device, effective_desc, initial_data, texture);
-    if (SUCCEEDED(result) && effective_desc != desc && texture != nullptr && *texture != nullptr)
+    // ---- 输入颜色零拷贝注入（2026-11-28，L2 #24② Stage 1）----
+    // 只对"游戏创建 + 尺寸/格式/绑定都符合 probe 边界"的纹理加 0x802 共享标志；
+    // 其它纹理一律走原 desc（键=0 时本块整体不执行，行为与改动前逐字节一致）。
+    D3D11_TEXTURE2D_DESC zc_texture_desc {};
+    const D3D11_TEXTURE2D_DESC *create_desc = effective_desc;
+    bool zc_injected = false;
+    std::uint32_t zc_mark_index = 0;
+    std::uint64_t zc_mark_bytes = 0;
+    if (g_config.ffx12_zero_copy && effective_desc != nullptr)
+    {
+        // 厂商门禁（2026-11-28）：未实测厂商一律 fail-closed；判定必须与「关后端」同源，所以
+        // 每进程只判一次、只打一行事件日志，结论落进**粘滞位** g_zc_vendor_allowed —— 注入判据与
+        // 「关后端」都只读这一处结论，绝不做第二次独立求值（理由见文件上方全局区 ④）。
+        // 为什么在这里判：本块只有键=1 才会进（键=0 一行都不打），且此时 vendor 已由
+        // record_adapter_info 落值（设备创建 hook 早于任何纹理创建）。
+        // 不支持时**不 return** —— native_ldr 改写与正常创建路径必须照常走；注入这一段整体
+        // 落在下面的 `if (g_zc_vendor_allowed)` 里，结论为 deny 时根本不进。
+        // 日志口径（§五.6：这一行是**每进程一次的事件快照**，字段都是当时状态）：
+        //   vendor=<当时读到的适配器厂商>  supported=1|0  need=<常量 k_zc_vendor_nvidia 格式化>
+        //   action=allow|deny —— 只表示门禁是否放行，不代表这张纹理进了候选/预算
+        //   zc_req=on|off —— 后端「零拷贝请求位」（不是后端类型；后端类型见 backend= 系列日志）
+        // ⚠️ 首个纹理若早于 route_from_d3d11_device 的补检，这里会如实打 supported=0/action=deny
+        //   （未知即 fail-closed），结论就此固定，本进程不再重判。
+        if (!g_zc_vendor_gate_logged.exchange(true, std::memory_order_relaxed))
+        {
+            const std::uint32_t gate_vendor = g_adapter_vendor.load(std::memory_order_relaxed);
+            const bool allowed = gate_vendor == k_zc_vendor_nvidia;
+            g_zc_vendor_allowed.store(allowed, std::memory_order_relaxed);
+            if (!allowed)
+                ffx12::set_zero_copy(false);
+            char vendor_hex[16] {};
+            char need_hex[16] {};
+            std::snprintf(vendor_hex, sizeof(vendor_hex), "0x%04X", gate_vendor);
+            std::snprintf(need_hex, sizeof(need_hex), "0x%04X", k_zc_vendor_nvidia);
+            LOG_INFO(blog::cat::core, std::string("zc_vendor_gate vendor=") + vendor_hex +
+                " supported=" + (allowed ? "1" : "0") + " need=" + need_hex +
+                " action=" + (allowed ? "allow" : "deny") +
+                " zc_req=" + (allowed ? "on" : "off"));
+        }
+        // 门禁 deny ⇒ 整段跳过：不取 g_state_mutex、不算候选、不占预算 —— 这样「不支持厂商等同
+        // 键=0」不只在行为上成立，在每帧开销上也成立。
+        if (g_zc_vendor_allowed.load(std::memory_order_relaxed))
+        {
+            std::uint32_t backbuffer_width = 0;
+            // 尺寸下限先过一遍再取锁：本钩子会看到游戏**所有** CreateTexture2D（含大量
+            // 小纹理），不该为不相干的小纹理去取 g_state_mutex。
+            if (effective_desc->Width >= 1280 && effective_desc->Height >= 720)
+            {
+                std::lock_guard lock(g_state_mutex);
+                backbuffer_width = g_state.backbuffer_width;
+            }
+            if (zc_input_candidate(*effective_desc, backbuffer_width))
+            {
+                // 23/TYPELESS = 4 B/px，1 mip / 1 array / 1 sample ⇒ 字节数可直接算
+                zc_mark_bytes = static_cast<std::uint64_t>(effective_desc->Width) *
+                    static_cast<std::uint64_t>(effective_desc->Height) * 4ull;
+                if (zc_reserve_budget(zc_mark_bytes, zc_mark_index))
+                {
+                    zc_texture_desc = *effective_desc;
+                    zc_texture_desc.MiscFlags |=
+                        D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+                    create_desc = &zc_texture_desc;
+                    zc_injected = true;
+                }
+                else
+                {
+                    zc_note_budget_skip();
+                }
+            }
+        }
+    }
+    HRESULT result = g_original_create_texture_2d(device, create_desc, initial_data, texture);
+    if (zc_injected && FAILED(result))
+    {
+        // 注入本身失败（驱动不支持该组合 / 资源不足）：必须按**原 desc** 原样重试一次，
+        // 绝不把注入造成的失败暴露给游戏 —— 否则一张本可创建的纹理创建失败就是画面缺失。
+        const HRESULT injected_result = result;
+        result = g_original_create_texture_2d(device, effective_desc, initial_data, texture);
+        // 无论重试成败都要归还预算：这张纹理最终没有带上共享标志，占用额度就是错的
+        zc_rollback_budget(zc_mark_bytes);
+        zc_injected = false;
+        if (SUCCEEDED(result))
+        {
+            const std::uint32_t fallback = g_zc_create_fallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
+            LOG_INFO(blog::cat::core, "zc_create_fallback count=" + std::to_string(fallback) +
+                " size=" + std::to_string(effective_desc->Width) + "x" + std::to_string(effective_desc->Height) +
+                " format=" + describe_dxgi_format(effective_desc->Format) +
+                " injected_hr=" + hex64(static_cast<std::uint64_t>(static_cast<std::uint32_t>(injected_result))));
+        }
+    }
+    if (zc_injected && SUCCEEDED(result))
+    {
+        g_zc_marked.fetch_add(1, std::memory_order_relaxed);
+        const std::string zc_line = "zc_mark index=" + std::to_string(zc_mark_index) +
+            " size=" + std::to_string(effective_desc->Width) + "x" + std::to_string(effective_desc->Height) +
+            " format=" + describe_dxgi_format(effective_desc->Format) +
+            " bind=" + hex64(effective_desc->BindFlags) +
+            " misc=" + hex64(zc_texture_desc.MiscFlags) +
+            " bytes=" + std::to_string(zc_mark_bytes);
+        // 前 16 张 INFO，之后 DEBUG（AGENTS.md §五.6：诊断日志必须有计数闸门）
+        if (zc_mark_index <= 16)
+            LOG_INFO(blog::cat::core, zc_line);
+        else
+            LOG_DEBUG(blog::cat::core, zc_line);
+    }
+    if (SUCCEEDED(result) && native_ldr_format_changed && texture != nullptr && *texture != nullptr)
     {
         LOG_INFO(blog::cat::core, std::string("native_ldr_final_target_created device=") +
             hex64(reinterpret_cast<std::uintptr_t>(device)) +
@@ -15564,7 +15830,7 @@ void install_device_hooks(ID3D11Device *device)
         { k_idx_device_create_buffer, reinterpret_cast<void *>(&hooked_create_buffer) },
         { k_idx_device_create_pixel_shader, reinterpret_cast<void *>(&hooked_create_pixel_shader) },
     };
-    if (g_config.trace_texture_creates || g_config.native_ldr_final_target_unorm)
+    if (need_create_texture_hook())
     {
         patches.emplace_back(k_idx_device_create_texture_2d, reinterpret_cast<void *>(&hooked_create_texture_2d));
     }
@@ -15576,7 +15842,7 @@ void install_device_hooks(ID3D11Device *device)
 #endif
     clone_and_patch_vtable(device, k_device_vtable_size, patches, "device");
 
-    if (g_config.trace_texture_creates || g_config.native_ldr_final_target_unorm)
+    if (need_create_texture_hook())
     {
         const std::vector<std::pair<std::size_t, void *>> texture_patches {
             { k_idx_device_create_texture_2d, reinterpret_cast<void *>(&hooked_create_texture_2d) },
@@ -16763,6 +17029,13 @@ static void record_adapter_info(std::uint32_t vendor, std::uint32_t device_id, c
     //   抢输的线程直接返回（旧行为：第二个适配器不改后端、不覆盖摘要）。
     if (g_route_applied.exchange(true, std::memory_order_acq_rel))
         return;
+    // 零拷贝厂商门禁的取值点（2026-11-28）：只有**赢得**这次单次路由的 device 才允许写 vendor
+    // （抢输者上面已 return）。必须写在 exchange 之后 —— 并发创建两个适配器的 device 时，后到者
+    // 若也写会覆盖先到者的 vendor；若后到者恰好是 0x10DE 而真正参与路由的是非 NVIDIA，门禁
+    // 就会 fail-OPEN（在非 NVIDIA 上注入）。
+    // 位置：vendor==0 已早退、发布权已抢到、且早于下面的快照发布 ⇒ 摘要里的 vendor 标签与
+    // 门禁读到的 vendor 出自同一次路由的同一个参数。
+    g_adapter_vendor.store(vendor, std::memory_order_relaxed);
     bool auto_want_ngx = false;
     bool auto_resolved = false;
     const std::string backend_auto_note =
