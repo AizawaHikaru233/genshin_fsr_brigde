@@ -374,6 +374,20 @@ struct NgxInstance
     std::uint32_t pool_rebuilds    = 0;    // 本实例建池次数（**只用于日志**）
     std::uint32_t lru_evict        = 0;    // **v8 起恒为 0**（单实例无驱逐）；保留字段仅为日志格式兼容
     std::uint64_t last_used_tick   = 0;    // 最后使用时刻（GetTickCount64）；v8 起不用于 LRU，仅日志
+
+    // ---- NgxZeroCopy 的**决策缓存**（每帧 dispatch 写一次，四个使用点只读）----
+    // ★ 为什么放在实例里而不是 dispatch 的局部量：create_feature 的签名由 SDS 3.8.1 写死
+    //   （不新增形参），它要读的「本帧是否零拷贝」只能挂在这里；而 dispatch 每帧都先重写
+    //   一遍（且唯一的写点在第 5 步建池**之后**），⇒ 不存在「读到上一帧残留」的窗口。
+    // ★ 为什么**不进**跨 key 复用谓词（ensure_instance 里那六个尺寸/格式比较）：
+    //   zc 判定会随场景（纹理绑定变化）在帧间变化；一旦入谓词，分辨率/场景切换时的判定漂移
+    //   就会触发 create_feature 重建（实测 g_release 一次 ~502 ms 卡顿，见 set_cross_key_reuse
+    //   的注释）。它只是**决策缓存**，不是 feature 的输入（计划审核细则 3）。
+    bool zc_in_ok  = false;   // 本帧 Color 直接指向游戏 in.color
+    bool zc_out_ok = false;   // 本帧 Output 直接指向游戏 in.output_target
+    // 不可用原因（指向字符串字面量，静态存储期，无需释放；取值见 zc_evaluate 的块头注）
+    const wchar_t *zc_reason_in  = L"off";
+    const wchar_t *zc_reason_out = L"off";
 };
 
 // ============================================================================
@@ -539,6 +553,34 @@ bool                      g_passthrough   = false;
 //   的跨线程读写就是数据竞争（C++ 层面 UB）。一个只在 key 切换时读一次的值，
 //   relaxed 语义的 atomic 开销可忽略，故取 atomic。
 std::atomic<bool>         g_cross_key_reuse { true };
+
+// ---- NgxZeroCopy（默认 false / ini 里 0）----
+// 语义：NGX 的 Color 直接指向游戏的 in.color、Output 直接指向游戏的 in.output_target，
+//   省掉每帧两次整纹理 CopyResource（2026-11-28 实机中位合计 64.7 µs/帧 = 153 fps 下 0.99%，
+//   输入 13.3 µs @1080p / 输出 51.4 µs @4K）。
+// ★ 为什么是 std::atomic<bool>：写方是 load_config()（初始化线程），读方是 dispatch() 的判据
+//   （渲染线程），与 g_cross_key_reuse 逐条同理（见该段的形态说明），不重复论证。
+std::atomic<bool>         g_zero_copy { false };
+
+// ★ zc 归因失败后的**进程内粘滞关闭**（计划 D2）。刻意与 g_release_all 分成两个位：
+//   - g_release_all = "NGX 整体不可用"（0→1 不可逆，会让全部 fail-open 早退）；
+//   - 本位 = "零拷贝这条路不可用"，NGX 本身照旧工作，下一帧回落拷贝即可。
+//   ⇒ 一条 zc 归因的失败绝不能把整个 NGX 关掉（那是用 -100% 的功能换 0.99% 的收益）。
+// ★ 复位点：**无**（计划审核细则 3）。destroy_instance / release_pool_resources / 分辨率切换
+//   一律不复位：一旦证实"这张游戏的纹理不能直接喂 NGX"，换分辨率不会改变这个事实，复位只会
+//   让同一场故障每换一次分辨率重演一次，并把"每帧失败"变成常态。
+std::atomic<bool>         g_zero_copy_disabled { false };
+
+// ---- NgxZeroCopy 的一次性取证行（各一行，互不共用闸门）----
+// ★ 计划审核细则 5：**每行一个独立的 atomic**。若四行共用一个 static + 一次 exchange，
+//   首帧判据行会把后面三条的配额一起烧掉 ⇒ "used_in 首次为 1" 这类关键事实永远打不出来。
+// ★ 为什么是 "首次为 1" 而不是 "每帧"：这两条是**结论证据**（真的用上了游戏纹理），
+//   而键=1 的逐帧结果由 ngx_in/ngx_out 行的 copy_us=-1 体现，不需要每帧再打一遍。
+// ★ 等级 Error：默认 NgxLogLevel=1 可见（E2 验收就是在这个默认档位下取证）。
+std::atomic<bool>         g_zc_logged_judge { false };   // ① 首帧判据结果（不论成立与否）
+std::atomic<bool>         g_zc_logged_in    { false };   // ② used_in 首次为 1
+std::atomic<bool>         g_zc_logged_out   { false };   // ③ used_out 首次为 1
+std::atomic<bool>         g_zc_logged_fail  { false };   // ④ zc 归因的 eval 失败
 
 // ---- 诊断计数 ----
 std::atomic<unsigned> g_ngx_log_count { 0 };   // §3.11.3 的 200 条硬限流
@@ -3188,6 +3230,260 @@ static CreateFeatureInputKey make_feature_input_key(const NgxInstance &inst,
     return make_feature_input_key_from(inst, build_create_flags(color_fmt, false));
 }
 
+// ============================================================================
+// 2026-11-28（NgxZeroCopy / 计划 v2 判据）：NGX 输入与输出的**零拷贝判据**
+//
+// 目的：把每帧两条整纹理 CopyResource（实机 E2 中位合计 64.7 µs/帧 = 153 fps 下 0.99%，
+//   输入 13.3 µs @1080p / 输出 51.4 µs @4K）换成「NGX 的 Color 直接读游戏 in.color、
+//   Output 直接写游戏 in.output_target」。收益上限就是这两个数，所以本函数只做判据：
+//   任何一条不成立 ⇒ **该方向**退回池纹理 + 拷贝（fail-open，绝不让 NGX 失效）。
+//
+// ★★ 判据单源（计划 R-7）：本函数**每帧只在 dispatch 里调用一次**，结果写进
+//   NgxInstance 的 zc_in_ok / zc_out_ok / zc_reason_*，四个使用点只读不判：
+//     ① 第 7 步输入拷贝是否跳过；② 第 10 步输出回写是否跳过；
+//     ③ create_feature 的 Color/Output 两个 set_tex；④ eval 的 Color/Output 两个 set_tex
+//     （D1：两处一起切，用同一份决策 —— 否则两处指向不同纹理必然错图）。
+//   禁止在任何使用点再判一次：两套判据必然漂移，而漂移的形态是**静默错图** ——
+//   「拷贝跳过了但 NGX 用的是池纹理」⇒ 黑帧；「NGX 用游戏纹理但拷贝也做了」⇒ 白做 65 µs。
+//
+// ★★ 键=0 时**零新增 D3D 调用**（计划 R-11 是「零 D3D 调用」，不是「零日志」）：首行直接
+//   return，OMGetRenderTargets / GetDevice 全部不发生。审核会 grep 每个 OMGetRenderTargets
+//   调用点确认都在条件内，故下面那一处前面有 zero_copy_requested() 早退 + 逐方向条件。
+//
+// 判据（计划 v2 的 13 条，逐条对应）：
+//   ① 键=1（zero_copy_requested）；② 解析后的后端 = ngx（ffx12::backend()，**不是** ini 原文）；
+//   ③ 非 passthrough；④ 两张纹理非空；⑤ GetDevice() == g_device（NGX 的 feature 绑在它上面）；
+//   ⑥ 两张不是同一张资源（同一资源同时当 Color 与 Output 是 UB）；
+//   ⑦ Usage=DEFAULT / CPUAccessFlags=0 / MiscFlags ∈ {0, 0x802}；
+//   ⑧ MipLevels=1 / ArraySize=1 / SampleDesc.Count=1 / SampleDesc.Quality=0；
+//   ⑨ 尺寸 == 池纹理尺寸（颜色用 inst.rw/rh，输出用 inst.dw/dh）；
+//   ⑩ 逐字段与池纹理等价（格式 == inst.color_fmt / inst.output_fmt）；
+//   ⑪ 颜色需要 SRV 位；⑫ 输出需要 UAV 位（BindFlags 允许超集）；
+//   ⑬ 颜色不在当前 OM 绑定集合里（见下）。
+//
+// ★★ 判据 ⑬ 只对**颜色**方向成立（计划修订：原稿对输出也要求「不在 OM 集合」，那条有致命
+//   冲突，已删）。实测事实：in.output_target 的**来源就是本 draw 绑定的那张 RTV** ——
+//   Dx11FsrBridge.cpp 的 try_fsr2_translation_draw 里 OMGetRenderTargets(4, bound_rtvs, …)
+//   → bound_rtvs[output_rtv_slot] 的 GetResource 就是 sdk_in.output_target，从那里到
+//   ffx12::dispatch 之间没有任何 OMSetRenderTargets（NgxBackend.cpp 全文件此前零 OM 调用）。
+//   若对输出也要求「不在 OM 集合」，这条判据在正常帧上**恒不成立** ⇒ used_out 永远 0、功能
+//   零帧生效；而「在 OM 集合才解绑」的保护分支也就永远进不去 = 死代码。
+//   ⇒ 输出方向**不做** OM 判据，改为 eval 前**每帧无条件**保存/解绑/恢复（见 dispatch 第 10b 步）。
+//   颜色方向保留：颜色是 SRV 输入，正常情况下不该同时是 RTV；假拒绝只损失一半收益，方向安全。
+//
+// ★ 为什么颜色方向的 OM 查询**每帧**做（不做「指针变化才查」的缓存）：一次
+//   OMGetRenderTargets(8)+9×Release 的实测量级是 ns 级（Dx11FsrBridge.cpp:9723 对
+//   OMGetRenderTargets(2)+Release 的记录是 2.4 ns），相对省掉的 13.3 µs 有数千倍余量；
+//   而缓存会带来「指针没变但绑定变了」的静默误判 —— 用 ns 换一个不可复现的错误不划算。
+//   计划原文的缓存优化针对的是**输出保护**，该处已按修订改为每帧无条件执行。
+//
+// ★ 关于 MiscFlags 允许 0x802（计划修订，与 Ffx12ZeroCopy 的交互）：Ffx12ZeroCopy=1 时
+//   桥在**创建期**给游戏纹理注入 D3D11_RESOURCE_MISC_SHARED | SHARED_NTHANDLE(= 0x802)，
+//   见 Dx11FsrBridge.cpp 的 zc 注入分支。原判据写「MiscFlags==0」会让「两个键同开」这个
+//   组合一律以 desc 理由拒绝零拷贝。注入只加共享标志、不改 BindFlags、不改内容，而 NGX 作为
+//   **同设备 D3D11 消费者**不需要关心纹理是否 NT 共享 ⇒ 允许 0 或恰好 0x802，其余任何位仍拒绝。
+// ============================================================================
+
+// MiscFlags 判据：只允许 0 或恰好 0x802（理由见上段「与 Ffx12ZeroCopy 的交互」）。
+// 用「等于」而不是「是子集」：其它任何 MiscFlags（GENERATE_MIPS / TEXTURECUBE / BUFFER …）
+//   都意味着这张纹理不是「普通 2D 单采样 RT」，语义上已经越界，放行只会把问题推到 NGX 内部。
+static bool zc_misc_flags_ok(UINT misc)
+{
+    const UINT kInjected = static_cast<UINT>(D3D11_RESOURCE_MISC_SHARED |
+                                             D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
+    return misc == 0u || misc == kInjected;
+}
+
+// 单方向判据（颜色/输出共用一个实现，差异全部由形参表达 ⇒ 两边不可能漂移）。
+// 返回值：true = 该方向可用；false 时 *reason 写入原因（顺序即判据顺序）。
+// ★ 检查顺序（与计划的原因清单同序）：desc → bind → format → size。
+//   顺序固定是为了让同一帧的日志**可复现**：同样的输入必得同样的 reason。
+static bool zc_texture_ok(const D3D11_TEXTURE2D_DESC &d,
+                          std::uint32_t want_w, std::uint32_t want_h, DXGI_FORMAT want_fmt,
+                          UINT need_bind, const wchar_t **reason)
+{
+    // ⑦：必须是普通 DEFAULT 纹理 + 无 CPU 访问 + MiscFlags ∈ {0, 0x802}
+    if (d.Usage != D3D11_USAGE_DEFAULT || d.CPUAccessFlags != 0u || !zc_misc_flags_ok(d.MiscFlags))
+    {
+        *reason = L"desc";
+        return false;
+    }
+    // ⑧：单 mip / 单 array / 单采样且 Quality==0（NGX 不接受 MSAA；池纹理也是这个形状）
+    if (d.MipLevels != 1u || d.ArraySize != 1u || d.SampleDesc.Count != 1u ||
+        d.SampleDesc.Quality != 0u)
+    {
+        *reason = L"desc";
+        return false;
+    }
+    // ⑪ / ⑫：该方向需要的绑定位（**允许超集**：游戏纹理常同时是 RTV，那不影响）
+    if ((d.BindFlags & need_bind) != need_bind)
+    {
+        *reason = L"bind";
+        return false;
+    }
+    // ⑩：格式必须与池纹理逐字段等价（池纹理就是按它建的 ⇒ 这是「同一形状」的直接证据）。
+    // ★ 注意：本分支目前**不可达** —— 第 5 步的重建判据已强制池纹理格式与游戏 desc 相同
+    //   （相同则不重建、重建则按 desc 建），故这里的 format 判据只是防御，不要把它当活证据
+    //   写进验收报告（§三 #11 精神：不可达分支不能充当「已验证」）。
+    if (d.Format != want_fmt)
+    {
+        *reason = L"format";
+        return false;
+    }
+    // ⑨：尺寸必须与池纹理一致。用 inst.*（池纹理的真实尺寸）而不是 in.render_*/display_*：
+    //   后者是**请求**，前者是**已建成的事实**，两者在动态分辨率边界上可能不同。
+    if (d.Width != want_w || d.Height != want_h)
+    {
+        *reason = L"size";
+        return false;
+    }
+    return true;
+}
+
+// ⑤：纹理必须属于本后端初始化时记下的**同一个**设备。
+// 为什么必须单独查：NGX 的 feature 与 g_params 都绑在 g_device 上，把另一台设备的纹理塞进
+//   参数袋是 UB，而失败形态是「静默错图」而不是报错（CreateFeature 连 nullptr 都不校验，
+//   见 create_feature 的「偏离 2」）。本函数只多一次 GetDevice/Release（ns 级，且只在键=1 时）。
+static bool zc_same_device(ID3D11Texture2D *tex)
+{
+    ID3D11Device *dev = nullptr;
+    tex->GetDevice(&dev);
+    const bool same = (dev != nullptr && dev == g_device.Get());
+    if (dev != nullptr)
+        dev->Release();
+    return same;
+}
+
+// 颜色方向是否落在当前 OM 绑定集合里（判据 ⑬，**只对颜色**；理由见该块头注）。
+// ★ 成对 Release：OMGetRenderTargets 给每个返回的视图都 AddRef 一次，漏一次就是每帧泄漏。
+// ★ dsv 允许为 nullptr，只在非空时 Release。
+static bool zc_color_in_om_set(ID3D11DeviceContext *ctx, ID3D11Texture2D *color)
+{
+    ID3D11RenderTargetView *rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] {};
+    ID3D11DepthStencilView *dsv = nullptr;
+    ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, &dsv);
+    bool bound = false;
+    for (ID3D11RenderTargetView *rtv : rtvs)
+    {
+        if (rtv == nullptr)
+            continue;
+        ID3D11Resource *res = nullptr;
+        rtv->GetResource(&res);
+        if (res != nullptr)
+        {
+            if (res == static_cast<ID3D11Resource *>(color))
+                bound = true;
+            res->Release();
+        }
+    }
+    for (ID3D11RenderTargetView *rtv : rtvs)
+    {
+        if (rtv != nullptr)
+            rtv->Release();
+    }
+    if (dsv != nullptr)
+        dsv->Release();
+    return bound;
+}
+
+// 判据求值：每帧一次，结果**写进实例**（决策缓存），四个使用点只读。
+static void zc_evaluate(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
+                        const D3D11_TEXTURE2D_DESC &cdesc, const D3D11_TEXTURE2D_DESC &odesc,
+                        NgxInstance &inst)
+{
+    // 先复位：任何一条不成立都必须留下与事实一致的原因，不允许残留上一帧的 ok/reason。
+    inst.zc_in_ok      = false;
+    inst.zc_out_ok     = false;
+    inst.zc_reason_in  = L"off";
+    inst.zc_reason_out = L"off";
+
+    // ① 键=0 ⇒ 立即返回（**零 D3D 调用**，R-11）
+    if (!zero_copy_requested())
+        return;
+    // 粘滞关闭（D2）：一次 zc 归因的 eval 失败后，本进程不再尝试。
+    //   reason 仍写 off（语义是「未生效」），而「为什么未生效」由那条一次性的
+    //   ngx_zero_copy fail 行回答 —— 它带着 rc 与当帧的 reason_in/out。
+    if (g_zero_copy_disabled.load(std::memory_order_relaxed))
+        return;
+    // ② 后端必须是 ngx —— 读**解析后的**值，不读 ini 原文（口径单一，同 cross_key_reuse）
+    if (ffx12::backend() != ffx12::BackendKind::Ngx)
+    {
+        inst.zc_reason_in  = L"not_ngx";
+        inst.zc_reason_out = L"not_ngx";
+        return;
+    }
+    // ③ passthrough 时 NGX 根本不接管本帧（第 0 步就返回），零拷贝无意义
+    if (g_passthrough)
+    {
+        inst.zc_reason_in  = L"passthrough";
+        inst.zc_reason_out = L"passthrough";
+        return;
+    }
+    // ④ 非空（dispatch 第 1 步已判过，此处只是让判据自洽：本函数不依赖调用顺序）
+    if (in.color == nullptr || in.output_target == nullptr)
+    {
+        inst.zc_reason_in  = L"null";
+        inst.zc_reason_out = L"null";
+        return;
+    }
+    // ⑥ 两张不能是同一张资源（同一资源同时当 Color(SRV) 与 Output(UAV) 是 UB）
+    if (static_cast<const void *>(in.color) == static_cast<const void *>(in.output_target))
+    {
+        inst.zc_reason_in  = L"same_tex";
+        inst.zc_reason_out = L"same_tex";
+        return;
+    }
+    // ⑤ 设备一致（逐方向：只有失败的那一侧写 device）
+    const bool color_dev = zc_same_device(in.color);
+    const bool out_dev   = zc_same_device(in.output_target);
+
+    // ⑦–⑬ 颜色方向
+    if (!color_dev)
+        inst.zc_reason_in = L"device";
+    else if (zc_texture_ok(cdesc, inst.rw, inst.rh, inst.color_fmt,
+                           D3D11_BIND_SHADER_RESOURCE, &inst.zc_reason_in))
+    {
+        if (zc_color_in_om_set(ctx, in.color))
+        {
+            // ⑬ 颜色在 OM 集合里：拒绝。此时这张纹理正被当作 RTV 写，
+            //   而 NGX 会把它当 SRV 读 —— 假拒绝只损失一半收益，方向安全。
+            // ★ 已知未覆盖（与输出方向同理）：这里只查 OM，不查「是否同时被绑成 UAV」。若游戏
+            //   把同一张纹理也绑成 UAV，NGX 的 SRV 读与那个 UAV 写并发属于未定义读。诊断构建有
+            //   一条只记录不处置的取证行覆盖**输出**方向（`ngx_zero_copy uav_hit`）；颜色方向
+            //   目前只有本行注释作为已知风险登记（docs/OPEN-ISSUES.md §15 待办第 3 条）。
+            inst.zc_reason_in = L"om_bound";
+        }
+        else
+        {
+            inst.zc_in_ok     = true;
+            inst.zc_reason_in = L"ok";
+        }
+    }
+    // (zc_texture_ok 失败时它已写好具体原因 desc/bind/format/size，此处不覆盖)
+
+    // ⑦–⑫ 输出方向（★ 没有 OM 判据：输出在 OM 集合里是常态，由第 10b 步解绑保护）
+    if (!out_dev)
+        inst.zc_reason_out = L"device";
+    else if (zc_texture_ok(odesc, inst.dw, inst.dh, inst.output_fmt,
+                           D3D11_BIND_UNORDERED_ACCESS, &inst.zc_reason_out))
+    {
+        inst.zc_out_ok     = true;
+        inst.zc_reason_out = L"ok";
+    }
+}
+
+// 四个使用点共用的取纹理函数（D1）：create_feature 与 eval 的 Color/Output 必须取**同一个**
+// 函数的结果，否则两处指向不同纹理 = 静默错图。把「用哪张」收敛到这两个函数，是判据单源
+// （R-7）的最后一道结构保证 —— 使用点想"顺手判一下"都没有入口。
+static ID3D11Texture2D *zc_color_tex(const NgxInstance &inst, const ffx12::FrameInput &in)
+{
+    return inst.zc_in_ok ? in.color : inst.color.Get();
+}
+
+static ID3D11Texture2D *zc_output_tex(const NgxInstance &inst, const ffx12::FrameInput &in)
+{
+    return inst.zc_out_ok ? in.output_target : inst.output.Get();
+}
 // 2026-11-13 增（§5）：CreateFeature 因**参数性 rc** 失败时，记录本次输入 key。
 //
 // ★ 唯一调用点：create_feature 的 rr != Success 分支、且 rr 命中白名单时。
@@ -3390,13 +3686,17 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     // 6. 四个纹理（走 set_tex，杜绝传视图）
     // 2026-11-24（T2a）：4 处调用补 &gr。外壳只做类型转换 + 转发，虚表调用在
     //   ngxguard::set_tex 里被 __try 包住（SDS §2.4）；日志放在调用点侧、__try 之外。
-    set_tex(g_params, NVSDK_NGX_Parameter_Color,         inst.color.Get(),  &gr);
+    // ★ 2026-11-28（NgxZeroCopy / D1）：Color 与 Output 改走 zc_color_tex / zc_output_tex ——
+    //   create_feature 与 eval **两处必须一起切**，且必须取同一个函数的结果。只切一处是
+    //   最典型的静默错图形态：CreateFeature 按游戏纹理记录形状、Evaluate 却喂池纹理
+    //   （或反之），NGX 不报错、只出错帧。判据本身不在这里重算（判据单源，R-7）。
+    set_tex(g_params, NVSDK_NGX_Parameter_Color,         zc_color_tex(inst, in),  &gr);
     NGX_VT_GUARD_LOG(NVSDK_NGX_Parameter_Color, gr);
     set_tex(g_params, NVSDK_NGX_Parameter_Depth,         inst.depth.Get(),  &gr);
     NGX_VT_GUARD_LOG(NVSDK_NGX_Parameter_Depth, gr);
     set_tex(g_params, NVSDK_NGX_Parameter_MotionVectors, inst.motion.Get(), &gr);
     NGX_VT_GUARD_LOG(NVSDK_NGX_Parameter_MotionVectors, gr);
-    set_tex(g_params, NVSDK_NGX_Parameter_Output,        inst.output.Get(), &gr);
+    set_tex(g_params, NVSDK_NGX_Parameter_Output,        zc_output_tex(inst, in), &gr);
     NGX_VT_GUARD_LOG(NVSDK_NGX_Parameter_Output, gr);
     // 7. 六个 preset 键（v1 全设同一值）
     apply_render_preset(g_render_preset);
@@ -3682,6 +3982,18 @@ static void release_pool_resources(NgxInstance &inst)
     //   纪律：cb 缓存的生命周期 == cb 对象的生命周期。
     inst.cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();
     inst.cb_uploaded_flip  = std::numeric_limits<float>::quiet_NaN();
+
+    // ---- NgxZeroCopy 的**观测状态**（计划 R-6）----
+    // 为什么放在这里：本函数是"池资源全清"的唯一出口，zc 的判据结论与池纹理的描述是
+    //   一一对应的（判据的一半就是"与池纹理逐字段等价"）⇒ 池没了，结论必须跟着作废，
+    //   否则下一次建池后可能沿用上一份池形状得出的 ok。
+    // ★ 只复位**观测/决策缓存**：进程级粘滞位 g_zero_copy_disabled **绝不**在这里复位
+    //   （计划审核细则 3）。它是"这条路在本进程不可用"的事实，与池的重建无关；
+    //   若在这里复位，换一次分辨率就会把同一场失败重演一遍，并把"每帧失败"变成常态。
+    inst.zc_in_ok      = false;
+    inst.zc_out_ok     = false;
+    inst.zc_reason_in  = L"off";
+    inst.zc_reason_out = L"off";
 }
 
 // TYPELESS 资源建 SRV 时必须显式给 typed 格式（D3D11 规定）：
@@ -4531,6 +4843,10 @@ struct CopyGpuTimer
     unsigned long long win_samples  = 0;   // 窗口内**有效**样本数
     unsigned long long win_disjoint = 0;   // 窗口内因 Disjoint=TRUE 丢弃的样本数
     unsigned long long win_busy     = 0;   // 窗口内因两组都在飞而放弃测量的次数
+    // 2026-11-28（NgxZeroCopy）：窗口内**跳过拷贝**的帧数。为什么必须单独计数：零拷贝生效
+    //   时本方向的样本数会掉到 0，若只看 samples=0，读者要么以为"拷贝耗时降到 0"，要么以为
+    //   "计时设施坏了"；有了 skip 就能直接对上"这一窗口里有多少帧压根没拷贝"（§五.6）。
+    unsigned long long win_skip     = 0;
     double win_sum_us = 0.0;               // 窗口内有效样本 µs 累加（打印时才求 avg）
     double win_max_us = 0.0;               // 窗口内最大 µs
 };
@@ -4575,6 +4891,7 @@ static void copy_gpu_on_device_lost()
         t->win_samples  = 0;
         t->win_disjoint = 0;
         t->win_busy     = 0;
+        t->win_skip     = 0;   // 设备级读数，随窗口统计一起清（理由同上）
         t->win_sum_us   = 0.0;
         t->win_max_us   = 0.0;
     }
@@ -4702,6 +5019,16 @@ static void copy_gpu_end(ID3D11DeviceContext *ctx, CopyGpuTimer &t)
     t.cur = -1;
 }
 
+// 2026-11-28（NgxZeroCopy）：本帧**跳过**了整条拷贝时调用（与 begin/end 成对跳过，三者
+// 不会同时出现）。只计数、**不碰 query**：没有 Begin 就没有结果可言，凭空 Begin 一组只会
+// 制造"未配对区间"（那是计时设施的故障形态，不是本功能的形态）。
+// ★ 本函数是 ngx_copy_gpu 行 in_skip/out_skip 的唯一来源：跳过帧的 GPU 成本**就是零**，
+//   而样本数下降本身有歧义（"拷贝变快"还是"没拷"），必须有显式字段说明跳过了多少帧。
+static void copy_gpu_skip(CopyGpuTimer &t)
+{
+    ++t.win_skip;
+}
+
 // 打印窗口统计并清零（窗口 = 上一条本行到本条之间的帧数；首条 = 第 1 帧到本条）。
 // ★ 口径（§五.6）：in_*/out_* 全是**窗口**计数；freq_hz 是**当前**时基；
 //   samples=0 时 avg_us 无意义（打 0.0，不代表「耗时为 0」）。
@@ -4710,7 +5037,13 @@ static void copy_gpu_end(ID3D11DeviceContext *ctx, CopyGpuTimer &t)
 //   时**不会**出现在日志里 —— 这是 §3.10.3 的等级口径，不是本行失效。
 static void copy_gpu_log(std::uint64_t frame_count)
 {
-    if (!g_copy_gpu_ready)
+    // 2026-11-28（NgxZeroCopy）：原来的守卫是 !g_copy_gpu_ready 就 return，而 query 是在
+    //   **拷贝路径**上懒创建的 ⇒ 若本局从头到尾都跳过拷贝（zc 两个方向全生效），ready 永远
+    //   为假、本行永远不打 ⇒ in_skip/out_skip **没有任何可观测出口**，E2 验收判据恒 0 命中。
+    //   ⇒ 守卫放宽为"没有样本也没有跳过才 return"；此时 samples=0 / freq_hz=0 是诚实读数
+    //   （本方向这一窗口没测过拷贝），skip 字段照常给出跳过的帧数。
+    const bool any_skip = g_copy_gpu_in.win_skip != 0 || g_copy_gpu_out.win_skip != 0;
+    if (!g_copy_gpu_ready && !any_skip)
         return;
     static std::uint64_t s_last_window_frame = 0;
     const std::uint64_t window =
@@ -4727,7 +5060,8 @@ static void copy_gpu_log(std::uint64_t frame_count)
     log_ngx_core(blog::Level::Info,
                  L"ngx_copy_gpu window=%llu in_samples=%llu in_avg_us=%.1f in_max_us=%.1f "
                  L"in_disjoint=%llu in_busy=%llu out_samples=%llu out_avg_us=%.1f "
-                 L"out_max_us=%.1f out_disjoint=%llu out_busy=%llu freq_hz=%llu",
+                 L"out_max_us=%.1f out_disjoint=%llu out_busy=%llu in_skip=%llu "
+                 L"out_skip=%llu freq_hz=%llu",
                  static_cast<unsigned long long>(window),
                  static_cast<unsigned long long>(g_copy_gpu_in.win_samples),
                  in_avg_us, g_copy_gpu_in.win_max_us,
@@ -4737,6 +5071,8 @@ static void copy_gpu_log(std::uint64_t frame_count)
                  out_avg_us, g_copy_gpu_out.win_max_us,
                  static_cast<unsigned long long>(g_copy_gpu_out.win_disjoint),
                  static_cast<unsigned long long>(g_copy_gpu_out.win_busy),
+                 static_cast<unsigned long long>(g_copy_gpu_in.win_skip),
+                 static_cast<unsigned long long>(g_copy_gpu_out.win_skip),
                  static_cast<unsigned long long>(g_copy_gpu_freq_hz));
 
     CopyGpuTimer *timers[2] = { &g_copy_gpu_in, &g_copy_gpu_out };
@@ -4745,8 +5081,90 @@ static void copy_gpu_log(std::uint64_t frame_count)
         t->win_samples  = 0;
         t->win_disjoint = 0;
         t->win_busy     = 0;
+        t->win_skip     = 0;
         t->win_sum_us   = 0.0;
         t->win_max_us   = 0.0;
+    }
+}
+
+// 2026-11-28（NgxZeroCopy，**诊断专用取证，不改任何行为**）：输出纹理是否躺在 UAV 槽里。
+// 为什么要有这条：本功能的写向保护只解除 OM（RTV/DSV）。UAV 槽是另一处绑定点 —— 若游戏在
+//   dispatch 时把 in.output_target 同时绑成 UAV，NGX 再把它当 UAV 写就与游戏是两个写者写
+//   同一张图（D3D11 允许同一 UAV 绑多处，但结果未定义）。目前**没有任何证据**说明会发生，
+//   故这里只**记录**、不做处置：命中就说明保护范围将来可能需要扩到 UAV 槽。
+// ★ D3D11 只有两个取回 UAV 绑定的入口（没有 PSGetUnorderedAccessViews，这点在首版写错、
+//   由诊断构建的编译错误当场纠正）：CS 侧 CSGetUnorderedAccessViews；PS 侧的 UAV 是
+//   通过 OMSetRenderTargetsAndUnorderedAccessViews 绑的，对偶取回是
+//   OMGetRenderTargetsAndUnorderedAccessViews（UAV 槽从 1 开始，槽 0 与 RTV 共用）。
+// ★ 只在键=1、未粘滞关闭、且该指针**最近没探过**时进入：它比 OM 查询贵（每个槽一次 GetResource），
+//   不该逐帧做；而「指针变化」正是绑定集合可能变化的时刻。只探前 8 个槽（CS/OM 各有 64 个 UAV
+//   槽位，探满会让这条纯取证项变贵；游戏的常用槽在低序号，命中就足以说明问题）。
+// ★★ 为什么要「最近 4 个指针」而不是一个：输出纹理可能是双/多缓冲，指针每帧都变 ⇒ 单槽缓存
+//   会退化成「每帧都探」。4 槽环形足以覆盖常见的双缓冲 + 偶尔切换，仍保持 O(1)。
+// ★★ 命中日志必须**有计数闸门**（AGENTS.md §五.6）：命中若发生在多缓冲上会是每帧一条 Error。
+//   这里只打前 2 条（`s_hits`），其余记数不打 —— 命中本身已足够说明保护范围需要扩展。
+static void diag_zc_probe_output_uav(ID3D11DeviceContext *ctx, ID3D11Texture2D *tex,
+                                     std::uint64_t instance_key)
+{
+    static const void *s_cache[4] = {nullptr, nullptr, nullptr, nullptr};
+    static std::uint32_t s_next = 0;
+    static std::atomic<unsigned> s_hits { 0 };
+    const void *probed = static_cast<const void *>(tex);
+    if (ctx == nullptr || tex == nullptr)
+        return;
+    for (const void *seen : s_cache)
+    {
+        if (seen == probed)
+            return;
+    }
+    s_cache[s_next] = probed;
+    s_next = (s_next + 1u) % 4u;
+
+    // 命中判定的小工具：数一个视图数组里指向 tex 的项数，并**全部 Release**（取回接口
+    //   给每个返回的视图都 AddRef 一次；漏一个就是每次探测泄漏一个引用计数）。
+    const auto count_hits = [tex](ID3D11UnorderedAccessView *const *views, UINT n) -> UINT
+    {
+        UINT hits = 0;
+        for (UINT i = 0; i < n; ++i)
+        {
+            ID3D11UnorderedAccessView *v = views[i];
+            if (v == nullptr)
+                continue;
+            ID3D11Resource *res = nullptr;
+            v->GetResource(&res);
+            if (res != nullptr && res == static_cast<ID3D11Resource *>(tex))
+                ++hits;
+            if (res != nullptr)
+                res->Release();
+            v->Release();
+        }
+        return hits;
+    };
+
+    // CS 侧：UAV 槽 0..7
+    ID3D11UnorderedAccessView *cs_views[8] {};
+    ctx->CSGetUnorderedAccessViews(0, 8, cs_views);
+    const UINT hit_cs = count_hits(cs_views, 8);
+
+    // OM（PS）侧：UAV 槽从 1 开始 ⇒ 取 1..7 共 7 个；同时取回 RTV 槽 0 与 DSV（必须逐个 Release）。
+    ID3D11RenderTargetView *rtv0[1] {};
+    ID3D11DepthStencilView *dsv = nullptr;
+    ID3D11UnorderedAccessView *om_views[7] {};
+    ctx->OMGetRenderTargetsAndUnorderedAccessViews(1, rtv0, &dsv, 1, 7, om_views);
+    const UINT hit_ps = count_hits(om_views, 7);
+    if (rtv0[0] != nullptr)
+        rtv0[0]->Release();
+    if (dsv != nullptr)
+        dsv->Release();
+
+    if (hit_cs != 0 || hit_ps != 0)
+    {
+        // 前 2 条必打（首现留证），之后只计数不打（§五.6：诊断行不能逐帧刷屏）。
+        if (s_hits.fetch_add(1, std::memory_order_relaxed) < 2u)
+        {
+            log_ngx_error(L"ngx_zero_copy uav_hit cs=%u om=%u inst=0x%llX", hit_cs, hit_ps,
+                          static_cast<unsigned long long>(instance_key));
+        }
     }
 }
 #endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS
@@ -5010,6 +5428,14 @@ void set_cross_key_reuse(bool on)
     g_cross_key_reuse.store(on, std::memory_order_relaxed);
 }
 
+// NgxZeroCopy（默认 false / ini 里 0）。只存值：判据在 zc_evaluate 里一次算清，
+//   本函数不做任何"顺手校验"（例如"后端不是 ngx 就提前关掉"）—— 那样会造出第二套口径，
+//   而判据读的是解析后的后端（ffx12::backend()），ini 原文在那里不可见也不该可见。
+void set_zero_copy(bool on)
+{
+    g_zero_copy.store(on, std::memory_order_relaxed);
+}
+
 // ============================================================================
 // 查询
 // ============================================================================
@@ -5035,6 +5461,83 @@ bool cross_key_reuse()
     return g_cross_key_reuse.load(std::memory_order_relaxed);
 }
 
+// NgxZeroCopy 的请求值（ini）。判据（zc_evaluate）与三条取证行都读这一个函数 ——
+//   不在任何地方直接读 g_zero_copy，避免"有的地方按 ini 判、有的地方按全局判"的两套口径。
+bool zero_copy_requested()
+{
+    return g_zero_copy.load(std::memory_order_relaxed);
+}
+
+// ============================================================================
+// 2026-11-28（NgxZeroCopy / P0-2）：EvaluateFeature 期间的 OM 绑定保护
+//
+// 为什么必须有它：zc 出向生效时 NGX 要把游戏的 in.output_target 当 UAV 写，而**同一张
+//   纹理此刻正被绑成 RTV**（in.output_target 的来源就是本 draw 的 output_rtv_slot，见
+//   zc_evaluate 的块头注）。D3D11 规定同一资源不能同时被绑成 RTV 与 UAV ⇒ eval 前保存
+//   整组 OM（8 个 RTV + 1 个 DSV）并解绑，eval 后**原样**恢复（含 depth-stencil）。
+//
+// ★ 恢复这一步本身就是保护动作，不能因为「这次判过输出不在 OM 集合」就跳过
+//   （计划审核细则 2 已明确禁止「只在指针变化时查 / 只在命中时处理」的优化）：
+//     ① 绑定状态每帧都可能变，「缓存出来的没绑」是不可复现错误的分母；
+//     ② 恢复 OMSetRenderTargets 同时把 NGX 内部可能残留的 UAV 绑定挤掉 ⇒ 游戏拿回的 OM
+//        状态与进来时逐位等价。
+//
+// ★★ 为什么用 RAII（审核细则 1）：eval 之后到函数末尾有多条 return 出口，逐一在 return
+//   前补恢复迟早漏一处，而漏一次的后果是把游戏的 OM 状态**永久留空**（黑屏/错帧，且下一
+//   次 dispatch 只会继续错下去）。析构在**任何**出口都会跑；同时提供 restore() 让调用方在
+//   eval 返回后立刻恢复，不把游戏的状态拖到后面的日志/采样之后。
+// ★ 键=0 / 非 zc 帧：整块（含 OMGetRenderTargets 本身）被 if (inst.zc_out_ok) 短路 ⇒
+//   一次 D3D 调用都不多（R-11 是「零新增 D3D 调用」，不是「零新增日志」）。
+// ============================================================================
+class OmBindGuard
+{
+public:
+    OmBindGuard() = default;
+    OmBindGuard(const OmBindGuard &) = delete;
+    OmBindGuard &operator=(const OmBindGuard &) = delete;
+    ~OmBindGuard()
+    {
+        restore();
+    }
+
+    // 保存当前 OM 绑定并解绑。**只允许在 zc_out_ok 的分支里调用**（见类头注）。
+    void save_and_unbind(ID3D11DeviceContext *ctx)
+    {
+        if (ctx == nullptr || ctx_ != nullptr)
+            return;
+        ctx_ = ctx;
+        ctx_->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs_, &dsv_);
+        // 无条件解绑（不是「命中了才解绑」）：理由见类头注 ★。
+        ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+    }
+
+    // 原样恢复 + 逐个 Release。幂等：RAII 析构再调一次是空操作。
+    void restore()
+    {
+        if (ctx_ == nullptr)
+            return;
+        ctx_->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs_, dsv_);
+        for (auto &rtv : rtvs_)
+        {
+            if (rtv != nullptr)
+            {
+                rtv->Release();   // OMGetRenderTargets 逐个 AddRef 过 ⇒ 必须成对释放
+                rtv = nullptr;
+            }
+        }
+        if (dsv_ != nullptr)
+        {
+            dsv_->Release();   // 同上：OMGetRenderTargets 对非空 DSV 也 AddRef 过
+            dsv_ = nullptr;
+        }
+        ctx_ = nullptr;
+    }
+
+private:
+    ID3D11DeviceContext *ctx_ = nullptr;   // 非空 = 已保存且尚未恢复
+    ID3D11RenderTargetView *rtvs_[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] {};
+    ID3D11DepthStencilView *dsv_ = nullptr;
+};
 // ============================================================================
 // 每帧（唯一入口）
 // ============================================================================
@@ -5216,6 +5719,64 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
         inst.first = true;                 // 尺寸变化 ⇒ 历史失效 ⇒ 下一帧 Reset
     }
 
+    // ---- 第 5b 步：NgxZeroCopy 判据（每帧一次；结果写进实例，四个使用点只读）----
+    // ★ 为什么放在第 5 步**之后**：第 5 步可能重建资源池并改写 inst.rw/rh/dw/dh/color_fmt/
+    //   output_fmt，而判据的第 ⑨ ⑩ 条正是拿这几个字段做比较 —— 只有放在这里才用到本帧的
+    //   最终值。它仍在第 6 步（两条 CS）与第 7 步（输入拷贝）之前 ⇒ 本帧的拷贝与 set_tex
+    //   都能读到同一份决策。
+    // ★ 为什么不是第 4 步：第 4 步只取到 cdesc/odesc（本函数**复用**这两个 desc，不新增
+    //   GetDesc），而实例尺寸/格式在第 5 步还可能变；判据只要落在"取 desc 之后、用 desc 之前"
+    //   这个区间即可。
+    // ★ create_pool 的重入会经 release_pool_resources 清掉 zc 观测状态（R-6）⇒ 判据必须在其后。
+    zc_evaluate(in, ctx, cdesc, odesc, inst);
+
+    // ---- NgxZeroCopy 的三条**一次性**取证行 ----
+    // 为什么是三条而不是一条：首帧判据常常落在加载画面里（纹理还没到最终形状）⇒ 只打首帧
+    //   的话，E2 会把"首帧不成立"读成"这局从不成立"。故拆成：
+    //     ① 首帧判据结果（含 reason / fmt / 尺寸 / misc，不论成立与否）；
+    //     ② used_in 首次为 1；③ used_out 首次为 1。
+    // ★ 三个闸门各自独立（计划审核细则 5）：共用一个 static + 一次 exchange 会把 ②③ 的
+    //   配额一起烧掉。等级 Error ⇒ 默认 NgxLogLevel=1 可见（E2 就在默认档位下取证）。
+    if (zero_copy_requested())
+    {
+        if (!g_zc_logged_judge.exchange(true, std::memory_order_relaxed))
+        {
+            log_ngx_error(L"ngx_zero_copy used_in=%d used_out=%d reason_in=%s reason_out=%s "
+                          L"color_fmt=%d out_fmt=%d color_misc=0x%X out_misc=0x%X "
+                          L"rw=%u rh=%u dw=%u dh=%u frame=%llu",
+                          inst.zc_in_ok ? 1 : 0, inst.zc_out_ok ? 1 : 0,
+                          inst.zc_reason_in, inst.zc_reason_out,
+                          static_cast<int>(cdesc.Format), static_cast<int>(odesc.Format),
+                          static_cast<unsigned>(cdesc.MiscFlags),
+                          static_cast<unsigned>(odesc.MiscFlags),
+                          inst.rw, inst.rh, inst.dw, inst.dh,
+                          static_cast<unsigned long long>(frame_count));
+        }
+        if (inst.zc_in_ok && !g_zc_logged_in.exchange(true, std::memory_order_relaxed))
+        {
+            log_ngx_error(L"ngx_zero_copy used_in_first frame=%llu color_fmt=%d color_misc=0x%X "
+                          L"rw=%u rh=%u inst=0x%llX",
+                          static_cast<unsigned long long>(frame_count),
+                          static_cast<int>(cdesc.Format), static_cast<unsigned>(cdesc.MiscFlags),
+                          inst.rw, inst.rh, static_cast<unsigned long long>(instance_key));
+        }
+        if (inst.zc_out_ok && !g_zc_logged_out.exchange(true, std::memory_order_relaxed))
+        {
+            log_ngx_error(L"ngx_zero_copy used_out_first frame=%llu out_fmt=%d out_misc=0x%X "
+                          L"dw=%u dh=%u inst=0x%llX",
+                          static_cast<unsigned long long>(frame_count),
+                          static_cast<int>(odesc.Format), static_cast<unsigned>(odesc.MiscFlags),
+                          inst.dw, inst.dh, static_cast<unsigned long long>(instance_key));
+        }
+    }
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    // 2026-11-28（NgxZeroCopy）：可选取证 —— 输出纹理是否已被游戏绑成 UAV（只记录、不处置，
+    //   理由见 diag_zc_probe_output_uav 的头注）。只在键=1 且未粘滞关闭时进入 ⇒ 键=0 时保持零
+    //   新增 D3D 调用；粘滞关闭后本进程已不再尝试零拷贝，再探也只会浪费取回开销。
+    if (zero_copy_requested() && !g_zero_copy_disabled.load(std::memory_order_relaxed))
+        diag_zc_probe_output_uav(ctx, in.output_target, instance_key);
+#endif
+
     // ---- 第 5 步之后：feature 的建与不建 ----
     // 永久不重试（§3.9.7 / S-81）：CreateFeature 失败的根因（PathListInfo 配错）不会自愈，
     // 相同输入重试只会每帧阻塞 + 每帧重复日志。锁存只在对象销毁时随对象消失。
@@ -5375,8 +5936,19 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
 
     // ---- 第 7 步：color 用游戏原格式 TYPELESS 原样拷（§4.2 第 17 行）----
     // ★ CopyResource 返回 void，**无法检测失败**；正确性靠建池时的同 desc 构造性约束。
-    // ★ 必须在第 8/9 步之前：两个 CS 的 t0 是**游戏的** in.depth / in.motion，
-    //   但它们的 t1/颜色通道读的是 inst.color —— 见 §3.7.1 约束 1 的澄清。
+    // ★ 必须在第 8/9 步之前，但**不是**因为 CS 要读 inst.color —— 这条旧注释是错的，已按
+    //   代码事实改写（AGENTS.md §二.2：注释与代码不一致就改注释）：
+    //     · 两条提取 CS（depth / motion）只读**游戏的** in.depth / in.motion（经
+    //       ensure_depth_src_srv / ensure_motion_src_srv 建的两个 SRV 绑在 t0），
+    //       inst.color 在整条 CS 路径上**没有任何绑定点**；
+    //     · inst.color 的唯一消费者是 NGX（CreateFeature/Evaluate 的 Color 参数）；
+    //     · 池内的 color_srv 全仓**零绑定点**（只在 create_pool 里建、release 里 Reset）。
+    //   ⇒ 本步真正的顺序约束只有一条：必须在第 10/11 步（参数袋 + Evaluate）之前，
+    //     因为 Color 参数指向它。旧注释把两件不相关的事写成因果，会误导后续以为
+    //     「跳过拷贝会让 CS 读到脏数据」—— 并不存在这条依赖（2026-11-28 核对）。
+    // 2026-11-28（NgxZeroCopy）：整段改为**成对跳过** —— zc_in_ok 时既不调 begin/end，
+    //   也不调 CopyResource（计划审核细则 2：零新增 D3D 调用，不只是零新增日志）。
+    //   跳过的帧记一次 copy_gpu_skip，供 ngx_copy_gpu 行的 in_skip 字段取证（R-9）。
     // 2026-11-28（输入拷贝成本无出口）：本步是**输入侧整纹理拷贝**；与之对称的输出侧回写
     //   拷贝早就有 copy_us（ngx_out 行），输入侧却没有任何计时 ⇒ 日志无法回答「Stage 1
     //   省掉的那条输入拷贝究竟值多少」，只能按字节数推算（§一.6 不许用推算代替测量）。
@@ -5393,17 +5965,30 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     //   §一.6 所禁的「用推算代替测量」，留此记录以防再被当作事实引用。
     // ★ 即便如此仍按 §二.5「诊断默认关」只在 DX11FSRBRIDGE_ENABLE_DIAGNOSTICS 下编译：
     //   发布构建里下面两段与 ngx_in 的 copy_us 字段整段不参与编译，热路径零新增操作。
+    // 2026-11-28（NgxZeroCopy）：跳过条件读的是第 5b 步的**唯一决策**（判据单源 R-7），
+    //   此处不做任何再判。zc 生效时这条 13.3 µs（实测中位）的整纹理拷贝整条消失。
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    const std::uint64_t in_copy_t0 = qpc_us();
-    copy_gpu_begin(ctx, g_copy_gpu_in);   // GPU 侧：起始时间戳（异步结果，不阻塞）
-#endif
-    ctx->CopyResource(inst.color.Get(), in.color);
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    copy_gpu_end(ctx, g_copy_gpu_in);     // GPU 侧：结束时间戳 + 结束 disjoint 区间
-    // 2026-11-28（审查 P2-1）：取样点必须与输出侧**同口径** —— 输出侧 copy_us 在 copy_gpu_end
-    //   之后取，故这里也放到 copy_gpu_end 之后：两个方向的 CPU 计时都包含「结束时间戳入队」
-    //   这一步，否则输入侧会少算一次 End 提交，两个数不可直接对照。
-    const std::uint64_t in_copy_us = qpc_us() - in_copy_t0;
+    // ★ CPU 侧计时：跳过时置 -1（**-1 = 本帧未拷贝**，与输出侧同口径）—— 绝不让"未拷贝"
+    //   以 0.0 的形式混进 copy_us 的样本分布里（那会被读成"耗时为 0"）。
+    std::int64_t in_copy_us = -1;
+    if (!inst.zc_in_ok)
+    {
+        const std::uint64_t in_copy_t0 = qpc_us();
+        copy_gpu_begin(ctx, g_copy_gpu_in);   // GPU 侧：起始时间戳（异步结果，不阻塞）
+        ctx->CopyResource(inst.color.Get(), in.color);
+        copy_gpu_end(ctx, g_copy_gpu_in);     // GPU 侧：结束时间戳 + 结束 disjoint 区间
+        // 2026-11-28（审查 P2-1）：取样点必须与输出侧**同口径** —— 输出侧 copy_us 在
+        //   copy_gpu_end 之后取，故这里也放到 copy_gpu_end 之后：两个方向的 CPU 计时都包含
+        //   「结束时间戳入队」这一步，否则输入侧会少算一次 End 提交，两个数不可直接对照。
+        in_copy_us = static_cast<std::int64_t>(qpc_us() - in_copy_t0);
+    }
+    else
+    {
+        copy_gpu_skip(g_copy_gpu_in);   // 成对跳过 begin/end，只记窗口内的 skip 计数
+    }
+#else
+    if (!inst.zc_in_ok)
+        ctx->CopyResource(inst.color.Get(), in.color);
 #endif
 
     // ---- 第 8 步：深度提取 + motion 解码（§3.6.1 / §3.6.2 / §3.6.3）----
@@ -5489,13 +6074,16 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     NgxGuardResult gr {};
 
     // 1-4：四个纹理（资源本体，**不是视图**）
-    set_tex(g_params, NVSDK_NGX_Parameter_Color,         inst.color.Get(),  &gr);
+    // ★ 2026-11-28（NgxZeroCopy / D1）：Color 与 Output 改为 zc_color_tex / zc_output_tex ——
+    //   与 create_feature 是**同一对函数、同一份判据结论**。两处必须永远一起读：一处读
+    //   游戏纹理、另一处读池纹理是"NGX 不报错、画面错"的典型形态（D1 的裁决理由）。
+    set_tex(g_params, NVSDK_NGX_Parameter_Color,         zc_color_tex(inst, in),  &gr);
     NGX_VT_GUARD_LOG(NVSDK_NGX_Parameter_Color, gr);
     set_tex(g_params, NVSDK_NGX_Parameter_Depth,         inst.depth.Get(),  &gr);
     NGX_VT_GUARD_LOG(NVSDK_NGX_Parameter_Depth, gr);
     set_tex(g_params, NVSDK_NGX_Parameter_MotionVectors, inst.motion.Get(), &gr);
     NGX_VT_GUARD_LOG(NVSDK_NGX_Parameter_MotionVectors, gr);
-    set_tex(g_params, NVSDK_NGX_Parameter_Output,        inst.output.Get(), &gr);
+    set_tex(g_params, NVSDK_NGX_Parameter_Output,        zc_output_tex(inst, in), &gr);
     NGX_VT_GUARD_LOG(NVSDK_NGX_Parameter_Output, gr);
     // 5：jitter —— **像素单位，直接透传**（不乘 render_w、不加 0.5，D4）
     // 2026-11-24（T2c）：dispatch 最后 12 处虚表写入改走 SEH 守卫，全部复用 T2a 在
@@ -5563,12 +6151,24 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     if (g_eval == nullptr)
         return false;
 
+    // ---- 第 10b 步：OM 绑定保护（P0-2；机制与理由见 OmBindGuard 的头注）----
+    // ★ 整块（**含 OMGetRenderTargets 本身**）被 inst.zc_out_ok 短路 ⇒ 键=0 / 非 zc 帧
+    //   一次 D3D 调用都不多（R-11 是零 D3D 调用，不只是零日志）。
+    OmBindGuard om_guard;
+    if (inst.zc_out_ok)
+        om_guard.save_and_unbind(ctx);
+
     const std::uint64_t eval_t0 = qpc_us();
     // 2026-11-17：改走 SEH 守卫（§3.4.0）。g_eval 是厂商 DLL 实现，AV 会带走整进程；
     // 接住后返回 Fail，走下方既有的失败计数/设备丢失判定路径，不改正常语义。
     unsigned long eval_crash = 0;
     const NVSDK_NGX_Result rr = guarded_eval(ctx, inst.feature, g_params, nullptr, &eval_crash);
     const std::uint64_t eval_us = qpc_us() - eval_t0;
+
+    // eval 一返回就恢复 OM：成功/失败/异常三条路径都经过这里，恢复不依赖任何分支判断。
+    //   （RAII 的析构仍是兜底：万一将来有人在下面加一条更早的 return，也不会把游戏的 OM
+    //   状态永久留空 —— 那正是审核细则 1 点名要防的形态。）
+    om_guard.restore();
 
     if (rr != NVSDK_NGX_Result_Success)
     {
@@ -5580,9 +6180,35 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
         const HRESULT drr = g_device ? g_device->GetDeviceRemovedReason() : E_FAIL;
         const bool device_removed = FAILED(drr);
 
-        ++inst.eval_fail_total;
-        if (!device_removed)
+        // 2026-11-28（NgxZeroCopy / D2）：本帧是否用了零拷贝 —— 读第 5b 步写下的决策缓存
+        //   （之后到 eval 之间无人改动它，故这里读到的就是本帧实际喂给 NGX 的那一套）。
+        const bool zc_frame = (inst.zc_in_ok || inst.zc_out_ok);
+
+        ++inst.eval_fail_total;   // ★ 照旧自增（审核细则 4）：log_gate_fail8_every256 那条
+                                  //   「ngx_core eval ok=0」取证行靠它才可观测；zc 归因只影响 streak。
+        if (!device_removed && !zc_frame)
             ++inst.eval_fail_streak;   // §4.2 第 12 行 / §3.9.7：设备丢失**不累加** streak
+
+        // ★★ D2：zc 帧的 eval 失败一律**进程内粘滞关 zc**，且不计 streak（避免 3 次后锁到原生
+        //   上采样）。为什么是「一律」而不是按 rc 分类：失败码无法区分「NGX 拒绝这张游戏纹理」
+        //   与其它原因，而重试的代价是每帧失败 + 每帧一条 Error；反过来「关掉 zc、回落拷贝」
+        //   只丢掉 65 µs 的收益，功能仍然在。归因信息由 rc + 当帧两个 reason 一起进日志。
+        //   ★ 本帧**不重试**（下面直接 return false）：同帧用池纹理重放 eval 会把「失败码」
+        //     与「哪套参数失败」两个变量绑在一起，下一帧回落拷贝才是单变量（§一.4）。
+        if (zc_frame)
+        {
+            g_zero_copy_disabled.store(true, std::memory_order_relaxed);
+            if (!g_zc_logged_fail.exchange(true, std::memory_order_relaxed))
+            {
+                log_ngx_error(L"ngx_zero_copy fail rc=0x%X drr=0x%08X used_in=%d used_out=%d "
+                              L"reason_in=%s reason_out=%s sticky_off=1 frame=%llu inst=0x%llX",
+                              static_cast<unsigned>(rr), static_cast<unsigned>(drr),
+                              inst.zc_in_ok ? 1 : 0, inst.zc_out_ok ? 1 : 0,
+                              inst.zc_reason_in, inst.zc_reason_out,
+                              static_cast<unsigned long long>(frame_count),
+                              static_cast<unsigned long long>(instance_key));
+            }
+        }
 
         // 2026-11-17（异常码此前只写不读）：守卫接住 AV 时 rr 恒为 Result_Fail，与"NGX 自己
         //   返回 Fail"在日志里**无法区分** —— 而两者处置不同（前者的运行时已经不可用，后者
@@ -5658,15 +6284,29 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     inst.eval_fail_streak = 0;   // 成功后只清 streak，**不清 total**（§3.12.2 计数器表）
     inst.first = false;
 
-    const std::uint64_t copy_t0 = qpc_us();
+    // 2026-11-28（NgxZeroCopy）：zc 出向生效时 NGX **直接写进了 in.output_target** ⇒ 这条
+    //   51.4 µs（实测中位，4K）的整纹理回写必须整条跳过。跳过不只是省时间，它还是**正确性**：
+    //   池纹理这一帧根本没被写过内容，照旧拷回去等于用上一帧的旧图覆盖 NGX 刚写好的结果。
+    //   ★ 成对跳过（begin/end 也不调用）；跳过的帧记一次 copy_gpu_skip，供 ngx_copy_gpu 行取证。
+    std::int64_t copy_us = -1;   // -1 = 本帧未拷贝（与 in_copy_us 同口径，不混进 0.0 的样本）
+    if (!inst.zc_out_ok)
+    {
+        const std::uint64_t copy_t0 = qpc_us();
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    copy_gpu_begin(ctx, g_copy_gpu_out);   // GPU 侧：起始时间戳（异步结果，不阻塞）
+        copy_gpu_begin(ctx, g_copy_gpu_out);   // GPU 侧：起始时间戳（异步结果，不阻塞）
 #endif
-    ctx->CopyResource(in.output_target, inst.output.Get());
+        ctx->CopyResource(in.output_target, inst.output.Get());
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    copy_gpu_end(ctx, g_copy_gpu_out);     // GPU 侧：结束时间戳 + 结束 disjoint 区间
+        copy_gpu_end(ctx, g_copy_gpu_out);     // GPU 侧：结束时间戳 + 结束 disjoint 区间
 #endif
-    const std::uint64_t copy_us = qpc_us() - copy_t0;
+        copy_us = static_cast<std::int64_t>(qpc_us() - copy_t0);
+    }
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    else
+    {
+        copy_gpu_skip(g_copy_gpu_out);
+    }
+#endif
 
     // ngx_out 行（§3.10.1 输出侧；逐帧 = **debug**；失败才用 error）
     // 采样周期同 ngx_in（kNgxJitterSamplePeriod），不复用 1024 闸门。
@@ -5701,20 +6341,37 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     //   §4.2 第 18 行的「是否置位」列明确为「否」）。
     if ((frame_count % 600u) == 0u)
     {
+        // 2026-11-28（NgxZeroCopy）：采样对象改为**本帧真正被写的输出纹理** —— zc 出向时是
+        //   in.output_target，否则是池纹理 inst.output。不这样改，zc 帧会去采一张本帧压根
+        //   没被写过的池纹理，得到"全零"再把结论扣在 NGX 头上（错误证据）。
+        ID3D11Texture2D *out_tex = zc_output_tex(inst, in);
         bool tl_zero = false, br_zero = false;
-        const bool tl_ok = sample_1x1_zero(ctx, inst.output.Get(), 0, 0, tl_zero);
-        const bool br_ok = sample_1x1_zero(ctx, inst.output.Get(), inst.dw - 1u, inst.dh - 1u, br_zero);
+        const bool tl_ok = sample_1x1_zero(ctx, out_tex, 0, 0, tl_zero);
+        const bool br_ok = sample_1x1_zero(ctx, out_tex, inst.dw - 1u, inst.dh - 1u, br_zero);
         if (tl_ok && br_ok && tl_zero && br_zero)
         {
             // ★ 已知偏离：本行同样**不置 g_release_all**、且**可重复**
             //   （场景本身持续全黑时每 600 帧都会命中），按判据本该改 log_ngx_error_throttled。
             //   此处**有意保留** log_ngx_error 不闸门：外层已有 600 帧（约 10 秒）的天然限频，
-            //   且这条是"CopyResource 可能无声失败"的唯一线索，排障时需要看到它是否
+            //   且这条是"输出无声失败"的唯一线索，排障时需要看到它是否
             //   与画面异常同步出现 —— 再叠一层计数闸门只会让因果对齐变难。
-            log_ngx_error(L"ngx_out copy fail suspect inst=0x%llX out=%ux%u fmt=%d frame=%llu",
-                          static_cast<unsigned long long>(instance_key),
-                          inst.dw, inst.dh, static_cast<int>(odesc.Format),
-                          static_cast<unsigned long long>(frame_count));
+            if (inst.zc_out_ok)
+            {
+                // ★ zc 帧没有 CopyResource ⇒ 措辞必须换（保留 "copy fail suspect" 会把
+                //   "NGX 写出了全零"说成"拷贝失败"，那是日志撒谎，§二.2）。copy=none 显式
+                //   标明本帧没有拷贝这一步，避免读者按旧口径解读。
+                log_ngx_error(L"ngx_out zc_zero suspect inst=0x%llX out=%ux%u fmt=%d frame=%llu copy=none",
+                              static_cast<unsigned long long>(instance_key),
+                              inst.dw, inst.dh, static_cast<int>(odesc.Format),
+                              static_cast<unsigned long long>(frame_count));
+            }
+            else
+            {
+                log_ngx_error(L"ngx_out copy fail suspect inst=0x%llX out=%ux%u fmt=%d frame=%llu",
+                              static_cast<unsigned long long>(instance_key),
+                              inst.dw, inst.dh, static_cast<int>(odesc.Format),
+                              static_cast<unsigned long long>(frame_count));
+            }
         }
     }
 
@@ -5725,19 +6382,25 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     {
         g_diag_first_eval_done = true;   // 无论采样成败都只做一次，避免采样失败后每帧重试
         const UINT cx = inst.dw / 2u, cy = inst.dh / 2u;
+        // 2026-11-28（NgxZeroCopy）：采样对象同上 —— 必须是本帧真正被写的那张输出纹理。
+        ID3D11Texture2D *out_tex = zc_output_tex(inst, in);
         bool o1 = false, o2 = false, o3 = false;
         bool i1 = false, i2 = false, i3 = false;
-        const bool out_ok = sample_1x1_zero(ctx, inst.output.Get(), 0, 0, o1)
-                         && sample_1x1_zero(ctx, inst.output.Get(), cx, cy, o2)
-                         && sample_1x1_zero(ctx, inst.output.Get(), inst.dw - 1u, inst.dh - 1u, o3);
+        const bool out_ok = sample_1x1_zero(ctx, out_tex, 0, 0, o1)
+                         && sample_1x1_zero(ctx, out_tex, cx, cy, o2)
+                         && sample_1x1_zero(ctx, out_tex, inst.dw - 1u, inst.dh - 1u, o3);
         const bool in_ok  = sample_1x1_zero(ctx, in.color, 0, 0, i1)
                          && sample_1x1_zero(ctx, in.color, in.render_w / 2u, in.render_h / 2u, i2)
                          && sample_1x1_zero(ctx, in.color, in.render_w - 1u, in.render_h - 1u, i3);
         if (out_ok && in_ok && o1 && o2 && o3 && !(i1 && i2 && i3))
         {
-            log_ngx_error(L"ngx_out all_black inst=0x%llX out=%ux%u in=%ux%u",
+            // ★ 尾部新增 zc_out=%d：判据（输出三点全零、输入不全零 ⇒ NGX 静默降级）与动作
+            //   （置 g_release_all）都与 zc 无关、一字未动；加这个字段只是让复盘时能区分
+            //   「NGX 写进池纹理后被我方拷丢」与「NGX 直接写进游戏纹理就是黑的」。
+            log_ngx_error(L"ngx_out all_black inst=0x%llX out=%ux%u in=%ux%u zc_out=%d",
                           static_cast<unsigned long long>(instance_key),
-                          inst.dw, inst.dh, in.render_w, in.render_h);
+                          inst.dw, inst.dh, in.render_w, in.render_h,
+                          inst.zc_out_ok ? 1 : 0);
             g_release_all.store(true, std::memory_order_relaxed);
         }
     }

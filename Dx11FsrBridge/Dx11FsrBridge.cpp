@@ -16,7 +16,7 @@
 #include "TransparentJitterHook.h"
 #include "Ffx12Backend.h"
 #include "GpuBackendPick.h" // Ffx12Backend=auto 的型号判据（纯 header，零依赖）
-#include "NgxBackend.h"   // ngx::set_*（D13 九键 + NgxCrossKeyReuse = 十个键）。十个 setter 都有消费者；
+#include "NgxBackend.h"   // ngx::set_*（D13 十键 + NgxCrossKeyReuse + NgxZeroCopy = 十二个键）。都有消费者；
                           // 本头不含 NGX SDK 头，故 OFF 构型包含它也安全（REQ-08），
                           // 但下面所有 ngx:: 调用点都被 DX11FSRBRIDGE_ENABLE_NGX 守卫。
 // A 阶段（2026-11-10）：NGX 参数映射的**纯计算层**（零 D3D / 零 NGX / 零全局）。
@@ -4625,8 +4625,9 @@ void load_config()
     // 故与输入键相与：输入键=0 ⇒ 输出请求位=0 ⇒ 后端 reason 恒 off。
     ffx12::set_zero_copy_output(g_config.ffx12_zero_copy && g_config.ffx12_zero_copy_output);
     ffx12::set_hdr_input(g_config.ffx12_hdr_input);
-    // ---- D13 十键读取（SDS §3.13.1）+ 键 11 NgxCrossKeyReuse：紧邻 Ffx12Hdr 的读取点 ----
-    // 此处 blog::init() 尚未执行 ⇒ 11 个 setter 只存值、一行日志都不打；
+        // ---- D13 十键读取（SDS §3.13.1）+ 键 11 NgxCrossKeyReuse + 键 12 NgxZeroCopy：
+    //      紧邻 Ffx12Hdr 的读取点 ----
+    // 此处 blog::init() 尚未执行 ⇒ 12 个 setter 只存值、一行日志都不打；
     // 唯一需要输出的是非法值告警，它先进 pending_warnings，由 initialize() 回放。
     //
     // ⚠️ Ffx12Backend 只接受**精确小写**的 auto / native / ngx：不 tolower、不 trim。
@@ -4784,9 +4785,26 @@ void load_config()
     const int ngx_ckr =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxCrossKeyReuse", 1, config_path.c_str());
     ngx::set_cross_key_reuse(ngx_ckr != 0);
+
+    // ---- 键 12：NgxZeroCopy（2026-11-28 增；默认 0）----
+    // 1 = NGX 的 Color 直接指向游戏的 in.color、Output 直接指向游戏的 in.output_target，
+    //     省掉每帧两次整纹理 CopyResource（实机诊断构建实测中位合计 64.7 µs/帧 = 153 fps 下 0.99%，
+    //     输入 13.3 µs @1080p / 输出 51.4 µs @4K）；
+    // 0 = 与引入本键之前**逐字节同一条路径**（池纹理 + 两次拷贝）。
+    // ★ 只在 Ffx12Backend=ngx 且未 passthrough 时可能生效：判据读的是**解析后的**后端
+    //   （ffx12::backend()），不是本文件读到的 ini 原文 ⇒ 后端=native 时键=1 也一律退回拷贝。
+    // ★ 默认 0 的理由：零拷贝把「游戏纹理能不能直接喂 NGX」（格式/绑定/尺寸/OM 状态全满足）
+    //   这个**尚未实机验证**的前提压进每帧路径，而失败形态是静默错图、不是报错 ⇒ 先默认关，
+    //   实机 A/B 之后再决定默认值（待验证条目见 docs/OPEN-ISSUES.md §15）。
+    // ★ 与 Ffx12ZeroCopy 的关系：那个键是**创建期**给游戏纹理注入 SHARED|SHARED_NTHANDLE，
+    //   会让本键的 MiscFlags 判据看到 0x802 而不是 0 —— 判据已按该组合放行（不是子集判定，
+    //   而是只允许 0 或恰好 0x802），两个键可以同开。
+    const int ngx_zc =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxZeroCopy", 0, config_path.c_str());
+    ngx::set_zero_copy(ngx_zc != 0);
 #else
     // ---- REQ-08：NGX 未编译进本产物 ----
-    // 十个键里只有 Ffx12Backend 有消费者（后端选择器归 ffx12），其余 9 个 NGX 键在 OFF
+    // 十二个键里只有 Ffx12Backend 有消费者（后端选择器归 ffx12），其余 11 个 NGX 键在 OFF
     // 构型下没有任何消费者，故不读。缺键（lpDefault=L"auto"）/ 显式 auto ⇒ 交给
     // resolve_backend_auto 按型号判；显式 native ⇒ 静默 native（不告警）；
     // 精确 ngx 与非法值 ⇒ 强制 Native + 一条固定告警。

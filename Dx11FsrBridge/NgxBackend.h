@@ -68,6 +68,19 @@ void set_passthrough(bool on);                              // NgxPassthrough，
 //   而进出角色界面这类 key 切换的尺寸/格式并不变，销毁重建纯属浪费 ⇒ ~500ms 卡顿 + 短暂黑屏。
 void set_cross_key_reuse(bool on);
 
+// NgxZeroCopy（默认 false / ini 里 0）。
+// 语义：让 NGX 的 Color 参数直接指向游戏的 in.color（render 尺寸、SRV 位）、Output 参数直接
+//   指向游戏的 in.output_target（display 尺寸、UAV 位），从而省掉每帧两次整纹理 CopyResource
+//   （实机实测中位合计 64.7 µs/帧 = 153 fps 下的 0.99%；输入 13.3 µs @1080p、输出 51.4 µs @4K）。
+// ★ 只在 Ffx12Backend=ngx 且未 passthrough 时才可能生效：判据里读的是**解析后的**后端
+//   （ffx12::backend()），不是 ini 原文；键=1 但后端=native 时一律退回拷贝。
+// ★ 默认 0 的理由：零拷贝把「游戏的纹理能不能直接喂 NGX」这个**未实机验证过**的前提
+//   （格式/绑定/尺寸/OM 状态全部满足才算）压进了每帧路径，而失败形态是静默错图而不是报错。
+//   ⇒ 先以"默认关、实机 A/B 后再决定默认值"的方式交付；关闭时行为与引入该键之前逐字节一致。
+// ★ 任一条判据不成立即**该方向**退回池纹理 + 拷贝（两个方向独立），不会让 NGX 失效。
+void set_zero_copy(bool on);
+bool zero_copy_requested();   // 返回判据读到的**同一个值**（口径单一，同 cross_key_reuse）
+
 // 2026-11-10（B154）：NGX 实现来源（NgxProvider 键），默认 auto。
 //   auto     = 先真 NGX（注册表 FullPath → _nvngx.dll），失败再找外部实现（默认）；
 //   nvidia   = 只走真 NGX（与 v1 逐条相同：失败即确定性失败，不重试、不换来源）；

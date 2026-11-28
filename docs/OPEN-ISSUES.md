@@ -935,11 +935,49 @@ zc_vendor_gate vendor=0x…. supported=0|1 need=0x10DE action=allow|deny zc_req=
 
 1. **性能收益未测**：4K 每帧一次 `CopyResource` 的带宽节省未做 PresentMon A/B。注意 `timing` 日志里的 `copy=` 段**不覆盖**输出拷贝（键=0 时同样是 `0us`），不能作为证据。需 `DX11FSRBRIDGE_DIAGNOSTICS=OFF` 的发布构建 + PresentMon 做键 0/1 的 A/B；改善 <1% 按规范写「未测出收益」。
 2. **非 NVIDIA 平台**：与输入侧共用厂商门禁，AMD/Intel 上键=1 等同键=0（刻意回退）；零拷贝本身未在 AMD/Intel 机器验证。放行其它厂商的完整步骤见 §13 的「厂商门禁的扩展步骤」。
-3. **部署脚本例外**：`scripts/Deploy-Bridge.ps1` 的 `$configValues` **有意不包含** `Ffx12ZeroCopy` 与 `Ffx12ZeroCopyOutput` —— 该脚本每次部署都会覆盖 ini，加进去会抹掉用户手改的 opt-in，也会把发布默认行为改成开启。这是「新增配置键四处同步」的**有意例外**，在此登记；当前生效的四处为 `load_config`、`Dx11FsrBridge.package.ini`、提交信息、本条目。
+3. **部署脚本例外**：`scripts/Deploy-Bridge.ps1` 的 `$configValues` **有意不包含** `Ffx12ZeroCopy` 与 `Ffx12ZeroCopyOutput` —— 该脚本每次部署都会覆盖 ini，加进去会抹掉用户手改的 opt-in，也会把发布默认行为改成开启。这是「新增配置键四处同步」的**有意例外**，在此登记；当前生效的四处为 `load_config`、`Dx11FsrBridge.package.ini`、提交信息、本条目。NGX 侧的 `NgxZeroCopy` 同规则（同样不加入部署脚本），见 §15 第 5 条。
 4. **后续可改进（独立审核提出，P2）**：① `open`/`uav` 失败无负缓存，坏配置下每帧会重试共享句柄打开；② `release_zc_outputs` 里「摘除诊断镜像」的分支不可达（镜像指针只会等于后端自建的输出纹理，不会等于游戏输出纹理）；③ 诊断构建的 `g_zc_out_marks` 只写不读、无消费者；④ `ensure_output_landing_resources` 里仍有第三份 23→24 typed 格式映射未共用 `output_enc_format_for()`；⑤ 候选判据未要求 `D3D11_BIND_UNORDERED_ACCESS`（实测输出纹理 `bind=0xA8` 已含该位）。
 5. **风险观察项**：给游戏输出纹理补共享位后，游戏**自建 UAV 视图**是否仍成功只有本机 E2 证据（E1 只证明打开后的 D3D12 flags 含 `ALLOW_UNORDERED_ACCESS`）；「与 FFX 并行、且触碰同一输出 RT 的 D3D11 工作」未覆盖。
 
 **相关代码位置**：`Dx11FsrBridge/Dx11FsrBridge.cpp` 的 `Config::ffx12_zero_copy_output`、`zc_output_candidate()`、`hooked_create_texture_2d()` 的注入分支与 `zc_vendor_gate` 日志；`Dx11FsrBridge/Ffx12Backend.cpp` 的 `zc_output_resolve()`、`release_zc_outputs()`、`output_enc_format_for()`、dispatch 内输出 barrier 与跳过 `CopyResource` 的分支。
+
+## 15. `NgxZeroCopy`（NGX 输入/输出零拷贝，实验键）：已实现并通过单机 E2，净收益与跨平台未测
+
+**现状**：`Dx11FsrBridge.ini` 的 `[Dx11FsrBridge]` 段新增 `NgxZeroCopy`（默认 `0`）。开启且 `Ffx12Backend=ngx`、未直通时，NGX 的 `Color` 参数直接指向游戏的 `in.color`、`Output` 参数直接指向游戏的 `in.output_target`，跳过原先每帧两次整纹理 `CopyResource`（输入颜色 + 输出回写）。判据每帧对**两个方向各自独立**求值：Usage=DEFAULT、CPU 访问=0、`MiscFlags ∈ {0, 0x802}`、单 mip/单 array/单采样、输入需要 `SHADER_RESOURCE` 位、输出需要 `UNORDERED_ACCESS` 位（允许超集）、格式与池纹理相同、尺寸与池纹理相同、与 NGX 同一设备、两张不是同一资源；**输入方向**另要求该纹理不在当前 OM 绑定集合（输出方向不做此要求 —— 它本来就是本 draw 绑定的 RTV，改为在 `EvaluateFeature` 前保存整组 RTV/DSV 并解绑、评估后立即原样恢复，任何出口都恢复）。任一条件不满足则该方向退回池纹理 + 拷贝，不影响 NGX 本身。若键=1 时出现一次**归因于零拷贝**的 `EvaluateFeature` 失败，进程内粘滞关闭零拷贝并回落拷贝（不重置、不触发「连续 3 次放手」）。
+
+**为什么默认关**：收益（实机诊断构建实测：两条拷贝的中位成本合计 **64.7 µs/帧**，即 153 fps 下 0.99%；输入 13.3 µs @1080p、输出 51.4 µs @4K）与「这张游戏纹理能直接喂 NGX」这一前提绑定，而该前提没有任何实机证据；且失败形态是**静默错图**而不是报错。故默认关，待实机 A/B 后再定默认值。
+
+**E2 验收清单**（前提：**诊断构建** + `NgxLogLevel=3`）：
+
+> 为什么不是「发布构建 + 默认 `NgxLogLevel=1`」：清单里要看的读数**只在这些条件下存在** ——
+> `ngx_copy_gpu`/`in_skip`/`out_skip`/`uav_hit` 整段在诊断宏内（发布版二进制里没有这些字段，按发布构建查会得到恒成立的旁证）；
+> `copy_us` 字段只在诊断构建编进 `ngx_in`（Info，需 `NgxLogLevel≥2`）与 `ngx_out`（Debug，需 `=3`）；
+> `ngx_copy_gpu` 还受窗口闸门限制（前 8 帧一条、之后每 1021 帧一条）⇒ 需跑足够帧数才有第二个窗口可比。
+> 发布构建下唯一可验的是 `ngx_zero_copy` 那一组 Error 行（默认档位即可见）。
+
+1. 键=0：发布构建日志**无**任何 `ngx_zero_copy` 行；诊断构建 `ngx_copy_gpu` 的 `in_skip`/`out_skip` 恒 `0`、`in_samples`/`out_samples` = 窗口帧数，`copy_us` 为真实值。
+2. 键=1：出现一次性 `ngx_zero_copy used_in=… used_out=… reason_in=… reason_out=… color_misc=… out_misc=…`（Error 级，默认档位可见）；诊断构建里 `ngx_in`/`ngx_out` 的 `copy_us=-1.0`（本帧未拷贝）、`ngx_copy_gpu` 的 `in_skip`/`out_skip` = 窗口帧数且 `in_samples`/`out_samples`=`0`。
+3. 键=1 但 `Ffx12Backend=native`：`reason_in=not_ngx`、`reason_out=not_ngx`，功能不生效（键=1 不强开不工作的路径）。
+4. 键=1 全程：无 `ngx_core eval ok=0`、无 `release_all`、无 `ngx_out copy fail suspect`、无 `ngx_out all_black`。
+5. 画面：与键=0 同机位截图对比亮度与近白像素占比一致；无黑帧、无错位、无拖影。
+
+**已实测（2026-11-28，RTX 4070 SUPER，3840x2160，`Ffx12Backend=ngx`，诊断构建 + `NgxLogLevel=3`，键 0/1 各一局）**：
+
+- **键=0（对照）**：`ngx_zero_copy` **0 行**；`ngx_copy_gpu` 全部窗口 `in_samples=out_samples=1021`、`in_skip=out_skip=0`；`eval ok=0` 与 `release_all` 均为 0；两条拷贝成本 `in_avg_us≈14` / `out_avg_us≈55`（与逻辑生效时省掉的量同一量级）。
+- **键=1**：三条一次性 Error 行 `used_in=1 used_out=1 reason_in=ok reason_out=ok color_fmt=23 out_fmt=23 color_misc=0x0 out_misc=0x0 rw=1920 rh=1080 dw=3840 dh=2160 frame=1` + `used_in_first` + `used_out_first`，**首帧即双向成立**。
+- 跳过可观测：`ngx_copy_gpu … in_samples=0 out_samples=0 in_skip=1021 out_skip=1021 freq_hz=0`（`freq_hz=0` 属预期：一次 GPU 查询都没建，因为两条拷贝从未开始）；`ngx_in`/`ngx_out` 的 `copy_us=-1.0`。
+- 稳定性：`[ERROR]` 总数 29 = 26（启动期一次性行）+ 3（本键取证行），无其它新增；`eval ok=0`=0、`release_all`=0、`all_black`=0、`suspect`=0。
+- 画面：键 0/1 同机位截图一致、无黑屏/花屏/偏色；RTSS 显示 151 vs 152 FPS —— **不作性能结论**（诊断构建 + ±1 帧噪声，按规范不能当收益）。
+- 输出的 UAV 槽探针（诊断构建，只记录不处置）**未命中**：`ngx_zero_copy uav_hit` 未出现。注：探针每张贴图只探一次、且只在键=1 且未粘滞关闭时进入，故「未命中」只覆盖取样时刻。
+
+**未验证 / 待办**：
+
+1. **净收益未测量**：64.7 µs/帧是**键=0 时**两条拷贝的成本实测（诊断构建），不是本键开启后的净收益。净收益需要发布构建 + PresentMon 做键 0/1 的 A/B（诊断构建自带探针，按规范不能用于性能结论）。
+2. **`MiscFlags=0x802` 组合未实测**：`Ffx12ZeroCopy=1` 时游戏纹理带 `SHARED|SHARED_NTHANDLE`（0x802），判据放行该组合；「NGX 作为同设备 D3D11 消费者接受这类纹理」目前只有代码推理，无实机证据。
+3. **UAV 槽未纳入保护（两个方向同理）**：输出方向只解除 OM（RTV/DSV）绑定，**颜色**方向的判据只要求「不在 OM 集合」，对「同一张纹理也被绑成 UAV」不作拒绝 —— 两个写者写同一张图的结果未定义。诊断构建有一条只记录不处置的取证行 `ngx_zero_copy uav_hit cs=… om=…`，命中即说明保护范围需要扩展（该行有命中计数闸门，不会刷屏）。
+4. **部署脚本例外**：`scripts/Deploy-Bridge.ps1` 的 `$configValues` **有意不包含**本键（理由与 `Ffx12ZeroCopy*` 相同，见 §14 第 3 条：该脚本每次部署覆盖 ini，加进去会抹掉用户手改的 opt-in）。当前生效的四处为 `load_config`、`Dx11FsrBridge.package.ini`、提交信息、本条目。
+
+**相关代码位置**：`Dx11FsrBridge/NgxBackend.cpp` 的 `zc_evaluate()` / `zc_texture_ok()` / `zc_misc_flags_ok()` / `zc_same_device()` / `zc_color_in_om_set()` / `zc_color_tex()` / `zc_output_tex()` / `OmBindGuard`、`dispatch()` 的判据步（三条一次性取证行）、输入拷贝与输出回写两处跳过、`EvaluateFeature` 前后的 OM 解绑/恢复、eval 失败分支的粘滞关闭、`release_pool_resources()` 的观测状态复位；`Dx11FsrBridge/NgxBackend.h` 的 `set_zero_copy()` / `zero_copy_requested()`；`Dx11FsrBridge/Dx11FsrBridge.cpp` 的 `load_config()` 内本键读取点；`Dx11FsrBridge/Dx11FsrBridge.package.ini`。
 ---
 
 ## 已解决
