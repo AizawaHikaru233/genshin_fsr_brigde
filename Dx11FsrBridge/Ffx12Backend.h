@@ -203,6 +203,16 @@ bool zero_copy_enabled();
 bool zero_copy_last_in();
 bool zero_copy_last_in_cached();
 const char *zero_copy_reason();
+// 零拷贝「可注入」判据（启动期常量，无锁）：只看已落位的后端与异步模式，**不看设备/队列是否就绪**。
+// 必须在 load_config 之后调用；且必须与厂商门禁串联 —— 设备创建钩子迟到安装时 g_backend 可能仍是初值
+// Native，单用会把 ngx 误判成 native。backend_native/async_overlap 两个出参供日志如实打印。
+// 2026-11-28（② 空注入修复）：为什么要这个判据 —— ngx 后端不建 D3D12、异步交叠必须每帧把输出拷回，
+// 两种情况下注入的共享纹理后端**永不使用**，只白占 VRAM 与共享句柄。证据：桥的门禁行日志
+// `zc_vendor_gate … inject=off reason=backend|async` 与后续 `ffx12_dispatch` 全程 `zc_in=0 zc_reason=off`；
+// 修复前同一配置会打出一串 `zc_mark`（注入发生）却 `zc_in` 恒 0。
+bool zero_copy_injectable(bool &backend_native, bool &async_overlap);
+// 零拷贝请求位的当前真值（= ini 的 Ffx12ZeroCopy，可能已被门禁关闭）。无锁。
+bool zero_copy_requested();
 // 完成挂起的异步 FFX（等 fence + 拷贝输出到 output_target）。无挂起时立即返回 true。
 // 由桥在 Present 前调用；dispatch 入口也会先 finish 上一帧（防异常路径堆积）。
 bool finish_pending();

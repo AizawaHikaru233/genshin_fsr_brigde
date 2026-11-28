@@ -828,16 +828,16 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 
 ## 13. `Ffx12ZeroCopy`（输入颜色零拷贝，实验键）只在 NVIDIA + native 同步路径生效
 
-**现状**：`Dx11FsrBridge.ini` 的 `[Dx11FsrBridge]` 段新增 `Ffx12ZeroCopy`（默认 `0`）。开启且 `Ffx12Backend=native`、`Ffx12AsyncUpscale=0` 时，桥在 `ID3D11Device::CreateTexture2D` 里给候选颜色纹理加 `D3D11_RESOURCE_MISC_SHARED | SHARED_NTHANDLE`（不改 BindFlags），D3D12 侧直接打开共享纹理作为 FFX 的输入颜色，跳过每帧一次输入 `CopyResource`；输出仍走原拷贝，深度/运动、NGX 后端、异步模式一律走原路径。余额度为进程生命期最多 8 张 / 256 MiB。
+**现状**：`Dx11FsrBridge.ini` 的 `[Dx11FsrBridge]` 段新增 `Ffx12ZeroCopy`（默认 `0`）。开启且 `Ffx12Backend=native`、`Ffx12AsyncUpscale=0` 时，桥在 `ID3D11Device::CreateTexture2D` 里给候选颜色纹理加 `D3D11_RESOURCE_MISC_SHARED | SHARED_NTHANDLE`（不改 BindFlags），D3D12 侧直接打开共享纹理作为 FFX 的输入颜色，跳过每帧一次输入 `CopyResource`；输出仍走原拷贝，深度/运动、NGX 后端、异步模式一律走原路径。预算为进程生命期最多 16 张 / 256 MiB（张数上限 2026-11-28 由 8 抬到 16，依据见下「已知缺陷」段的 E2 观测）。
 
-**厂商门禁（2026-11-28 起）**：该键**只在 NVIDIA（PCI vendor `0x10DE`）上生效**。桥在**首次**纹理创建时按「首个成功路由的适配器厂商」判一次（每进程一次，结论粘滞），非 NVIDIA（含厂商未识别=0）时：不注入共享标志、不下调候选/预算，并同时关掉后端的零拷贝请求位 ⇒ 渲染与后端口径都与键=0 相同；日志只留一条 `zc_vendor_gate vendor=0x…. supported=0|1 need=0x10DE action=allow|deny zc_req=on|off`。
+**厂商门禁（2026-11-28 起）**：该键**只在 NVIDIA（PCI vendor `0x10DE`）上生效**。桥在**首次**纹理创建时按「首个成功路由的适配器厂商」判一次（每进程一次，结论粘滞），非 NVIDIA（含厂商未识别=0）时：不注入共享标志、不下调候选/预算，并同时关掉后端的零拷贝请求位 ⇒ 渲染与后端口径都与键=0 相同；日志只留一条 `zc_vendor_gate vendor=0x…. supported=0|1 need=0x10DE action=allow|deny zc_req=on|off`（同一行还带 `backend=`/`async=`/`inject=`/`reason=` 四个字段，读法见下「已修复」）。
 
 > 注意：非 NVIDIA + 键=1 时日志里仍会看到 `vtable_clone_result what=device … patches=3`（键=0 为 2）并多出 `device_extended` 的补丁与 5 条 `texture_device_interface_hook` DEBUG —— 纹理钩子照装、门禁在钩子内部把关，**这是预期差异**，不是门禁失效。
 
 **已实测（2026-11-28，RTX 4070 SUPER）**：
 
 - Stage 1（门禁前，3840x2160 全屏）：正向 `zc_mark` 命中 6 张、全部采样派发行 `zc_in=1`（首帧 `zc_in_cache=0`，之后 `=1`）；键 `0` 时纹理创建钩子根本不安装、行为与改动前一致；`async=1` 与 `Ffx12Backend=ngx` 两个负例均 `zc_in=0` 并回退原拷贝。四轮均无错误日志、画面正常。
-- 厂商门禁（2026-11-28，native + 同步 + `upscale=debug`，最终构建）：NVIDIA 正向 `zc_vendor_gate vendor=0x10DE supported=1 need=0x10DE action=allow zc_req=on`（每进程 1 条）、`patches=3`、`zc_mark=8`、19/19 条 `zc_in=1 zc_reason=ok`（首帧 `zc_in_cache=0`）、153 FPS、画面正常；同构建键 `0` 对照：0 条 `zc_vendor_gate`、`patches=2`、`zc_mark=0`、35/35 条 `zc_in=0 zc_reason=off`、0 错误。
+- 厂商门禁（2026-11-28，native + 同步 + `upscale=debug`，该轮构建；**旧格式** —— 当前构建的这一行已追加 `backend=`/`async=`/`inject=`/`reason=`）：NVIDIA 正向 `zc_vendor_gate vendor=0x10DE supported=1 need=0x10DE action=allow zc_req=on`（每进程 1 条）、`patches=3`、`zc_mark=8`、19/19 条 `zc_in=1 zc_reason=ok`（首帧 `zc_in_cache=0`）、153 FPS、画面正常；同构建键 `0` 对照：0 条 `zc_vendor_gate`、`patches=2`、`zc_mark=0`、35/35 条 `zc_in=0 zc_reason=off`、0 错误。
 - 门禁的「非 NVIDIA」分支：把厂商常量临时改成 `0x1002` 的一次性试验构建（不入库）在 NVIDIA 机器上跑出 `zc_vendor_gate vendor=0x10DE supported=0 need=0x1002 action=deny zc_req=off`、`patches=3`、`zc_mark=0`、`zc_budget_exhausted=0`、18/18 条 `zc_in=0 zc_reason=off`、0 错误、画面正常 ⇒ 该分支的**行为**已实机证明；但「真实 AMD 驱动上建共享纹理/共享句柄会不会失败」仍未验证（本机无 A 卡）。
 
 **已知缺陷：候选判据过标，8 张预算可能被非输入纹理吃满（2026-11-28 第 5 轮实机）**
@@ -877,9 +877,26 @@ zc_budget_exhausted marked=8 reserved=8 reserved_bytes=66355200 skipped=1 limit_
 2. **性能**：用 `DX11FSRBRIDGE_DIAGNOSTICS=OFF` 发布构建 + PresentMon 做键 `0`/`1` 三段 A/B，改善 <1% 就按规范写“未测出收益”。注意 PresentMon 需要管理员权限（非提权运行会以 `failed to start trace session: access denied` 退出）。
 3. **是否默认开**：若上述两项通过并决定默认开，需先把该键加进 `scripts/Deploy-Bridge.ps1` 的 `$configValues`（当前有意不加：该脚本每次部署都会覆盖 ini，会抹掉用户手改的 opt-in）。
 
-**既有缺口（不属门禁，未在本次修）**：键=1 且 `Ffx12Backend=ngx` 或 `Ffx12AsyncUpscale=1` 时，桥仍会给候选纹理加 `0x802`（注入条件不检查后端/异步），而后端永远不会用上它（`zero_copy_enabled()` 要求 native + 同步）。后果只是多占共享资源额度与一次创建开销，无正确性影响；修法是把「后端会不会用」也纳入注入判据。
+**已修复（2026-11-28）：注入判据现在也看「后端会不会真的用它」**
 
-**相关代码位置**：`Dx11FsrBridge/Dx11FsrBridge.cpp` 的 `Config::ffx12_zero_copy`、`need_create_texture_hook()`、`zc_input_candidate()`、`hooked_create_texture_2d()`、厂商门禁的 `k_zc_vendor_nvidia`/`g_adapter_vendor`/`g_zc_vendor_allowed`/`zc_vendor_gate` 与 `record_adapter_info()`；`Dx11FsrBridge/Ffx12Backend.cpp` 的 `ZcInput`、`set_zero_copy()`、dispatch 决策块、`release_zc_inputs()`；`Dx11FsrBridge/Dx11FsrBridge.package.ini` 的 `Ffx12ZeroCopy`。
+原先的缺口：键=1 且 `Ffx12Backend=ngx` 或 `Ffx12AsyncUpscale=1` 时，桥仍会给候选纹理加 `0x802`，而后端永远不会用上它（`zero_copy_enabled()` 要求 native + 同步）⇒ 白占 VRAM 与共享句柄。
+
+现在的做法：厂商门禁同一处再判一次「后端可注入」（`Ffx12Backend.h` 的 `zero_copy_injectable()`，只读启动期常量、**不取锁**，也不要求 D3D12 设备/队列就绪 —— 纹理创建远早于后端 init，要求就绪会恒 false），注入条件 = **厂商放行 && 后端可注入**（native 且 `Ffx12AsyncUpscale=0`）；只要综合结论是「不注入」，就同时 `set_zero_copy(false)` 关掉后端请求位，桥与后端口径一致。日志行扩展为：
+
+```
+zc_vendor_gate vendor=0x…. supported=0|1 need=0x10DE action=allow|deny zc_req=on|off \
+               backend=native|ngx async=0|1 inject=on|off reason=ok|vendor|backend|async|multiple
+```
+
+读法：
+
+- `action=` 只表示**厂商门禁**；`inject=` 是「门禁这一层会不会注入」的综合结论 ——**放行 ≠ 一定注入**：放行之后还要过尺寸/格式候选与预算闸门，那两步不进这一行；`reason=` 给不注入的**第一个**原因（优先级 vendor > backend > async，两个条件同时不满足时打 `multiple`）。
+- `zc_req=` 是**门禁判定之前**的请求位快照（= ini 的 `Ffx12ZeroCopy`）。门禁关闭后会调 `set_zero_copy(false)`，若在关之后再读就永远打 `off`、看不出用户其实开了键；要看「现在真的生效吗」请看 `inject=` 与后续 `ffx12_dispatch` 的 `zc_in=` / `zc_reason=`。
+- `Ffx12AsyncUpscale` **默认为 1**（部署脚本只给 RDNA2 写 0）⇒ NVIDIA + 键=1 + 默认配置下会打出 `inject=off reason=async`，**这是设计行为**：要实测零拷贝必须显式设 `Ffx12AsyncUpscale=0`。`Ffx12Backend=ngx` 同理（`reason=backend`）。
+- 并发边界：门禁在**首个**键=1 的纹理创建时才判定（此时后端类型/异步模式已定，但同刻可能有别的线程也在建纹理）。判据是**在注入闸门处重新读一次结论**：读到「放行」才注入；读到「未判定」⇒ 按 fail-closed 跳过，并留一行 `zc_gate_loser_skip count=1 note=skipped-before-gate-decided`（每进程最多一行）；读到「拒绝」⇒ 静默跳过（每张纹理都如此，不记录）。该标记与「本次读到未判定、且因此没有注入」严格同源（结论已发布但本次读尚未可见也算此列）。`count=1` 只证明「出现过一次输家」，是字面标记**不是累计计数**（没有累加器，其它输家不再单独记录）。该判定点与候选/预算判定互斥（未定案时根本不进那段，小纹理也会被计入），所以「出现过输家」不代表漏掉一张颜色输入。
+- **实测（2026-11-28 实机，RTX 4070 SUPER，同一构建四轮）**：native + 同步 + 键=1 ⇒ `action=allow zc_req=on backend=native async=0 inject=on reason=ok`、`zc_mark` 6 张、`zc_in=1` 17/17；ngx + 同步 + 键=1 ⇒ `backend=ngx async=0 inject=off reason=backend`、`zc_mark` **0 张**、`zc_in=0 zc_reason=off` 22/22；native + 异步 + 键=1 ⇒ `async=1 inject=off reason=async`、`zc_mark` **0 张**、`zc_in=0 reason=off` 20/20；键=0 ⇒ 门禁行 **0 条**、`patches=2`、`zc_mark` 0 张、`zc_in=0` 22/22。四轮均无本插件 ERROR（ngx 轮另有 25 条 `[ERROR] [upscale] ngx_*`，是该后端既有的日志口径 `log_ngx_error`，与本改动无关）。
+
+**相关代码位置**：`Dx11FsrBridge/Dx11FsrBridge.cpp` 的 `Config::ffx12_zero_copy`、`need_create_texture_hook()`、`zc_input_candidate()`、`hooked_create_texture_2d()`、注入门禁的 `k_zc_vendor_nvidia`/`g_adapter_vendor`/`g_zc_gate_state`（三态常量 `k_zc_gate_undecided`/`k_zc_gate_allow`/`k_zc_gate_deny`）/`g_zc_gate_loser_seen`/`zc_vendor_gate`/`zc_gate_loser_skip` 与 `record_adapter_info()`；`Dx11FsrBridge/Ffx12Backend.h` 的 `zero_copy_injectable()`/`zero_copy_requested()`；`Dx11FsrBridge/Ffx12Backend.cpp` 的 `ZcInput`、`set_zero_copy()`、`zero_copy_enabled()`、dispatch 决策块、`release_zc_inputs()`；`Dx11FsrBridge/Dx11FsrBridge.package.ini` 的 `Ffx12ZeroCopy`。
 
 ---
 

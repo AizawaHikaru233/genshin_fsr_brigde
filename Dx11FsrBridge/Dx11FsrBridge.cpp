@@ -1227,8 +1227,23 @@ void zc_register_mark(ID3D11Texture2D *texture, std::uint32_t index);
 constexpr std::uint32_t k_zc_vendor_nvidia = 0x10DEu;
 std::atomic_uint32_t g_adapter_vendor { 0 };        // 首个成功路由的适配器厂商；0=未知(fail-closed)
 std::atomic_bool g_zc_vendor_gate_logged { false }; // 门禁行每进程一次
-std::atomic_bool g_zc_vendor_allowed { false };    // 门禁的粘滞结论；每进程只写一次
-// ④ 门禁结论必须是**粘滞位**（g_zc_vendor_allowed），注入判据与「关后端」只能同源：
+// 门禁的粘滞结论：三态而不是 bool —— k_zc_gate_undecided=未判定、k_zc_gate_allow=放行、
+// k_zc_gate_deny=不注入。取值用命名常量：状态位散落在门禁块与日志行里，字面量 `1`/`2` 读代码时
+// 要回头数语义，改一处漏一处就是「判据与动作不同源」。
+// 为什么「未判定」必须独立成状态：门禁在**首个**键=1 的纹理创建时才判，并发输家线程此刻可能
+// 还没看到结论。输家必须 fail-closed（按不注入处理），但「还没判完」不等于 deny —— 若不区分，
+// deny 定案之后每张纹理都会被当成输家，把下面这个一次性标记刷成噪声、也掩盖真实边界。
+constexpr int k_zc_gate_undecided = 0;
+constexpr int k_zc_gate_allow = 1;
+constexpr int k_zc_gate_deny = 2;
+std::atomic<int> g_zc_gate_state { k_zc_gate_undecided };
+// 只记「是否出现过输家」：并发窗口内的其它输家不再单独记录 —— 那个累计值没有任何出口（日志里
+// `count=1` 是字面量），再维护一个计数器只是每张纹理多一次原子 RMW，清零成本大于收益。
+// 口径 = 门禁判定窗口内到达、因「本次读到未判定」而没注入的纹理。它与候选/预算判定**互斥**：
+// 未定案时根本不进那段，所以远小于候选门槛的小纹理也会被计入 ⇒ 它**不是**「被跳过的候选数」，
+// 看到这个标记并不代表漏掉了 1 张颜色输入。
+std::atomic_bool g_zc_gate_loser_seen { false };
+// ④ 门禁结论必须是**粘滞位**（g_zc_gate_state），注入判据与「关后端」只能同源：
 //   若每次注入时都重新调一次判定（旧实现是再算一遍 g_adapter_vendor == 0x10DE），两处独立
 //   求值会分歧 —— 门禁按「不支持」关了后端，而后续 vendor 又被另一个 device 的 route 覆盖成
 //   0x10DE 时，注入会重新打开 ⇒ 出现 zc_mark>0 但 zc_in=0 / zc_reason=off，违反「不支持厂商
@@ -15771,38 +15786,73 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
     std::uint64_t zc_mark_bytes = 0;
     if (g_config.ffx12_zero_copy && effective_desc != nullptr)
     {
-        // 厂商门禁（2026-11-28）：未实测厂商一律 fail-closed；判定必须与「关后端」同源，所以
-        // 每进程只判一次、只打一行事件日志，结论落进**粘滞位** g_zc_vendor_allowed —— 注入判据与
-        // 「关后端」都只读这一处结论，绝不做第二次独立求值（理由见文件上方全局区 ④）。
+        // 注入门禁（2026-11-28）：把「该不该注入」收成一条判据 = 厂商放行 **且** 后端会真的用它。
+        // 为什么还要看后端/模式：后端 zero_copy_enabled() 要求 native + 同步（Ffx12Backend.cpp），
+        //   ngx 后端根本不建 D3D12、异步交叠又必须每帧拷回 ⇒ 这两种情况下注入的共享纹理会一直
+        //   用不上，白占 VRAM 与共享句柄（日志表现为 zc_mark>0 但 zc_in=0 且原因不是 ok）。
+        // 判定必须与「关后端请求位」同源：每进程只判一次、只打一行事件日志，结论落进**粘滞位**
+        //   g_zc_gate_state（`k_zc_gate_*`：0=未判定/1=allow/2=deny），注入与 set_zero_copy(false) 都只读
+        //   这一处结论，绝不做第二次独立求值（理由见文件上方全局区 ④）。
         // 为什么在这里判：本块只有键=1 才会进（键=0 一行都不打），且此时 vendor 已由
-        // record_adapter_info 落值（设备创建 hook 早于任何纹理创建）。
+        // record_adapter_info 落值、后端类型/异步模式也已在 load_config 之后定案。
         // 不支持时**不 return** —— native_ldr 改写与正常创建路径必须照常走；注入这一段整体
-        // 落在下面的 `if (g_zc_vendor_allowed)` 里，结论为 deny 时根本不进。
+        // 落在注入闸门 `if (gate_state_now == k_zc_gate_allow)` 里，结论为 deny 时根本不进。
         // 日志口径（§五.6：这一行是**每进程一次的事件快照**，字段都是当时状态）：
         //   vendor=<当时读到的适配器厂商>  supported=1|0  need=<常量 k_zc_vendor_nvidia 格式化>
-        //   action=allow|deny —— 只表示门禁是否放行，不代表这张纹理进了候选/预算
-        //   zc_req=on|off —— 后端「零拷贝请求位」（不是后端类型；后端类型见 backend= 系列日志）
+        //   action=allow|deny —— **只表示厂商门禁**是否放行，不代表这张纹理进了候选/预算
+        //   zc_req=on|off —— 门禁判定**之前**的请求位快照（set_zero_copy(false) 会清掉真值，
+        //     若在关之后再读就会永远打 off、看不出「用户其实开了键」）
+        //   backend=native|ngx  async=0|1 —— 后端类型与异步交叠（启动期常量）
+        //   inject=on|off —— 综合结论（厂商 && 可注入），真正决定这张纹理会不会被注入
+        //   reason=ok|vendor|backend|async|multiple —— 不注入的原因（优先级 vendor > backend > async）
         // ⚠️ 首个纹理若早于 route_from_d3d11_device 的补检，这里会如实打 supported=0/action=deny
         //   （未知即 fail-closed），结论就此固定，本进程不再重判。
-        if (!g_zc_vendor_gate_logged.exchange(true, std::memory_order_relaxed))
+        const int gate_state_seen = g_zc_gate_state.load(std::memory_order_acquire);
+        if (gate_state_seen == k_zc_gate_undecided &&
+            !g_zc_vendor_gate_logged.exchange(true, std::memory_order_acq_rel))
         {
             const std::uint32_t gate_vendor = g_adapter_vendor.load(std::memory_order_relaxed);
-            const bool allowed = gate_vendor == k_zc_vendor_nvidia;
-            g_zc_vendor_allowed.store(allowed, std::memory_order_relaxed);
-            if (!allowed)
+            const bool vendor_allowed = gate_vendor == k_zc_vendor_nvidia;
+            bool backend_native = false;
+            bool async_overlap = false;
+            const bool injectable = ffx12::zero_copy_injectable(backend_native, async_overlap);
+            const bool inject = vendor_allowed && injectable;
+            const bool req_before = ffx12::zero_copy_requested(); // 判定前的请求位快照（§五.6 口径）
+            if (!inject)
                 ffx12::set_zero_copy(false);
+            const char *reason = "ok";
+            if (!vendor_allowed && !injectable)
+                reason = "multiple";
+            else if (!vendor_allowed)
+                reason = "vendor";
+            else if (!backend_native && async_overlap)
+                reason = "multiple";
+            else if (!backend_native)
+                reason = "backend";
+            else if (async_overlap)
+                reason = "async";
             char vendor_hex[16] {};
             char need_hex[16] {};
             std::snprintf(vendor_hex, sizeof(vendor_hex), "0x%04X", gate_vendor);
             std::snprintf(need_hex, sizeof(need_hex), "0x%04X", k_zc_vendor_nvidia);
             LOG_INFO(blog::cat::core, std::string("zc_vendor_gate vendor=") + vendor_hex +
-                " supported=" + (allowed ? "1" : "0") + " need=" + need_hex +
-                " action=" + (allowed ? "allow" : "deny") +
-                " zc_req=" + (allowed ? "on" : "off"));
+                " supported=" + (vendor_allowed ? "1" : "0") + " need=" + need_hex +
+                " action=" + (vendor_allowed ? "allow" : "deny") +
+                " zc_req=" + (req_before ? "on" : "off") +
+                " backend=" + (backend_native ? "native" : "ngx") +
+                " async=" + (async_overlap ? "1" : "0") +
+                " inject=" + (inject ? "on" : "off") +
+                " reason=" + reason);
+            g_zc_gate_state.store(inject ? k_zc_gate_allow : k_zc_gate_deny, std::memory_order_release);
         }
-        // 门禁 deny ⇒ 整段跳过：不取 g_state_mutex、不算候选、不占预算 —— 这样「不支持厂商等同
-        // 键=0」不只在行为上成立，在每帧开销上也成立。
-        if (g_zc_vendor_allowed.load(std::memory_order_relaxed))
+        // 重新读一次结论，**不沿用**上面的 gate_state_seen：那个值是进本块时读的，门禁可能刚刚在
+        // 本线程做完（赢家分支），也可能被别的线程做完。注入与「因未定案而没注入」的判定都必须对着**现在**的
+        // 结论（gate_state_now 的读数必须对得上实际分支）：否则会出现「deny 已定案却仍记一次输家」
+        // 或「allow 定案时记了输家但其实注入了」。
+        const int gate_state_now = g_zc_gate_state.load(std::memory_order_acquire);
+        // 门禁 deny / 未定案 ⇒ 整段跳过：不取 g_state_mutex、不算候选、不占预算 —— 这样「不支持厂商 /
+        // 后端用不上」不只在行为上等同键=0，在每帧开销上也成立。
+        if (gate_state_now == k_zc_gate_allow)
         {
             std::uint32_t backbuffer_width = 0;
             // 尺寸下限先过一遍再取锁：本钩子会看到游戏**所有** CreateTexture2D（含大量
@@ -15831,6 +15881,15 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
                     zc_note_budget_skip(zc_limit);
                 }
             }
+        }
+        else if (gate_state_now == k_zc_gate_undecided &&
+            !g_zc_gate_loser_seen.exchange(true, std::memory_order_relaxed))
+        {
+            // 只有「确实因为结论还没定案而没注入」才走到这里：门禁正在判定中，或刚判完但本线程这次
+            // 读到的是旧值。只记「是否出现过输家」并打一行（其它输家不再单独记录），免得并发场景下
+            // 看起来像「零星漏注入」；定案（allow 或 deny）之后再到达的纹理读到具体状态，既不走注入段、
+            // 也不进本分支 ⇒ 不再被误记成输家。`count=1` 只是「出现过输家」的字面标记，不是计数。
+            LOG_INFO(blog::cat::core, "zc_gate_loser_skip count=1 note=skipped-before-gate-decided");
         }
     }
     HRESULT result = g_original_create_texture_2d(device, create_desc, initial_data, texture);

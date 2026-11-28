@@ -3462,8 +3462,9 @@ void set_instance_diag(bool enable)
 
 void set_zero_copy(bool enable)
 {
-    // 同 set_instance_diag：不加锁 —— 桥在 load_config 调用一次；厂商门禁不支持时启动期
-    // 再调一次 false。两次都实际早于首个 dispatch；即便并发也只写原子位，最坏一帧旧值。
+    // 同 set_instance_diag：不加锁 —— 桥在 load_config 按 ini 值调用一次；注入门禁判为「不注入」时
+    // 再调一次 false（三种原因：厂商不支持 / 后端非 native / 异步交叠），语义都是「关掉请求位」，
+    // 与桥侧注入判据同源。两次都实际早于首个 dispatch；即便并发也只写原子位，最坏一帧旧值。
     g_zero_copy.store(enable, std::memory_order_relaxed);
     if (!enable)
     {
@@ -3484,6 +3485,23 @@ bool zero_copy_enabled()
     return g_zero_copy.load(std::memory_order_relaxed) &&
         g_backend == BackendKind::Native && !g_async_upscale &&
         g_d12dev != nullptr && g_queue != nullptr;
+}
+
+// 零拷贝「可注入」判据（2026-11-28）：注入前先问「后端会不会真的用这张共享纹理」。
+// 与 zero_copy_enabled() 的分工：那个是**运行期**能不能用（还要求设备/队列就绪），
+// 这个是**启动期**该不该注入（只看后端类型与异步模式）。
+bool zero_copy_injectable(bool &backend_native, bool &async_overlap)
+{
+    // 不取 g_mutex：后端持锁时会 CreateTexture2D 重入桥的创建钩子，同线程取非递归 timed_mutex = 死锁。
+    // 也不要求 g_d12dev/g_queue 就绪：纹理创建远早于后端 init，那样会恒 false ⇒ 永不注入。
+    backend_native = g_backend == BackendKind::Native;
+    async_overlap = g_async_upscale;
+    return backend_native && !async_overlap;
+}
+
+bool zero_copy_requested()
+{
+    return g_zero_copy.load(std::memory_order_relaxed);
 }
 
 bool async_upscale_enabled()
