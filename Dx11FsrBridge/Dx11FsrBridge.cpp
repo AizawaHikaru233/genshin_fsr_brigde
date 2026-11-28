@@ -1212,6 +1212,15 @@ std::atomic_uint32_t g_zc_marks_registered { 0 }; // 已发布槽数（写入方
 std::atomic_bool g_zc_first_hit_logged { false };  // zc_first_hit 每进程一次
 std::uint32_t zc_mark_index_of(const ID3D11Texture2D *texture); // 定义见预算辅助函数一处
 void zc_register_mark(ID3D11Texture2D *texture, std::uint32_t index);
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+// ---- 输出零拷贝标记跟踪表（2026-11-28，Stage 2；**只喂诊断日志，不设注入上限**）----
+// 为什么纯记录、不做预算/拒绝：输出纹理只有 2 张双缓冲（场景切换会换一对），8 槽足够覆盖
+// 观测窗口；注入与否只由 zc_output_candidate() 决定 —— 这里加限制反而会改变 Stage 2 的行为。
+// 为什么只在诊断构建：验收口径要求发布 DLL 里检索不到 `zc_out_mark`（诊断串不占发布体积）。
+constexpr std::uint32_t k_zc_out_mark_slots = 8;
+std::array<std::atomic<std::uintptr_t>, k_zc_out_mark_slots> g_zc_out_marks {};
+std::atomic_uint32_t g_zc_out_mark_count { 0 }; // 累计标记次数；槽号 = (count-1) % 8（不是张数上限）
+#endif
 // ---- 输入颜色零拷贝的厂商门禁（2026-11-28：未实测厂商一律 fail-closed；且门禁判定必须与后端开关同源）----
 // ① 为什么只允许 NVIDIA（0x10DE）：Stage 1 只在 RTX 4070 SUPER 上做过 E1 实测（probe
 //   `celia24_zc`：23/TYPELESS + 0x802 → D3D12 opened flags=0x21、typed SRV diff_bytes=0）。
@@ -1350,6 +1359,177 @@ std::string hex64(std::uint64_t value)
     out << "0x" << std::uppercase << std::hex << value;
     return out.str();
 }
+
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+// ---- Stage 2 观测（2026-11-28）：FFX 的「输出目标」到底是谁 ----
+// 要回答的问题：后端 dispatch 的同步输出分支做 `context->CopyResource(input.output_target, 后端自建
+// 共享纹理)`（Ffx12Backend.cpp 的同步路径），等于每帧一次全分辨率拷贝。若 output_target 是**游戏
+// 用 CreateTexture2D 自建**的离屏 RT ⇒ Stage 2（让后端直接写它、省掉这次拷贝）有机会成立；若它是
+// swapchain backbuffer（GetBuffer 来的），创建期无法注 BIND_UNORDERED_ACCESS / MISC_SHARED_NTHANDLE
+// ⇒ Stage 2 不可达，只需把结论记下来。
+// 下面四条**只喂日志**，不参与任何判定；全部只在诊断构建里存在（发布构建连这些静态变量都不生成）。
+// 登记范围：只登记「BindFlags 含 RENDER_TARGET 且 ≥1280×720」的纹理。全量登记会让 64 槽环被大量
+// 小纹理挤爆，输出 RT 一旦被淘汰就会把 created 误报成 0（§一.6：旁证当结论）⇒ created=0 的准确
+// 口径是「不在本进程最近 64 张**大尺寸 RT** 里」，多半是 swapchain 或外部（转译层/驱动）来源。
+struct ZcOutRegEntry
+{
+    std::atomic<std::uintptr_t> ptr { 0 }; // 发布位：先写下面各字段，再 release 写它（同 zc_register_mark）
+    std::atomic_uint32_t fmt { 0 };
+    std::atomic_uint32_t width { 0 };
+    std::atomic_uint32_t height { 0 };
+    std::atomic_uint32_t bind { 0 };
+    std::atomic_uint32_t misc { 0 };
+    std::atomic_uint32_t usage { 0 };
+    std::atomic_uint32_t cpu { 0 };
+};
+constexpr std::uint32_t k_zc_out_reg_slots = 64;       // 环形表容量（按累计写入序号取模，允许覆盖）
+constexpr std::uint32_t k_zc_out_cand_limit = 8;       // 候选探针最多 8 条（同时是去重槽数）
+constexpr std::uint32_t k_zc_out_win_slots = 8;        // 窗口去重表容量（实测输出 2 张就够，留余量）
+constexpr std::uint32_t k_zc_out_win_dispatch = 1024;  // 窗口统计周期（以 dispatch 次数计）
+std::array<ZcOutRegEntry, k_zc_out_reg_slots> g_zc_out_reg {};
+std::atomic_uint32_t g_zc_out_reg_written { 0 };   // 累计登记条数；环形下标 = 值 % 槽数
+std::atomic_bool g_zc_out_desc_logged { false };   // zc_out_desc 每进程只打一条
+std::array<std::atomic<std::uintptr_t>, k_zc_out_cand_limit> g_zc_out_cand_ptrs {};
+std::atomic_uint32_t g_zc_out_cand_used { 0 };     // 候选探针已认领槽数（= 已打条数）
+std::array<std::atomic<std::uintptr_t>, k_zc_out_win_slots> g_zc_out_win_ptrs {};
+std::atomic_uint32_t g_zc_out_win_used { 0 };      // 本窗口去重表已认领槽数
+std::atomic_bool g_zc_out_win_overflow { false };  // 去重表被塞满过（窗口 distinct 只算下限）
+std::atomic_uint32_t g_zc_out_win_count { 0 };     // 累计 dispatch 次数（% 周期 == 0 时开新窗口）
+
+// 登记一条刚创建成功的大尺寸 RT（环形覆盖、无锁、不取任何互斥量）。
+// ⚠️ 环形覆盖会在读者读一半时改写同一槽 ⇒ 极端并发下可能读到「指针在、字段是新一轮的」；
+//   这只影响诊断行的字段值，不影响结论（created 判据只看指针）。§一.6：这是已知的观测界限。
+void zc_out_register(ID3D11Texture2D *texture, const D3D11_TEXTURE2D_DESC &desc)
+{
+    if (texture == nullptr)
+        return;
+    const std::uint32_t seq = g_zc_out_reg_written.fetch_add(1, std::memory_order_relaxed);
+    ZcOutRegEntry &slot = g_zc_out_reg[seq % k_zc_out_reg_slots];
+    const std::uintptr_t ptr = reinterpret_cast<std::uintptr_t>(texture);
+    // 先把指针清零再写字段、最后 release 发布指针：让读者要么看不到条目、要么看到自洽的条目。
+    slot.ptr.store(0, std::memory_order_release);
+    slot.fmt.store(static_cast<std::uint32_t>(desc.Format), std::memory_order_relaxed);
+    slot.width.store(desc.Width, std::memory_order_relaxed);
+    slot.height.store(desc.Height, std::memory_order_relaxed);
+    slot.bind.store(desc.BindFlags, std::memory_order_relaxed);
+    slot.misc.store(desc.MiscFlags, std::memory_order_relaxed);
+    slot.usage.store(static_cast<std::uint32_t>(desc.Usage), std::memory_order_relaxed);
+    slot.cpu.store(desc.CPUAccessFlags, std::memory_order_relaxed);
+    slot.ptr.store(ptr, std::memory_order_release);
+}
+
+// 在登记表里按指针回查（从最新写到最旧扫：最近登记的才是当前输出目标）。只在一处调用 ——
+// zc_out_desc 那一行，每进程一次 ⇒ 最多 64 次读取，代价可忽略。
+// 出参是普通的快照结构（不是原子），只是为了让调用点少写几行。
+struct ZcOutRegSnapshot
+{
+    std::uint32_t fmt = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t bind = 0;
+    std::uint32_t misc = 0;
+    std::uint32_t usage = 0;
+    std::uint32_t cpu = 0;
+};
+bool zc_out_lookup(std::uintptr_t ptr, ZcOutRegSnapshot &out)
+{
+    if (ptr == 0)
+        return false;
+    const std::uint32_t written = g_zc_out_reg_written.load(std::memory_order_acquire);
+    const std::uint32_t scan = written < k_zc_out_reg_slots ? written : k_zc_out_reg_slots;
+    for (std::uint32_t back = 0; back < scan; ++back)
+    {
+        const ZcOutRegEntry &slot = g_zc_out_reg[(written - 1 - back) % k_zc_out_reg_slots];
+        if (slot.ptr.load(std::memory_order_acquire) != ptr)
+            continue;
+        out.fmt = slot.fmt.load(std::memory_order_relaxed);
+        out.width = slot.width.load(std::memory_order_relaxed);
+        out.height = slot.height.load(std::memory_order_relaxed);
+        out.bind = slot.bind.load(std::memory_order_relaxed);
+        out.misc = slot.misc.load(std::memory_order_relaxed);
+        out.usage = slot.usage.load(std::memory_order_relaxed);
+        out.cpu = slot.cpu.load(std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
+// 创建期候选探针：desc 撞上 display 尺寸且含 RENDER_TARGET 就立刻打一条（每进程最多 8 条、按指针去重）。
+// 它能回答「游戏到底会不会自建 display 尺寸的 RT、有几张」—— 这是 Stage 2 可达性的直接证据。
+// §五.6：条数闸门 = k_zc_out_cand_limit（不是按帧限频，因为纹理创建是低频事件）。
+void zc_out_note_candidate(ID3D11Texture2D *texture, const D3D11_TEXTURE2D_DESC &desc)
+{
+    if (texture == nullptr)
+        return;
+    const std::uintptr_t ptr = reinterpret_cast<std::uintptr_t>(texture);
+    const std::uint32_t used = g_zc_out_cand_used.load(std::memory_order_acquire);
+    const std::uint32_t scan = used < k_zc_out_cand_limit ? used : k_zc_out_cand_limit;
+    for (std::uint32_t i = 0; i < scan; ++i)
+        if (g_zc_out_cand_ptrs[i].load(std::memory_order_acquire) == ptr)
+            return; // 同址已打过；指针复用会让新纹理少打一条，属可接受的观测损失
+    const std::uint32_t slot = g_zc_out_cand_used.fetch_add(1, std::memory_order_acq_rel);
+    if (slot >= k_zc_out_cand_limit)
+        return;
+    g_zc_out_cand_ptrs[slot].store(ptr, std::memory_order_release);
+    LOG_INFO(blog::cat::core, std::string("zc_out_cand ptr=") + hex64(ptr) +
+        " fmt=" + format_string(desc.Format) +
+        " size=" + std::to_string(desc.Width) + "x" + std::to_string(desc.Height) +
+        " bind=" + hex64(desc.BindFlags) +
+        " misc=" + hex64(desc.MiscFlags));
+}
+
+// 每次 dispatch 记一次输出指针；每满 k_zc_out_win_dispatch 次打一条并开新窗口。
+// 用途：判断输出目标是否 2 张双缓冲交替 —— 同一窗口里出现 2 个不同指针 ⇒ 是。
+void zc_out_note_window(ID3D11Texture2D *output)
+{
+    const std::uintptr_t ptr = reinterpret_cast<std::uintptr_t>(output);
+    if (ptr != 0)
+    {
+        const std::uint32_t used = g_zc_out_win_used.load(std::memory_order_acquire);
+        const std::uint32_t scan = used < k_zc_out_win_slots ? used : k_zc_out_win_slots;
+        bool known = false;
+        for (std::uint32_t i = 0; i < scan; ++i)
+            if (g_zc_out_win_ptrs[i].load(std::memory_order_acquire) == ptr)
+            {
+                known = true;
+                break;
+            }
+        if (!known)
+        {
+            const std::uint32_t slot = g_zc_out_win_used.fetch_add(1, std::memory_order_acq_rel);
+            if (slot < k_zc_out_win_slots)
+                g_zc_out_win_ptrs[slot].store(ptr, std::memory_order_release);
+            else
+                g_zc_out_win_overflow.store(true, std::memory_order_relaxed);
+        }
+    }
+    const std::uint32_t count = g_zc_out_win_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (count % k_zc_out_win_dispatch != 0)
+        return;
+    // ⚠️ 必须先取快照再清表：本次 dispatch 的指针已在上面入表，开窗动作不能把它自己抹掉（§五.6）。
+    const std::uint32_t used = g_zc_out_win_used.load(std::memory_order_acquire);
+    const std::uint32_t distinct = used < k_zc_out_win_slots ? used : k_zc_out_win_slots;
+    std::string line = std::string("zc_out_ptr_set window=") + std::to_string(k_zc_out_win_dispatch) +
+        " distinct=" + std::to_string(distinct) +
+        " total_dispatch=" + std::to_string(count); // 累计值，与 window= 区分（§五.6）
+    static const char *const slot_names[4] = { " a=", " b=", " c=", " d=" };
+    for (std::uint32_t i = 0; i < 4; ++i)
+    {
+        const std::uintptr_t one = i < distinct ? g_zc_out_win_ptrs[i].load(std::memory_order_acquire) : 0;
+        line += std::string(slot_names[i]) + hex64(one);
+    }
+    if (distinct > 4)
+        line += " more=" + std::to_string(distinct - 4);
+    // 去重表被塞满过 ⇒ distinct 只是**下限**（实机输出目标不可能有 9 张，出现即说明判据要重看）。
+    if (g_zc_out_win_overflow.load(std::memory_order_relaxed))
+        line += " overflow=1";
+    LOG_INFO(blog::cat::upscale, line);
+    for (std::uint32_t i = 0; i < k_zc_out_win_slots; ++i)
+        g_zc_out_win_ptrs[i].store(0, std::memory_order_relaxed);
+    g_zc_out_win_used.store(0, std::memory_order_relaxed);
+    g_zc_out_win_overflow.store(false, std::memory_order_relaxed);
+}
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（zc_out_desc / zc_out_cand / zc_out_ptr_set —— 只喂日志）
 
 // 只读诊断：在尝试安装任何 IL2CPP 相机 hook 前，记录目标函数的实际机器码。
 // 这避免把历史版本的 RVA/序言假设直接带入运行中的渲染线程。
@@ -13904,6 +14084,44 @@ bool try_fsr2_translation_draw(
                     st->dbg_depth = d_ptr;
                 }
 
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                // ---- Stage 2 观测（2026-11-28）：输出目标的 desc / 来源 / 双缓冲（只喂日志）----
+                // 为什么先 exchange 再取 desc：GetDesc 是 COM 调用，不能每帧都做 —— 这行每进程一条。
+                // created=1 ⇒ 这个指针在本进程「大尺寸 RT 登记表」里，说明它由 CreateTexture2D 创建
+                //   （CreateTexture2D 之外的来源，如 swapchain GetBuffer / 转译层自建，都不会进表）。
+                if (output_tex != nullptr && !g_zc_out_desc_logged.exchange(true, std::memory_order_relaxed))
+                {
+                    D3D11_TEXTURE2D_DESC out_desc {};
+                    output_tex->GetDesc(&out_desc);
+                    ZcOutRegSnapshot reg {};
+                    const bool created = zc_out_lookup(reinterpret_cast<std::uintptr_t>(output_tex), reg);
+                    // reg_* 只在 created=1 时出现：它们来自**创建时**登记的那份 desc，与上面的实时 GetDesc
+                    // 相互独立 ⇒ 两处 bind/misc 一致即可证明「这条登记就是这张纹理」，而不是地址复用撞上的旧条目。
+                    std::string reg_fields;
+                    if (created)
+                        reg_fields = " reg_fmt=" + std::to_string(reg.fmt) +
+                            " reg_size=" + std::to_string(reg.width) + "x" + std::to_string(reg.height) +
+                            " reg_bind=" + hex64(reg.bind) +
+                            " reg_misc=" + hex64(reg.misc) +
+                            " reg_usage=" + std::to_string(reg.usage) +
+                            " reg_cpu=" + hex64(reg.cpu);
+                    LOG_INFO(blog::cat::upscale, std::string("zc_out_desc ptr=") +
+                        hex64(reinterpret_cast<std::uintptr_t>(output_tex)) +
+                        " created=" + (created ? "1" : "0") +
+                        " fmt=" + format_string(out_desc.Format) +
+                        " size=" + std::to_string(out_desc.Width) + "x" + std::to_string(out_desc.Height) +
+                        " bind=" + hex64(out_desc.BindFlags) +
+                        " misc=" + hex64(out_desc.MiscFlags) +
+                        " usage=" + std::to_string(static_cast<std::uint32_t>(out_desc.Usage)) +
+                        " cpu=" + hex64(out_desc.CPUAccessFlags) +
+                        " mips=" + std::to_string(out_desc.MipLevels) +
+                        " array=" + std::to_string(out_desc.ArraySize) +
+                        " samples=" + std::to_string(out_desc.SampleDesc.Count) +
+                        reg_fields);
+                }
+                // 窗口统计：window= 是**窗口长度**、distinct= 是本窗口内不同输出指针数、total_dispatch= 累计（§五.6）。
+                zc_out_note_window(output_tex);
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（zc_out_desc / zc_out_ptr_set —— 只喂日志）
                 if (ffx12::dispatch(sdk_in, context, call_params.instance))
                 {
                     // ---- 【功能 · B124】① 记下本路**自己的** color 采样来源 ----
@@ -15936,6 +16154,32 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
         else
             LOG_DEBUG(blog::cat::core, zc_line);
     }
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    // ---- Stage 2 观测（2026-11-28）：登记大尺寸 RT + 探针 display 尺寸 RT（只喂日志）----
+    // 只处理「RT 且 ≥1280×720」：登记表口径见 zc_out_register() 上方注释（避免 64 槽被小纹理挤爆）。
+    // 候选探针要读 display 尺寸（首个 Present 之后才有值），故只在「还没打满 8 条」时取一次 g_state_mutex；
+    // 否则之后每建一张大 RT 都要抢锁 —— 与零拷贝候选的「小纹理不为日志取锁」同一口径。
+    if (SUCCEEDED(result) && texture != nullptr && *texture != nullptr && effective_desc != nullptr &&
+        (effective_desc->BindFlags & D3D11_BIND_RENDER_TARGET) != 0 &&
+        effective_desc->Width >= 1280 && effective_desc->Height >= 720)
+    {
+        zc_out_register(*texture, *effective_desc);
+        if (g_zc_out_cand_used.load(std::memory_order_relaxed) < k_zc_out_cand_limit)
+        {
+            std::uint32_t display_width = 0;
+            std::uint32_t display_height = 0;
+            {
+                std::lock_guard lock(g_state_mutex);
+                display_width = g_state.backbuffer_width;
+                display_height = g_state.backbuffer_height;
+            }
+            // display 尺寸未知（首个 Present 之前）⇒ 这张不计入候选；它已进登记表，created 判据不受影响。
+            if (display_width != 0 && display_height != 0 &&
+                effective_desc->Width == display_width && effective_desc->Height == display_height)
+                zc_out_note_candidate(*texture, *effective_desc);
+        }
+    }
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（zc_out_cand + 登记表 —— 只喂日志）
     if (SUCCEEDED(result) && native_ldr_format_changed && texture != nullptr && *texture != nullptr)
     {
         LOG_INFO(blog::cat::core, std::string("native_ldr_final_target_created device=") +
