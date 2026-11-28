@@ -846,13 +846,20 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 
 ```
 zc_budget_exhausted marked=8 reserved=8 reserved_bytes=66355200 skipped=1 limit_textures=8 limit_bytes=268435456
+（旧格式；当前构建的同一行字段为 marked_total= / reserved_now= / reserved_bytes_now= / skipped_total= / limit=）
 ```
 
 ⇒ 第 9 张候选没有注入。候选判据（format 23 + `RT|SRV` + 1 mip/array/sample + 两维 ≥1280×720 + 宽 < 后缓冲）确实会命中多张同规格的 1920×1080 渲染目标，其中只有一部分是 FSR 颜色输入。
 
-**影响**：正确性不受影响（未注入的纹理在 dispatch 侧校验失败后走原拷贝；该轮仍 `zc_in=1`、`reason=ok`），但**零拷贝是否生效取决于真实输入纹理是否排在预算耗尽之前**，长会话 / 多次场景重建后可能静默退化为全拷贝，且只留一条 INFO 级 `zc_budget_exhausted`。
+**影响**：~~零拷贝是否生效取决于真实输入纹理是否排在预算耗尽之前，长会话 / 多次场景重建后可能静默退化为全拷贝~~（**2026-11-28 13:36 实测证伪**，见下）。实际影响仅为非输入纹理白占共享资源与 VRAM（3–8 张 × 7.91 MiB ≈ 24–63 MiB），正确性不受影响（未注入的纹理在 dispatch 侧校验失败后走原拷贝；该轮仍 `zc_in=1`、`reason=ok`）。
 
-**可选修法**（下次动这个键时择一）：① 收紧候选（`BindFlags` 精确等于 `RT|SRV`、排除已知中间 RT）；② dispatch 首次命中时记录“真实输入是第几号 mark”，据此判断 8 张够不够；③ 保留现判据，但把 `zc_budget_exhausted` 提升为可见告警，并在低频行里区分「候选已满」与「非候选」。
+**2026-11-28 13:36 观测落地（E2，native + 同步 + 键=1，`upscale=debug`）**：已加四项观测——`zc_mark` 行 `ptr=`、一次性 `zc_first_hit mark_of_input=<第几号 mark> marked_total= reserved_now= reserved_bytes_now= limit_textures= limit_bytes=`、采样行 `zc_mark_of_input=`、`zc_budget_exhausted … limit=<textures|bytes|textures+bytes>`。实测（同一构建两轮）：第一轮 `zc_first_hit mark_of_input=2`、采样行 `zc_mark_of_input=2` × 25/25（`zc_in=1` 25/25、0 error）；第二轮出现**两批各 3 张**（`zc_mark` 1/2/3 与 4/5/6），`zc_mark_of_input` 先 **2**（×11）后 **5**（×10），`zc_in=1` 21/21 ⇒ **真实输入 = 每批 3 张里的第 2 张，序号随场景加载推进（2、5、8、11…）**。
+
+⇒ 8 张上限只覆盖前两批：第 3 批输入 = 8 仍在限内，**第 4 批输入 = 11 超出 ⇒ 静默退化为全拷贝**。原「长会话可能静默退化」的推断由此获得实测链条（`zc_mark_of_input` 2→5）。
+
+**处置（缺陷① 仍开放，下一步独立提交）**：① **抬上限**：`k_zc_max_textures` 8 → **16**（字节上限保持 256 MiB：1080p 每张 8.29 MB ⇒ 16 张 132.7 MB 由张数先触顶；1440p 渲染 14.06 MB/张时 256 MiB 允许 18 张）；② **不收紧候选**（`BindFlags` 精确相等会冒漏真实输入的风险，后端本就不读 `BindFlags`）；③ 原「可选修法」中的「② 记录真实输入是第几号 mark」已实施，`zc_budget_exhausted` 也已带 `limit=` 四态。后续判据：若某轮出现 `mark_of_input=0`（输入不在表里）或 `zc_in=0` + `reason=not_shared` 且 `zc_mark` 已达上限，按当时的 `limit=` 再评估上限。
+
+> 原可选修法（备查，已不采用）：① 收紧候选（`BindFlags` 精确等于 `RT|SRV`、排除已知中间 RT）；② dispatch 首次命中时记录“真实输入是第几号 mark”，据此判断 8 张够不够；③ 保留现判据，但把 `zc_budget_exhausted` 提升为可见告警，并在低频行里区分「候选已满」与「非候选」。
 
 **未验证**：
 

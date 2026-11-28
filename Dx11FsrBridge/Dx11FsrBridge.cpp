@@ -1192,6 +1192,26 @@ std::atomic_uint64_t g_zc_reserved_bytes { 0 };  // 预算已预留字节数
 std::atomic_uint32_t g_zc_skipped { 0 };         // 因预算耗尽而放弃注入的次数
 std::atomic_uint32_t g_zc_create_fallbacks { 0 }; // 注入 create 失败、按原 desc 重试成功的次数
 std::atomic_bool g_zc_budget_exhausted_logged { false };
+// ---- 零拷贝可观测性：标记表（2026-11-28；**只影响日志，不改任何注入行为**）----
+// 为什么桥这边要自己维护一张小表：后端只知道 D3D11 纹理指针，而日志要回答「真实输入是第几号
+// mark，8 张上限够不够」。注入成功时把 `ID3D11Texture2D* → 预留序号` 记下来，dispatch 时按
+// 输入的指针回查即可。**按指针查、不按序号查**：滚动回滚（zc_rollback_budget）只归还计数、
+// 序号在后续纹理上会重复出现，按序号查会把「A 的第 3 号」错配成「B 的第 3 号」。
+// 为什么**无锁**：写入在纹理创建钩子的注入成功分支，读取在 dispatch 成功分支；用 acquire/
+// release 保证「读到指针即能读到配套 index」即可。**绝不可取 g_mutex**：后端会在持有 g_mutex
+// 时 CreateTexture2D 重入本钩子，同线程取非递归 timed_mutex 就是死锁。
+// 容量 32 远大于张数上限（8）：表满也只丢观测记录，不影响注入与预算（那些是独立原子计数）。
+constexpr std::uint32_t k_zc_mark_table_capacity = 32;
+struct ZcMarkEntry
+{
+    std::atomic<ID3D11Texture2D *> texture { nullptr };
+    std::atomic<std::uint32_t> index { 0 };
+};
+std::array<ZcMarkEntry, k_zc_mark_table_capacity> g_zc_marks {};
+std::atomic_uint32_t g_zc_marks_registered { 0 }; // 已发布槽数（写入方 release 递增；读方 clamp）
+std::atomic_bool g_zc_first_hit_logged { false };  // zc_first_hit 每进程一次
+std::uint32_t zc_mark_index_of(const ID3D11Texture2D *texture); // 定义见预算辅助函数一处
+void zc_register_mark(ID3D11Texture2D *texture, std::uint32_t index);
 // ---- 输入颜色零拷贝的厂商门禁（2026-11-28：未实测厂商一律 fail-closed；且门禁判定必须与后端开关同源）----
 // ① 为什么只允许 NVIDIA（0x10DE）：Stage 1 只在 RTX 4070 SUPER 上做过 E1 实测（probe
 //   `celia24_zc`：23/TYPELESS + 0x802 → D3D12 opened flags=0x21、typed SRV diff_bytes=0）。
@@ -13877,6 +13897,30 @@ bool try_fsr2_translation_draw(
                     //   ⇒ 发布构建必须保留。口径：只在**派发成功**时更新（"上次派发用的那张"
                     //   才有归属含义）。
                     st->acc_in_color = reinterpret_cast<std::uint64_t>(color_tex);
+                    // ---- 零拷贝可观测性（2026-11-28）：首次**真的**走零拷贝时留一行 ----
+                    // 为什么放在采样块之外：采样行是限频的（`count <= 8 || count % 1024`），首次
+                    //   命中完全可能落在没有采样的帧上。这行每进程只打一次，不构成热路径噪声。
+                    // 闸门为什么这样写：`zero_copy_last_in() && !load(relaxed)` 让**尚未首次命中**的
+                    //   帧只付一次 relaxed 载入（第一次命中后就更是只付这一次载入），**不做 RMW**；
+                    //   真正第一次命中时才执行一次 exchange。若改成无条件 exchange，则每帧都要付一次
+                    //   原子 RMW，而且「首帧未命中」时就把一次性闸门烧掉、之后真命中反而一条都不打。
+                    // mark_of_input=0 表示输入纹理指针不在标记表里（异常：说明注入的那张不是实际被读
+                    //   的那张，或表满/并发写丢了记录），需要查；正常应在 1..k_zc_max_textures。
+                    if (ffx12::zero_copy_last_in() &&
+                        !g_zc_first_hit_logged.load(std::memory_order_relaxed))
+                    {
+                        if (!g_zc_first_hit_logged.exchange(true, std::memory_order_relaxed))
+                        {
+                            LOG_INFO(blog::cat::core, "zc_first_hit mark_of_input=" +
+                                std::to_string(zc_mark_index_of(color_tex)) +
+                                " marked_total=" + std::to_string(g_zc_marked.load(std::memory_order_relaxed)) +
+                                " reserved_now=" + std::to_string(g_zc_reserved.load(std::memory_order_relaxed)) +
+                                " reserved_bytes_now=" +
+                                std::to_string(g_zc_reserved_bytes.load(std::memory_order_relaxed)) +
+                                " limit_textures=" + std::to_string(k_zc_max_textures) +
+                                " limit_bytes=" + std::to_string(k_zc_max_bytes));
+                        }
+                    }
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
                     // 【仅诊断 · B123】① 进了 dispatch + 记下本路其余的输入/输出资源键、
                     // 归属路径与槽位（供 `ffx12_accum_dest` 对账行与别名分类使用）。
@@ -14191,6 +14235,8 @@ bool try_fsr2_translation_draw(
                             " zc_in_cache=" + std::to_string(ffx12::zero_copy_last_in_cached() ? 1 : 0) +
                             " zc_mark=" + std::to_string(g_zc_marked.load(std::memory_order_relaxed)) +
                             " zc_reason=" + ffx12::zero_copy_reason() +
+                            // zc_mark_of_input=本帧真实输入纹理在标记表里的序号（0=不在表里）
+                            " zc_mark_of_input=" + std::to_string(zc_mark_index_of(color_tex)) +
                             " version=" + ffx12::selected_version_name());
                         if (g_config.ffx12_camera_hook)
                         {
@@ -15460,29 +15506,107 @@ HRESULT STDMETHODCALLTYPE hooked_create_buffer(ID3D11Device *device, const D3D11
 // 256 MiB 足以覆盖同一时刻真正被读的一两张（双缓冲/双 RT），又不会随分辨率与重开局
 // 无限累积；到达上限后停止注入并计数，不再重试。常量与计数器见文件上方全局区
 // （k_zc_max_textures / g_zc_marked 等，日志行要先用）。
+// 按**指针**查这张纹理是第几号 mark（0 = 不在表里 / 已失效，含指针为空）。
+// 读顺序：先 acquire 读已认领槽数、再逐项 acquire 读指针；写入方保证「先写 index、再 release
+// 写指针」⇒ 只要读到指针，配套的 index 一定已可见。
+std::uint32_t zc_mark_index_of(const ID3D11Texture2D *texture)
+{
+    if (texture == nullptr)
+        return 0;
+    const std::uint32_t registered = g_zc_marks_registered.load(std::memory_order_acquire);
+    const std::uint32_t scan = registered < k_zc_mark_table_capacity ? registered : k_zc_mark_table_capacity;
+    for (std::uint32_t i = 0; i < scan; ++i)
+    {
+        if (g_zc_marks[i].texture.load(std::memory_order_acquire) != texture)
+            continue;
+        // 命中后必须再校验「这张纹理现在仍是共享 NT 纹理」，否则观测值会撒谎：本表**不清理**
+        // （没有纹理销毁钩子），纹理销毁后地址可被**新**纹理复用 ⇒ 单看指针会把旧序号报给
+        // 一张无关的新纹理。判据用 0x802：真正被注入过的纹理一定带 SHARED_NTHANDLE。
+        // 注意校验的是**调用方传进来的活指针**（此处它一定还活着），不解引用表条目。
+        D3D11_TEXTURE2D_DESC live_desc {};
+        const_cast<ID3D11Texture2D *>(texture)->GetDesc(&live_desc);
+        if ((live_desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) == 0)
+            return 0;
+        return g_zc_marks[i].index.load(std::memory_order_relaxed);
+    }
+    return 0;
+}
+
+// 注册一张刚注入成功的纹理。
+// ① **同址已在表里 ⇒ 覆盖该槽的 index、不新增条目**：纹理销毁后地址可被新纹理复用，若新增
+//   条目，查表时旧条目（同指针）会先命中、把新序号遮蔽掉（表现是序号一直停在上一个）。
+// ② 新条目由 `fetch_add(1)` 认领槽位（并发下不会两个写者抢同一槽）；**顺序固定**：先写 index
+//   ⇒ 再 release 写指针，读者读到指针就一定能读到配套 index。注册计数在认领时就递增 ⇒ 读者
+//   可能短暂扫到「计数已含、指针仍为空」的槽，比较即失败、跳过，无副作用。
+// ③ 极端并发下最坏**丢一条观测记录**（两个创建线程同时注册），不影响注入与预算（那些是
+//   独立的原子计数）。表满同样只丢观测（上限 8 张、容量 32，实际到不了）。
+void zc_register_mark(ID3D11Texture2D *texture, std::uint32_t index)
+{
+    if (texture == nullptr)
+        return;
+    const std::uint32_t registered = g_zc_marks_registered.load(std::memory_order_acquire);
+    const std::uint32_t scan = registered < k_zc_mark_table_capacity ? registered : k_zc_mark_table_capacity;
+    for (std::uint32_t i = 0; i < scan; ++i)
+    {
+        if (g_zc_marks[i].texture.load(std::memory_order_acquire) == texture)
+        {
+            // 同址复用：只改序号，指针与槽位不变（读者按指针比，不会看到中间态）
+            g_zc_marks[i].index.store(index, std::memory_order_relaxed);
+            return;
+        }
+    }
+    const std::uint32_t slot = g_zc_marks_registered.fetch_add(1, std::memory_order_acq_rel);
+    if (slot >= k_zc_mark_table_capacity)
+        return; // 表满：只少一条观测记录
+    g_zc_marks[slot].index.store(index, std::memory_order_relaxed);
+    g_zc_marks[slot].texture.store(texture, std::memory_order_release);
+}
+
+// 预算耗尽到底撞的是哪个上限 —— 四态。`Both` 必须**可达**：所以两个判据必须先各算一次
+// （按「撞张数就先 return」的写法，字节判据根本没算，`Both` 永远不可达 ⇒ 四态是假的）。
+// 数值前提：`Both` 要求「张数与字节同时超」= 9 × 单张字节 > 256 MiB ⇔ 单张 ≥ 29.8 MB，
+// 即 4K 级（3840×2160×4 B ≈ 33.2 MB/张，9 张 ≈ 299 MB）。1920×1080 每张 ≈ 8.3 MB，8 张才
+// 66 MB ⇒ 1080p 下只可能出现 `textures`，`bytes`/`textures+bytes` 只在 4K 及以上出现。
+enum class ZcLimit
+{
+    None,
+    Textures,
+    Bytes,
+    Both,
+};
+
 // 预留一张纹理的预算。成功时 `index` = 第几张（1 基，用于日志与 INFO/DEBUG 分档）；
+// 失败时返回撞到的上限（供 zc_budget_exhausted 的 limit= 字段）。
 // 调用方在注入的 CreateTexture2D 失败时必须调 zc_rollback_budget() 归还。
-bool zc_reserve_budget(std::uint64_t bytes, std::uint32_t &index)
+ZcLimit zc_reserve_budget(std::uint64_t bytes, std::uint32_t &index)
 {
     const std::uint32_t reserved = g_zc_reserved.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (reserved > k_zc_max_textures)
+    // 两个上限都先各算一次，不短路：否则 limit= 的 Both 永远打不出来（见 ZcLimit 注释）。
+    const bool over_textures = reserved > k_zc_max_textures;
+    std::uint64_t current = g_zc_reserved_bytes.load(std::memory_order_relaxed);
+    const bool over_bytes = current + bytes > k_zc_max_bytes;
+    if (over_textures || over_bytes)
     {
         g_zc_reserved.fetch_sub(1, std::memory_order_relaxed);
-        return false;
+        if (over_textures && over_bytes)
+            return ZcLimit::Both;
+        return over_textures ? ZcLimit::Textures : ZcLimit::Bytes;
     }
-    std::uint64_t current = g_zc_reserved_bytes.load(std::memory_order_relaxed);
     for (;;)
     {
+        if (g_zc_reserved_bytes.compare_exchange_weak(current, current + bytes, std::memory_order_relaxed))
+        {
+            index = reserved;
+            return ZcLimit::None;
+        }
+        // CAS 竞争：别人先占了字节额度 ⇒ 这一轮才看见超限。此处张数未超 ⇒ 只可能是 Bytes
+        // （准确反映「挡住它的是字节上限」，不需要也不该再判 Both）。
         if (current + bytes > k_zc_max_bytes)
         {
             g_zc_reserved.fetch_sub(1, std::memory_order_relaxed);
-            return false;
+            return ZcLimit::Bytes;
         }
-        if (g_zc_reserved_bytes.compare_exchange_weak(current, current + bytes, std::memory_order_relaxed))
-            break;
     }
-    index = reserved;
-    return true;
 }
 
 void zc_rollback_budget(std::uint64_t bytes)
@@ -15493,16 +15617,27 @@ void zc_rollback_budget(std::uint64_t bytes)
 
 // 预算耗尽的一次性留痕。没有这一行，日志里只会看到前 8 张 zc_mark、之后全是
 // zc_in=0，看起来像"零拷贝只生效了几张就坏了"——必须说明是预算封顶而不是失败。
-void zc_note_budget_skip()
+// 字段口径（§五.6：累计值 / 当时值写进字段名，不许含糊）：
+//   marked_total        —— 累计注入成功张数
+//   reserved_now        —— 当时已预留张数（含尚未创建成功的）
+//   reserved_bytes_now  —— 当时已预留字节数
+//   skipped_total       —— 累计因预算放弃注入的次数（本行只在第 1 次打印，故通常为 1）
+//   limit               —— 挡住的到底是哪个上限：textures / bytes / textures+bytes（None 时为 none）
+void zc_note_budget_skip(ZcLimit limit)
 {
     const std::uint32_t skipped = g_zc_skipped.fetch_add(1, std::memory_order_relaxed) + 1;
     if (!g_zc_budget_exhausted_logged.exchange(true, std::memory_order_relaxed))
     {
-        LOG_INFO(blog::cat::core, "zc_budget_exhausted marked=" +
+        // 四态各给一个名字；`None` 显式写 none（兜底落进 textures 会让这条日志撒谎）
+        const char *limit_name = limit == ZcLimit::Both ? "textures+bytes"
+            : (limit == ZcLimit::Bytes ? "bytes"
+            : (limit == ZcLimit::Textures ? "textures" : "none"));
+        LOG_INFO(blog::cat::core, "zc_budget_exhausted marked_total=" +
             std::to_string(g_zc_marked.load(std::memory_order_relaxed)) +
-            " reserved=" + std::to_string(g_zc_reserved.load(std::memory_order_relaxed)) +
-            " reserved_bytes=" + std::to_string(g_zc_reserved_bytes.load(std::memory_order_relaxed)) +
-            " skipped=" + std::to_string(skipped) +
+            " reserved_now=" + std::to_string(g_zc_reserved.load(std::memory_order_relaxed)) +
+            " reserved_bytes_now=" + std::to_string(g_zc_reserved_bytes.load(std::memory_order_relaxed)) +
+            " skipped_total=" + std::to_string(skipped) +
+            " limit=" + limit_name +
             " limit_textures=" + std::to_string(k_zc_max_textures) +
             " limit_bytes=" + std::to_string(k_zc_max_bytes));
     }
@@ -15676,7 +15811,8 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
                 // 23/TYPELESS = 4 B/px，1 mip / 1 array / 1 sample ⇒ 字节数可直接算
                 zc_mark_bytes = static_cast<std::uint64_t>(effective_desc->Width) *
                     static_cast<std::uint64_t>(effective_desc->Height) * 4ull;
-                if (zc_reserve_budget(zc_mark_bytes, zc_mark_index))
+                const ZcLimit zc_limit = zc_reserve_budget(zc_mark_bytes, zc_mark_index);
+                if (zc_limit == ZcLimit::None)
                 {
                     zc_texture_desc = *effective_desc;
                     zc_texture_desc.MiscFlags |=
@@ -15686,7 +15822,7 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
                 }
                 else
                 {
-                    zc_note_budget_skip();
+                    zc_note_budget_skip(zc_limit);
                 }
             }
         }
@@ -15713,12 +15849,20 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
     if (zc_injected && SUCCEEDED(result))
     {
         g_zc_marked.fetch_add(1, std::memory_order_relaxed);
+        // 出参必须判空再取（同本函数末尾 native_ldr_final_target_created 的写法）：CreateTexture2D
+        // 成功也可能返回空指针（驱动/参数组合），不判空就解引用会崩游戏。
+        // 只在这个「注入成功」分支注册指针表；rollback 路径不写（那张纹理最终没带共享标志）。
+        ID3D11Texture2D *created_texture = (texture != nullptr) ? *texture : nullptr;
+        const std::uint64_t zc_mark_ptr = reinterpret_cast<std::uintptr_t>(created_texture);
+        if (created_texture != nullptr)
+            zc_register_mark(created_texture, zc_mark_index);
         const std::string zc_line = "zc_mark index=" + std::to_string(zc_mark_index) +
             " size=" + std::to_string(effective_desc->Width) + "x" + std::to_string(effective_desc->Height) +
             " format=" + describe_dxgi_format(effective_desc->Format) +
             " bind=" + hex64(effective_desc->BindFlags) +
             " misc=" + hex64(zc_texture_desc.MiscFlags) +
-            " bytes=" + std::to_string(zc_mark_bytes);
+            " bytes=" + std::to_string(zc_mark_bytes) +
+            " ptr=" + hex64(zc_mark_ptr);
         // 前 16 张 INFO，之后 DEBUG（AGENTS.md §五.6：诊断日志必须有计数闸门）
         if (zc_mark_index <= 16)
             LOG_INFO(blog::cat::core, zc_line);
