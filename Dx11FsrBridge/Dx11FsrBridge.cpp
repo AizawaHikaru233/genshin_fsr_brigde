@@ -398,6 +398,9 @@ struct Config
     // 一样在 FSR2_TRANSLATION_EXPERIMENTAL 段内；该宏关闭时整条 native/ffx12 链本就不编译，
     // set_zero_copy 不会被调用、g_zero_copy 保持 false ⇒ 钩子不装，行为等同键=0。
     bool ffx12_zero_copy = false;
+    // 输出零拷贝（2026-11-28，Stage 2）：同样放在守卫之外 —— 创建钩子的门禁块要读到它。
+    // 语义上依赖 ffx12_zero_copy=1：注入只在输入键的块里求值（见 hooked_create_texture_2d）。
+    bool ffx12_zero_copy_output = false;
     bool show_osd = false;
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     bool enable_similarity_probe = false;
@@ -4602,6 +4605,21 @@ void load_config()
     g_config.ffx12_zero_copy =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ZeroCopy", 0, config_path.c_str()) != 0;
     ffx12::set_zero_copy(g_config.ffx12_zero_copy);
+    // 输出零拷贝（2026-11-28，L2 Stage 2）：1 = 让 FFX 的 UAV 直接写游戏自己的输出 RT，
+    // 跳过每帧一次 display 分辨率的 D3D11 CopyResource；0（默认）= 完全走既有拷贝路径。
+    // 默认值必须与发布 ini（Dx11FsrBridge.package.ini 的 Ffx12ZeroCopyOutput=0）一致。
+    // ★ 依赖 Ffx12ZeroCopy=1：厂商门禁与注入判据都只在输入键=1 的块里求值 —— 单开本键
+    //   不会有任何注入（语义如此，不是故障；ini 注释同口径）。
+    // ★ 无条件读取（不放进 #if DIAGNOSTICS）：这是发布版也要生效的键。
+    g_config.ffx12_zero_copy_output =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ZeroCopyOutput", 0, config_path.c_str()) != 0;
+    // 2026-11-28（审核 P1-1）：请求位必须与「钩子会不会装」同源 —— 钩子安装谓词
+    // need_create_texture_hook() 依赖输入键，单开输出键时本进程根本不会注入；若请求位仍为 1，
+    // 后端会把「本进程不会注入」误读成「请求了但本帧没命中」，默认异步下每帧 reason=async、
+    // 非异步下 reason=not_shared ⇒ 白白打出 4 条 zc_out_fallback 并让累计计数一直涨，
+    // 与「单开输出键=未请求，不是故障」的口径自相矛盾（§五.1 判据与动作同源）。
+    // 故与输入键相与：输入键=0 ⇒ 输出请求位=0 ⇒ 后端 reason 恒 off。
+    ffx12::set_zero_copy_output(g_config.ffx12_zero_copy && g_config.ffx12_zero_copy_output);
     ffx12::set_hdr_input(g_config.ffx12_hdr_input);
     // ---- D13 十键读取（SDS §3.13.1）+ 键 11 NgxCrossKeyReuse：紧邻 Ffx12Hdr 的读取点 ----
     // 此处 blog::init() 尚未执行 ⇒ 11 个 setter 只存值、一行日志都不打；
@@ -14470,6 +14488,13 @@ bool try_fsr2_translation_draw(
                             " zc_reason=" + ffx12::zero_copy_reason() +
                             // zc_mark_of_input=本帧真实输入纹理在标记表里的序号（0=不在表里）
                             " zc_mark_of_input=" + std::to_string(zc_mark_index_of(color_tex)) +
+                            // 输出零拷贝结果（2026-11-28，Stage 2）：zc_out=本帧 FFX 是否直接写进
+                            // 游戏自己的输出纹理（1 = 已跳过输出 CopyResource）；zc_out_reason=短原因串
+                            // （ok/off/async/not_shared/format/size/desc/open/uav）。
+                            // off 也覆盖「键=0 / 门禁 deny / 本帧没有输出目标」。这两个字段在发布版
+                            // 同样存在（只是没有 zc_out_mark 那类诊断留痕），便于用户侧直接判断是否生效。
+                            " zc_out=" + std::to_string(ffx12::zero_copy_last_out() ? 1 : 0) +
+                            " zc_out_reason=" + ffx12::zero_copy_reason_out() +
                             " version=" + ffx12::selected_version_name());
                         if (g_config.ffx12_camera_hook)
                         {
@@ -15906,6 +15931,39 @@ bool zc_input_candidate(const D3D11_TEXTURE2D_DESC &candidate, std::uint32_t bac
     return true;
 }
 
+// 输出零拷贝注入候选判据（2026-11-28，L2 Stage 2 opt-in Ffx12ZeroCopyOutput）。
+// 观测到的目标形态（实测，Stage 2 观测轮）：游戏自己 CreateTexture2D 的离屏输出 RT，
+//   23/R10G10B10A2_TYPELESS、3840×2160（=display 尺寸）、bind=0xA8（RT|SRV|UAV）、misc=0、
+//   单 mip / 单 array / 单 sample；日志 `zc_out_desc … created=1 … reg_bind=0xA8`。
+// ★ 与输入候选互斥：输出要求 Width == backbuffer 且 bind 含 RT；输入要求 Width < backbuffer
+//   （backbuffer 尺寸未知时输入侧放过、输出侧必拒）⇒ 同一张纹理不可能同时被两处注入。
+// ★ **绝不改 BindFlags**：UAV 位本来就有（bind 0xA8），只补 SHARED|SHARED_NTHANDLE(0x802)，
+//   与输入侧同一手法 —— 改 bind 会改变游戏自己的视图可用性。
+// ★ 要求 MiscFlags == 0（原样）：已经带共享标志的纹理（游戏自己共享的、或已注入过的）不再处理，
+//   否则会重复标记、且无法区分「是桥注入的还是游戏自己共享的」。
+bool zc_output_candidate(const D3D11_TEXTURE2D_DESC &candidate, std::uint32_t backbuffer_width,
+    std::uint32_t backbuffer_height)
+{
+    if (candidate.Usage != D3D11_USAGE_DEFAULT || candidate.CPUAccessFlags != 0 ||
+        candidate.MiscFlags != 0)
+        return false;
+    if (candidate.MipLevels != 1 || candidate.ArraySize != 1 || candidate.SampleDesc.Count != 1)
+        return false;
+    if (candidate.Format != DXGI_FORMAT_R10G10B10A2_TYPELESS)
+        return false;
+    // 允许含 UAV（实测 bind=0xA8）——**不检查也不改**该位：少这个位时后端会用 `reason=uav`
+    // 如实报出来（那条 failure 归因比在这里静默拒绝更有诊断价值，观测轮也据此确认过 bind）。
+    if ((candidate.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)) !=
+        (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE))
+        return false;
+    // display 尺寸必须已知且精确相等：分辨率切换的那一帧尺寸未同步，宁可这一帧不注入。
+    if (backbuffer_width == 0 || backbuffer_height == 0)
+        return false;
+    if (candidate.Width != backbuffer_width || candidate.Height != backbuffer_height)
+        return false;
+    return true;
+}
+
 HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D3D11_TEXTURE2D_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial_data, ID3D11Texture2D **texture)
 {
     if (g_config.native_ldr_final_target_unorm && desc != nullptr)
@@ -16002,6 +16060,12 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
     bool zc_injected = false;
     std::uint32_t zc_mark_index = 0;
     std::uint64_t zc_mark_bytes = 0;
+    // ---- 输出零拷贝注入（2026-11-28，L2 Stage 2）----
+    // 与输入侧共用 create_desc / 同一条 fail-open 重试；区别是**不占预算**：输出纹理每实例只有
+    // 2 张双缓冲（场景切换换一对 ⇒ 观测窗口内最多 4 张），不存在输入侧那种无限累积风险，
+    // 加预算上限反而会在 4K 下把每张 33 MB 的额度算进 256 MiB 的输入预算里（两套语义混在一起）。
+    D3D11_TEXTURE2D_DESC zc_out_texture_desc {};
+    bool zc_out_injected = false;
     if (g_config.ffx12_zero_copy && effective_desc != nullptr)
     {
         // 注入门禁（2026-11-28）：把「该不该注入」收成一条判据 = 厂商放行 **且** 后端会真的用它。
@@ -16021,8 +16085,11 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
         //   zc_req=on|off —— 门禁判定**之前**的请求位快照（set_zero_copy(false) 会清掉真值，
         //     若在关之后再读就会永远打 off、看不出「用户其实开了键」）
         //   backend=native|ngx  async=0|1 —— 后端类型与异步交叠（启动期常量）
-        //   inject=on|off —— 综合结论（厂商 && 可注入），真正决定这张纹理会不会被注入
+        //   inject=on|off —— 综合结论（厂商 && 可注入），真正决定**输入侧**注入会不会发生
         //   reason=ok|vendor|backend|async|multiple —— 不注入的原因（优先级 vendor > backend > async）
+        //   out_req=on|off —— 判定**之前**的 Ffx12ZeroCopyOutput 请求位快照（2026-11-28 Stage 2）
+        //   inject_out=on|off —— 输出侧注入的综合结论（= inject && out_req）；它继承同一条门禁，
+        //     deny 时桥会连带 set_zero_copy_output(false) ⇒ 后端请求位与本结论始终同源
         // ⚠️ 首个纹理若早于 route_from_d3d11_device 的补检，这里会如实打 supported=0/action=deny
         //   （未知即 fail-closed），结论就此固定，本进程不再重判。
         const int gate_state_seen = g_zc_gate_state.load(std::memory_order_acquire);
@@ -16036,8 +16103,16 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
             const bool injectable = ffx12::zero_copy_injectable(backend_native, async_overlap);
             const bool inject = vendor_allowed && injectable;
             const bool req_before = ffx12::zero_copy_requested(); // 判定前的请求位快照（§五.6 口径）
+            // 输出零拷贝的请求位快照（2026-11-28 Stage 2）：与 zc_req 同理，必须在清位之前读，
+            // 否则日志恒 off、看不出「用户其实开了 Ffx12ZeroCopyOutput」。
+            const bool out_req_before = ffx12::zero_copy_output_requested();
             if (!inject)
+            {
                 ffx12::set_zero_copy(false);
+                // 门禁 deny ⇒ 输出侧注入同样不能发生（它继承同一条厂商/后端/同步判据）：
+                // 一并清请求位，保证「后端请求位 = 桥是否真的会注入」始终同源（§五.1）。
+                ffx12::set_zero_copy_output(false);
+            }
             const char *reason = "ok";
             if (!vendor_allowed && !injectable)
                 reason = "multiple";
@@ -16057,9 +16132,13 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
                 " supported=" + (vendor_allowed ? "1" : "0") + " need=" + need_hex +
                 " action=" + (vendor_allowed ? "allow" : "deny") +
                 " zc_req=" + (req_before ? "on" : "off") +
+                // out_req= 是**判定前**的输出请求位快照；inject_out= 是综合结论（= allow && out_req），
+                // 即「输出侧到底会不会被注入」。两者分开打，才能区分「用户没开键」与「门禁挡了」。
+                " out_req=" + (out_req_before ? "on" : "off") +
                 " backend=" + (backend_native ? "native" : "ngx") +
                 " async=" + (async_overlap ? "1" : "0") +
                 " inject=" + (inject ? "on" : "off") +
+                " inject_out=" + ((inject && out_req_before) ? "on" : "off") +
                 " reason=" + reason);
             g_zc_gate_state.store(inject ? k_zc_gate_allow : k_zc_gate_deny, std::memory_order_release);
         }
@@ -16073,12 +16152,15 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
         if (gate_state_now == k_zc_gate_allow)
         {
             std::uint32_t backbuffer_width = 0;
+            std::uint32_t backbuffer_height = 0;
             // 尺寸下限先过一遍再取锁：本钩子会看到游戏**所有** CreateTexture2D（含大量
             // 小纹理），不该为不相干的小纹理去取 g_state_mutex。
+            // 输出零拷贝候选要 display 尺寸的宽+高 ⇒ 同一次取锁里一并读（不为第二维再抢一次锁）。
             if (effective_desc->Width >= 1280 && effective_desc->Height >= 720)
             {
                 std::lock_guard lock(g_state_mutex);
                 backbuffer_width = g_state.backbuffer_width;
+                backbuffer_height = g_state.backbuffer_height;
             }
             if (zc_input_candidate(*effective_desc, backbuffer_width))
             {
@@ -16099,6 +16181,23 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
                     zc_note_budget_skip(zc_limit);
                 }
             }
+            // ---- 输出零拷贝候选（2026-11-28，L2 Stage 2）----
+            // 为什么用 else if 而不是并列的 if：两条候选判据互斥（输入要求 Width < backbuffer，
+            // 输出要求 Width == backbuffer），串起来还可以避免「输入侧因预算放弃、输出侧又把它
+            // 当作输出 RT 注入」这种同一张纹理被两次改写 desc 的形态。
+            // 为什么还要再问一次 zero_copy_output_requested()：门禁 deny 时刚刚（可能由别的线程）
+            // 清了请求位，而「桥的注入动作」与「后端请求位」必须同源（§五.1）；门禁 allow 时它是真值。
+            else if (g_config.ffx12_zero_copy_output && ffx12::zero_copy_output_requested() &&
+                zc_output_candidate(*effective_desc, backbuffer_width, backbuffer_height))
+            {
+                // ★ 只补共享标志，**绝不动 BindFlags**：UAV 位本来就有（实测 bind=0xA8），
+                //   改 bind 会改变游戏自己那些视图的可用性。
+                zc_out_texture_desc = *effective_desc;
+                zc_out_texture_desc.MiscFlags |=
+                    D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+                create_desc = &zc_out_texture_desc;
+                zc_out_injected = true;
+            }
         }
         else if (gate_state_now == k_zc_gate_undecided &&
             !g_zc_gate_loser_seen.exchange(true, std::memory_order_relaxed))
@@ -16111,21 +16210,30 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
         }
     }
     HRESULT result = g_original_create_texture_2d(device, create_desc, initial_data, texture);
-    if (zc_injected && FAILED(result))
+    if ((zc_injected || zc_out_injected) && FAILED(result))
     {
         // 注入本身失败（驱动不支持该组合 / 资源不足）：必须按**原 desc** 原样重试一次，
         // 绝不把注入造成的失败暴露给游戏 —— 否则一张本可创建的纹理创建失败就是画面缺失。
+        // 2026-11-28（Stage 2）：输入/输出两条注入路径共用这一条 fallback（fail-open 只写一次）；
+        // 预算只在输入侧占用 ⇒ 只对 zc_injected 归还，漏判/多判都会让预算计数长期失真。
         const HRESULT injected_result = result;
+        const bool was_input_injected = zc_injected;
+        const bool was_output_injected = zc_out_injected;
         result = g_original_create_texture_2d(device, effective_desc, initial_data, texture);
         // 无论重试成败都要归还预算：这张纹理最终没有带上共享标志，占用额度就是错的
-        zc_rollback_budget(zc_mark_bytes);
+        if (was_input_injected)
+            zc_rollback_budget(zc_mark_bytes);
         zc_injected = false;
+        zc_out_injected = false;
         if (SUCCEEDED(result))
         {
             const std::uint32_t fallback = g_zc_create_fallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
             LOG_INFO(blog::cat::core, "zc_create_fallback count=" + std::to_string(fallback) +
                 " size=" + std::to_string(effective_desc->Width) + "x" + std::to_string(effective_desc->Height) +
                 " format=" + describe_dxgi_format(effective_desc->Format) +
+                // path= 标明是**哪条注入路径**失败（Stage 2 起同一钩子里有两条）
+                " path=" + (was_input_injected && was_output_injected ? "in+out" :
+                    (was_input_injected ? "in" : "out")) +
                 " injected_hr=" + hex64(static_cast<std::uint64_t>(static_cast<std::uint32_t>(injected_result))));
         }
     }
@@ -16154,6 +16262,33 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
         else
             LOG_DEBUG(blog::cat::core, zc_line);
     }
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    // ---- 输出零拷贝标记留痕（2026-11-28，Stage 2；**只在诊断构建**）----
+    // 为什么只在诊断构建：验收口径要求发布 DLL 里检索不到 `zc_out_mark`（诊断串不占发布体积、
+    // 也不让发布日志多一条每进程 8 行以上的噪音）。发布版仍有一条 zc_out= 结果字段（来自后端原子位）。
+    if (zc_out_injected && SUCCEEDED(result) && texture != nullptr && *texture != nullptr)
+    {
+        // 8 槽环形记录：先记指针再打日志（槽号由累计次数取模得出）。
+        // index= 是**槽号**（1..8 循环复用），count= 才是累计标记次数 —— 两个数字口径不同（§五.6）。
+        const std::uint32_t mark_count = g_zc_out_mark_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        const std::uint32_t mark_slot = (mark_count - 1) % k_zc_out_mark_slots;
+        ID3D11Texture2D *created_output = *texture;
+        g_zc_out_marks[mark_slot].store(reinterpret_cast<std::uintptr_t>(created_output),
+            std::memory_order_release);
+        // 计数闸门（§五.6）：前 8 条（正好一圈）+ 之后每 256 条一条；release 构建里整段不存在。
+        if (mark_count <= k_zc_out_mark_slots || (mark_count % 256u) == 0)
+        {
+            LOG_INFO(blog::cat::core, std::string("zc_out_mark ptr=") +
+                hex64(reinterpret_cast<std::uintptr_t>(created_output)) +
+                " fmt=" + std::to_string(static_cast<std::uint32_t>(effective_desc->Format)) +
+                " size=" + std::to_string(zc_out_texture_desc.Width) + "x" +
+                std::to_string(zc_out_texture_desc.Height) +
+                " bind=" + hex64(zc_out_texture_desc.BindFlags) +
+                " index=" + std::to_string(mark_slot + 1) +
+                " count=" + std::to_string(mark_count));
+        }
+    }
+#endif
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     // ---- Stage 2 观测（2026-11-28）：登记大尺寸 RT + 探针 display 尺寸 RT（只喂日志）----
     // 只处理「RT 且 ≥1280×720」：登记表口径见 zc_out_register() 上方注释（避免 64 槽被小纹理挤爆）。

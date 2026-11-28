@@ -213,6 +213,23 @@ const char *zero_copy_reason();
 bool zero_copy_injectable(bool &backend_native, bool &async_overlap);
 // 零拷贝请求位的当前真值（= ini 的 Ffx12ZeroCopy，可能已被门禁关闭）。无锁。
 bool zero_copy_requested();
+// ---- 输出零拷贝（Ffx12ZeroCopyOutput，opt-in，默认 0；**依赖 Ffx12ZeroCopy=1**）----
+// 2026-11-28（Stage 2）：桥在创建钩子里给**游戏自己的输出 RT**（23/TYPELESS、display 尺寸、
+// bind 含 RT|SRV，实测 0xA8）注入 SHARED|SHARED_NTHANDLE(0x802)；**不改 BindFlags**（UAV 本来就有），
+// 后端在 dispatch 时打开它、让 FFX 的 UAV 直接写进这张纹理，跳过每帧一次全分辨率 D3D11 CopyResource。
+// 门禁继承输入侧：只有厂商门禁判 allow（NVIDIA + native + 同步）时桥才注入；判 deny 时桥会把
+// set_zero_copy_output(false) 一并清掉 ⇒ 语义上本键只在 Ffx12ZeroCopy=1 时才有意义。
+// ⚠️ 后端侧实现**绝不取 g_mutex**：dispatch_gpu_shared 已持有它（std::timed_mutex 非递归，再取即自锁）。
+void set_zero_copy_output(bool enable);
+// 请求位当前真值（= ini 的 Ffx12ZeroCopyOutput，可能已被门禁关闭）。无锁。
+bool zero_copy_output_requested();
+// 最近一次 dispatch 的输出零拷贝结果（供桥侧低频 ffx12_dispatch 行如实上报）：
+//   last_out 1 = 本帧 FFX 的 UAV 直接写游戏输出纹理（未发输出 CopyResource）
+//   reason    "ok"/"off"/"async"/"not_shared"/"format"/"size"/"desc"/"open"/"uav"
+// 注：失败归因的次数不进本接口 —— 那条 zc_out_fallback 归因行由后端在判定处直接写
+// （原因串只有后端知道），桥侧只需要读结果位，避免多一个「谁能读到谁」的跨 TU 约定。
+bool zero_copy_last_out();
+const char *zero_copy_reason_out();
 // 完成挂起的异步 FFX（等 fence + 拷贝输出到 output_target）。无挂起时立即返回 true。
 // 由桥在 Present 前调用；dispatch 入口也会先 finish 上一帧（防异常路径堆积）。
 bool finish_pending();

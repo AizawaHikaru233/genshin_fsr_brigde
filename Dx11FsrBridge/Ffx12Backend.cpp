@@ -100,6 +100,15 @@ std::atomic_bool g_zero_copy { false };
 std::atomic_bool g_zc_last_in { false };
 std::atomic_bool g_zc_last_in_cached { false };
 std::atomic<const char *> g_zc_reason { "off" };
+// ---- 输出零拷贝（Ffx12ZeroCopyOutput，opt-in，默认 0；依赖 Ffx12ZeroCopy=1）----
+// 2026-11-28（Stage 2）：桥给游戏自己的输出 RT（23/TYPELESS display 尺寸）注入
+// SHARED|SHARED_NTHANDLE(0x802)，这里在 dispatch 时打开并让 FFX 的 UAV 直接写它，
+// 跳过每帧一次 display 分辨率的 D3D11 CopyResource。g_zero_copy_output 只是配置请求位，
+// 真正能不能用还要看门禁/同步/设备就绪（见 zc_output_resolve）。
+std::atomic_bool g_zero_copy_output { false };
+std::atomic_bool g_zc_last_out { false };
+std::atomic<const char *> g_zc_out_reason { "off" };
+std::atomic_uint32_t g_zc_out_failures { 0 }; // 累计「请求了但本帧未命中」次数（日志口径）
 // 挂起的异步 FFX：P2 起 pending 槽**按实例**存放（见 InstanceRes::pending*）——
 // 原先的全局单槽会让甲实例的提交被乙实例的 dispatch 顺手落地，两路输出互相借道，
 // 而且 Present 前只能收一个实例。仍仅 g_async_upscale 时使用；由 dispatch（提交）、
@@ -188,6 +197,17 @@ struct ZcInput
     std::uint64_t tick = 0;      // LRU：最近一次被 dispatch 使用的序号
 };
 
+// 输出零拷贝缓存槽（2026-11-28，Stage 2）。结构与 ZcInput 同构，方向相反：
+// src = 游戏的**输出** RT（FFX 的 UAV 直接写它），tex = 同一纹理的 D3D12 打开结果。
+// src 持引用同样有两个作用：① 缓存键（按指针判等）；② 防游戏释放后地址复用 ——
+// 否则会拿旧的 D3D12 打开结果去写一张新的、语义完全不同的纹理（画面错乱且无报错）。
+struct ZcOutput
+{
+    ComPtr<ID3D11Texture2D> src;
+    SharedTex tex;
+    std::uint64_t tick = 0;
+};
+
 // P2：每个 ffxContext（= 每个 instance_key）独占一整套 GPU 互操作资源。
 //
 // 为什么必须拆（M4，P1 已实机确证）：游戏同时驱动多个 FSR2 上下文时（双相机/画中画），
@@ -272,6 +292,11 @@ struct InstanceRes
     // 本实例白持更多游戏纹理引用（render 尺寸每张约 33MB@4K）且淘汰窗口过大。
     std::array<ZcInput, 2> zc_inputs;
     std::uint64_t zc_tick = 0;
+    // ---- 2026-11-28 Stage 2：输出零拷贝缓存（4 槽，按 ID3D11Texture2D* 判等，LRU by tick）----
+    // 为什么 4 槽（比输入侧多）：实测每实例输出是 2 张双缓冲交替，**场景切换会换一对** ⇒
+    // 观测窗口内出现过 4 个不同指针；2 槽会在每次切换后重开句柄（CreateSharedHandle 是昂贵 CPU 路径）。
+    std::array<ZcOutput, 4> zc_outputs;
+    std::uint64_t zc_out_tick = 0;
 };
 
 // 每实例独立 FSR context（全部实例接管，防历史串流污染）
@@ -294,6 +319,9 @@ bool finish_instance(SdkContext &sc);
 // 输入颜色零拷贝缓存释放（定义在 release_instance_res 之前；ensure_pool 的重建路径
 // 需要显式调用它，故此处提前声明）。
 void release_zc_inputs(InstanceRes &r);
+// 输出零拷贝缓存释放（2026-11-28 Stage 2；理由同上：ensure_pool 重建路径要先放掉
+// 旧的游戏输出纹理引用，否则尺寸切换后 4 个槽会一直钉住已作废的 display 尺寸纹理）。
+void release_zc_outputs(InstanceRes &r);
 std::string g_version_name = "ffx12";
 // 实际匹配到的 provider 版本名（如 "4.1.1"/"4.0.2c"/"3.1.5"）——日志如实上报。
 std::string g_sdk_matched_name = "?";
@@ -957,6 +985,124 @@ bool zc_validate_typed_srv(ID3D11Texture2D *texture)
     return SUCCEEDED(g_d11dev->CreateShaderResourceView(texture, &desc, &srv)) && srv != nullptr;
 }
 
+// 输出落地格式映射（2026-11-28，Stage 2 抽成单一 helper）：FFX 的 UAV 输出不能用 TYPELESS
+// 格式，必须给 typed 变体；资源本体保持游戏的 Typeless 以便 D3D11 侧 CopyResource 格式一致。
+// 为什么抽出来：输出零拷贝要给**游戏输出纹理**算同一个 typed 格式，而池构建（ensure_pool）
+// 也在算 —— 两处各写一份迟早分叉，分叉时的表现是「D3D12 写进去的格式不对」，全程无报错。
+DXGI_FORMAT output_enc_format_for(DXGI_FORMAT fmt)
+{
+    if (fmt == DXGI_FORMAT_R10G10B10A2_TYPELESS)
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+    if (fmt == DXGI_FORMAT_R8G8B8A8_TYPELESS)
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (fmt == DXGI_FORMAT_B8G8R8A8_TYPELESS)
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+    return fmt;
+}
+
+// 输出零拷贝判定（2026-11-28，Stage 2）。返回本帧要直接当 UAV 写的 D3D12 资源
+// （nullptr = 本帧不用零拷贝，调用方照旧写自建共享输出纹理再拷回）。
+// 判定顺序固定（requested → async → target → desc → 缓存/打开 → UAV 标志），每条失败给独立
+// reason 串：日志必须能指出坏在哪一环，否则「zc_out=0」只是个无法定位的结论。
+// ⚠️ 不取任何锁：调用方 dispatch_gpu_shared 已持有 g_mutex（std::timed_mutex 非递归）。
+ID3D12Resource *zc_output_resolve(InstanceRes &r, const FrameInput &input, bool &requested,
+    const char *&reason, DXGI_FORMAT &enc)
+{
+    requested = zero_copy_output_requested();
+    reason = "off";
+    if (!requested)
+        return nullptr;
+    // 异步交叠：游戏可能在本实例 FFX 完成前就去读/覆写这张输出纹理 ⇒ 一律不用（不是失败，是语义限制）。
+    if (g_async_upscale)
+    {
+        reason = "async";
+        return nullptr;
+    }
+    ID3D11Texture2D *const target = input.output_target;
+    if (target == nullptr)
+        return nullptr; // 没有输出目标：本来就没有拷贝可省，reason 保持 off（不算失败）
+    D3D11_TEXTURE2D_DESC desc {};
+    target->GetDesc(&desc);
+    // 没带 SHARED_NTHANDLE ⇒ 这张输出纹理不是桥注入的那张（键=0 / 门禁 deny / 创建早于钩子安装）
+    if ((desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) == 0)
+    {
+        reason = "not_shared";
+        return nullptr;
+    }
+    if (desc.Format != DXGI_FORMAT_R10G10B10A2_TYPELESS)
+    {
+        reason = "format"; // FFX 输出按 23→24 的 typed 映射写；别的格式族没验证过
+        return nullptr;
+    }
+    if (desc.Width != input.display_w || desc.Height != input.display_h)
+    {
+        reason = "size"; // 与 FFX 的 display 尺寸不符（窗口/分辨率切换的那一帧）
+        return nullptr;
+    }
+    if (desc.MipLevels != 1 || desc.ArraySize != 1 || desc.SampleDesc.Count != 1)
+    {
+        reason = "desc";
+        return nullptr;
+    }
+    ZcOutput *entry = nullptr;
+    for (ZcOutput &candidate : r.zc_outputs)
+    {
+        if (candidate.src.Get() == target)
+        {
+            entry = &candidate;
+            break;
+        }
+    }
+    if (entry == nullptr)
+    {
+        // 选空槽；都满时淘汰 tick 最小（最久未用）的槽
+        entry = &r.zc_outputs[0];
+        for (ZcOutput &candidate : r.zc_outputs)
+        {
+            if (!candidate.src)
+            {
+                entry = &candidate;
+                break;
+            }
+            if (candidate.tick < entry->tick)
+                entry = &candidate;
+        }
+        // 复用槽前先清干净：否则旧的 D3D12 打开结果与游戏纹理引用都泄漏
+        if (entry->src)
+        {
+            release_shared_nt(entry->tex);
+            entry->src.Reset();
+        }
+        entry->src = target;
+        // open_shared_nt 读 tex.d11：同一对象再持一份引用（release_shared_nt 会一并释放）
+        entry->tex.d11 = entry->src;
+        entry->tex.w = desc.Width;
+        entry->tex.h = desc.Height;
+        if (!open_shared_nt(entry->tex))
+        {
+            release_shared_nt(entry->tex);
+            entry->src.Reset();
+            entry->tick = 0;
+            reason = "open";
+            return nullptr;
+        }
+        // 句柄能开 ≠ FFX 能把它当 UAV 写：D3D12 打开结果必须带 ALLOW_UNORDERED_ACCESS。
+        // 依据（E1 已实测）：0x802 + bind 0xA8 的 4K fmt23 纹理开放后 flags 含 allow_uav。
+        if ((entry->tex.d12->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0)
+        {
+            release_shared_nt(entry->tex);
+            entry->src.Reset();
+            entry->tick = 0;
+            reason = "uav";
+            return nullptr;
+        }
+    }
+    entry->tick = ++r.zc_out_tick;
+    enc = output_enc_format_for(desc.Format);
+    reason = "ok";
+    return entry->tex.d12.Get();
+}
+
 void release_motion_decode()
 {
     if (g_up_motion_cvt && g_up_motion_cvt_ptr)
@@ -1572,6 +1718,9 @@ bool ensure_pool(const FrameInput &input, SdkContext &sc)
     // 留着只会在下一个 dispatch 被 size 校验拒绝并白占两槽引用（release_instance_res
     // 内部已调过一次，这里是幂等保险 —— 将来若重构 release 路径也不会漏）。
     release_zc_inputs(sc.res);
+    // 输出零拷贝缓存同理必须一起失效：display 尺寸变了，旧的游戏输出纹理已不匹配，
+    // 留着只会让下一个 dispatch 被 size 校验拒绝、并白占 4 个槽的纹理引用（§二.4 引用计数）。
+    release_zc_outputs(sc.res);
     g_render_w = g_render_h = g_display_w = g_display_h = 0;
 
     // 池格式 = 输入纹理的实际格式（CopyResource 要求格式一致；游戏多为 TYPELESS）
@@ -1720,13 +1869,9 @@ bool ensure_pool(const FrameInput &input, SdkContext &sc)
         // FFX 输出格式映射（UAV 不能用 TYPELESS 格式，须用 typed 变体；与
         // ensure_output_landing_resources 同规则）。资源本体保持游戏 Typeless 以便
         // D3D11 CopyResource(游戏输出 ← 共享输出) 格式一致。
-        DXGI_FORMAT enc_fmt = output_fmt;
-        if (output_fmt == DXGI_FORMAT_R10G10B10A2_TYPELESS)
-            enc_fmt = DXGI_FORMAT_R10G10B10A2_UNORM;
-        else if (output_fmt == DXGI_FORMAT_R8G8B8A8_TYPELESS)
-            enc_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
-        else if (output_fmt == DXGI_FORMAT_B8G8R8A8_TYPELESS)
-            enc_fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
+        // 2026-11-28（Stage 2）：映射抽成 output_enc_format_for()，输出零拷贝路径算同一个格式
+        // （两处各写一份迟早分叉，而分叉的表现只是画面对不上、全程无报错）。
+        const DXGI_FORMAT enc_fmt = output_enc_format_for(output_fmt);
         r.output_enc_format = enc_fmt;
         g_output_enc_format = enc_fmt; // 全局镜像（dead path / 诊断）
         g_motion_src_state = D3D12_RESOURCE_STATE_COMMON;
@@ -2310,6 +2455,33 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     }
     if (input.color != nullptr && zc_color == nullptr)
         game_context->CopyResource(r.tex_color.d11.Get(), input.color);
+
+    // ---- 输出零拷贝（2026-11-28，Stage 2，opt-in Ffx12ZeroCopyOutput）----
+    // 命中时 FFX 的 UAV 直接写游戏自己创建的输出 RT，**跳过**下面同步分支里的
+    // `CopyResource(output_target, r.tex_output.d11)`（每帧一次 display 分辨率的拷贝）。
+    // 同步性依据（与输入侧同源，故只允许同步模式）：游戏在这张纹理上的读取排在本帧 dispatch
+    // 之后，而同步分支返回前的 Wait(v2) 保证 FFX 已写完 ⇒ 不会读到半成品。异步交叠不满足
+    // 这一点（游戏可能在本实例 FFX 完成前就覆写它）⇒ 一律不用，reason=async。
+    // 任何一步不成立都回落拷贝路径（fail-open）：绝不因输出零拷贝失败让本帧 dispatch 失败。
+    const char *zc_out_reason = "off";
+    DXGI_FORMAT zc_out_enc = DXGI_FORMAT_UNKNOWN;
+    bool zc_out_req = false;
+    ID3D12Resource *const zc_out = zc_output_resolve(r, input, zc_out_req, zc_out_reason, zc_out_enc);
+    if (zc_out_req)
+    {
+        g_zc_last_out.store(zc_out != nullptr, std::memory_order_relaxed);
+        g_zc_out_reason.store(zc_out_reason, std::memory_order_relaxed);
+        // 一次性失败归因（§五.6：count= 是**累计**次数，不是窗口）：前 4 条 + 之后每 1024 条一条。
+        // 没有这一行时，桥的低频日志只会显示 zc_out=0，看不出是「没注入」还是「注入了但打不开」。
+        // 本行只会在**请求位=1**（= Ffx12ZeroCopy 与 Ffx12ZeroCopyOutput 同时为 1）时产生；
+        // 输入键关闭时桥把请求位按 0 传出 ⇒ 整段不进、不会出现本行（不是「漏了日志」）。
+        if (zc_out == nullptr && std::strcmp(zc_out_reason, "off") != 0)
+        {
+            const std::uint32_t failures = g_zc_out_failures.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (failures <= 4 || (failures % 1024u) == 0)
+                sdk_note(L"zc_out_fallback reason=%hs count=%u", zc_out_reason, failures);
+        }
+    }
     // motion 不再拷贝进共享 raw 纹理——解码 CS 已直接读游戏纹理，
     // 解码结果（共享 R16G16）才是 FFX 的 motion 输入。
     const std::uint64_t t_cs_end = qpc_us();
@@ -2389,7 +2561,12 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
         barrier(resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     // FFX：color/depth/motion 全为共享纹理（SRV），输出直写共享输出（UAV）
-    barrier(r.tex_output.d12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // 2026-11-28（Stage 2）：输出零拷贝命中时写的是**游戏自己的输出纹理**，自建共享输出纹理
+    // 本帧不参与（它的两条 barrier 一并跳过 —— 对没用到的资源做 transition 会让驱动白等）。
+    if (zc_out != nullptr)
+        barrier(zc_out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    else
+        barrier(r.tex_output.d12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     ffxDispatchDescUpscale dispatch {};
     dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
     dispatch.commandList = cmd;
@@ -2408,9 +2585,13 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
             ffxApiGetResourceDX12(r.tex_reactive_share.d12.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
         dispatch.reactive.description.format = FFX_API_SURFACE_FORMAT_R8_UNORM;
     }
-    dispatch.output = ffxApiGetResourceDX12(r.tex_output.d12.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
-    // P2：输出格式取**本实例**池的落地格式（全局镜像会被另一实例的池构建覆盖）
-    dispatch.output.description.format = ffxApiGetSurfaceFormatDX12(r.output_enc_format);
+    dispatch.output = zc_out != nullptr
+        ? ffxApiGetResourceDX12(zc_out, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS)
+        : ffxApiGetResourceDX12(r.tex_output.d12.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    // P2：输出格式取**本实例**池的落地格式（全局镜像会被另一实例的池构建覆盖）。
+    // Stage 2：零拷贝命中时改用**游戏输出纹理**的 typed 映射（同一 helper，23→24）。
+    dispatch.output.description.format =
+        ffxApiGetSurfaceFormatDX12(zc_out != nullptr ? zc_out_enc : r.output_enc_format);
     dispatch.jitterOffset = {input.jitter_x, input.jitter_y};
     dispatch.motionVectorScale = {input.motion_scale_x, input.motion_scale_y};
     dispatch.renderSize = {input.render_w, input.render_h};
@@ -2430,8 +2611,11 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
         sdk_note(L"gpu ffxDispatch rc=%d stage=direct", static_cast<int>(rc));
 
     // 全部归还 COMMON（跨 API 交接契约），再交给 D3D11 侧
-    barrier(r.tex_output.d12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_COMMON);
+    if (zc_out != nullptr)
+        barrier(zc_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    else
+        barrier(r.tex_output.d12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON);
     for (ID3D12Resource *resource : inputs)
         barrier(resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_COMMON);
@@ -2460,7 +2644,10 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     {
         if (FAILED(r.game_ctx4->Wait(g_shared_fence11.Get(), v2)))
             return false;
-        if (input.output_target)
+        // 2026-11-28（Stage 2）：输出零拷贝命中 ⇒ FFX 已直接写进游戏输出纹理，跳过这次全分辨率拷贝。
+        // ⚠️ 上面的 Wait(v2) 必须保留：它才是「FFX 写完 → 游戏可读」的交接点，删掉就会读到半成品。
+        // Flush 本轮同样保留（删它属于另一次单独评估的改动，不与本次混在一起归因）。
+        if (input.output_target && zc_out == nullptr)
             game_context->CopyResource(input.output_target, r.tex_output.d11.Get());
         game_context->Flush();
     }
@@ -2559,6 +2746,25 @@ void release_zc_inputs(InstanceRes &r)
     r.zc_tick = 0;
 }
 
+// 释放某实例的输出零拷贝缓存（2026-11-28，Stage 2）。
+// 与 release_zc_inputs 同构：槽里同时持有「D3D12 打开结果」和「游戏输出纹理引用」，
+// 而 InstanceRes 的其它纹理都是本后端自己创建的，release_shared* 覆盖不到这两个字段 ——
+// 漏掉就是每实例最多 4 张 4K 游戏纹理（≈132MB）+ 4 个 D3D12 资源永久泄漏。
+// 调用点：release_instance_res（LRU 驱逐 / 停机 / 设备移除）、ensure_pool 重建路径。
+void release_zc_outputs(InstanceRes &r)
+{
+    for (ZcOutput &entry : r.zc_outputs)
+    {
+        // 诊断镜像可能正指向这组纹理（只读镜像，先摘掉再放引用，否则留下悬空指针）
+        if (g_mirror_output_tex.Get() == entry.src.Get())
+            g_mirror_output_tex.Reset();
+        release_shared_nt(entry.tex);
+        entry.src.Reset();
+        entry.tick = 0;
+    }
+    r.zc_out_tick = 0;
+}
+
 // 释放某实例**整套** GPU 互操作资源（共享纹理 + 视图 + b0 + ctx4 + pending）。
 // 生命周期要点（最容易泄漏的地方）：
 //   · LRU 驱逐 / 上限 4 轮换时每个实例约 68MB（1080p render + 4K display），不释放
@@ -2576,6 +2782,8 @@ void release_instance_res(SdkContext &sc)
     }
     // 输入颜色零拷贝缓存：先放（内部会顺带摘掉指向游戏纹理的诊断镜像）
     release_zc_inputs(r);
+    // 输出零拷贝缓存同样先放（2026-11-28 Stage 2）：4 个槽都钉着游戏输出纹理的引用
+    release_zc_outputs(r);
     // 诊断镜像若指向本实例的纹理，必须一起清掉（否则留下悬空指针）
     if (g_mirror_color_tex.Get() == r.tex_color.d11.Get())
         g_mirror_color_tex.Reset();
@@ -3502,6 +3710,35 @@ bool zero_copy_injectable(bool &backend_native, bool &async_overlap)
 bool zero_copy_requested()
 {
     return g_zero_copy.load(std::memory_order_relaxed);
+}
+
+// ---- 输出零拷贝（Ffx12ZeroCopyOutput，2026-11-28，Stage 2）----
+void set_zero_copy_output(bool enable)
+{
+    // 与 set_zero_copy 完全同构：不加锁（桥在 load_config 调一次；厂商门禁判 deny 时再调一次
+    // false）。两次都实际早于首个 dispatch；即便并发也只是写原子位，最坏一帧读到旧值。
+    g_zero_copy_output.store(enable, std::memory_order_relaxed);
+    if (!enable)
+    {
+        // 关掉时同步复位「最近一次结果」，否则低频日志仍会显示上一轮的 zc_out=1
+        g_zc_last_out.store(false, std::memory_order_relaxed);
+        g_zc_out_reason.store("off", std::memory_order_relaxed);
+    }
+}
+
+bool zero_copy_output_requested()
+{
+    return g_zero_copy_output.load(std::memory_order_relaxed);
+}
+
+bool zero_copy_last_out()
+{
+    return g_zc_last_out.load(std::memory_order_relaxed);
+}
+
+const char *zero_copy_reason_out()
+{
+    return g_zc_out_reason.load(std::memory_order_relaxed);
 }
 
 bool async_upscale_enabled()

@@ -900,6 +900,26 @@ zc_vendor_gate vendor=0x…. supported=0|1 need=0x10DE action=allow|deny zc_req=
 
 ---
 
+## 14. `Ffx12ZeroCopyOutput`（输出零拷贝，实验键）：已实现并通过单机 E2，性能与跨平台验证未做
+
+**现状**：`Dx11FsrBridge.ini` 的 `[Dx11FsrBridge]` 段新增 `Ffx12ZeroCopyOutput`（默认 `0`）。启用条件与输入侧同源：`Ffx12ZeroCopy=1` + `Ffx12Backend=native` + `Ffx12AsyncUpscale=0` + NVIDIA 厂商门禁放行（桥在创建钩子里只对该粘滞结论为 allow 时，给候选输出纹理追加 `D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE`（**不修改 BindFlags**）；后端在 dispatch 时校验该纹理（`fmt=R10G10B10A2_TYPELESS`、尺寸=display、单 mip/array/sample、打开后 D3D12 flags 含 `ALLOW_UNORDERED_ACCESS`）后用 FFX UAV 直接写入，跳过原先每帧 4K 的 `CopyResource`，仅保留共享 fence 的 `Wait`。
+
+**实测（2026-11-28，RTX 4070 SUPER，3840x2160，native + 同步）**：
+
+- 正向：`zc_vendor_gate … out_req=on inject_out=on reason=ok`；4 张 `zc_out_mark`（两轮场景各 2 张，`fmt=23 / 3840x2160 / bind=0xA8`）；采样行 `zc_out=1 zc_out_reason=ok` 全中，`zc_out_fallback=0`、无 ERROR；同机位 A/B 截图亮度与近白像素占比与键=0 基线一致（无偏色、无新增过曝）。
+- 负向：键=0 ⇒ `zc_out=0 zc_out_reason=off`；`Ffx12Backend=ngx` ⇒ `inject_out=off reason=backend`，不注入、无 `zc_out_mark`。
+
+**未验证 / 待办**：
+
+1. **性能收益未测**：4K 每帧一次 `CopyResource` 的带宽节省未做 PresentMon A/B。注意 `timing` 日志里的 `copy=` 段**不覆盖**输出拷贝（键=0 时同样是 `0us`），不能作为证据。需 `DX11FSRBRIDGE_DIAGNOSTICS=OFF` 的发布构建 + PresentMon 做键 0/1 的 A/B；改善 <1% 按规范写「未测出收益」。
+2. **非 NVIDIA 平台**：与输入侧共用厂商门禁，AMD/Intel 上键=1 等同键=0（刻意回退）；零拷贝本身未在 AMD/Intel 机器验证。
+3. **部署脚本例外**：`scripts/Deploy-Bridge.ps1` 的 `$configValues` **有意不包含** `Ffx12ZeroCopy` 与 `Ffx12ZeroCopyOutput` —— 该脚本每次部署都会覆盖 ini，加进去会抹掉用户手改的 opt-in，也会把发布默认行为改成开启。这是「新增配置键四处同步」的**有意例外**，在此登记；当前生效的四处为 `load_config`、`Dx11FsrBridge.package.ini`、提交信息、本条目。
+4. **后续可改进（独立审核提出，P2）**：① `open`/`uav` 失败无负缓存，坏配置下每帧会重试共享句柄打开；② `release_zc_outputs` 里「摘除诊断镜像」的分支不可达（镜像指针只会等于后端自建的输出纹理，不会等于游戏输出纹理）；③ 诊断构建的 `g_zc_out_marks` 只写不读、无消费者；④ `ensure_output_landing_resources` 里仍有第三份 23→24 typed 格式映射未共用 `output_enc_format_for()`；⑤ 候选判据未要求 `D3D11_BIND_UNORDERED_ACCESS`（实测输出纹理 `bind=0xA8` 已含该位）。
+5. **风险观察项**：给游戏输出纹理补共享位后，游戏**自建 UAV 视图**是否仍成功只有本机 E2 证据（E1 只证明打开后的 D3D12 flags 含 `ALLOW_UNORDERED_ACCESS`）；「与 FFX 并行、且触碰同一输出 RT 的 D3D11 工作」未覆盖。
+
+**相关代码位置**：`Dx11FsrBridge/Dx11FsrBridge.cpp` 的 `Config::ffx12_zero_copy_output`、`zc_output_candidate()`、`hooked_create_texture_2d()` 的注入分支与 `zc_vendor_gate` 日志；`Dx11FsrBridge/Ffx12Backend.cpp` 的 `zc_output_resolve()`、`release_zc_outputs()`、`output_enc_format_for()`、dispatch 内输出 barrier 与跳过 `CopyResource` 的分支。
+---
+
 ## 已解决
 
 ### NGX 参数袋（`NVSDK_NGX_Parameter` 虚表）厂商调用补 SEH 守卫（2026-11-24）
