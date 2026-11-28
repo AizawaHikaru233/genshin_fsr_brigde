@@ -4484,6 +4484,273 @@ static void diag_check_create_params(const NgxInstance &inst)
 static bool g_diag_first_eval_done = false;
 #endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS
 
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+// ============================================================================
+// 2026-11-28（task-22 二轮）：两条整纹理 CopyResource 的 **GPU 侧**耗时（timestamp query）
+//
+// ★ 为什么必须上 GPU 计时：CPU 侧 qpc_us() 量到的只是「提交命令的耗时」—— CopyResource 是
+//   异步 GPU 命令，调用立即返回。同机实机实测（2026-11-28 16:36；4K 输出拷贝、153 fps
+//   场景）38 个 CPU 样本 p50=0.0 µs、mean=0.76 µs、max=13 µs —— 这些数字描述的是驱动/
+//   运行时的提交开销，**不是**拷贝在 GPU 上占用的时间 ⇒ 不能用它回答「这条拷贝值不值得
+//   消除」。CPU 提交开销留在 ngx_in / ngx_out 的 copy_us，本行给 GPU 侧成本（带宽代价），
+//   两者口径不同、不可互相替代。
+//
+// 设计要点（评审关注项逐条对应）：
+//   ① **绝不阻塞渲染线程**：只用 D3D11_ASYNC_GETDATA_DONOTFLUSH 取结果，拿不到（S_FALSE）就
+//      留到下一帧再取；不 Flush、不等待、不轮询 ⇒ 计时不会把 GPU 队列拉直。
+//   ② **Disjoint 必须丢**：D3D11_QUERY_DATA_TIMESTAMP_DISJOINT.Disjoint=TRUE 表示该区间内
+//      GPU 时基被重置/切换（驱动降频、设备丢失、休眠唤醒）⇒ 两个时间戳之差无意义。这类样本
+//      整段丢弃并单独计数（in_disjoint/out_disjoint），不进 avg/max —— 否则一次时钟复位就能
+//      把均值拉成荒谬的数。
+//   ③ **不覆盖未读结果**：2 组 query 轮转；某组结果还没取回就不复用它（记 in_busy/out_busy），
+//      绝不在同一组上重新 Begin（那会丢掉上一条结果）。帧率再高也只是少采几帧，不会算错。
+//      ★ 判读方法：`samples` 恒 0 且 `busy` 持续增长 ⇒ 这台设备/驱动根本没把 query 跑完
+//      （例如 ctx 是延迟上下文、或该划线的设备不支持时间戳）⇒ 本行不可用，不代表拷贝为 0。
+//   ④ **只有诊断构建编译**：query 对象、字段名、格式串、每帧三处调用在发布构建里全部不存在。
+//   ⑤ **建一次、失败即粘性放弃**：CreateQuery 在不支持时间戳的设备上会失败 ⇒ 打一条原因行
+//      后彻底放弃；拷贝路径本身完全不受影响（诊断设施不许把功能带下水）。
+//   ⑥ **生命周期跟设备走**：query 由设备创建，随 shutdown_all()（换设备 / 设备丢失）一起
+//      Reset，绝不让旧设备的 query 到新设备上 Begin。
+// ============================================================================
+
+constexpr int kCopyGpuSets = 2;   // 每组 = TIMESTAMP_DISJOINT + 2×TIMESTAMP；2 组轮转
+
+struct CopyGpuQuerySet
+{
+    Microsoft::WRL::ComPtr<ID3D11Query> disjoint;
+    Microsoft::WRL::ComPtr<ID3D11Query> begin;
+    Microsoft::WRL::ComPtr<ID3D11Query> end;
+    bool pending = false;   // 已 End、结果还没取回；pending 期间禁止复用本组
+};
+
+// 一个方向（输入 / 输出）的计时器 + **窗口**统计（窗口 = 上一条本行到本条之间的帧数）
+struct CopyGpuTimer
+{
+    CopyGpuQuerySet sets[kCopyGpuSets];
+    int cur = -1;                          // 本帧正在写哪一组；-1 = 本帧没测
+    unsigned long long win_samples  = 0;   // 窗口内**有效**样本数
+    unsigned long long win_disjoint = 0;   // 窗口内因 Disjoint=TRUE 丢弃的样本数
+    unsigned long long win_busy     = 0;   // 窗口内因两组都在飞而放弃测量的次数
+    double win_sum_us = 0.0;               // 窗口内有效样本 µs 累加（打印时才求 avg）
+    double win_max_us = 0.0;               // 窗口内最大 µs
+};
+
+CopyGpuTimer g_copy_gpu_in;
+CopyGpuTimer g_copy_gpu_out;
+bool g_copy_gpu_ready = false;               // 12 个 query 已建好
+bool g_copy_gpu_failed = false;              // 建失败/不支持 ⇒ 粘性放弃
+bool g_copy_gpu_fail_logged = false;         // 原因行只打一条（进程级）
+unsigned long long g_copy_gpu_freq_hz = 0;   // 最近一次读到的 GPU 时基（Hz）；换设备即清
+
+// 只丢弃 query 对象与在途状态（不动「是否放弃」的粘性位、不动窗口统计）。
+static void copy_gpu_drop_queries()
+{
+    CopyGpuTimer *timers[2] = { &g_copy_gpu_in, &g_copy_gpu_out };
+    for (CopyGpuTimer *t : timers)
+    {
+        for (int i = 0; i < kCopyGpuSets; ++i)
+        {
+            t->sets[i].disjoint.Reset();
+            t->sets[i].begin.Reset();
+            t->sets[i].end.Reset();
+            t->sets[i].pending = false;
+        }
+        // cur 必须一起清：关停时若停在「已 Begin 未 End」的半个区间上，残留的 cur 会让下一次
+        // dispatch 拿新设备的 query 去收尾旧区间（未定义行为）。
+        t->cur = -1;
+    }
+}
+
+// 设备级关停（shutdown_all 的「清设备」段调用）：释放 query + 复位全部设备级读数。
+static void copy_gpu_on_device_lost()
+{
+    copy_gpu_drop_queries();
+    g_copy_gpu_ready = false;
+    g_copy_gpu_failed = false;   // 新设备值得重试一次（旧设备不支持不代表新设备不支持）
+    g_copy_gpu_freq_hz = 0;      // 时基随设备/驱动变，必须清
+    CopyGpuTimer *timers[2] = { &g_copy_gpu_in, &g_copy_gpu_out };
+    for (CopyGpuTimer *t : timers)
+    {
+        // 窗口统计是设备级读数：换设备后旧样本既不可比也取不回来 ⇒ 一起清。
+        t->win_samples  = 0;
+        t->win_disjoint = 0;
+        t->win_busy     = 0;
+        t->win_sum_us   = 0.0;
+        t->win_max_us   = 0.0;
+    }
+    // g_copy_gpu_fail_logged 故意不清：进程级，避免每次设备重建再刷一条同样的原因行。
+}
+
+// 懒创建：首次进入计时路径时建 12 个 query。为什么不放进 ensure_init：query 只是诊断设施，
+// 创建失败必须**只影响诊断**，绝不能牵进初始化成功判据（那会把诊断故障变成功能性故障）。
+static void copy_gpu_create(ID3D11Device *dev)
+{
+    if (g_copy_gpu_ready || g_copy_gpu_failed)
+        return;
+    if (dev == nullptr)
+    {
+        g_copy_gpu_failed = true;   // 没有设备对象就没法建 query；粘性放弃直到换设备
+        return;
+    }
+
+    const D3D11_QUERY_DESC ts_desc { D3D11_QUERY_TIMESTAMP, 0 };
+    const D3D11_QUERY_DESC dj_desc { D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+    CopyGpuTimer *timers[2] = { &g_copy_gpu_in, &g_copy_gpu_out };
+    bool ok = true;
+    for (CopyGpuTimer *t : timers)
+    {
+        for (int i = 0; i < kCopyGpuSets && ok; ++i)
+        {
+            CopyGpuQuerySet &s = t->sets[i];
+            ok = SUCCEEDED(dev->CreateQuery(&dj_desc, s.disjoint.GetAddressOf())) &&
+                 SUCCEEDED(dev->CreateQuery(&ts_desc, s.begin.GetAddressOf())) &&
+                 SUCCEEDED(dev->CreateQuery(&ts_desc, s.end.GetAddressOf()));
+        }
+    }
+    if (!ok)
+    {
+        g_copy_gpu_failed = true;
+        copy_gpu_drop_queries();   // 已建好的几组也一并放掉，不留半套
+        if (!g_copy_gpu_fail_logged)
+        {
+            g_copy_gpu_fail_logged = true;
+            log_ngx_core(blog::Level::Info,
+                         L"ngx_copy_gpu available=0 reason=create_query "
+                         L"(正常设备上不会出现本条；拷贝路径不受影响)");
+        }
+        return;
+    }
+    g_copy_gpu_ready = true;
+}
+
+// 取回一组结果（异步、绝不阻塞）。返回 true = 这一组已经取完，可以复用。
+static bool copy_gpu_harvest(ID3D11DeviceContext *ctx, CopyGpuQuerySet &s, CopyGpuTimer &t)
+{
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj {};
+    if (ctx->GetData(s.disjoint.Get(), &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+        return false;   // GPU 还没算到 disjoint 的 End：保持 pending，下一帧再取（不丢、不覆盖）
+    // Disjoint=TRUE / Frequency=0 ⇒ 该区间时基不可信 ⇒ 整段丢弃，只计数，不进 avg/max。
+    if (dj.Disjoint != FALSE || dj.Frequency == 0)
+    {
+        ++t.win_disjoint;
+        return true;
+    }
+    std::uint64_t t0 = 0;
+    std::uint64_t t1 = 0;
+    if (ctx->GetData(s.begin.Get(), &t0, sizeof(t0), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+        ctx->GetData(s.end.Get(), &t1, sizeof(t1), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+        return false;   // disjoint 已就绪但时间戳还没好（少见）：继续挂着，下一帧再取
+    if (t1 < t0)
+    {
+        ++t.win_disjoint;   // 计数器回绕/异常：按不可用处理，绝不产生负值样本
+        return true;
+    }
+    const double us = static_cast<double>(t1 - t0) * 1000000.0 / static_cast<double>(dj.Frequency);
+    t.win_sum_us += us;
+    if (us > t.win_max_us)
+        t.win_max_us = us;
+    ++t.win_samples;
+    g_copy_gpu_freq_hz = dj.Frequency;
+    return true;
+}
+
+// 拷贝**之前**调用：先收割上一轮结果，再挑一组空闲 query 打 Begin(disjoint) + 起始时间戳。
+static void copy_gpu_begin(ID3D11DeviceContext *ctx, CopyGpuTimer &t)
+{
+    t.cur = -1;
+    if (ctx == nullptr)
+        return;
+    copy_gpu_create(g_device.Get());
+    if (!g_copy_gpu_ready)
+        return;
+
+    for (int i = 0; i < kCopyGpuSets; ++i)
+    {
+        if (t.sets[i].pending && copy_gpu_harvest(ctx, t.sets[i], t))
+            t.sets[i].pending = false;
+    }
+
+    int pick = -1;
+    for (int i = 0; i < kCopyGpuSets; ++i)
+    {
+        if (!t.sets[i].pending)
+        {
+            pick = i;
+            break;
+        }
+    }
+    if (pick < 0)
+    {
+        ++t.win_busy;   // 两组都还没取回：本帧不测（绝不在未取回的组上重新 Begin）
+        return;
+    }
+    CopyGpuQuerySet &s = t.sets[pick];
+    ctx->Begin(s.disjoint.Get());
+    ctx->End(s.begin.Get());   // D3D11_QUERY_TIMESTAMP 的打点方式是 End()
+    t.cur = pick;
+}
+
+// 拷贝**之后**调用：打结束时间戳、结束 disjoint 区间。只在 begin 成功时配对调用。
+static void copy_gpu_end(ID3D11DeviceContext *ctx, CopyGpuTimer &t)
+{
+    if (t.cur < 0)
+        return;
+    CopyGpuQuerySet &s = t.sets[t.cur];
+    ctx->End(s.end.Get());
+    ctx->End(s.disjoint.Get());   // 顺序硬约束：disjoint 必须最后 End，否则它盖不住结束时间戳
+    s.pending = true;
+    t.cur = -1;
+}
+
+// 打印窗口统计并清零（窗口 = 上一条本行到本条之间的帧数；首条 = 第 1 帧到本条）。
+// ★ 口径（§五.6）：in_*/out_* 全是**窗口**计数；freq_hz 是**当前**时基；
+//   samples=0 时 avg_us 无意义（打 0.0，不代表「耗时为 0」）。
+// ★ 样本有 1~2 帧延迟：结果在**下一次**拷贝前才异步取回（不阻塞的代价）。
+// ★ 可见性前提：本行是 Info 级 ⇒ 需 NgxLogLevel>=2 才可见（实机诊断一般用 3）；默认值 1（error）
+//   时**不会**出现在日志里 —— 这是 §3.10.3 的等级口径，不是本行失效。
+static void copy_gpu_log(std::uint64_t frame_count)
+{
+    if (!g_copy_gpu_ready)
+        return;
+    static std::uint64_t s_last_window_frame = 0;
+    const std::uint64_t window =
+        (s_last_window_frame == 0) ? frame_count : (frame_count - s_last_window_frame);
+    s_last_window_frame = frame_count;
+
+    double in_avg_us = 0.0;
+    double out_avg_us = 0.0;
+    if (g_copy_gpu_in.win_samples != 0)
+        in_avg_us = g_copy_gpu_in.win_sum_us / static_cast<double>(g_copy_gpu_in.win_samples);
+    if (g_copy_gpu_out.win_samples != 0)
+        out_avg_us = g_copy_gpu_out.win_sum_us / static_cast<double>(g_copy_gpu_out.win_samples);
+
+    log_ngx_core(blog::Level::Info,
+                 L"ngx_copy_gpu window=%llu in_samples=%llu in_avg_us=%.1f in_max_us=%.1f "
+                 L"in_disjoint=%llu in_busy=%llu out_samples=%llu out_avg_us=%.1f "
+                 L"out_max_us=%.1f out_disjoint=%llu out_busy=%llu freq_hz=%llu",
+                 static_cast<unsigned long long>(window),
+                 static_cast<unsigned long long>(g_copy_gpu_in.win_samples),
+                 in_avg_us, g_copy_gpu_in.win_max_us,
+                 static_cast<unsigned long long>(g_copy_gpu_in.win_disjoint),
+                 static_cast<unsigned long long>(g_copy_gpu_in.win_busy),
+                 static_cast<unsigned long long>(g_copy_gpu_out.win_samples),
+                 out_avg_us, g_copy_gpu_out.win_max_us,
+                 static_cast<unsigned long long>(g_copy_gpu_out.win_disjoint),
+                 static_cast<unsigned long long>(g_copy_gpu_out.win_busy),
+                 static_cast<unsigned long long>(g_copy_gpu_freq_hz));
+
+    CopyGpuTimer *timers[2] = { &g_copy_gpu_in, &g_copy_gpu_out };
+    for (CopyGpuTimer *t : timers)
+    {
+        t->win_samples  = 0;
+        t->win_disjoint = 0;
+        t->win_busy     = 0;
+        t->win_sum_us   = 0.0;
+        t->win_max_us   = 0.0;
+    }
+}
+#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS
+
 // ============================================================================
 // shutdown_all()：整体关停（SDS §3.9A.1 只给了签名，函数体按 §3.7 第 2 步 /
 // §3.9.7「共同纪律」逐条落地）
@@ -4567,6 +4834,12 @@ void shutdown_all()
     //   （代价只是每次设备重建泄漏一个参数表，设备重建在本项目里是低频事件）。
     release_query_params();
     g_pq_range_cache = OptimalRangeCache {};
+    // 2026-11-28：诊断用的 GPU 计时 query 也归设备所有 —— 必须随设备一起释放，否则换设备/
+    //   设备丢失后旧 query 留在全局，下一次 dispatch 会拿旧设备的 query 去新设备上 Begin
+    //   （未定义行为）。位置：g_device.Reset() **之前**（query 是由这个设备创建的）。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    copy_gpu_on_device_lost();
+#endif
     g_device.Reset();
     g_params = nullptr;
     // ★★ 陷阱 3（T-5 任务书）：**漏清 g_inited ⇒ 下次 dispatch 以为已初始化、直接拿空表 ⇒ 崩溃**。
@@ -5104,7 +5377,34 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     // ★ CopyResource 返回 void，**无法检测失败**；正确性靠建池时的同 desc 构造性约束。
     // ★ 必须在第 8/9 步之前：两个 CS 的 t0 是**游戏的** in.depth / in.motion，
     //   但它们的 t1/颜色通道读的是 inst.color —— 见 §3.7.1 约束 1 的澄清。
+    // 2026-11-28（输入拷贝成本无出口）：本步是**输入侧整纹理拷贝**；与之对称的输出侧回写
+    //   拷贝早就有 copy_us（ngx_out 行），输入侧却没有任何计时 ⇒ 日志无法回答「Stage 1
+    //   省掉的那条输入拷贝究竟值多少」，只能按字节数推算（§一.6 不许用推算代替测量）。
+    //   故在此取样，值作为 ngx_in 行**尾部**新增字段 copy_us 输出（既有字段与顺序不动），
+    //   两侧因此可以直接横向比较。
+    // ★ 为什么这里放 QPC 不违反 §二.5「给纳秒级函数加微秒级探针，测到的是探针」：
+    //   那条红线的实测反例是「探针报 avg_ns=2583、被测逻辑约 1 ns」——**探针比被测对象大**
+    //   3 个数量级，读到的全是探针。本处方向相反：实测（2026-11-28 实机诊断构建，4K/1080p、
+    //   153 fps，窗口均值取中位）输入 13.3 µs / 输出 51.4 µs，与一次 QPC（约 50 ns，量级估计）
+    //   仍差 2~3 个数量级 ⇒ 探针比被测对象**小**，探针误差不改变读数，不构成「测到的是探针」。
+    // ★ 2026-11-28（审查 P2-4，按 §一.5 标注更正）：本段旧稿写「D3D11 侧是数百 µs 量级 ⇒
+    //   两者差 4 个数量级」，该估计**已被上述实测推翻**（真实值 13.3 / 51.4 µs，只差 2~3 个
+    //   数量级）。结论（探针不改变读数）不变，只更正数字与量级；旧稿是按字节数推算的，正是
+    //   §一.6 所禁的「用推算代替测量」，留此记录以防再被当作事实引用。
+    // ★ 即便如此仍按 §二.5「诊断默认关」只在 DX11FSRBRIDGE_ENABLE_DIAGNOSTICS 下编译：
+    //   发布构建里下面两段与 ngx_in 的 copy_us 字段整段不参与编译，热路径零新增操作。
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    const std::uint64_t in_copy_t0 = qpc_us();
+    copy_gpu_begin(ctx, g_copy_gpu_in);   // GPU 侧：起始时间戳（异步结果，不阻塞）
+#endif
     ctx->CopyResource(inst.color.Get(), in.color);
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    copy_gpu_end(ctx, g_copy_gpu_in);     // GPU 侧：结束时间戳 + 结束 disjoint 区间
+    // 2026-11-28（审查 P2-1）：取样点必须与输出侧**同口径** —— 输出侧 copy_us 在 copy_gpu_end
+    //   之后取，故这里也放到 copy_gpu_end 之后：两个方向的 CPU 计时都包含「结束时间戳入队」
+    //   这一步，否则输入侧会少算一次 End 提交，两个数不可直接对照。
+    const std::uint64_t in_copy_us = qpc_us() - in_copy_t0;
+#endif
 
     // ---- 第 8 步：深度提取 + motion 解码（§3.6.1 / §3.6.2 / §3.6.3）----
     if (!ensure_depth_src_srv(in, inst))
@@ -5155,19 +5455,30 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     // ★ 本行是**逐帧**行，绝不与一次性快照的 ngx_core 混用（§3.10.2 末尾的硬约束）。
     // ★ 采样周期用 kNgxJitterSamplePeriod 而非 1024：1024 与抖动相位周期整倍共振，
     //   会让「jitter 在不在动」这个判断永远看到同一个相位（见闸门定义处的实机数字）。
+    // ★ 2026-11-28：尾部字段 copy_us = 第 7 步输入颜色整纹理拷贝的耗时（µs，同一 qpc_us()），
+    //   与 ngx_out 行同口径；**只在诊断构建存在**（发布构建连这段字面量都不编译）⇒ 既有字段
+    //   与其顺序逐字未动，`grep 'ngx_in jitter'` 的前缀与形状仍可解析。
     if (log_gate_win8_jitter(frame_count))
     {
         D3D11_TEXTURE2D_DESC ddesc {}, mdesc {};
         in.depth->GetDesc(&ddesc);
         in.motion->GetDesc(&mdesc);
         log_ngx_core(blog::Level::Info,
-                     L"ngx_in jitter=%.6f,%.6f mvscale=%.1f,%.1f reset=%d dt=%.2f fmt=%d/%d/%d",
+                     L"ngx_in jitter=%.6f,%.6f mvscale=%.1f,%.1f reset=%d dt=%.2f fmt=%d/%d/%d"
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                     L" copy_us=%.1f"
+#endif
+                     ,   // 分隔逗号必须留在 #if 外：两个构建都要有它
                      static_cast<double>(in.jitter_x), static_cast<double>(in.jitter_y),
                      static_cast<double>(in.motion_scale_x), static_cast<double>(in.motion_scale_y),
                      reset_val,
                      static_cast<double>(in.frame_time_delta_ms),
                      static_cast<int>(cdesc.Format), static_cast<int>(ddesc.Format),
-                     static_cast<int>(mdesc.Format));
+                     static_cast<int>(mdesc.Format)
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                     , static_cast<double>(in_copy_us)
+#endif
+                     );
     }
 
     // 2026-11-24（T2a 收口）：本函数所有参数袋写入共用一个出参（SDS §2.4：复用同一个
@@ -5348,7 +5659,13 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     inst.first = false;
 
     const std::uint64_t copy_t0 = qpc_us();
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    copy_gpu_begin(ctx, g_copy_gpu_out);   // GPU 侧：起始时间戳（异步结果，不阻塞）
+#endif
     ctx->CopyResource(in.output_target, inst.output.Get());
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    copy_gpu_end(ctx, g_copy_gpu_out);     // GPU 侧：结束时间戳 + 结束 disjoint 区间
+#endif
     const std::uint64_t copy_us = qpc_us() - copy_t0;
 
     // ngx_out 行（§3.10.1 输出侧；逐帧 = **debug**；失败才用 error）
@@ -5358,6 +5675,12 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
         log_ngx_core(blog::Level::Debug, L"ngx_out copy out=%dx%d fmt=%d copy_us=%.1f",
                      static_cast<int>(inst.dw), static_cast<int>(inst.dh),
                      static_cast<int>(odesc.Format), static_cast<double>(copy_us));
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+        // 2026-11-28：两条整纹理拷贝的 **GPU 侧**成本。CPU 侧 copy_us 只量到提交开销
+        //   （实机 p50=0.0 µs），真实带宽成本只能由 timestamp query 给出；样本有 1~2 帧
+        //   延迟（异步取回，绝不阻塞）。字段口径见 copy_gpu_* 块的说明。
+        copy_gpu_log(frame_count);
+#endif
     }
 
     // ngx_core eval 成功行（**info**；每 1024 帧一次，与抖动相位无关，故不跟随 kNgxJitterSamplePeriod）
