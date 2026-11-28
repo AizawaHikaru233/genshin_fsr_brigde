@@ -898,6 +898,28 @@ zc_vendor_gate vendor=0x…. supported=0|1 need=0x10DE action=allow|deny zc_req=
 
 **相关代码位置**：`Dx11FsrBridge/Dx11FsrBridge.cpp` 的 `Config::ffx12_zero_copy`、`need_create_texture_hook()`、`zc_input_candidate()`、`hooked_create_texture_2d()`、注入门禁的 `k_zc_vendor_nvidia`/`g_adapter_vendor`/`g_zc_gate_state`（三态常量 `k_zc_gate_undecided`/`k_zc_gate_allow`/`k_zc_gate_deny`）/`g_zc_gate_loser_seen`/`zc_vendor_gate`/`zc_gate_loser_skip` 与 `record_adapter_info()`；`Dx11FsrBridge/Ffx12Backend.h` 的 `zero_copy_injectable()`/`zero_copy_requested()`；`Dx11FsrBridge/Ffx12Backend.cpp` 的 `ZcInput`、`set_zero_copy()`、`zero_copy_enabled()`、dispatch 决策块、`release_zc_inputs()`；`Dx11FsrBridge/Dx11FsrBridge.package.ini` 的 `Ffx12ZeroCopy`。
 
+### 厂商门禁的扩展步骤（面向后续接手者，2026-11-28 补）
+
+门禁**只有一处判据**：纹理创建钩子里的 `vendor_allowed = gate_vendor == k_zc_vendor_nvidia`；结论写入粘滞三态 `g_zc_gate_state`（`undecided` / `allow` / `deny`），一次判定、本进程不再重判。要放行别的厂商，**只改那一处谓词**（例如改成允许集合判断 `v == 0x10DEu || v == 0x1002u`），不需要动其它任何地方。
+
+**必须遵守的边界**（改动下面任一处都会让门禁失效或误伤别的键）：
+
+1. 不要把这个条件塞进 `need_create_texture_hook()`：钩子安装早于适配器路由（此刻厂商未知 ⇒ 条件恒假 ⇒ 钩子永不安装），且该谓词还被纹理创建追踪与 LDR 终态两个诊断键共用。
+2. 不要改判定时机：必须在厂商已落值、纹理创建时判定；`g_adapter_vendor == 0`（未知）时 fail-closed 是刻意行为，不是缺陷。
+3. 不要改 `zero_copy_injectable()`：它判的是「后端类型 + 异步交叠」，与厂商正交。
+4. 不要为放行而放宽 `zc_input_candidate()` / `zc_output_candidate()` 的尺寸/格式判据与张数/字节预算：那些决定「哪些纹理值得共享」，不是「本厂商能否共享」。
+
+**放行后仍然可能不生效**：注入还要求 `Ffx12Backend=native` 且 `Ffx12AsyncUpscale=0`，否则日志给出 `reason=backend` / `reason=async`、`inject=off`。
+
+**改代码之前必须先拿到目标厂商的证据链**（顺序不可颠倒）：
+
+1. **E1 探针**：确认该驱动下「D3D11 创建时注入 `0x802` 的纹理」能被 D3D12 打开并按 typed SRV 正确读取（NVIDIA 上的实测口径：打开后 flags 含 `ALLOW_UNORDERED_ACCESS`、typed SRV 逐字节比对 `diff_bytes=0`）。失败形态是**黑屏/花屏而不是报错**，所以这一步不能只看返回值。
+2. **E2 实机**：用放行后的构建按本节的观测口径跑（输入侧 `zc_mark` / `zc_first_hit` / 采样派发行的 `zc_in=1`；输出侧 `zc_out_mark` 与 `zc_out=1`），至少覆盖两次场景切换与 10 分钟以上连续运行。
+3. **失败即回退**：若出现黑屏/花屏/崩溃，保留失败记录并把门禁改回单厂商（按仓库规范标注被证伪的结论，而不是删掉记录）。
+
+**长期支持多厂商时需要补的**：门禁日志行现在只有单值 `need=0x…`。多厂商放行后应改成打「允许集合」或逐厂商分行，否则日志无法区分「实测放行的厂商」与「默认拒绝的厂商」。
+
+**刻意不做的事**：目前**不**提供 ini 键或环境变量来关闭厂商门禁。理由：该路径的失败形态是黑屏，把开关暴露给用户等于把未验证组合的风险直接下放；实验者要验证，请改上面这一处谓词并自行构建（产物不随包分发）。
 ---
 
 ## 14. `Ffx12ZeroCopyOutput`（输出零拷贝，实验键）：已实现并通过单机 E2，性能与跨平台验证未做
@@ -912,7 +934,7 @@ zc_vendor_gate vendor=0x…. supported=0|1 need=0x10DE action=allow|deny zc_req=
 **未验证 / 待办**：
 
 1. **性能收益未测**：4K 每帧一次 `CopyResource` 的带宽节省未做 PresentMon A/B。注意 `timing` 日志里的 `copy=` 段**不覆盖**输出拷贝（键=0 时同样是 `0us`），不能作为证据。需 `DX11FSRBRIDGE_DIAGNOSTICS=OFF` 的发布构建 + PresentMon 做键 0/1 的 A/B；改善 <1% 按规范写「未测出收益」。
-2. **非 NVIDIA 平台**：与输入侧共用厂商门禁，AMD/Intel 上键=1 等同键=0（刻意回退）；零拷贝本身未在 AMD/Intel 机器验证。
+2. **非 NVIDIA 平台**：与输入侧共用厂商门禁，AMD/Intel 上键=1 等同键=0（刻意回退）；零拷贝本身未在 AMD/Intel 机器验证。放行其它厂商的完整步骤见 §13 的「厂商门禁的扩展步骤」。
 3. **部署脚本例外**：`scripts/Deploy-Bridge.ps1` 的 `$configValues` **有意不包含** `Ffx12ZeroCopy` 与 `Ffx12ZeroCopyOutput` —— 该脚本每次部署都会覆盖 ini，加进去会抹掉用户手改的 opt-in，也会把发布默认行为改成开启。这是「新增配置键四处同步」的**有意例外**，在此登记；当前生效的四处为 `load_config`、`Dx11FsrBridge.package.ini`、提交信息、本条目。
 4. **后续可改进（独立审核提出，P2）**：① `open`/`uav` 失败无负缓存，坏配置下每帧会重试共享句柄打开；② `release_zc_outputs` 里「摘除诊断镜像」的分支不可达（镜像指针只会等于后端自建的输出纹理，不会等于游戏输出纹理）；③ 诊断构建的 `g_zc_out_marks` 只写不读、无消费者；④ `ensure_output_landing_resources` 里仍有第三份 23→24 typed 格式映射未共用 `output_enc_format_for()`；⑤ 候选判据未要求 `D3D11_BIND_UNORDERED_ACCESS`（实测输出纹理 `bind=0xA8` 已含该位）。
 5. **风险观察项**：给游戏输出纹理补共享位后，游戏**自建 UAV 视图**是否仍成功只有本机 E2 证据（E1 只证明打开后的 D3D12 flags 含 `ALLOW_UNORDERED_ACCESS`）；「与 FFX 并行、且触碰同一输出 RT 的 D3D11 工作」未覆盖。

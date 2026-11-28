@@ -1266,6 +1266,10 @@ std::atomic_bool g_zc_gate_loser_seen { false };
 //   · 纹理钩子若经 ensure_context_device_texture_hook 迟到安装、路由从未跑过，vendor 恒 0
 //     ⇒ 键=1 也等同键=0。
 //   · route 的 IDXGIDevice / GetAdapter / GetDesc 任一失败 ⇒ 不落 vendor ⇒ 同样 fail-closed。
+// ⑥ 要放行其它厂商（AMD/Intel）时，判据只有下面 inject 计算里的 vendor_allowed 这一处，改它即可；
+//   但必须先在该厂商上完成 E1 探针（注入 0x802 的纹理能否被 D3D12 打开、typed SRV 是否逐字节一致）
+//   与 E2 实机 —— 该路径的失败形态是黑屏/花屏而不是报错，不能靠代码推断。完整步骤（含必须遵守的
+//   四处边界、放行后仍可能被后端/异步条件挡掉）见 docs/OPEN-ISSUES.md §13「厂商门禁的扩展步骤」。
 
 HRESULT WINAPI hooked_create_device_and_swapchain(
     IDXGIAdapter *adapter,
