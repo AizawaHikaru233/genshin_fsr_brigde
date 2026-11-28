@@ -379,7 +379,7 @@ pwsh -File .\Build-OnlineInstaller.ps1 -Configuration Release
 
 不配证书时打包照常进行，但会打印一次"本次产物未签名"的警告；配了证书却签失败会**直接中止**（`-RequireSigning` 可强制要求签名）。也可以单独签已编译好的产物：`pwsh -File .\scripts\Sign-Binaries.ps1`（加 `-VerifyOnly` 只校验）。上游组件（OptiScaler / ReShade / DLSS / FFX / FPS Unlocker）一律不签。
 
-⚠️ 自签名**不等于可信**：没把证书导入「受信任的根证书颁发机构」的机器上仍显示"未知发布者"，也拿不到 SmartScreen 信任；要让提示消失，把生成的 `.cer` 用 `certutil -addstore Root` 与 `-addstore TrustedPublisher` 导入。私钥（`.pfx`）默认生成在仓库外的 `%LOCALAPPDATA%\FSR\signing\`，**不要提交、不要随包分发**。
+⚠️ 自签名**不等于可信**：没把证书导入「受信任的根证书颁发机构」的机器上仍显示"未知发布者"，也拿不到 SmartScreen 信任；要让提示消失，把生成的 `.cer` 用 `certutil -addstore Root` 与 `-addstore TrustedPublisher` 导入。私钥（`.pfx`）默认生成在仓库外的 `%LOCALAPPDATA%\FSR\signing\`，**不要提交、不要随包分发**。想把私钥放在别处（云盘、移动硬盘等）：在 `%LOCALAPPDATA%\FSR\signing\pfx-path.txt` 里写一行 PFX 完整路径即可，打包脚本与签名脚本都按这一行解析（仓库里不出现任何本机路径）。
 
 ## 日志与问题反馈
 

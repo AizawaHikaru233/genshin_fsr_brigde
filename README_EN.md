@@ -386,7 +386,7 @@ pwsh -File .\Build-OnlineInstaller.ps1 -Configuration Release
 
 Without a certificate packaging still succeeds but prints a one-time "artifacts are unsigned" warning; with a certificate configured, a signing failure **aborts** the run (`-RequireSigning` makes signing mandatory). Already-built binaries can be signed separately: `pwsh -File .\scripts\Sign-Binaries.ps1` (`-VerifyOnly` only verifies). Upstream components (OptiScaler / ReShade / DLSS / FFX / FPS Unlocker) are never signed.
 
-⚠️ Self-signing is **not** trust: machines that have not imported the certificate into *Trusted Root Certification Authorities* still show "Unknown publisher" and SmartScreen keeps ignoring it — import the generated `.cer` with `certutil -addstore Root` and `-addstore TrustedPublisher` to silence the prompt. The private key (`.pfx`) is written outside the repository, under `%LOCALAPPDATA%\FSR\signing\` — **never commit it or ship it in a package**.
+⚠️ Self-signing is **not** trust: machines that have not imported the certificate into *Trusted Root Certification Authorities* still show "Unknown publisher" and SmartScreen keeps ignoring it — import the generated `.cer` with `certutil -addstore Root` and `-addstore TrustedPublisher` to silence the prompt. The private key (`.pfx`) is written outside the repository, under `%LOCALAPPDATA%\FSR\signing\` — **never commit it or ship it in a package**. To keep the key somewhere else (cloud drive, external disk), put its full path on a single line in `%LOCALAPPDATA%\FSR\signing\pfx-path.txt`; both the packaging script and the signing script resolve the certificate through that line, so no machine-specific path ever lands in the repository.
 
 ## Logs and Issue Feedback
 

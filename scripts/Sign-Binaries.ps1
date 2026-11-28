@@ -77,34 +77,24 @@ function Get-SignToolPath
     throw '找不到 signtool.exe：装 Windows SDK（Signing Tools），或把 signtool 加进 PATH。'
 }
 
-# ---- 解析证书来源 ----
-# 默认 PFX 只在"没指定证书"时兜底。`-VerifyOnly` 允许完全没有证书（此时只校验签名存在 /
-# 哈希一致 / 有时间戳，不比对签名者）—— 这样别人拿到发布包也能就地验签名，不必持有私钥。
-if ([string]::IsNullOrWhiteSpace($Pfx) -and [string]::IsNullOrWhiteSpace($Thumbprint))
+# ---- 解析证书来源（唯一实现见 scripts\SigningConfig.ps1，打包脚本共用同一份规则）----
+. (Join-Path $PSScriptRoot 'SigningConfig.ps1')
+$cert = Resolve-SigningCertificate -Pfx $Pfx -Thumbprint $Thumbprint -AllowMissing:([bool]$VerifyOnly)
+if ($cert.Configured)
 {
-    $defaultPfx = Join-Path $env:LOCALAPPDATA 'FSR\signing\fsr-codesign.pfx'
-    if (Test-Path -LiteralPath $defaultPfx -PathType Leaf) { $Pfx = $defaultPfx }
+    $Pfx = $cert.Pfx
+    $Thumbprint = $cert.Thumbprint
 }
-if ([string]::IsNullOrWhiteSpace($Pfx) -and [string]::IsNullOrWhiteSpace($Thumbprint))
+else
 {
-    if (-not $VerifyOnly)
-    {
-        throw ('没有可用证书：请用 -Pfx <pfx> 或 -Thumbprint <sha1>，或先跑 ' +
-            'scripts\New-SigningCertificate.ps1 生成默认 PFX，或设 FSR_SIGN_PFX / FSR_SIGN_THUMBPRINT。')
-    }
     Write-Host '未指定证书：只校验"签名存在 / 哈希一致 / 有时间戳"，不比对签名者指纹。' -ForegroundColor Yellow
 }
-if (-not [string]::IsNullOrWhiteSpace($Pfx))
+if (-not [string]::IsNullOrWhiteSpace($Pfx) -and [string]::IsNullOrWhiteSpace($PfxPassword) -and -not $VerifyOnly)
 {
-    if (-not (Test-Path -LiteralPath $Pfx -PathType Leaf)) { throw "PFX 不存在：$Pfx" }
-    if ([string]::IsNullOrWhiteSpace($PfxPassword) -and -not $VerifyOnly)
-    {
-        throw 'PFX 需要口令：设环境变量 FSR_SIGN_PFX_PASSWORD，或用 -PfxPassword 传入。'
-    }
+    throw 'PFX 需要口令：设环境变量 FSR_SIGN_PFX_PASSWORD，或用 -PfxPassword 传入。'
 }
 
-# 期望的签名者指纹（校验用）：指纹模式直接用传入值；PFX 模式从 PFX 里读（需要口令）。
-# 拿不到就是 $null ⇒ 校验时跳过指纹比对（只有 -VerifyOnly 允许这种情况）。
+# 期望的签名者指纹（校验用）：能拿到就比对，拿不到就跳过（只有 -VerifyOnly 允许）。
 $expectedThumbprint = $null
 if (-not [string]::IsNullOrWhiteSpace($Thumbprint))
 {
@@ -120,8 +110,8 @@ elseif (-not [string]::IsNullOrWhiteSpace($Pfx) -and -not [string]::IsNullOrWhit
 
 $signTool = Get-SignToolPath
 if ($VerifyOnly) { $signMode = '只校验（-VerifyOnly，不签名）' }
-elseif (-not [string]::IsNullOrWhiteSpace($Thumbprint)) { $signMode = "thumbprint $expectedThumbprint" }
-else { $signMode = "pfx $(Split-Path -Leaf $Pfx)" }
+elseif (-not [string]::IsNullOrWhiteSpace($Thumbprint)) { $signMode = "thumbprint $expectedThumbprint（来源：$($cert.Source)）" }
+else { $signMode = "pfx $(Split-Path -Leaf $Pfx)（来源：$($cert.Source)）" }
 Write-Host "签名工具：$signTool" -ForegroundColor Cyan
 Write-Host "证书来源：$signMode" -ForegroundColor Cyan
 Write-Host "时间戳  ：$(if ($NoTimestamp) { '不打（-NoTimestamp）' } else { $TimestampUrl })" -ForegroundColor Cyan

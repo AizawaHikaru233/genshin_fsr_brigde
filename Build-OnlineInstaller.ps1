@@ -52,21 +52,15 @@ $ErrorActionPreference = 'Stop'
 
 $root = [IO.Path]::GetFullPath((Split-Path -Parent $PSCommandPath))
 
-# ---- 签名配置解析 ----
-# 未配置 = 不签名（但会打印一次醒目警告，避免"安静地发出未签名包"）。默认 PFX 放在**仓库外**
-# 的用户目录：私钥一旦进仓库或被 .gitignore 之外的路径带出去，等于把发布者身份送人。
-$script:signPfxPath = ''
-$script:signingThumbprint = ''
-if (-not [string]::IsNullOrWhiteSpace($SignPfx)) { $script:signPfxPath = [IO.Path]::GetFullPath($SignPfx) }
-if (-not [string]::IsNullOrWhiteSpace($SignThumbprint)) { $script:signingThumbprint = $SignThumbprint.Replace(' ', '') }
-if ([string]::IsNullOrWhiteSpace($script:signPfxPath) -and [string]::IsNullOrWhiteSpace($script:signingThumbprint)) {
-    $defaultSignPfx = Join-Path $env:LOCALAPPDATA 'FSR\signing\fsr-codesign.pfx'
-    if (Test-Path -LiteralPath $defaultSignPfx -PathType Leaf) { $script:signPfxPath = $defaultSignPfx }
-}
-$script:signingEnabled = (-not [string]::IsNullOrWhiteSpace($script:signPfxPath)) -or (-not [string]::IsNullOrWhiteSpace($script:signingThumbprint))
+# ---- 签名配置解析（规则唯一实现见 scripts\SigningConfig.ps1，签名脚本共用同一份）----
+# 未配置 = 不签名（但会打印一次醒目警告，避免"安静地发出未签名包"）。私钥路径**不写进仓库**：
+# 本机用 `%LOCALAPPDATA%\FSR\signing\pfx-path.txt` 指到实际位置（换仓库/换盘符只改那一行）。
+. (Join-Path $root 'scripts\SigningConfig.ps1')
+$script:signCert = Resolve-SigningCertificate -Pfx $SignPfx -Thumbprint $SignThumbprint -AllowMissing
+$script:signingEnabled = $script:signCert.Configured
 if (-not $script:signingEnabled -and $RequireSigning) {
-    throw ('-RequireSigning 要求签名，但没有证书：请用 -SignPfx/-SignThumbprint，或先跑 ' +
-        'scripts\New-SigningCertificate.ps1 生成默认 PFX（%LOCALAPPDATA%\FSR\signing\）。')
+    throw ('-RequireSigning 要求签名，但没有可用证书：请用 -SignPfx / -SignThumbprint，或先跑 ' +
+        'scripts\New-SigningCertificate.ps1 生成，或在 `%LOCALAPPDATA%\FSR\signing\pfx-path.txt` 写一行 PFX 路径。')
 }
 $script:signWarned = $false
 $installerSource = Join-Path $root 'tools\FpsUnlockInstaller'
@@ -740,8 +734,8 @@ function Invoke-ReleaseSigning {
         return
     }
     $signParams = @{ Paths = $existing; TimestampUrl = $SignTimestampUrl }
-    if (-not [string]::IsNullOrWhiteSpace($script:signingThumbprint)) { $signParams['Thumbprint'] = $script:signingThumbprint }
-    else { $signParams['Pfx'] = $script:signPfxPath }
+    if (-not [string]::IsNullOrWhiteSpace($script:signCert.Thumbprint)) { $signParams['Thumbprint'] = $script:signCert.Thumbprint }
+    else { $signParams['Pfx'] = $script:signCert.Pfx }
     & (Join-Path $root 'scripts\Sign-Binaries.ps1') @signParams
 }
 
