@@ -368,6 +368,26 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 
 `-FetchUpstream` combines both steps. The four first-party DLLs (Bridge / AntiPlayerMosaic / TextureLoader / FufuGraphicsPlugin) are compiled automatically by the build script with the Ninja generator; no manual cmake invocation is needed.
 
+### Code Signing (optional)
+
+First-party binaries are **unsigned** by default. To sign them, generate a self-signed code-signing certificate on your machine first (it only writes files; nothing is added to any certificate store):
+
+```powershell
+$env:FSR_SIGN_PFX_PASSWORD = '<password>'
+pwsh -File .\scripts\New-SigningCertificate.ps1
+```
+
+Then package with the same environment variable set — the script signs the four first-party DLLs and the graphical installer, and reads every signature back to check it (signature, hash, signer thumbprint, timestamp):
+
+```powershell
+$env:FSR_SIGN_PFX_PASSWORD = '<password>'
+pwsh -File .\Build-OnlineInstaller.ps1 -Configuration Release
+```
+
+Without a certificate packaging still succeeds but prints a one-time "artifacts are unsigned" warning; with a certificate configured, a signing failure **aborts** the run (`-RequireSigning` makes signing mandatory). Already-built binaries can be signed separately: `pwsh -File .\scripts\Sign-Binaries.ps1` (`-VerifyOnly` only verifies). Upstream components (OptiScaler / ReShade / DLSS / FFX / FPS Unlocker) are never signed.
+
+⚠️ Self-signing is **not** trust: machines that have not imported the certificate into *Trusted Root Certification Authorities* still show "Unknown publisher" and SmartScreen keeps ignoring it — import the generated `.cer` with `certutil -addstore Root` and `-addstore TrustedPublisher` to silence the prompt. The private key (`.pfx`) is written outside the repository, under `%LOCALAPPDATA%\FSR\signing\` — **never commit it or ship it in a package**.
+
 ## Logs and Issue Feedback
 
 Bridge and the anti-mosaic component retain error logs by default (when OptiScaler/ReShade are connected, they also retain their own logs). Each new run overwrites the previous run's logs.

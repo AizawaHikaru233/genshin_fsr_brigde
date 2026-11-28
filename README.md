@@ -361,6 +361,26 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 
 需要先更新组件再打包时可合并为 `-FetchUpstream`。四个自有 DLL（Bridge / AntiPlayerMosaic / TextureLoader / FufuGraphicsPlugin）由构建脚本以 Ninja 生成器自动编译，无需手动执行 cmake。
 
+### 代码签名（可选）
+
+自有二进制默认**不签名**。要签，先在本机生成一把自签名代码签名证书（只写文件，不写入证书存储）：
+
+```powershell
+$env:FSR_SIGN_PFX_PASSWORD = '<口令>'
+pwsh -File .\scripts\New-SigningCertificate.ps1
+```
+
+然后带着同一个环境变量打包即可 —— 脚本会签 4 个自有 DLL 与图形安装器，并回读校验签名、哈希、签名者指纹与时间戳：
+
+```powershell
+$env:FSR_SIGN_PFX_PASSWORD = '<口令>'
+pwsh -File .\Build-OnlineInstaller.ps1 -Configuration Release
+```
+
+不配证书时打包照常进行，但会打印一次"本次产物未签名"的警告；配了证书却签失败会**直接中止**（`-RequireSigning` 可强制要求签名）。也可以单独签已编译好的产物：`pwsh -File .\scripts\Sign-Binaries.ps1`（加 `-VerifyOnly` 只校验）。上游组件（OptiScaler / ReShade / DLSS / FFX / FPS Unlocker）一律不签。
+
+⚠️ 自签名**不等于可信**：没把证书导入「受信任的根证书颁发机构」的机器上仍显示"未知发布者"，也拿不到 SmartScreen 信任；要让提示消失，把生成的 `.cer` 用 `certutil -addstore Root` 与 `-addstore TrustedPublisher` 导入。私钥（`.pfx`）默认生成在仓库外的 `%LOCALAPPDATA%\FSR\signing\`，**不要提交、不要随包分发**。
+
 ## 日志与问题反馈
 
 Bridge 和反虚化组件默认会保留错误日志（接入 OptiScaler/ReShade 时它们也会保留各自日志）。每次重新运行会覆盖上一轮日志。

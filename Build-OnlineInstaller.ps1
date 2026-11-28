@@ -19,7 +19,7 @@
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 [-Configuration Release]
-#   [-GithubOnly] [-FetchUpstream] [-SevenZipPath <7z.exe>]
+#   [-GithubOnly] [-FetchUpstream] [-SevenZipPath <7z.exe>] [-SignPfx <pfx> | -SignThumbprint <sha1>]
 [CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release', 'RelWithDebInfo', 'MinSizeRel')]
@@ -34,13 +34,41 @@ param(
     # 旧行为（PS1 安装脚本）已不再是默认，保留 -GuiInstaller 只为兼容旧命令行，可省略。
     [switch]$GuiInstaller,
     # GUI 安装器 exe 路径；留空则用 Installer\app\GenshinFSRBridgeInstaller.exe。
-    [string]$GuiInstallerExe
+    [string]$GuiInstallerExe,
+    # ---- 代码签名（可选）----
+    # 只签本项目**自己编译**的 4 个自有 DLL 与 GUI 安装器；上游组件（OptiScaler/ReShade/DLSS/FFX/
+    # FPS Unlocker）一律不签 —— 给别人的二进制签名等于冒充来源。
+    # 证书优先用 $SignPfx（配合环境变量 FSR_SIGN_PFX_PASSWORD），其次 $SignThumbprint（证书+私钥
+    # 已在证书存储里，例如硬件令牌）。都不给则不签名，但只要配了证书而签失败就**直接报错中止**。
+    [string]$SignPfx = $env:FSR_SIGN_PFX,
+    [string]$SignThumbprint = $env:FSR_SIGN_THUMBPRINT,
+    [string]$SignTimestampUrl = 'http://timestamp.digicert.com',
+    # 必须签名：没配证书也直接报错（默认关闭，避免 CI/临时构建被迫配证书）
+    [switch]$RequireSigning
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
 $root = [IO.Path]::GetFullPath((Split-Path -Parent $PSCommandPath))
+
+# ---- 签名配置解析 ----
+# 未配置 = 不签名（但会打印一次醒目警告，避免"安静地发出未签名包"）。默认 PFX 放在**仓库外**
+# 的用户目录：私钥一旦进仓库或被 .gitignore 之外的路径带出去，等于把发布者身份送人。
+$script:signPfxPath = ''
+$script:signingThumbprint = ''
+if (-not [string]::IsNullOrWhiteSpace($SignPfx)) { $script:signPfxPath = [IO.Path]::GetFullPath($SignPfx) }
+if (-not [string]::IsNullOrWhiteSpace($SignThumbprint)) { $script:signingThumbprint = $SignThumbprint.Replace(' ', '') }
+if ([string]::IsNullOrWhiteSpace($script:signPfxPath) -and [string]::IsNullOrWhiteSpace($script:signingThumbprint)) {
+    $defaultSignPfx = Join-Path $env:LOCALAPPDATA 'FSR\signing\fsr-codesign.pfx'
+    if (Test-Path -LiteralPath $defaultSignPfx -PathType Leaf) { $script:signPfxPath = $defaultSignPfx }
+}
+$script:signingEnabled = (-not [string]::IsNullOrWhiteSpace($script:signPfxPath)) -or (-not [string]::IsNullOrWhiteSpace($script:signingThumbprint))
+if (-not $script:signingEnabled -and $RequireSigning) {
+    throw ('-RequireSigning 要求签名，但没有证书：请用 -SignPfx/-SignThumbprint，或先跑 ' +
+        'scripts\New-SigningCertificate.ps1 生成默认 PFX（%LOCALAPPDATA%\FSR\signing\）。')
+}
+$script:signWarned = $false
 $installerSource = Join-Path $root 'tools\FpsUnlockInstaller'
 $guiInstallerSource = Join-Path $root 'Installer\app'
 if (-not $ScriptInstaller) {
@@ -190,6 +218,9 @@ function Build-PackageComponents {
         [string]::IsNullOrWhiteSpace($script:tloaderDll)) {
         throw 'CMake 未生成必要的 FPS Unlock 包 DLL。'
     }
+    # 编译产物**就地处签**：这样 build 目录里的 DLL（部署脚本会直接取用）与之后拷进 stage
+    # 的那份是同一批字节，不会出现"包里有签名、部署目录里没有"的半状态。
+    Invoke-ReleaseSigning -Paths @($script:bridgeDll, $script:antiDll, $script:tloaderDll)
 }
 
 function Remove-BuildOutputPath {
@@ -691,6 +722,29 @@ function Assert-FufuInstallerVersionSynced {
     }
 }
 
+function Invoke-ReleaseSigning {
+    # 用 scripts\Sign-Binaries.ps1 给**本项目自己编译**的二进制签名，并由该脚本回读校验
+    # （签名存在 / 哈希一致 / 签名者指纹匹配 / 时间戳存在）。
+    # 不配置证书 ⇒ 不签名，但**只警告一次**：安静的未签名发布包比报错更难发现。
+    # 配置了证书 ⇒ 签名失败直接抛错中止（fail-closed），绝不带着未签名产物继续打包。
+    param([string[]]$Paths)
+    $existing = @($Paths | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path -LiteralPath $_ -PathType Leaf) })
+    if ($existing.Count -eq 0) { return }
+    if (-not $script:signingEnabled) {
+        if (-not $script:signWarned) {
+            $script:signWarned = $true
+            Write-Host ('未配置代码签名证书：本次产物保持**未签名**（要签：先跑 scripts\New-SigningCertificate.ps1，' +
+                '或传 -SignPfx / -SignThumbprint）。') -ForegroundColor Yellow
+        }
+        return
+    }
+    $signParams = @{ Paths = $existing; TimestampUrl = $SignTimestampUrl }
+    if (-not [string]::IsNullOrWhiteSpace($script:signingThumbprint)) { $signParams['Thumbprint'] = $script:signingThumbprint }
+    else { $signParams['Pfx'] = $script:signPfxPath }
+    & (Join-Path $root 'scripts\Sign-Binaries.ps1') @signParams
+}
+
 function Build-FufuMarketplacePackage {
 param([Parameter(Mandatory)][string]$Version)
 $version = $Version
@@ -705,6 +759,7 @@ if ((Get-Item -LiteralPath $fufuDll).VersionInfo.FileVersion -ne "$version.0") {
     throw "FSR-Bridge-Plugin.dll 版本未同步：实际 $((Get-Item $fufuDll).VersionInfo.FileVersion)，期望 $version.0"
 }
 Assert-FufuInstallerVersionSynced -Version $version
+Invoke-ReleaseSigning -Paths @($fufuDll)
 
 $stage = Join-Path $dist '.fufu-marketplace-stage'
 Reset-Stage -Path $stage
@@ -849,6 +904,9 @@ if ($FetchUpstream) {
 Remove-DistArtifacts -DistPath $dist
 
 Build-PackageComponents
+
+# GUI 安装器是外部产物（Installer\app\build-app.ps1 生成），打包前就地处签：之后进 stage 的副本即带签名。
+if (-not $ScriptInstaller) { Invoke-ReleaseSigning -Paths @($guiInstallerExe) }
 
 # TextureLoader.ini 的**唯一权威源**在组件源码目录 `TextureLoader\TextureLoader.ini`
 # （见上方 $tloaderConfig 与 4 处 Copy-Item）—— 与 Bridge 的做法一致：
