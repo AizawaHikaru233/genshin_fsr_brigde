@@ -857,7 +857,7 @@ zc_budget_exhausted marked=8 reserved=8 reserved_bytes=66355200 skipped=1 limit_
 
 ⇒ 8 张上限只覆盖前两批：第 3 批输入 = 8 仍在限内，**第 4 批输入 = 11 超出 ⇒ 静默退化为全拷贝**。原「长会话可能静默退化」的推断由此获得实测链条（`zc_mark_of_input` 2→5）。
 
-**处置（缺陷① 仍开放，下一步独立提交）**：① **抬上限**：`k_zc_max_textures` 8 → **16**（字节上限保持 256 MiB：1080p 每张 8.29 MB ⇒ 16 张 132.7 MB 由张数先触顶；1440p 渲染 14.06 MB/张时 256 MiB 允许 18 张）；② **不收紧候选**（`BindFlags` 精确相等会冒漏真实输入的风险，后端本就不读 `BindFlags`）；③ 原「可选修法」中的「② 记录真实输入是第几号 mark」已实施，`zc_budget_exhausted` 也已带 `limit=` 四态。后续判据：若某轮出现 `mark_of_input=0`（输入不在表里）或 `zc_in=0` + `reason=not_shared` 且 `zc_mark` 已达上限，按当时的 `limit=` 再评估上限。
+**处置（已实施）**：① **抬上限**：`k_zc_max_textures` 8 → **16**（字节上限保持 256 MiB：1080p 每张 8.29 MB ⇒ 16 张 132.7 MB 由张数先触顶；1440p 渲染 14.06 MB/张时 256 MiB 允许 18 张）⇒ 覆盖 5 批（输入到 14）。② **不收紧候选**（`BindFlags` 精确相等会冒漏真实输入的风险，后端本就不读 `BindFlags`）；③ 原「可选修法」中的「② 记录真实输入是第几号 mark」已实施，`zc_budget_exhausted` 也已带 `limit=` 四态。后续判据：若某轮出现 `mark_of_input=0`（输入不在表里）或 `zc_in=0` + `reason=not_shared` 且 `zc_mark` 已达上限，按当时的 `limit=` 再评估上限。
 
 > 原可选修法（备查，已不采用）：① 收紧候选（`BindFlags` 精确等于 `RT|SRV`、排除已知中间 RT）；② dispatch 首次命中时记录“真实输入是第几号 mark”，据此判断 8 张够不够；③ 保留现判据，但把 `zc_budget_exhausted` 提升为可见告警，并在低频行里区分「候选已满」与「非候选」。
 

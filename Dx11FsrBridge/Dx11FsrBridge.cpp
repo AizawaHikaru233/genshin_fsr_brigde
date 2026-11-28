@@ -1184,7 +1184,7 @@ std::atomic_uint32_t g_native_ldr_texture_create_observed_count { 0 };
 // ---- 输入颜色零拷贝（2026-11-28，L2 #24② Stage 1，opt-in Ffx12ZeroCopy）----
 // 这些计数器/配额放在这里而不是贴着钩子：桥的低频 ffx12_dispatch 行（本文件 14000 行附近）
 // 要用 g_zc_marked，不能引用"定义在它之后"的变量（C++ 要求先声明）。
-constexpr std::uint32_t k_zc_max_textures = 8;
+constexpr std::uint32_t k_zc_max_textures = 16;
 constexpr std::uint64_t k_zc_max_bytes = 256ull * 1024ull * 1024ull;
 std::atomic_uint32_t g_zc_marked { 0 };          // 注入成功（真正标记）的张数，低频日志用
 std::atomic_uint32_t g_zc_reserved { 0 };        // 预算已预留张数（含尚未 CreateTexture2D 的）
@@ -1194,7 +1194,7 @@ std::atomic_uint32_t g_zc_create_fallbacks { 0 }; // 注入 create 失败、按�
 std::atomic_bool g_zc_budget_exhausted_logged { false };
 // ---- 零拷贝可观测性：标记表（2026-11-28；**只影响日志，不改任何注入行为**）----
 // 为什么桥这边要自己维护一张小表：后端只知道 D3D11 纹理指针，而日志要回答「真实输入是第几号
-// mark，8 张上限够不够」。注入成功时把 `ID3D11Texture2D* → 预留序号` 记下来，dispatch 时按
+// mark，上限（16 张）够不够」。注入成功时把 `ID3D11Texture2D* → 预留序号` 记下来，dispatch 时按
 // 输入的指针回查即可。**按指针查、不按序号查**：滚动回滚（zc_rollback_budget）只归还计数、
 // 序号在后续纹理上会重复出现，按序号查会把「A 的第 3 号」错配成「B 的第 3 号」。
 // 为什么**无锁**：写入在纹理创建钩子的注入成功分支，读取在 dispatch 成功分支；用 acquire/
@@ -15502,10 +15502,15 @@ HRESULT STDMETHODCALLTYPE hooked_create_buffer(ID3D11Device *device, const D3D11
 // 为什么不复用后端自己建的 tex_color：那张是后端新建的落地纹理，游戏每帧必须
 // CopyResource 写进去 —— 零拷贝要省掉的正是这次拷贝，所以必须在源头（游戏纹理）上动手。
 
-// 预算硬上限（张数 + 字节）：注入的纹理由游戏持有、我们观测不到它的销毁时机，8 张 /
-// 256 MiB 足以覆盖同一时刻真正被读的一两张（双缓冲/双 RT），又不会随分辨率与重开局
-// 无限累积；到达上限后停止注入并计数，不再重试。常量与计数器见文件上方全局区
-// （k_zc_max_textures / g_zc_marked 等，日志行要先用）。
+// 预算硬上限（张数 + 字节）：注入的纹理由游戏持有、我们观测不到它的销毁时机，所以必须有
+// 上限，否则会随分辨率与重开局无限累积；到达上限后停止注入并计数，不再重试。常量与计数器
+// 见文件上方全局区（k_zc_max_textures / g_zc_marked 等，日志行要先用）。
+// 张数上限 16 的依据（2026-11-28 实测：`zc_mark_of_input` 从 2 递增到 5，即每批 3 张、真实
+// 输入是**每批第 2 张**）⇒ 输入序号 2、5、8、11、14…；上限 8 只覆盖前两批（第 3 批输入=8
+// 仍在限内，第 4 批输入=11 超限 ⇒ 静默退化为全拷贝，日志只剩 zc_in=0 而看不出原因）⇒ 16 张
+// 覆盖 5 批、输入到 14，正好留一批余量。
+// 字节上限保持 256 MiB：1080p 每张 1920×1080×4 B ≈ 8.29 MB ⇒ 16 张 ≈ 132.7 MB < 256 MB
+// （先撞张数）；1440p 渲染尺寸每张 ≈ 14.06 MB ⇒ 256 MiB 允许 18 张（仍是张数先触顶）。
 // 按**指针**查这张纹理是第几号 mark（0 = 不在表里 / 已失效，含指针为空）。
 // 读顺序：先 acquire 读已认领槽数、再逐项 acquire 读指针；写入方保证「先写 index、再 release
 // 写指针」⇒ 只要读到指针，配套的 index 一定已可见。
@@ -15539,7 +15544,7 @@ std::uint32_t zc_mark_index_of(const ID3D11Texture2D *texture)
 //   ⇒ 再 release 写指针，读者读到指针就一定能读到配套 index。注册计数在认领时就递增 ⇒ 读者
 //   可能短暂扫到「计数已含、指针仍为空」的槽，比较即失败、跳过，无副作用。
 // ③ 极端并发下最坏**丢一条观测记录**（两个创建线程同时注册），不影响注入与预算（那些是
-//   独立的原子计数）。表满同样只丢观测（上限 8 张、容量 32，实际到不了）。
+//   独立的原子计数）。表满同样只丢观测（上限 16 张、容量 32，余量足够、实际到不了）。
 void zc_register_mark(ID3D11Texture2D *texture, std::uint32_t index)
 {
     if (texture == nullptr)
@@ -15564,9 +15569,10 @@ void zc_register_mark(ID3D11Texture2D *texture, std::uint32_t index)
 
 // 预算耗尽到底撞的是哪个上限 —— 四态。`Both` 必须**可达**：所以两个判据必须先各算一次
 // （按「撞张数就先 return」的写法，字节判据根本没算，`Both` 永远不可达 ⇒ 四态是假的）。
-// 数值前提：`Both` 要求「张数与字节同时超」= 9 × 单张字节 > 256 MiB ⇔ 单张 ≥ 29.8 MB，
-// 即 4K 级（3840×2160×4 B ≈ 33.2 MB/张，9 张 ≈ 299 MB）。1920×1080 每张 ≈ 8.3 MB，8 张才
-// 66 MB ⇒ 1080p 下只可能出现 `textures`，`bytes`/`textures+bytes` 只在 4K 及以上出现。
+// 数值前提（张数上限 16 时）：`Both` 要求「张数与字节同时超」= 17 × 单张字节 > 256 MiB ⇔
+// 单张 ≥ 15.06 MB，即 4K 级（3840×2160×4 B ≈ 33.2 MB/张，17 张 ≈ 564 MB）。1920×1080 每张
+// ≈ 8.3 MB、16 张 132.7 MB ⇒ 1080p 下只可能出现 `textures`；1440p 渲染 ≈ 14.06 MB/张、16 张
+// 225 MB 仍 < 256 MiB ⇒ 同样只出现 `textures`；`bytes`/`textures+bytes` 只在 4K 及以上出现。
 enum class ZcLimit
 {
     None,
@@ -15615,7 +15621,7 @@ void zc_rollback_budget(std::uint64_t bytes)
     g_zc_reserved_bytes.fetch_sub(bytes, std::memory_order_relaxed);
 }
 
-// 预算耗尽的一次性留痕。没有这一行，日志里只会看到前 8 张 zc_mark、之后全是
+// 预算耗尽的一次性留痕。没有这一行，日志里只会看到前 16 张 zc_mark、之后全是
 // zc_in=0，看起来像"零拷贝只生效了几张就坏了"——必须说明是预算封顶而不是失败。
 // 字段口径（§五.6：累计值 / 当时值写进字段名，不许含糊）：
 //   marked_total        —— 累计注入成功张数
@@ -15863,7 +15869,9 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
             " misc=" + hex64(zc_texture_desc.MiscFlags) +
             " bytes=" + std::to_string(zc_mark_bytes) +
             " ptr=" + hex64(zc_mark_ptr);
-        // 前 16 张 INFO，之后 DEBUG（AGENTS.md §五.6：诊断日志必须有计数闸门）
+        // 上限就是 16 ⇒ 这个判断恒成立、每张都走 INFO（不是「只记前 16 张」的截断语义）。
+        // 保留判断的原因：若以后把上限再改大，这里自动退回「前 16 张 INFO、之后 DEBUG」的
+        // 限流语义（AGENTS.md §五.6：诊断日志必须有计数闸门）。
         if (zc_mark_index <= 16)
             LOG_INFO(blog::cat::core, zc_line);
         else
