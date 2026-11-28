@@ -701,7 +701,15 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 
 ---
 
-## 9. 桥的 `Present` 钩子在本游戏的启动方式下从不执行
+## 9. 发布构建默认不装 `Present` 钩子 ⇒ Present 路径功能不可达（原「从不执行」结论已证伪）
+
+> **2026-11-28 实机 E2 更正**：下方「游戏调用 `Present1`、钩子从不执行」的推断已被推翻。诊断构建里设 `Ffx12PresentProbe=1` 后，
+> `swapchain_hook_decision install=1 present=1 controls=1 color=1`、`vtable_clone_result patches=8`（controls 4 + color 3 + present 1），
+> `present frame=` 35,102 条（frame 1→35,102）、`present_probe` 495 条 ⇒ **游戏确实调用 `IDXGISwapChain::Present`（vtable 槽 8）**，
+> `g_state.frame_index` 也正常自增。旧日志 `patches=7` = 4+3+0，即 present 槽位从未 patch。
+> 根因（E0，代码确定）：`swapchain_present_hook_needed()` 的五个输入里，`hook_present` / `final_scene_probe` / `final_scene_snapshot` 全仓无赋值点，
+> `hdr_composite_probe` / `ffx12_present_probe` 只在 `#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)` 内读取；发布构建 ⇒ 该函数恒 false，钩子**按设计不装**。
+> ⇒ 下面的影响列表仍然成立（发布构建里这些功能不执行），但原因不是 Present1；推进条件改为「产品决策是否默认装钩子」。
 
 **现状**
 
@@ -726,7 +734,9 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 
 **推进需要**
 
-- 先**证实**游戏到底调哪个：在交换链 vtable 的 `Present` 与 `Present1` 两个槽位分别下钩并各自打一条
+- **2026-11-28 更新**：证实步骤已完成 —— 游戏调用 `Present`，`Present1` 假设作废。剩下的是产品决策：发布构建是否默认安装 Present 钩子以恢复 `present_probe` / `fsr2_runtime_status` / `tone_map_hdr_backbuffer_to_sdr` / `finish_pending` 等功能；若安装，需先按 §二.5 证明每帧 `hooked_present` 与新增日志无扰动。若不安装，应把这些功能明确标为「诊断构建可用」，并让依赖 `frame_index` 的判据改用调用计数。
+- ⚠️ 若决定默认装钩子：`hooked_present` 的 `present frame=` 是**每帧 INFO**（本次 E2 4 分钟 35,102 条、日志 2.78 MB），必须先把该行改成诊断门控，否则每帧字符串构造 + I/O 违反 §二.5 热路径红线。
+- 原计划（已不需要）：先**证实**游戏到底调哪个：在交换链 vtable 的 `Present` 与 `Present1` 两个槽位分别下钩并各自打一条
   一次性日志（或在 `hooked_present` 里打一条**不受等级门控**的探针）。**在证伪 `Present1` 假设之前，
   不要据此改架构**。
 - 若确认是 `Present1`：需要同时钩两个槽位，或改在二者共同的下游（如游戏的 FFX2 dispatch 路径）取帧号。
