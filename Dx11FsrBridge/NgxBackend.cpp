@@ -298,10 +298,26 @@ struct NgxInstance
     UINT depth_src_w = 0, depth_src_h = 0;
     UINT motion_src_w = 0, motion_src_h = 0;
 
-    // ---- b0 常数缓冲（16 B，两条 CS 共用）----
+    // ---- b0 常数缓冲（16 B，depth/merged 两条 CS 共用）----
     Microsoft::WRL::ComPtr<ID3D11Buffer> cb;
     float cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();  // 缓存判据（照 Ffx12Backend.cpp:1680-1683）
     float cb_uploaded_flip  = std::numeric_limits<float>::quiet_NaN();
+
+    // ---- 2026-11-28（OPEN-ISSUES §10）：**独立 motion CS 专用**的第二份 b0 ----
+    // 为什么必须单独一份：g_motion_decode_d11_hlsl 的 cbuffer MotionParams 只声明了一个实参
+    //   g_flip（Ffx12ShaderSource.h:27-31，另一个成员只是 g_pad 占位）⇒ 它读的是 **b0.x**。
+    //   而共享 cb 的 b0.x 是 depth_scale ⇒ 合并派发不可用、退回两次派发时，motion 矢量被乘上
+    //   depth_scale（NgxDepthScale=1.0 时两者相等，症状被掩盖）。
+    //   合并变体的 MergedParams 有 g_depth_scale / g_flip 两个成员、读 b0.y，不受影响，仍绑 cb。
+    // 形状照 Ffx12Backend.cpp:254（motion_cb 字段）/ :2337（只写 {flip, 0, 0, 0}）；缓存判据与
+    //   cb_uploaded_flip 同风格。
+    // 与 Ffx12Backend.cpp 的关系（如实记录）：那边 *不是* 同样形状 —— r.motion_cb（:254）被
+    //   depth 提取（约 :2312）与独立 motion（约 :2338）**共用**，两者各有独立缓存判据；
+    //   于是「写方按自己的缓存跳过上传、读方拿到对方刚写的值」这一同型隐患在那边依然存在
+    //   （当前不可达：ffx12::set_depth_scale 无调用者 ⇒ 其 g_depth_scale 恒 1.0、与 flip 同值）。
+    //   本条只在 NGX 侧修，Ffx12 侧另记 OPEN-ISSUES。
+    Microsoft::WRL::ComPtr<ID3D11Buffer> motion_cb;
+    float motion_cb_uploaded_flip = std::numeric_limits<float>::quiet_NaN();
 
     // ---- NGX feature ----
     NVSDK_NGX_Handle *feature = nullptr;   // CreateFeature 的句柄；**实例切换销毁前必须 ReleaseFeature**（v8：无驱逐）
@@ -3956,12 +3972,13 @@ static void release_pool_resources(NgxInstance &inst)
     inst.color.Reset();  inst.depth.Reset();  inst.motion.Reset();
     inst.reactive.Reset(); inst.output.Reset();
 
-    // ---- 池内视图 + cb：1 SRV + 3 UAV + 1 cb ----
+    // ---- 池内视图 + cb：1 SRV + 3 UAV + 2 cb（共享 b0 + 独立 motion 专用 b0）----
     // ★ 只 Reset 真实存在的字段。**没有** output_uav / depth_srv / motion_srv / reactive_srv
     //   （§3.3.4.1 明文「v1 不用，不要加」；写过它们会 C2039）
     inst.color_srv.Reset();
     inst.depth_uav.Reset(); inst.motion_uav.Reset();
     inst.reactive_uav.Reset(); inst.cb.Reset();
+    inst.motion_cb.Reset();   // 2026-11-28（§10）：独立 motion CS 的专用 b0，与 cb 同生共死
 
     // ---- 输入侧 SRV 与身份缓存（depth_src_last / motion_src_last 是裸指针，只置空不 Release）----
     inst.depth_src_srv.Reset(); inst.motion_src_srv.Reset();
@@ -3982,6 +3999,9 @@ static void release_pool_resources(NgxInstance &inst)
     //   纪律：cb 缓存的生命周期 == cb 对象的生命周期。
     inst.cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();
     inst.cb_uploaded_flip  = std::numeric_limits<float>::quiet_NaN();
+    // 2026-11-28（§10）：motion_cb 的判据同理 —— 漏这一行，重建后 upload_motion_cb 会被短路，
+    //   新 motion_cb 保持全 0 ⇒ g_flip = 0 ⇒ 运动矢量全 0（比旧错位更彻底的失效）。
+    inst.motion_cb_uploaded_flip = std::numeric_limits<float>::quiet_NaN();
 
     // ---- NgxZeroCopy 的**观测状态**（计划 R-6）----
     // 为什么放在这里：本函数是"池资源全清"的唯一出口，zc 的判据结论与池纹理的描述是
@@ -4134,6 +4154,18 @@ static bool create_pool(ID3D11Device *dev, NgxInstance &inst,
     {
         log_ngx_error_throttled<log_throttle_slot::Slot::CbFail>(
             L"ngx_inst cb fail hr=0x%08X", static_cast<unsigned>(hr));
+        return fail();
+    }
+
+    // 2026-11-28（OPEN-ISSUES §10）：独立 motion CS 专用的第二份 16 B cb（复用同一个 desc）。
+    //   为什么需要两份见 struct NgxInstance 里 motion_cb 的说明 —— 那份 CS 读 b0.x = g_flip，
+    //   而共享 cb 的 b0.x 是 depth_scale；两份各写各的，谁也不用将就对方的槽位。
+    // ★ 失败沿用 cb 的限频槽（同一条 CreateBuffer 路径、同一种非致命重复性错误），不新增槽。
+    hr = dev->CreateBuffer(&bd, nullptr, inst.motion_cb.GetAddressOf());
+    if (FAILED(hr))
+    {
+        log_ngx_error_throttled<log_throttle_slot::Slot::CbFail>(
+            L"ngx_inst motion_cb fail hr=0x%08X", static_cast<unsigned>(hr));
         return fail();
     }
 
@@ -4420,7 +4452,13 @@ static bool ensure_shaders()
     return true;
 }
 
-// 每帧两段 CS 之前调用一次；值与上次相同则跳过上传。
+// 每帧派发之前调用一次；值与上次相同则跳过上传。
+// 2026-11-28（OPEN-ISSUES §10）：本函数填的这份 cb 只服务 **depth CS 与合并 CS** ——
+//   两者的 b0 布局都是「x = depth_scale、y = flip」（DepthParams 读 x，MergedParams 读 x/y，
+//   Ffx12ShaderSource.h:9-13 / :71-76）。独立 motion CS 的 MotionParams 只声明了 g_flip 一个实参
+//   （Ffx12ShaderSource.h:27-31）⇒ 它读 b0.x，与本函数的布局对不上，所以那份 CS 改用
+//   upload_motion_cb() 写自己的 motion_cb。
+//   ★ 不要为了「省一份缓冲」把 flip 挪到 b0.x：depth CS 的 DepthParams 读的就是 b0.x。
 // ★ 缓存初值是 quiet_NaN()（不是 0.0f）⇒ 保证首帧必上传一次（§3.6.5）。
 static void upload_cb(ID3D11DeviceContext *ctx, NgxInstance &inst,
                       float depth_scale, float flip)
@@ -4431,6 +4469,19 @@ static void upload_cb(ID3D11DeviceContext *ctx, NgxInstance &inst,
     ctx->UpdateSubresource(inst.cb.Get(), 0, nullptr, vals, 0, 0);
     inst.cb_uploaded_depth = depth_scale;
     inst.cb_uploaded_flip  = flip;
+}
+
+// 独立 motion CS 的 b0：MotionParams 只有 g_flip 一个实参（Ffx12ShaderSource.h:27-31）⇒ 读 b0.x。
+// 2026-11-28（OPEN-ISSUES §10）：单独一份 16 B 缓冲，只写 {flip, 0, 0, 0}，形状同 Ffx12Backend.cpp:2337。
+//   flip 当前恒 1.0f ⇒ 每个 motion_cb 对象只上传一次（池重建会再上传一次）；每帧代价是一次
+//   浮点比较，没有新增 D3D 调用与日志（判据同 upload_cb）。
+static void upload_motion_cb(ID3D11DeviceContext *ctx, NgxInstance &inst, float flip)
+{
+    if (inst.motion_cb_uploaded_flip == flip)
+        return;
+    const float vals[4] = { flip, 0.0f, 0.0f, 0.0f };   // 16 B，正好 b0（b0.x = g_flip）
+    ctx->UpdateSubresource(inst.motion_cb.Get(), 0, nullptr, vals, 0, 0);
+    inst.motion_cb_uploaded_flip = flip;
 }
 
 // 深度 CS 的 t0：格式三分支 + 身份缓存。
@@ -4595,12 +4646,17 @@ static void dispatch_depth_cs(ID3D11DeviceContext *ctx, NgxInstance &inst)
 }
 
 // §3.6.2 motion 解码 CS（1 SRV / 1 CB / 2 UAV）
+// 2026-11-28（OPEN-ISSUES §10）：b0 绑的是 **motion_cb**（b0.x = flip），不是共享的 inst.cb ——
+//   本 CS 的 cbuffer MotionParams 只声明了 g_flip 一个实参（Ffx12ShaderSource.h:27-31）⇒ 读 b0.x，
+//   而 inst.cb 的 b0.x 是 depth_scale。写成 inst.cb 时，合并派发不可用的机器上运动幅度会被乘上
+//   depth_scale（E1 离线实测：修复前该组 9 个用例 u1 全像素不同、max_abs 与 depth_scale 成正比；
+//   修复后同一探针 PASS=43 FAIL=0，两条派发路径逐位等价）。
 static void dispatch_motion_cs(ID3D11DeviceContext *ctx, NgxInstance &inst)
 {
     ctx->CSSetShader(g_motion_cs.Get(), nullptr, 0);
     ID3D11ShaderResourceView *msrvs[1] = { inst.motion_src_srv.Get() };
     ctx->CSSetShaderResources(0, 1, msrvs);
-    ID3D11Buffer *mcbs[1] = { inst.cb.Get() };
+    ID3D11Buffer *mcbs[1] = { inst.motion_cb.Get() };
     ctx->CSSetConstantBuffers(0, 1, mcbs);
     // ★ 槽序不可换：u0 = 解码 motion（R16G16），u1 = reactive（R8，motion B 通道）
     ID3D11UnorderedAccessView *muavs[2] = { inst.motion_uav.Get(), inst.reactive_uav.Get() };
@@ -4627,10 +4683,11 @@ static void dispatch_merged_cs(ID3D11DeviceContext *ctx, NgxInstance &inst)
     // ★ 槽序不可换：t0 = 游戏深度（格式三分支），t1 = 游戏 motion（固定 R10G10B10A2_UNORM）
     ID3D11ShaderResourceView *srvs[2] = { inst.depth_src_srv.Get(), inst.motion_src_srv.Get() };
     ctx->CSSetShaderResources(0, 2, srvs);
-    // ★ b0 = {depth_scale, flip}：upload_cb 一次写两个值，合并变体按 x/y 各取所需。
-    //   独立的 motion CS 只声明了 g_flip ⇒ 读的是 b0.x，与 upload_cb 写 {depth, flip} 的
-    //   布局对不上（默认 depth_scale=1.0 时才碰巧等价）。这处既有错位不在本次范围内，
-    //   合并路径读 b0.y，天然绕开它。
+    // ★ b0 = {depth_scale, flip}：upload_cb 一次写两个值，合并变体按 x/y 各取所需
+    //   （MergedParams 声明 g_depth_scale / g_flip 两个成员，Ffx12ShaderSource.h:71-76）。
+    //   2026-11-28（OPEN-ISSUES §10 已修）：独立的 motion CS 的 MotionParams 只声明了 g_flip
+    //   ⇒ 它读 b0.x，与这里的 {depth, flip} 布局对不上；那份 CS 现在绑它自己的 motion_cb
+    //   （b0.x = flip，见 upload_motion_cb）。本函数继续绑共享的 inst.cb，读法不变。
     ID3D11Buffer *cbs[1] = { inst.cb.Get() };
     ctx->CSSetConstantBuffers(0, 1, cbs);
     // ★ 槽序不可换：u0 = 提取深度（R32），u1 = 解码 motion（R16G16），u2 = reactive（R8）
@@ -5996,9 +6053,12 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
         return false;
     // 2026-11-17（PR A / A3）：depth_scale 不再硬编码 —— 接 g_depth_scale（默认 1.0，
     //   与改动前等价）。原神 reverse-z 值域约 [0, 0.03]，是否要放大需实机 A/B。
-    //   flip 仍恒 1.0（写在 b0.y；合并变体读 b0.y。独立的 motion CS 读的是 b0.x ——
-    //   那处既有错位见 §3.6.3 的注）。
+    //   flip 仍恒 1.0（写在 b0.y；合并变体读 b0.y）。
+    //   2026-11-28（OPEN-ISSUES §10 已修）：独立的 motion CS 读 b0.x，所以它改绑自己的
+    //   motion_cb（b0.x = flip，由 upload_motion_cb 写）；共享的 inst.cb 仍只服务 depth / 合并。
+    //   两处上传都在这里做：flip 恒 1.0f ⇒ 每实例各只写一次，热路径增量是一次浮点比较。
     upload_cb(ctx, inst, g_depth_scale, 1.0f);
+    upload_motion_cb(ctx, inst, 1.0f);
     if (!ensure_motion_src_srv(in, inst))
         return false;
     // 2026-11-27：两条 CS 的调度结构完全一致（[numthreads(8,8,1)] + 整数坐标 Load、无采样器），

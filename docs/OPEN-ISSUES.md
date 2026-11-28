@@ -753,7 +753,10 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 
 ## 10. NGX 路径的独立 motion 解码 CS 读错 b0 槽位（把 `depth_scale` 当成了 `flip`）
 
-**现状**：`NgxBackend.cpp` 的 `upload_cb()` 每个实例只维护一份 16 B 常数缓冲，写入布局是
+> **状态（2026-11-28）**：代码已修（E1 已过），**实机 E2 仍待做** —— 该路径没有运行时开关
+> 能强制进入，见下文「推进需要什么」。
+
+**现状（修复前的状态，按 §一.5 保留作历史）**：`NgxBackend.cpp` 的 `upload_cb()` 每个实例只维护一份 16 B 常数缓冲，写入布局是
 `{depth_scale, flip, 0, 0}`（`b0.x = depth_scale`、`b0.y = flip`），调用点注释也一直声称
 「flip 在 b0.y」。但独立 motion 解码 CS 用的 HLSL（`Ffx12ShaderSource.h` 的
 `g_motion_decode_d11_hlsl`）里 `MotionParams` 只声明了一个 `float g_flip` ⇒ 它实际读的是 **b0.x**，
@@ -766,14 +769,44 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 **合并派发不可用**（合并 CS 编译失败 / 两条输入不同尺寸 / 合并 b0 未建成）**且** `NgxDepthScale != 1`
 的组合下才会暴露。两套路径对同一个参数取不同值，这个状态本身也需要消除。
 
-**推进需要什么**：
-- 先定 ABI 方向：把独立 motion CS 的 `g_flip` 挪到 `b0.y` 最干净，但必须同时改
-  `Ffx12Backend.cpp` 的两次派发路径（它把 flip 写在 `b0.x`），即两份既有 HLSL 加两处上传点一起动；
-  另一个办法是让 `upload_cb` 另写一份 `b0.x = flip`，但那会与深度 CS 抢同一个槽位，不可行。
-- 改完两条后端都要复测：`Ffx12MotionDecode=1` 的平方解码方向，以及 `NgxDepthScale` 取 1.0 / 2.0 的画面。
+**2026-11-28 更新：代码已修，实机验证仍待做。**
 
-**相关代码位置**：`Dx11FsrBridge/NgxBackend.cpp` 的 `upload_cb()`、`dispatch_motion_cs()`、
-`dispatch_merged_cs()`；`Dx11FsrBridge/Ffx12Backend.cpp` 的 `dispatch_gpu_shared()`（两次派发段）；
+- **采用的方案（第三方案）**：给每个 NGX 实例加**第二份** 16 B 常数缓冲 `motion_cb`，只写
+  `{flip, 0, 0, 0}`（即 `b0.x = flip`），**只由** `dispatch_motion_cs()` 绑定；共享的 `inst.cb`
+  （写 `{depth_scale, flip, 0, 0}`）继续服务 `dispatch_depth_cs()` 与 `dispatch_merged_cs()`。
+  新增上传点 `upload_motion_cb()` 带「值没变就跳过」的缓存（初值 `quiet_NaN()` ⇒ 首帧必上传一次），
+  `flip` 当前恒 `1.0f` ⇒ 每个 `motion_cb` 对象只上传一次，每帧代价是一次浮点比较、不新增 D3D 调用与日志。
+  选择理由：一份缓冲的 `b0.x` 只能放一个值，而 `DepthParams` 读 `b0.x`、`MotionParams` 也读 `b0.x`
+  ⇒ 只要两条 CS 共用一份缓冲，必然有一方读到别人的值。加一份 16 B 缓冲是唯一既不改 HLSL、
+  不动 Ffx12 侧、也不让任何一方将就对方槽位的做法。
+- **与下文「另一个办法」的关系**：那里否决的是「让 `upload_cb` 在**同一份**缓冲里把 `b0.x` 写成 flip」
+  —— 那确实会与深度 CS 抢槽位。独立第二份缓冲不共享槽位，不在否决范围。
+- **E1 离线实测**（真卡 RTX 4070 SUPER，D3D11，探针直接 `#include` 生产头里的三条 HLSL 字符串，
+  不复制公式）：修复前 `PASS=32 FAIL=9`，9 个 FAIL 全是 `depth_scale != flip` 时 `u1`(motion) 全像素不同，
+  `max_abs` 与 `depth_scale` 成正比（`ds=2` 正好 2 倍、`ds=0.5` 正好一半 —— 与「读的是 `b0.x`」一致）；
+  改成「共享 cb 写 `{depth, flip}`、`motion_cb` 写 `{flip}`」后同一探针 **`PASS=43 FAIL=0`**，
+  两条派发路径在 `flip=0` / `flip=-1` / `ds=2` / `ds=0.5` / 奇数尺寸 / 1×1 下逐位等价。
+  `D3DReflect` 读**编译产物**确认 `MotionParams` 的 `g_flip` `StartOffset=0`、`MergedParams` 的
+  `g_depth_scale@0` / `g_flip@4`。
+- **分级 L2**：改动在 `NgxBackend.cpp` 的资源生命周期与上采样主链上（多 1 个 `ID3D11Buffer` + 1 个浮点缓存字段）。
+- **E1 的边界（不要读成端到端已验证）**：探针是对生产上传语义的**复刻**，不调用 `upload_*` / `dispatch_*`
+  生产函数 ⇒ 它证明「按新语义填两份 cb 后两条路径逐位等价」，生产接线本身靠构建 + 代码审查 + 独立审核。
+
+**推进需要什么（2026-11-28 更新后）**：
+
+- **已完成**：上面「采用的方案」已落进代码，E1 证据见上。
+- **仍待 ①（实机 E2）**：该路径只在「合并派发不可用」时走，而 `g_merged_cs` 只由「合并 CS 编译/建对象
+  是否成功」决定，**没有任何运行时开关**能强制关掉合并派发 ⇒ 实机上无法主动进入这条路径做端到端验证。
+  要补 E2，需要先加一个诊断入口（例如按 ini 键或环境变量跳过合并派发），而那本身是另一处改动。
+- **仍待 ②**：`NgxDepthScale` 取 1.0 / 2.0 的画面复测 —— 依赖 ① 的可达性。
+  `Ffx12MotionDecode=1` 的平方解码方向与本次改动无关（Ffx12 侧未动），不再列在这里。
+- **关联**：同型的镜像隐患在 Ffx12 后端仍然存在（depth 提取与独立 motion 共用同一份 `motion_cb`），
+  当前不可达，见 §16。
+
+**相关代码位置**：`Dx11FsrBridge/NgxBackend.cpp` 的 `NgxInstance::motion_cb` / `motion_cb_uploaded_flip`、
+`create_pool()`（两份 16 B 缓冲的创建）、`upload_cb()` / `upload_motion_cb()`、`dispatch_motion_cs()`、
+`dispatch_merged_cs()`、`release_pool_resources()`（两份缓冲一起复位）；
+`Dx11FsrBridge/Ffx12Backend.cpp` 的 `dispatch_gpu_shared()`（两次派发段，本次未动）；
 `Dx11FsrBridge/Ffx12ShaderSource.h` 的 `g_motion_decode_d11_hlsl` 与 `g_depth_motion_merged_hlsl`。
 
 ---
@@ -978,6 +1011,41 @@ zc_vendor_gate vendor=0x…. supported=0|1 need=0x10DE action=allow|deny zc_req=
 4. **部署脚本例外**：`scripts/Deploy-Bridge.ps1` 的 `$configValues` **有意不包含**本键（理由与 `Ffx12ZeroCopy*` 相同，见 §14 第 3 条：该脚本每次部署覆盖 ini，加进去会抹掉用户手改的 opt-in）。当前生效的四处为 `load_config`、`Dx11FsrBridge.package.ini`、提交信息、本条目。
 
 **相关代码位置**：`Dx11FsrBridge/NgxBackend.cpp` 的 `zc_evaluate()` / `zc_texture_ok()` / `zc_misc_flags_ok()` / `zc_same_device()` / `zc_color_in_om_set()` / `zc_color_tex()` / `zc_output_tex()` / `OmBindGuard`、`dispatch()` 的判据步（三条一次性取证行）、输入拷贝与输出回写两处跳过、`EvaluateFeature` 前后的 OM 解绑/恢复、eval 失败分支的粘滞关闭、`release_pool_resources()` 的观测状态复位；`Dx11FsrBridge/NgxBackend.h` 的 `set_zero_copy()` / `zero_copy_requested()`；`Dx11FsrBridge/Dx11FsrBridge.cpp` 的 `load_config()` 内本键读取点；`Dx11FsrBridge/Dx11FsrBridge.package.ini`。
+---
+
+## 16. Ffx12 后端的 depth 提取与独立 motion 解码共用同一份 b0（镜像隐患，当前不可达）
+
+**现状**：`Ffx12Backend.cpp` 的 `r.motion_cb`（字段在 `:254`）被两处写、两处绑：
+
+- `:2306-2317` depth 提取：值变才写 `{g_depth_scale, 0, 0, 0}`，缓存 `r.cb_uploaded_depth`；
+- `:2333-2342` 独立 motion 解码：值变才写 `{g_motion_flip, 0, 0, 0}`，缓存 `r.cb_uploaded_flip`。
+
+两份缓存各自独立，而缓冲只有一份 ⇒ 两个值**不同**时，第 2 帧起先跑的那一方会跳过上传、读到另一方刚写的值。
+具体后果：设 `g_motion_flip = -1`、`g_depth_scale = 1`。第 1 帧 depth 写 `{1, …}` 并派发（正确）、
+motion 写 `{-1, …}` 并派发（正确）；第 2 帧 depth 判「`1` 没变」跳过上传 ⇒ depth 提取 CS 读到
+`g_depth_scale = -1` ⇒ 深度被整体取负。这与 §10 是同一个错误的镜像（§10 是 motion 读到 depth 的值），
+成因也相同：一份 16 B 缓冲的 `b0.x` 装不下两个不同语义的值。
+
+**来源（不是 §10 的修复引入的）**：该共用关系自 `f9e52b3`（2026-09-28）起就存在 —— 当时实例上只有**一份**
+`motion_cb`，depth 提取写 `dscale`、motion 解码写 `flip`，两处各自记缓存；`5412121`（2026-11-27）把这两段代码
+重排并**新增**了一份独立的 `merged_cb`（其注释还专门写了「为什么不与 motion_cb 共用」），但 depth 与 motion 的
+共用关系原样保留。2026-11-28 的 NGX 修复**没有触碰** `Ffx12Backend.cpp`，本条只是把既有隐患补记入库。
+
+**影响 / 可达性**：`ffx12::set_depth_scale()` 与 `ffx12::set_motion_flip()` 目前**没有任何调用者**
+（`Dx11FsrBridge.cpp` 只调 `ngx::set_depth_scale()`），两个全局量恒为 `1.0f` ⇒ 数值相同、症状被掩盖，
+**当前不可达**。一旦接上 XeSS/DLSS 取向开关（`set_motion_flip(-1.0)` 是显然的下一步），就会静默出现
+上面的错值，且日志不会有任何异常。
+
+**推进需要什么**：照 NGX 侧 2026-11-28 的做法，给 depth 提取与独立 motion 各配一份 16 B 缓冲
+（`merged_cb` 已经是独立的一份，可作模板）；改完用同一套离线探针思路（直接 `#include` 生产头里的 HLSL 字符串、在真 D3D11 device 上按两种填法各派发一次、逐位比较读回结果）
+对比 `depth_scale != flip` 时两条派发路径的输出。若短期不修，唯一的临时约束是「不得单独调用
+`set_motion_flip()`」—— 但没有机制保证，所以更稳的做法是修掉。
+
+**相关代码位置**：`Dx11FsrBridge/Ffx12Backend.cpp` 的 `:254`（`motion_cb`）、`:255-256`（两份缓存）、
+`:257-264`（`merged_cb` 及其注释）、`:2306-2330`（depth 提取的两次派发段）、`:2331-2360`（独立 motion 段）、
+`:3857-3865`（`set_motion_flip()` / `set_depth_scale()`，当前无调用者）；
+`Dx11FsrBridge/Ffx12ShaderSource.h` 的 `g_depth_extract_hlsl`（读 `b0.x`）与 `g_motion_decode_d11_hlsl`（读 `b0.x`）。
+
 ---
 
 ## 已解决
