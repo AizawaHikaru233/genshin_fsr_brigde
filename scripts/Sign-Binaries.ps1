@@ -28,6 +28,9 @@ param(
     [string]$PfxPassword = $env:FSR_SIGN_PFX_PASSWORD,
     [string]$Thumbprint = $env:FSR_SIGN_THUMBPRINT,
     [string]$TimestampUrl = 'http://timestamp.digicert.com',
+    # 备用 RFC3161 服务器：单个 TSA 偶发抽风不该让整轮发版失败（2026-11-28 实测 DigiCert
+    # 一次 "could not be reached or returned an invalid response" 直接中止了打包）
+    [string[]]$FallbackTimestampUrls = @('http://timestamp.sectigo.com', 'http://time.certum.pl'),
     [switch]$NoTimestamp,
     # 只校验、不签名（用于确认发布物确实带签名）
     [switch]$VerifyOnly
@@ -129,25 +132,34 @@ if (-not $VerifyOnly)
 {
     foreach ($file in $targets)
     {
-        $signArgs = @('sign', '/fd', 'sha256')
-        if (-not $NoTimestamp)
+        # 参数逐个试：主 TSA 失败就换备用（只换 `/tr`，证书与文件路径不变）。
+        # 2026-11-28 实测：DigiCert 偶发 "could not be reached" 曾直接中止整轮打包，
+        # 而同一时刻另外三个 TSA 都可用 ⇒ 单点故障不该阻断发版。
+        $urls = @()
+        if (-not $NoTimestamp) { $urls = @($TimestampUrl) + @($FallbackTimestampUrls) }
+        else { $urls = @($null) }
+        $lastOut = @()
+        $signed = $false
+        foreach ($url in $urls)
         {
-            $signArgs += @('/td', 'sha256', '/tr', $TimestampUrl)
+            $tryArgs = @('sign', '/fd', 'sha256')
+            if (-not $NoTimestamp) { $tryArgs += @('/td', 'sha256', '/tr', $url) }
+            if (-not [string]::IsNullOrWhiteSpace($Thumbprint))
+            {
+                $tryArgs += @('/sha1', $Thumbprint.Replace(' ', ''))
+            }
+            else
+            {
+                $tryArgs += @('/f', $Pfx, '/p', $PfxPassword)
+            }
+            $tryArgs += $file
+            $lastOut = & $signTool @tryArgs 2>&1
+            if ($LASTEXITCODE -eq 0) { $signed = $true; break }
+            if ($urls.Count -gt 1) { Write-Host "  时间戳服务器不可用，换下一个：$url" -ForegroundColor DarkYellow }
         }
-        if (-not [string]::IsNullOrWhiteSpace($Thumbprint))
+        if (-not $signed)
         {
-            $signArgs += @('/sha1', $Thumbprint.Replace(' ', ''))
-        }
-        else
-        {
-            $signArgs += @('/f', $Pfx, '/p', $PfxPassword)
-        }
-        $signArgs += $file
-        Write-Host "签名：$(Split-Path -Leaf $file)" -ForegroundColor Gray
-        $out = & $signTool @signArgs 2>&1
-        if ($LASTEXITCODE -ne 0)
-        {
-            throw ("signtool sign 失败（exit=$LASTEXITCODE）：$(Split-Path -Leaf $file)`n" + ($out -join "`n"))
+            throw ("signtool sign 失败（exit=$LASTEXITCODE）：$(Split-Path -Leaf $file)`n" + ($lastOut -join "`n"))
         }
     }
     Write-Host ''
